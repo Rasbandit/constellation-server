@@ -25,7 +25,9 @@ pub enum Command {
 
 /// One log entry.
 ///
-/// Out of scope for now: ULID event ids (doc 05 7.1). The room-wide `seq` is the id until then.
+/// Deviations from doc 05 7.1, both out of scope for now: no ULID event id (the room-wide `seq`
+/// is the id), and `Item` carries no `item_uid` (`H(room, location_id)`, doc 02 D3); the
+/// `location` field identifies the item until the hash exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     /// Room-wide, gapless, starts at 1.

@@ -15,6 +15,12 @@ Status: foundation only. Internal, not for external use; text mentioning Archipe
 
 Next crates, in doc 05 section 20 order: `runtime`, `edge-native`. Decision D-99: start as one process, so the edge talks to the room through an in-process seam and there is no network code yet.
 
+## Known deviations from doc 05 7.1 and 7.2
+- `Item` events carry no `item_uid`, and events have no ULID id (`seq` is the id).
+- `fold(snapshot, limits, tail)` takes the limits and returns `Result`; `Ctx::limits` is a borrow.
+- `Applied` has one `reply` plus `depends_on` (the hold rule: do not release a reply until that `seq` is durable), and no `effects`.
+- `LogStore` has `read_cursors` and no outbox rows yet. `Cid` and `RoomId` are integers.
+
 ## Rules (doc 05 6.2)
 1. L0/L1 crates never depend on tokio, sqlx, axum, a clock or an OS RNG.
 2. `unsafe` is forbidden workspace-wide; exceptions go in `docs/unsafe-register.md`.

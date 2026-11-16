@@ -4,6 +4,11 @@
 //! turns a command into events and one reply; `fold` rebuilds state from a snapshot and a log
 //! tail. Both go through `RoomState::record`, so live state and rehydrated state cannot drift.
 //!
+//! Deviations from doc 05 7.1: `fold` also takes `&Limits` (dedupe pruning needs the window) and
+//! returns `Result` (a corrupt log is an error, not a panic); `Ctx::limits` is a borrow, not
+//! `&'static`; `Applied` has one reply, `depends_on`, and no `effects`; `Item` events carry no
+//! `item_uid` (see `proto::Event`).
+//!
 //! Applied cursors (`Ack`) are not log events (D-02): `fold` does not restore them, the caller
 //! reads them from the store and calls [`RoomState::restore_applied`].
 #![no_std]
@@ -414,6 +419,9 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
 }
 
 /// Rebuild state from a snapshot and the log events after it.
+///
+/// Unlike the doc 05 7.1 sketch it takes the limits and returns `Result`. Validate a stored snapshot with
+/// [`RoomState::validate`] first. Every event is checked against the placement table.
 ///
 /// # Errors
 /// `LogGap`, `ItemGap`, `BadEvent` or `SeqOverflow` when the tail is not a valid continuation.
