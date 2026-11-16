@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use config::Limits;
+use config::{Limits, Secrets};
 use edge_compat::CompatRoom;
 use log::MemLogStore;
 use proto::RoomId;
@@ -18,6 +18,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use yawc::{DeflatePool, IncomingUpgrade, Options};
 
 /// Command line settings.
@@ -29,13 +30,11 @@ pub struct Args {
     pub port: u16,
     /// Address to bind.
     pub host: IpAddr,
-    /// Room password, overriding the bundle's.
-    pub password: Option<String>,
 }
 
 /// How to run the binary.
-pub const USAGE: &str =
-    "usage: constellation-server --bundle <path> --port <port> [--host <ip>] [--password <pw>]";
+pub const USAGE: &str = "usage: constellation-server --bundle <path> --port <port> [--host <ip>] \
+     (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE)";
 
 impl Args {
     /// Parse the arguments after the program name.
@@ -43,7 +42,7 @@ impl Args {
     /// # Errors
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let (mut bundle, mut port, mut host, mut password) = (None, None, None, None);
+        let (mut bundle, mut port, mut host) = (None, None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -51,7 +50,6 @@ impl Args {
                 "--bundle" => bundle = Some(PathBuf::from(value()?)),
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
-                "--password" => password = Some(value()?),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -59,7 +57,6 @@ impl Args {
             bundle: bundle.ok_or("--bundle is required")?,
             port: port.ok_or("--port is required")?,
             host: host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            password,
         })
     }
 }
@@ -85,6 +82,8 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<SeedBundle
 struct AppState {
     room: Arc<CompatRoom>,
     options: Options,
+    /// One permit per open WebSocket (`Limits::max_connections`).
+    slots: Arc<Semaphore>,
 }
 
 /// Start the room for `bundle` and build the router.
@@ -100,13 +99,16 @@ pub fn app(bundle: SeedBundle, password: Option<String>, limits: Limits) -> Resu
     let (handle, _task) = RoomHandle::spawn(room_id, epoch, state, store, limits);
     let room = Arc::new(CompatRoom::new(Arc::new(bundle), handle, password, limits)?);
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
-    Ok(Router::new()
-        .route("/", get(upgrade))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(AppState { room, options }))
+    Ok(Router::new().route("/", get(upgrade)).route("/healthz", get(|| async { "ok" })).with_state(
+        AppState { room, options, slots: Arc::new(Semaphore::new(limits.max_connections)) },
+    ))
 }
 
 async fn upgrade(State(s): State<AppState>, ws: IncomingUpgrade) -> Response {
+    let Ok(permit) = Arc::clone(&s.slots).try_acquire_owned() else {
+        tracing::warn!("connection cap reached");
+        return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
+    };
     let (response, fut) = match ws.upgrade(s.options) {
         Ok(pair) => pair,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -118,6 +120,8 @@ async fn upgrade(State(s): State<AppState>, ws: IncomingUpgrade) -> Response {
             Ok(socket) => edge_compat::serve(socket, s.room).await,
             Err(e) => tracing::debug!(error = %e, "upgrade did not complete"),
         }
+        drop(permit);
+        tracing::info!("connection closed");
     });
     response.into_response()
 }
@@ -137,10 +141,10 @@ pub fn init_logging() {
 ///
 /// # Errors
 /// A message when the bundle or the socket fails.
-pub async fn run(args: Args, limits: Limits) -> Result<(), String> {
+pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), String> {
     let bundle = load_bundle(&args.bundle, &limits)?;
     let seed = bundle.seed_name.clone();
-    let router = app(bundle, args.password, limits)?;
+    let router = app(bundle, secrets.room_password, limits)?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
         .await
         .map_err(|e| format!("bind: {e}"))?;
@@ -184,9 +188,9 @@ mod tests {
     fn the_documented_flags_parse_and_host_defaults_to_loopback() {
         let a = parse("--bundle b.json --port 0").unwrap();
         assert_eq!(a.bundle, PathBuf::from("b.json"));
-        assert_eq!((a.port, a.host, a.password), (0, IpAddr::V4(Ipv4Addr::LOCALHOST), None));
-        let a = parse("--port 38281 --host 0.0.0.0 --password pw --bundle x").unwrap();
-        assert_eq!((a.port, a.password.as_deref()), (38281, Some("pw")));
+        assert_eq!((a.port, a.host), (0, IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let a = parse("--port 38281 --host 0.0.0.0 --bundle x").unwrap();
+        assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
     }
 
     #[test]
@@ -198,6 +202,7 @@ mod tests {
             ("--bundle b --port 70000", "--port needs a number"),
             ("--bundle b --port 1 --host nope", "--host needs an IP"),
             ("--bundle b --port 1 --verbose", "unknown argument"),
+            ("--bundle b --port 1 --password pw", "unknown argument"),
         ] {
             assert!(parse(args).unwrap_err().contains(want), "{args:?}");
         }

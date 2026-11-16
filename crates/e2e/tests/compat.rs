@@ -188,7 +188,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_bad_password_is_refused_with_invalid_password() {
-        let server = Server::start(&["--password", "secret"]).unwrap();
+        let server = Server::start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD", "secret")]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         assert_eq!(c.next().await.unwrap()["password"], true);
         c.send(&connect_packet("Alice", Some("wrong"))).await.unwrap();
@@ -281,6 +281,69 @@ mod scenarios {
         tokio::time::timeout(e2e::GUARD, tcp.read_to_string(&mut body)).await.unwrap().unwrap();
         assert!(body.starts_with("HTTP/1.1 200"), "{body}");
         assert!(body.ends_with("ok"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_password_can_come_from_a_file_and_never_from_the_command_line() {
+        let dir = std::env::temp_dir().join(format!("e2e-pw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pw");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let server =
+            Server::start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD_FILE", path.to_str().unwrap())])
+                .unwrap();
+        let mut c = Client::connect(&server.url()).await.unwrap();
+        c.next().await.unwrap();
+        c.send(&connect_packet("Alice", Some("from-file"))).await.unwrap();
+        assert_eq!(c.next_cmd("Connected").await.unwrap().0["slot"], 1);
+        assert!(Server::start(&["--password", "x"]).is_err(), "the flag is gone");
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_cap_get_503_and_a_freed_slot_is_reused() {
+        let server = Server::start_env(&[], &[("CONSTELLATION_MAX_CONNECTIONS", "1")]).unwrap();
+        let mut first = Client::connect(&server.url()).await.unwrap();
+        first.next().await.unwrap();
+        let head = handshake_headers(&server, None).await;
+        assert!(head.starts_with("http/1.1 503"), "{head}");
+        first.close().await.unwrap();
+        server.wait_for_log("connection closed").unwrap();
+        let mut again = Client::connect(&server.url()).await.unwrap();
+        assert_eq!(again.next().await.unwrap()["cmd"], "RoomInfo");
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_never_connects_to_a_slot_is_closed() {
+        let server =
+            Server::start_env(&[], &[("CONSTELLATION_CONNECT_TIMEOUT_MS", "200")]).unwrap();
+        let mut c = Client::connect(&server.url()).await.unwrap();
+        assert_eq!(c.next().await.unwrap()["cmd"], "RoomInfo");
+        let end = c.next().await.unwrap_err();
+        assert!(end.contains("closed") || end.contains("socket"), "{end}");
+        server.wait_for_log("connect timeout").unwrap();
+        // A client that connects in time is not affected.
+        let mut ok = Client::connect(&server.url()).await.unwrap();
+        ok.next().await.unwrap();
+        ok.send(&connect_packet("Alice", None)).await.unwrap();
+        assert_eq!(ok.next_cmd("Connected").await.unwrap().0["slot"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_pings_is_closed_as_idle() {
+        let env =
+            [("CONSTELLATION_IDLE_TIMEOUT_MS", "300"), ("CONSTELLATION_PING_INTERVAL_MS", "100")];
+        let server = Server::start_env(&[], &env).unwrap();
+        // A raw socket: upgraded, then silent; it never answers the server's pings.
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            server.addr
+        );
+        tcp.write_all(req.as_bytes()).await.unwrap();
+        let mut sink = Vec::new();
+        tokio::time::timeout(e2e::GUARD, tcp.read_to_end(&mut sink)).await.unwrap().unwrap();
+        server.wait_for_log("idle timeout").unwrap();
     }
 
     #[test]

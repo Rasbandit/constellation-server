@@ -47,6 +47,17 @@ pub struct Limits {
     pub datapackage_burst: u32,
     /// Refill of that bucket, thousandths per second (100 = one every 10 s).
     pub datapackage_refill_milli_per_sec: u32,
+    /// Open WebSocket connections per process; more get HTTP 503 (`CONSTELLATION_MAX_CONNECTIONS`).
+    pub max_connections: usize,
+    /// A socket that has not connected to a slot within this long is closed
+    /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
+    pub connect_timeout_ms: u64,
+    /// A socket that sends nothing (not even a pong) for this long is closed
+    /// (`CONSTELLATION_IDLE_TIMEOUT_MS`).
+    pub idle_timeout_ms: u64,
+    /// The server pings each socket this often, so a quiet live client answers in time
+    /// (`CONSTELLATION_PING_INTERVAL_MS`; keep it under the idle timeout).
+    pub ping_interval_ms: u64,
 }
 
 impl Limits {
@@ -70,6 +81,10 @@ impl Limits {
         bounce_max_bytes: 16 * 1024,
         datapackage_burst: 4,
         datapackage_refill_milli_per_sec: 100,
+        max_connections: 10_000,
+        connect_timeout_ms: 30_000,
+        idle_timeout_ms: 60_000,
+        ping_interval_ms: 20_000,
     };
 }
 
@@ -94,7 +109,61 @@ pub fn load() -> Limits {
         l.sim_seeds = v;
     }
     l.sim_replay_seed = num("SIM_SEED");
+    if let Some(v) = num("CONSTELLATION_MAX_CONNECTIONS").and_then(|v| usize::try_from(v).ok()) {
+        l.max_connections = v;
+    }
+    for (key, field) in [
+        ("CONSTELLATION_CONNECT_TIMEOUT_MS", &mut l.connect_timeout_ms),
+        ("CONSTELLATION_IDLE_TIMEOUT_MS", &mut l.idle_timeout_ms),
+        ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
+    ] {
+        if let Some(v) = num(key) {
+            *field = v;
+        }
+    }
     l
+}
+
+/// Values that must not appear on a command line (visible to every local user in `ps`).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Secrets {
+    /// Room password: `CONSTELLATION_ROOM_PASSWORD`, or the first line of the file named by
+    /// `CONSTELLATION_ROOM_PASSWORD_FILE`. `None` keeps the seed's own.
+    pub room_password: Option<String>,
+}
+
+/// Read [`Secrets`] from the environment.
+///
+/// # Errors
+/// Both password variables set, an unreadable file, or an empty password.
+#[cfg(feature = "std")]
+pub fn load_secrets() -> Result<Secrets, String> {
+    secrets_from(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))
+}
+
+#[cfg(feature = "std")]
+fn secrets_from(
+    var: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&std::path::Path) -> std::io::Result<String>,
+) -> Result<Secrets, String> {
+    let direct = var("CONSTELLATION_ROOM_PASSWORD");
+    let file = var("CONSTELLATION_ROOM_PASSWORD_FILE");
+    let room_password = match (direct, file) {
+        (Some(_), Some(_)) => {
+            return Err("set CONSTELLATION_ROOM_PASSWORD or ..._FILE, not both".to_owned());
+        }
+        (Some(p), None) => Some(p),
+        (None, Some(path)) => {
+            let text = read(std::path::Path::new(&path)).map_err(|e| format!("{path}: {e}"))?;
+            Some(text.lines().next().unwrap_or("").to_owned())
+        }
+        (None, None) => None,
+    };
+    if room_password.as_deref() == Some("") {
+        return Err("the room password is empty".to_owned());
+    }
+    Ok(Secrets { room_password })
 }
 
 #[cfg(test)]
@@ -119,6 +188,43 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
+    }
+
+    #[test]
+    fn the_password_comes_from_the_variable_or_the_files_first_line() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        let file = |p: &std::path::Path| {
+            if p == std::path::Path::new("/pw") {
+                Ok("s3cret\nignored\n".to_owned())
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+            }
+        };
+        assert_eq!(secrets_from(env(&[]), file), Ok(Secrets::default()));
+        let direct = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD", "pw")]), file);
+        assert_eq!(direct.unwrap().room_password.as_deref(), Some("pw"));
+        let from_file = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD_FILE", "/pw")]), file);
+        assert_eq!(from_file.unwrap().room_password.as_deref(), Some("s3cret"));
+        let both: &'static [(&str, &str)] =
+            &[("CONSTELLATION_ROOM_PASSWORD", "a"), ("CONSTELLATION_ROOM_PASSWORD_FILE", "/pw")];
+        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
+        let missing = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD_FILE", "/nope")]), file);
+        assert!(missing.unwrap_err().contains("/nope"));
+        let empty = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD", "")]), file);
+        assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn connection_limits_are_design_values_and_the_ping_beats_the_idle_timeout() {
+        let l = Limits::DESIGN;
+        assert_eq!(l.max_connections, 10_000);
+        assert_eq!(
+            (l.connect_timeout_ms, l.idle_timeout_ms, l.ping_interval_ms),
+            (30_000, 60_000, 20_000)
+        );
+        assert!(l.ping_interval_ms < l.idle_timeout_ms);
     }
 
     #[test]

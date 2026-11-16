@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use yawc::{Frame, MaybeTlsStream, OpCode, Options, WebSocket};
@@ -77,7 +77,7 @@ pub struct Server {
     child: Child,
     /// Where it listens.
     pub addr: SocketAddr,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<(Mutex<Vec<String>>, Condvar)>,
 }
 
 impl Server {
@@ -86,18 +86,28 @@ impl Server {
     /// # Errors
     /// When the binary cannot be built or started, or never logs its address.
     pub fn start(extra: &[&str]) -> Res<Self> {
+        Self::start_env(extra, &[])
+    }
+
+    /// As [`Server::start`], with environment variables for the server process (how `config`
+    /// reads limits and secrets).
+    ///
+    /// # Errors
+    /// As [`Server::start`].
+    pub fn start_env(extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
         let mut child = Command::new(binary()?)
             .arg("--bundle")
             .arg(fixture_path())
             .args(["--port", "0"])
             .args(extra)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn server: {e}"))?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
         let sink = Arc::clone(&log);
         std::thread::spawn(move || {
@@ -105,11 +115,12 @@ impl Server {
                 if let Some(addr) = listening_addr(&line) {
                     let _ = tx.send(addr);
                 }
-                sink.lock().unwrap_or_else(PoisonError::into_inner).push(line);
+                sink.0.lock().unwrap_or_else(PoisonError::into_inner).push(line);
+                sink.1.notify_all();
             }
         });
         let addr = rx.recv_timeout(GUARD).map_err(|_| {
-            let lines = log.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+            let lines = log.0.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
             format!("server never logged its address; log:\n{lines}")
         })?;
         Ok(Self { child, addr, log })
@@ -124,7 +135,25 @@ impl Server {
     /// Every log line so far.
     #[must_use]
     pub fn log(&self) -> Vec<String> {
-        self.log.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.log.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Wait until a log line contains `needle` (the signal for server-side events), and return
+    /// it.
+    ///
+    /// # Errors
+    /// When no such line appears within the guard timeout.
+    pub fn wait_for_log(&self, needle: &str) -> Res<String> {
+        let (lines, cv) = &*self.log;
+        let (guard, _) = cv
+            .wait_timeout_while(lines.lock().unwrap_or_else(PoisonError::into_inner), GUARD, |l| {
+                !l.iter().any(|x| x.contains(needle))
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let found = guard.iter().find(|x| x.contains(needle)).cloned();
+        let all = guard.join("\n");
+        drop(guard);
+        found.ok_or_else(|| format!("no log line with {needle:?}; log:\n{all}"))
     }
 
     /// Send SIGTERM and wait for the exit.

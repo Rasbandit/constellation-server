@@ -142,6 +142,12 @@ impl Session {
         }
     }
 
+    /// Whether a `Connect` has succeeded on this socket.
+    #[must_use]
+    pub const fn is_joined(&self) -> bool {
+        self.joined.is_some()
+    }
+
     /// The live stream, once connected; the socket loop waits on it.
     pub const fn live(&mut self) -> Option<&mut mpsc::Receiver<Arc<Published>>> {
         match &mut self.joined {
