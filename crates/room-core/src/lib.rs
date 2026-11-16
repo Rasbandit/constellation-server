@@ -12,7 +12,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::{collections::BTreeMap, collections::BTreeSet, vec, vec::Vec};
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use config::Limits;
 use core::fmt;
 use proto::{Cid, Command, Event, EventKind, ItemSeq, Seq, SlotNo, Timestamp};
@@ -50,7 +50,10 @@ struct Dedupe {
 pub struct RoomState {
     placement: Placement,
     head: Seq,
-    checked: BTreeSet<u32>,
+    /// Highest `seq` known to be in the log. Live states lag `head` until `mark_durable`.
+    durable: Seq,
+    /// Checked locations and the `seq` of their `Checked` event.
+    checked: BTreeMap<u32, Seq>,
     slots: BTreeMap<SlotNo, SlotCursor>,
     /// `(slot, cid)` index, expiring after `dedupe_window_secs` (D-13).
     dedupe: BTreeMap<SlotNo, BTreeMap<Cid, Dedupe>>,
@@ -74,12 +77,21 @@ pub enum Reply {
 }
 
 /// Output of one command.
+///
+/// **Hold rule.** A caller must not release `reply` until `depends_on` (when `Some`) is durable in
+/// the log, and must then call [`RoomState::mark_durable`]. `depends_on` is set whenever the reply
+/// rests on an event that is not yet known durable: the command's own new events, or the original
+/// event behind a repeated cid or an already-checked location. Releasing earlier would answer
+/// "done" for something a crash can still erase (doc 05 8.1 rule 2). Batches must hold whole
+/// commands, so durable always covers a command's `Checked` and `Item` events together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     /// To append to the log, in order. Empty for repeats, acks and already-checked locations.
     pub events: Vec<Event>,
     /// For the caller, after the append commits.
     pub reply: Reply,
+    /// Hold `reply` until this `seq` is durable; `None` means release at once.
+    pub depends_on: Option<Seq>,
 }
 
 /// Why a command or a fold was refused. State is unchanged on every error from `apply`.
@@ -112,6 +124,11 @@ pub enum CoreError {
     },
     /// A folded event has no slot.
     BadEvent,
+    /// `mark_durable` above the head.
+    DurableAhead {
+        /// The current head.
+        head: Seq,
+    },
 }
 
 impl fmt::Display for CoreError {
@@ -155,10 +172,36 @@ impl RoomState {
         Ok(Self {
             placement,
             head: Seq(0),
-            checked: BTreeSet::new(),
+            durable: Seq(0),
+            checked: BTreeMap::new(),
             slots,
             dedupe: BTreeMap::new(),
         })
+    }
+
+    /// Highest `seq` known durable. Equals `head` for a state rebuilt by `fold`.
+    #[must_use]
+    pub const fn durable(&self) -> Seq {
+        self.durable
+    }
+
+    /// Number of `(slot, cid)` dedupe entries held, for tests and metrics.
+    #[must_use]
+    pub fn dedupe_len(&self) -> usize {
+        self.dedupe.values().map(BTreeMap::len).sum()
+    }
+
+    /// Record that the log holds everything up to `seq` (the caller's append committed). Lower
+    /// values are a no-op. See the hold rule on [`Applied`].
+    ///
+    /// # Errors
+    /// `DurableAhead` when `seq` is above the head.
+    pub fn mark_durable(&mut self, seq: Seq) -> Result<(), CoreError> {
+        if seq > self.head {
+            return Err(CoreError::DurableAhead { head: self.head });
+        }
+        self.durable = self.durable.max(seq);
+        Ok(())
     }
 
     /// The last assigned room `seq` (0 for a new room).
@@ -196,6 +239,11 @@ impl RoomState {
         Ok(c.applied)
     }
 
+    /// `Some(seq)` when `seq` (the last event of an original command) is not yet durable.
+    fn wait_for(&self, seq: u64) -> Option<Seq> {
+        (seq > self.durable.0).then_some(Seq(seq))
+    }
+
     /// The only place an event changes state; shared by `apply` and `fold`.
     fn record(&mut self, ev: &Event, limits: &Limits) -> Result<(), CoreError> {
         let expected = next_seq(self.head)?;
@@ -213,7 +261,7 @@ impl RoomState {
                 cursor.item_head = item_seq;
             }
             EventKind::Checked { cid, location, at } => {
-                self.checked.insert(location);
+                self.checked.insert(location, ev.seq);
                 let index = self.dedupe.entry(slot).or_default();
                 // shortcut: prunes this slot's whole index on each new check, O(entries);
                 // upgrade to a time-ordered index when a room's 24 h window gets large.
@@ -234,7 +282,7 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
     match cmd {
         Command::Ack { slot, applied } => {
             let applied = state.restore_applied(slot, applied)?;
-            Ok(Applied { events: Vec::new(), reply: Reply::Acked { applied } })
+            Ok(Applied { events: Vec::new(), reply: Reply::Acked { applied }, depends_on: None })
         }
         Command::Check { slot, cid, location } => {
             if !state.slots.contains_key(&slot) {
@@ -243,16 +291,23 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
             let window = ctx.limits.dedupe_window_secs;
             if let Some(d) = state.dedupe.get(&slot).and_then(|m| m.get(&cid)) {
                 if live(d.at, ctx.now, window) {
+                    let depends_on = state.wait_for(d.seq.0.saturating_add(1));
                     return Ok(Applied {
                         events: Vec::new(),
                         reply: Reply::Checked { seq: d.seq },
+                        depends_on,
                     });
                 }
             }
             let &(receiver, item) =
                 state.placement.get(&location).ok_or(CoreError::UnknownLocation(location))?;
-            if state.checked.contains(&location) {
-                return Ok(Applied { events: Vec::new(), reply: Reply::AlreadyChecked });
+            if let Some(&at_seq) = state.checked.get(&location) {
+                let depends_on = state.wait_for(at_seq.0.saturating_add(1));
+                return Ok(Applied {
+                    events: Vec::new(),
+                    reply: Reply::AlreadyChecked,
+                    depends_on,
+                });
             }
             // Validate every counter first so `record` cannot fail half way.
             let checked_seq = next_seq(state.head)?;
@@ -275,7 +330,11 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
             for e in &events {
                 state.record(e, ctx.limits)?;
             }
-            Ok(Applied { events, reply: Reply::Checked { seq: checked_seq } })
+            Ok(Applied {
+                events,
+                reply: Reply::Checked { seq: checked_seq },
+                depends_on: Some(item_event_seq),
+            })
         }
     }
 }
@@ -292,6 +351,8 @@ pub fn fold(
     for e in tail {
         snapshot.record(&e, limits)?;
     }
+    // Log events are durable by definition.
+    snapshot.durable = snapshot.head;
     Ok(snapshot)
 }
 

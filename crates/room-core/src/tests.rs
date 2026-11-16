@@ -230,6 +230,8 @@ fn fold_rebuilds_the_state_from_a_snapshot_and_a_tail() {
     let mut snap = room();
     snap = fold(snap, &LIM, head.iter().copied()).unwrap();
     let rebuilt = fold(snap, &LIM, tail.iter().copied()).unwrap();
+    // The live state learns its events are durable from the caller; fold knows by definition.
+    live.mark_durable(live.head()).unwrap();
     assert_eq!(rebuilt, live);
 }
 
@@ -386,7 +388,7 @@ mod properties {
             cmds in proptest::collection::vec(command(), 0..60),
             cut in 0_usize..60,
         ) {
-            let (live, events, _) = run(&cmds);
+            let (mut live, events, _) = run(&cmds);
             // Snapshot at an arbitrary event boundary, then fold the tail onto it.
             let cut = cut.min(events.len());
             let (head, tail) = events.split_at(cut);
@@ -396,7 +398,86 @@ mod properties {
             for slot in [SlotNo(1), SlotNo(2)] {
                 rebuilt.restore_applied(slot, live.cursor(slot).unwrap().applied).unwrap();
             }
+            live.mark_durable(live.head()).unwrap();
             prop_assert_eq!(rebuilt, live);
         }
     }
+}
+
+mod hold_rule {
+    use super::*;
+
+    #[test]
+    fn a_new_check_depends_on_its_last_event_until_that_is_durable() {
+        let mut s = room();
+        let a = apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+        assert_eq!(a.depends_on, Some(Seq(2)));
+    }
+
+    #[test]
+    fn a_repeat_of_an_uncommitted_check_must_wait_for_the_original() {
+        let mut s = room();
+        apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+        let again = apply(&mut s, &at(1), check(1, 1, 10)).unwrap();
+        assert_eq!(again.reply, Reply::Checked { seq: Seq(1) });
+        assert_eq!(again.events, NO_EVENTS);
+        assert_eq!(again.depends_on, Some(Seq(2)));
+        s.mark_durable(Seq(2)).unwrap();
+        assert_eq!(apply(&mut s, &at(2), check(1, 1, 10)).unwrap().depends_on, None);
+    }
+
+    #[test]
+    fn already_checked_by_an_uncommitted_event_must_wait_for_it() {
+        let mut s = room();
+        apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+        let r = apply(&mut s, &at(0), check(2, 9, 10)).unwrap();
+        assert_eq!((r.reply, r.depends_on), (Reply::AlreadyChecked, Some(Seq(2))));
+        s.mark_durable(Seq(1)).unwrap();
+        // Half durable is still not durable for the whole command.
+        assert_eq!(apply(&mut s, &at(0), check(2, 9, 10)).unwrap().depends_on, Some(Seq(2)));
+        s.mark_durable(Seq(2)).unwrap();
+        assert_eq!(apply(&mut s, &at(0), check(2, 9, 10)).unwrap().depends_on, None);
+    }
+
+    #[test]
+    fn an_ack_never_waits() {
+        let mut s = room();
+        apply(&mut s, &at(0), check(1, 1, 11)).unwrap();
+        assert_eq!(apply(&mut s, &at(0), ack(2, 1)).unwrap().depends_on, None);
+    }
+
+    #[test]
+    fn durable_only_rises_and_never_passes_the_head() {
+        let mut s = room();
+        assert_eq!(s.mark_durable(Seq(1)), Err(CoreError::DurableAhead { head: Seq(0) }));
+        apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+        s.mark_durable(Seq(2)).unwrap();
+        s.mark_durable(Seq(1)).unwrap();
+        assert_eq!(s.durable(), Seq(2));
+    }
+
+    #[test]
+    fn a_folded_state_is_durable_by_definition() {
+        let mut live = room();
+        let ev = apply(&mut live, &at(0), check(1, 1, 10)).unwrap().events;
+        let mut s = fold(room(), &LIM, ev).unwrap();
+        assert_eq!(s.durable(), Seq(2));
+        assert_eq!(apply(&mut s, &at(1), check(1, 1, 10)).unwrap().depends_on, None);
+    }
+}
+
+#[test]
+fn expired_dedupe_entries_are_pruned() {
+    let mut s = room();
+    apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+    apply(&mut s, &at(50), check(1, 2, 11)).unwrap();
+    assert_eq!(s.dedupe_len(), 2, "both inside the 100 s window");
+    apply(&mut s, &at(120), check(1, 3, 12)).unwrap();
+    assert_eq!(s.dedupe_len(), 2, "the entry from t=0 expired, the one from t=50 did not");
+    let lim = Limits { dedupe_window_secs: 0, ..LIM };
+    let ctx = Ctx { now: Timestamp(0), limits: &lim };
+    let mut z = room();
+    apply(&mut z, &ctx, check(1, 1, 10)).unwrap();
+    apply(&mut z, &ctx, check(1, 2, 11)).unwrap();
+    assert_eq!(z.dedupe_len(), 1, "a zero window keeps only the newest entry");
 }
