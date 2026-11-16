@@ -213,6 +213,30 @@ impl Client {
         self.queue.pop_front().ok_or_else(|| "empty queue".to_owned())
     }
 
+    /// Read until `n` pings from the server have arrived (data frames are queued, not lost).
+    ///
+    /// # Errors
+    /// As [`Client::next`].
+    pub async fn wait_pings(&mut self, n: usize) -> Res<()> {
+        let mut seen = 0;
+        while seen < n {
+            let frame = tokio::time::timeout(GUARD, self.ws.next_frame())
+                .await
+                .map_err(|_| "no frame within the guard timeout".to_owned())?
+                .map_err(|e| format!("socket: {e}"))?;
+            match frame.opcode() {
+                OpCode::Ping => seen = seen.saturating_add(1),
+                OpCode::Text => match serde_json::from_slice(frame.payload()) {
+                    Ok(Value::Array(v)) => self.queue.extend(v),
+                    other => return Err(format!("unexpected frame: {other:?}")),
+                },
+                OpCode::Close => return Err("server closed the connection".to_owned()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The next packet with this `cmd`, skipping (and returning) others before it.
     ///
     /// # Errors

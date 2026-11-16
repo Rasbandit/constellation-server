@@ -325,18 +325,38 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn a_socket_that_never_connects_to_a_slot_is_closed() {
-        let server = start_env(&[], &[("CONSTELLATION_CONNECT_TIMEOUT_MS", "200")]).unwrap();
-        let mut c = Client::connect(&server.url()).await.unwrap();
-        assert_eq!(c.next().await.unwrap()["cmd"], "RoomInfo");
-        let end = c.next().await.unwrap_err();
-        assert!(end.contains("closed") || end.contains("socket"), "{end}");
-        server.wait_for_log("connect timeout").unwrap();
-        // A client that connects in time is not affected.
+    async fn a_socket_that_never_connects_to_a_slot_is_closed_and_a_connected_one_is_not() {
+        // 2 s is generous for a loopback Connect, so the timely client never races the timer.
+        let server = start_env(&[], &[("CONSTELLATION_CONNECT_TIMEOUT_MS", "2000")]).unwrap();
+        let mut idle = Client::connect(&server.url()).await.unwrap();
         let mut ok = Client::connect(&server.url()).await.unwrap();
+        assert_eq!(idle.next().await.unwrap()["cmd"], "RoomInfo");
         ok.next().await.unwrap();
         ok.send(&connect_packet("Alice", None)).await.unwrap();
         assert_eq!(ok.next_cmd("Connected").await.unwrap().0["slot"], 1);
+        let end = idle.next().await.unwrap_err();
+        assert!(end.contains("closed") || end.contains("socket"), "{end}");
+        server.wait_for_log("connect timeout").unwrap();
+        // The timer has fired for the other socket; the connected one still answers.
+        ok.send(&json!([{"cmd": "Get", "keys": []}])).await.unwrap();
+        assert_eq!(ok.next_cmd("Retrieved").await.unwrap().0["keys"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_client_that_answers_pings_stays_open_past_the_idle_timeout() {
+        let env =
+            [("CONSTELLATION_IDLE_TIMEOUT_MS", "300"), ("CONSTELLATION_PING_INTERVAL_MS", "50")];
+        let server = start_env(&[], &env).unwrap();
+        let mut c = Client::connect(&server.url()).await.unwrap();
+        c.next().await.unwrap();
+        c.send(&connect_packet("Alice", None)).await.unwrap();
+        c.next_cmd("Connected").await.unwrap();
+        // The server's own pings are the clock: 12 of them, 50 ms apart, span well past 300 ms,
+        // and the client only answers them (yawc replies to pings while reading).
+        c.wait_pings(12).await.unwrap();
+        c.send(&json!([{"cmd": "Get", "keys": []}])).await.unwrap();
+        assert_eq!(c.next_cmd("Retrieved").await.unwrap().0["cmd"], "Retrieved");
+        assert!(!server.log().iter().any(|l| l.contains("idle timeout")), "closed as idle");
     }
 
     #[tokio::test]
