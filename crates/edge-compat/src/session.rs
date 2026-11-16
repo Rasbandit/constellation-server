@@ -45,9 +45,15 @@ struct Handling {
 
 impl Handling {
     fn parse(v: &Value) -> Option<Self> {
-        // Only the three documented flags count; higher bits are ignored, as the reference
-        // server tests bits rather than ranges (MultiServer.py, `items_handling` setter).
-        let bits = v.as_u64()? & 0b111;
+        // The reference server reads this as an integer bit set (MultiServer.py, the
+        // `items_handling` setter): only the three documented flags count, higher bits are
+        // ignored, a negative number is its two's complement bits (-1 is every flag), and a
+        // boolean is the integer 0 or 1. Anything else is refused.
+        let raw = match v {
+            Value::Bool(b) => u64::from(*b),
+            _ => v.as_u64().or_else(|| v.as_i64().map(|i| u64::from_le_bytes(i.to_le_bytes())))?,
+        };
+        let bits = raw & 0b111;
         let any = bits & 0b001 != 0;
         // Bits 1 and 2 need bit 0.
         if !any && bits != 0 {

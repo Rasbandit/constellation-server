@@ -667,7 +667,7 @@ async fn items_handling_bits_above_the_three_flags_are_ignored() {
     assert_eq!(send(&mut s, &connect_packet("A", &json!(15))).await[0]["cmd"], "Connected");
     let mut s = Session::new(room());
     assert_eq!(send(&mut s, &connect_packet("A", &json!(8))).await[0]["cmd"], "Connected");
-    for bad in [json!(-1), json!(6), json!(1.5)] {
+    for bad in [json!(6), json!(-2), json!(1.5), json!("7"), Value::Null] {
         let mut s = Session::new(room());
         assert_eq!(
             send(&mut s, &connect_packet("A", &bad)).await[0]["errors"],
@@ -835,4 +835,25 @@ async fn a_slow_checker_resyncs_its_own_checks_and_items_with_nothing_missed_or_
         .collect();
     assert_eq!(items, (1000..1030).collect::<Vec<_>>(), "every item once, in order");
     assert_eq!(indexes(&got), (0..30).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn items_handling_is_read_as_bits_like_the_reference_so_minus_one_and_true_are_flag_sets() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    // -1 has every bit set: all three flags, so own items too.
+    let mut all = Session::new(Arc::clone(&room));
+    assert_eq!(send(&mut all, &connect_packet("A", &json!(-1))).await[0]["cmd"], "Connected");
+    // true is 1: items from other worlds only.
+    let mut remote = Session::new(Arc::clone(&room));
+    assert_eq!(send(&mut remote, &connect_packet("A", &json!(true))).await[0]["cmd"], "Connected");
+    let mut none = Session::new(Arc::clone(&room));
+    assert_eq!(send(&mut none, &connect_packet("A", &json!(false))).await[0]["cmd"], "Connected");
+    pump(&mut all).await;
+    pump(&mut remote).await;
+    pump(&mut none).await;
+    check(&mut a, &[101]).await; // A's own item
+    assert_eq!(of(&pump(&mut all).await, "ReceivedItems").len(), 1);
+    assert_eq!(of(&pump(&mut remote).await, "ReceivedItems").len(), 0);
+    assert_eq!(of(&pump(&mut none).await, "ReceivedItems").len(), 0);
 }
