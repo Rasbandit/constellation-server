@@ -7,13 +7,13 @@ use crate::wire::{
     NetworkItem, NetworkPlayer, NetworkSlot, Permissions, PrintJson, Say, ServerPacket,
     StatusUpdate, TextPart,
 };
-use crate::{CompatRoom, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
+use crate::{CompatRoom, NO_GAME_MIN_VERSION, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
 use proto::{Command, Event, EventKind, Seq, SlotNo};
 use runtime::{Published, Subscription};
 use seed_bundle::{Slot, SlotKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -44,7 +44,9 @@ struct Handling {
 
 impl Handling {
     fn parse(v: &Value) -> Option<Self> {
-        let bits = v.as_u64().filter(|b| *b <= 0b111)?;
+        // Only the three documented flags count; higher bits are ignored, as the reference
+        // server tests bits rather than ranges (MultiServer.py, `items_handling` setter).
+        let bits = v.as_u64()? & 0b111;
         let any = bits & 0b001 != 0;
         // Bits 1 and 2 need bit 0.
         if !any && bits != 0 {
@@ -214,7 +216,7 @@ impl Session {
             }
             "Sync" => Ok(self.full_items().into_iter().collect()),
             "LocationChecks" => self.location_checks(parse(cmd, p)?).await,
-            "LocationScouts" => Ok(vec![self.scout(&parse(cmd, p)?)]),
+            "LocationScouts" => Ok(vec![self.scout(&parse(cmd, p)?)?]),
             "StatusUpdate" => self.status(&parse(cmd, p)?).await,
             "Say" => self.say(parse(cmd, p)?).await,
             "Bounce" => self.bounce(p).await,
@@ -235,7 +237,7 @@ impl Session {
         let Some((team, slot, handling)) = ok.filter(|_| errors.is_empty()) else {
             return Ok(vec![wire::frame(&[ServerPacket::ConnectionRefused { errors }])]);
         };
-        let first = self.joined.is_none();
+        let previous = self.joined.as_ref().map(|j| (j.team, j.slot));
         let Subscription { history, live } =
             self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
         let mut j = Joined {
@@ -261,7 +263,11 @@ impl Session {
         if !wanted.is_empty() {
             packets.push(ServerPacket::ReceivedItems { index: 0, items: wanted });
         }
-        if first {
+        // A re-Connect to the same slot announces nothing; to another slot it leaves the old one.
+        if previous.is_none_or(|(_, old)| old != slot.id) {
+            if let Some((old_team, old)) = previous {
+                self.fan(old, &Fanout::Print { print: part_print(old_team, old) }).await?;
+            }
             let print = PrintJson {
                 kind: "Join".to_owned(),
                 data: json!([TextPart::player(slot.id), TextPart::text(" joined the room.")]),
@@ -370,13 +376,7 @@ impl Session {
     /// The client is gone: tell the others.
     pub async fn leave(&mut self) {
         let Some(j) = self.joined.take() else { return };
-        let print = PrintJson {
-            kind: "Part".to_owned(),
-            data: json!([TextPart::player(j.slot), TextPart::text(" left the room.")]),
-            team: Some(j.team),
-            slot: Some(j.slot),
-            ..PrintJson::default()
-        };
+        let print = part_print(j.team, j.slot);
         let body = serde_json::to_value(Fanout::Print { print }).unwrap_or(Value::Null);
         // The room may already be gone; nobody is left to tell then.
         drop(self.room.room.ext(SlotNo(j.slot), Arc::new(body)).await);
@@ -403,7 +403,8 @@ impl Session {
         let j = self.joined.as_mut()?;
         let items = j.wanted();
         j.sent = items.len();
-        Some(wire::frame(&[ServerPacket::ReceivedItems { index: 0, items }]))
+        // Nothing to send (no items yet, or a client that takes none): no empty packet.
+        (!items.is_empty()).then(|| wire::frame(&[ServerPacket::ReceivedItems { index: 0, items }]))
     }
 
     async fn location_checks(&self, req: Locations) -> Result<Vec<String>, Step> {
@@ -427,27 +428,41 @@ impl Session {
         Ok(Vec::new())
     }
 
-    fn scout(&self, req: &Locations) -> String {
-        let Some(slot) = self.joined.as_ref().and_then(|j| self.room.bundle.slot(j.slot)) else {
-            return String::new();
-        };
-        let wanted: BTreeSet<i64> = req.locations.iter().copied().collect();
-        let locations = slot
+    /// One answer per requested id, in request order; an id outside the slot's world refuses
+    /// the whole packet.
+    fn scout(&self, req: &Locations) -> Result<String, Step> {
+        let slot = self.joined.as_ref().and_then(|j| self.room.bundle.slot(j.slot));
+        let slot = slot.ok_or(Step::Closed)?;
+        let world: BTreeMap<i64, _> = slot.locations.iter().map(|p| (p.location, p)).collect();
+        let locations = req
             .locations
             .iter()
-            .filter(|p| wanted.contains(&p.location))
-            .map(|p| NetworkItem {
-                item: p.item,
-                location: p.location,
-                player: p.receiver,
-                flags: p.flags,
+            .map(|l| {
+                let p = world.get(l).ok_or_else(|| {
+                    let text = format!("LocationScouts: location {l} is not in this world");
+                    Step::from(invalid("arguments", Some("LocationScouts"), text))
+                })?;
+                Ok(NetworkItem {
+                    item: p.item,
+                    location: p.location,
+                    player: p.receiver,
+                    flags: p.flags,
+                })
             })
-            .collect();
-        wire::frame(&[ServerPacket::LocationInfo { locations }])
+            .collect::<Result<_, Step>>()?;
+        Ok(wire::frame(&[ServerPacket::LocationInfo { locations }]))
     }
 
     async fn status(&self, req: &StatusUpdate) -> Result<Vec<String>, Step> {
-        let slot = self.joined.as_ref().ok_or(Step::Closed)?.slot;
+        let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        let slot = j.slot;
+        if req.status == CLIENT_GOAL && j.no_locations() {
+            return Err(Step::from(invalid(
+                "arguments",
+                Some("StatusUpdate"),
+                "trackers and text clients cannot reach a goal",
+            )));
+        }
         if req.status == CLIENT_GOAL {
             let out = self.room.room.command(Command::Goal { slot: SlotNo(slot) });
             out.await.map_err(|_| Step::Closed)?.map_err(|_| Step::Closed)?;
@@ -533,6 +548,12 @@ impl Session {
             let goal = slot.is_some_and(|s| j.is_some_and(|j| j.goals.contains(&s)));
             return if goal { json!(CLIENT_GOAL) } else { json!(0) };
         }
+        if key.starts_with("_read_hints_") {
+            return json!([]); // no hints yet
+        }
+        if key == "_read_race_mode" {
+            return json!(b.race_mode);
+        }
         if let Some(rest) = key.strip_prefix("_read_slot_data_") {
             let slot = rest.parse::<u32>().ok().and_then(|s| b.slot(s));
             return slot.map_or(Value::Null, |s| s.slot_data.clone());
@@ -542,17 +563,22 @@ impl Session {
 
     fn connect_update(&mut self, req: ConnectUpdate) -> Result<Vec<String>, Step> {
         let j = self.joined.as_mut().ok_or(Step::Closed)?;
+        // Validate everything before changing anything.
+        let handling = match req.items_handling.as_ref().map(Handling::parse) {
+            Some(None) => {
+                return Err(Step::from(invalid(
+                    "arguments",
+                    Some("ConnectUpdate"),
+                    "bad items_handling",
+                )));
+            }
+            Some(Some(h)) => Some(h),
+            None => None,
+        };
         if let Some(tags) = req.tags {
             j.tags = tags.into_iter().collect();
         }
-        let Some(raw) = req.items_handling else { return Ok(Vec::new()) };
-        let Some(h) = Handling::parse(&raw) else {
-            return Err(Step::from(invalid(
-                "arguments",
-                Some("ConnectUpdate"),
-                "bad items_handling",
-            )));
-        };
+        let Some(h) = handling else { return Ok(Vec::new()) };
         if h == j.handling {
             return Ok(Vec::new());
         }
@@ -597,7 +623,9 @@ fn refusals<'a>(
         errors.push("InvalidGame");
     }
     let min = slot.minimum_client_version;
-    if c.version.tuple() < (min.major, min.minor, min.build) {
+    // A client without a game is held to the server-wide minimum, not the world's.
+    let min = if no_game { NO_GAME_MIN_VERSION } else { (min.major, min.minor, min.build) };
+    if c.version.tuple() < min {
         errors.push("IncompatibleVersion");
     }
     let handling = Handling::parse(&c.items_handling);
@@ -678,17 +706,36 @@ fn events_packets(room: &CompatRoom, j: &mut Joined, evs: &[Event]) -> Vec<Serve
     packets
 }
 
+fn part_print(team: u32, slot: u32) -> PrintJson {
+    PrintJson {
+        kind: "Part".to_owned(),
+        data: json!([TextPart::player(slot), TextPart::text(" left the room.")]),
+        team: Some(team),
+        slot: Some(slot),
+        ..PrintJson::default()
+    }
+}
+
 fn item_send(receiver: u32, it: NetworkItem) -> ServerPacket {
-    let data = json!([
-        TextPart::player(it.player),
-        TextPart::text(" sent "),
-        TextPart::item(it.item, receiver, it.flags),
-        TextPart::text(" to "),
-        TextPart::player(receiver),
+    // Deliberately the same part layout Archipelago clients already display for an item send,
+    // so their logs read the same with us (compatibility, not a copy of their code).
+    let mut data = vec![TextPart::player(it.player)];
+    if it.player == receiver {
+        data.extend([TextPart::text(" found their "), TextPart::item(it.item, receiver, it.flags)]);
+    } else {
+        data.extend([
+            TextPart::text(" sent "),
+            TextPart::item(it.item, receiver, it.flags),
+            TextPart::text(" to "),
+            TextPart::player(receiver),
+        ]);
+    }
+    data.extend([
         TextPart::text(" ("),
         TextPart::location(it.location, it.player),
         TextPart::text(")"),
     ]);
+    let data = json!(data);
     ServerPacket::PrintJson(PrintJson {
         kind: "ItemSend".to_owned(),
         data,

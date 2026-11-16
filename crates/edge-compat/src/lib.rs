@@ -25,6 +25,10 @@ pub use socket::{serve, ws_options};
 /// checkout we read). Sent in `RoomInfo.version`.
 pub const PROTOCOL_VERSION: (u32, u32, u32) = (0, 6, 8);
 
+/// The oldest client version accepted from a client with no game (a tracker): the same
+/// server-wide floor as the reference server (`min_client_version` in `MultiServer.py`).
+const NO_GAME_MIN_VERSION: (u32, u32, u32) = (0, 5, 0);
+
 /// Tags that mean "no game": such clients may connect with an empty game name and may not
 /// send checks (section `Tags`).
 const NO_GAME_TAGS: [&str; 3] = ["HintGame", "Tracker", "TextOnly"];

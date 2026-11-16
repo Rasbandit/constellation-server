@@ -35,6 +35,9 @@ pub struct SeedBundle {
     pub connect_names: BTreeMap<String, (u32, u32)>,
     /// Data package per game name.
     pub games: BTreeMap<String, GameData>,
+    /// The generator's race mode flag (0 or 1); clients read it as `_read_race_mode`.
+    #[serde(default)]
+    pub race_mode: u8,
 }
 
 /// A three-part version.

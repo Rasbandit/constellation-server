@@ -155,7 +155,6 @@ async fn each_bad_connect_is_refused_with_its_error_and_the_socket_can_try_again
     let cases = [
         (connect_packet("Nobody", &json!(7)), "InvalidSlot"),
         (connect_packet("A", &json!(6)), "InvalidItemsHandling"),
-        (connect_packet("A", &json!(8)), "InvalidItemsHandling"),
         (connect_packet("A", &json!("7")), "InvalidItemsHandling"),
     ];
     for (p, want) in cases {
@@ -385,10 +384,10 @@ async fn chat_reaches_everyone_and_no_text_clients_skip_prints() {
 }
 
 #[tokio::test]
-async fn scouts_answer_with_the_receiver_and_skip_unknown_locations() {
+async fn scouts_answer_with_the_receiver_of_each_item() {
     let room = room();
     let mut a = joined(&room, "A").await;
-    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [101, 100, 5]}])).await;
+    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [100, 101]}])).await;
     assert_eq!(
         ps,
         [json!({"cmd": "LocationInfo", "locations": [
@@ -577,4 +576,144 @@ fn a_bucket_refills_at_its_rate_and_never_above_its_burst() {
     assert!(b.take(later) && b.take(later) && !b.take(later), "capped at the burst");
     let mut never = limit::Bucket::new(0, 1000, t0);
     assert!(!never.take(later));
+}
+
+/// The test bundle with an edit applied.
+fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
+    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    edit(&mut v);
+    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
+    Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap())
+}
+
+fn tracker_packet(name: &str, version: (u32, u32, u32)) -> Value {
+    let mut p = connect_packet(name, &json!(0));
+    p[0]["game"] = json!("");
+    p[0]["tags"] = json!(["Tracker"]);
+    p[0]["version"] = json!({"major": version.0, "minor": version.1, "build": version.2});
+    p
+}
+
+#[tokio::test]
+async fn a_tracker_cannot_declare_a_goal() {
+    let mut t = Session::new(room());
+    send(&mut t, &tracker_packet("A", (0, 6, 8))).await;
+    let ps = send(&mut t, &json!([{"cmd": "StatusUpdate", "status": 30}])).await;
+    assert_eq!(
+        (ps[0]["cmd"].clone(), ps[0]["original_cmd"].clone()),
+        (json!("InvalidPacket"), json!("StatusUpdate"))
+    );
+    let ps = send(&mut t, &json!([{"cmd": "Get", "keys": ["_read_client_status_0_1"]}])).await;
+    assert_eq!(ps[0]["keys"]["_read_client_status_0_1"], 0);
+}
+
+#[tokio::test]
+async fn trackers_meet_the_global_minimum_version_and_games_meet_their_slots() {
+    let room = room_edit(|v| {
+        v["slots"][0]["minimum_client_version"] = json!({"major": 0, "minor": 6, "build": 0});
+    });
+    let mut s = Session::new(Arc::clone(&room));
+    assert_eq!(send(&mut s, &tracker_packet("A", (0, 5, 5))).await[0]["cmd"], "Connected");
+    let mut s = Session::new(Arc::clone(&room));
+    let ps = send(&mut s, &tracker_packet("A", (0, 4, 9))).await;
+    assert_eq!(ps[0]["errors"], json!(["IncompatibleVersion"]));
+    let mut s = Session::new(room);
+    let mut p = connect_packet("A", &json!(7));
+    p[0]["version"] = json!({"major": 0, "minor": 5, "build": 5});
+    assert_eq!(send(&mut s, &p).await[0]["errors"], json!(["IncompatibleVersion"]));
+}
+
+#[tokio::test]
+async fn no_empty_received_items_and_none_for_clients_that_take_no_items() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    assert_eq!(send(&mut a, &json!([{"cmd": "Sync"}])).await, Vec::<Value>::new(), "nothing yet");
+    let mut none = Session::new(Arc::clone(&room));
+    send(&mut none, &connect_packet("A", &json!(0))).await;
+    check(&mut a, &[101]).await;
+    pump(&mut none).await;
+    assert_eq!(send(&mut none, &json!([{"cmd": "Sync"}])).await, Vec::<Value>::new());
+    let ps =
+        send(&mut none, &json!([{"cmd": "ConnectUpdate", "items_handling": 0, "tags": ["X"]}]))
+            .await;
+    assert_eq!(ps, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn a_bad_connect_update_changes_nothing_not_even_the_tags() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let ps =
+        send(&mut a, &json!([{"cmd": "ConnectUpdate", "items_handling": 6, "tags": ["NoText"]}]))
+            .await;
+    assert_eq!(ps[0]["type"], "arguments");
+    send(&mut a, &json!([{"cmd": "Say", "text": "still here"}])).await;
+    assert_eq!(pump(&mut a).await[0]["type"], "Chat", "NoText was not applied");
+}
+
+#[tokio::test]
+async fn items_handling_bits_above_the_three_flags_are_ignored() {
+    let mut s = Session::new(room());
+    assert_eq!(send(&mut s, &connect_packet("A", &json!(15))).await[0]["cmd"], "Connected");
+    let mut s = Session::new(room());
+    assert_eq!(send(&mut s, &connect_packet("A", &json!(8))).await[0]["cmd"], "Connected");
+    for bad in [json!(-1), json!(6), json!(1.5)] {
+        let mut s = Session::new(room());
+        assert_eq!(
+            send(&mut s, &connect_packet("A", &bad)).await[0]["errors"],
+            json!(["InvalidItemsHandling"]),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_self_found_item_reads_found_their() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    check(&mut a, &[101]).await;
+    let print = pump(&mut a).await.into_iter().find(|p| p["type"] == "ItemSend").unwrap();
+    let texts: Vec<&str> =
+        print["data"].as_array().unwrap().iter().filter_map(|p| p["text"].as_str()).collect();
+    assert_eq!(texts, ["1", " found their ", "8", " (", "101", ")"]);
+}
+
+#[tokio::test]
+async fn scouts_answer_in_request_order_and_refuse_unknown_ids() {
+    let mut a = joined(&room(), "A").await;
+    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [101, 100, 101]}])).await;
+    let locs: Vec<_> =
+        ps[0]["locations"].as_array().unwrap().iter().map(|l| l["location"].clone()).collect();
+    assert_eq!(locs, [json!(101), json!(100), json!(101)]);
+    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [100, 5]}])).await;
+    assert_eq!((ps.len(), ps[0]["type"].clone()), (1, json!("arguments")));
+}
+
+#[tokio::test]
+async fn hints_read_as_empty_and_race_mode_as_the_rooms_value() {
+    let mut a = Session::new(room_edit(|v| {
+        v["race_mode"] = json!(1);
+    }));
+    send(&mut a, &connect_packet("A", &json!(7))).await;
+    let ps = send(&mut a, &json!([{"cmd": "Get", "keys": ["_read_hints_0_1", "_read_race_mode"]}]))
+        .await;
+    assert_eq!(ps[0]["keys"], json!({"_read_hints_0_1": [], "_read_race_mode": 1}));
+}
+
+#[tokio::test]
+async fn reconnecting_to_another_slot_announces_part_then_join_and_the_same_slot_nothing() {
+    let room = room();
+    let mut watcher = joined(&room, "A").await;
+    let mut s = joined(&room, "B").await;
+    pump(&mut watcher).await;
+    send(&mut s, &connect_packet("B", &json!(7))).await;
+    assert_eq!(pump(&mut watcher).await, Vec::<Value>::new(), "same slot: no prints");
+    send(&mut s, &connect_packet("A", &json!(7))).await;
+    let seen: Vec<_> =
+        pump(&mut watcher).await.iter().map(|p| (p["type"].clone(), p["slot"].clone())).collect();
+    assert_eq!(seen, [(json!("Part"), json!(2)), (json!("Join"), json!(1))]);
 }
