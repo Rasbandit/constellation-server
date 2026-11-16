@@ -68,7 +68,7 @@ pub type Outcome = Result<Reply, CoreError>;
 enum RoomMsg {
     Commands { cmds: Vec<Command>, reply: oneshot::Sender<Vec<Outcome>> },
     Subscribe { reply: oneshot::Sender<Result<Subscription, RoomError>> },
-    Ext { from: SlotNo, body: Arc<serde_json::Value> },
+    Ext { from: SlotNo, body: Arc<serde_json::Value>, done: oneshot::Sender<()> },
 }
 
 /// The edge's handle on a room. Cheap to clone.
@@ -122,12 +122,15 @@ impl RoomHandle {
         rx.await.map_err(|_| RoomError::Unavailable)?
     }
 
-    /// Fan a non-durable message out to every subscriber, ordered with the events.
+    /// Fan a non-durable message out to every subscriber, ordered with the events. Returns once
+    /// it is published.
     ///
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.
     pub async fn ext(&self, from: SlotNo, body: Arc<serde_json::Value>) -> Result<(), RoomError> {
-        self.send(RoomMsg::Ext { from, body }).await
+        let (done, rx) = oneshot::channel();
+        self.send(RoomMsg::Ext { from, body, done }).await?;
+        rx.await.map_err(|_| RoomError::Unavailable)
     }
 
     async fn send(&self, msg: RoomMsg) -> Result<(), RoomError> {
@@ -166,9 +169,10 @@ impl<S: LogStore> Actor<S> {
                     drop(reply.send(sub));
                     ok
                 }
-                RoomMsg::Ext { from, body } => {
+                RoomMsg::Ext { from, body, done } => {
                     // No subscribers is not an error.
                     drop(self.publish.send(Arc::new(Published::Ext { from, body })));
+                    let _ = done.send(());
                     true
                 }
             };
