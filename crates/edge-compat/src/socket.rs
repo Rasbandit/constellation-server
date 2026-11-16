@@ -2,7 +2,7 @@
 //!
 //! Cancellation (doc 11 R5): both `select!` arms are cancel safe. `WebSocket::next_frame` keeps
 //! partial frames inside the `WebSocket` value, not in the future (yawc's documented message
-//! API; not verified under fault injection yet), and `broadcast::Receiver::recv` is cancel safe
+//! API; not verified under fault injection yet), and `mpsc::Receiver::recv` is cancel safe
 //! per tokio's docs. Sends happen outside `select!`.
 
 use crate::{CompatRoom, Session};
@@ -11,7 +11,6 @@ use futures_util::SinkExt;
 use runtime::Published;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast::error::RecvError;
 use yawc::{CompressionLevel, DeflatePool, Frame, OpCode, Options, WebSocket, close::CloseCode};
 
 /// Socket options for this edge (doc 11 R1: every buffer and cap set here, from `config`;
@@ -30,10 +29,11 @@ pub fn ws_options(limits: &Limits, pool: DeflatePool) -> Options {
 
 enum Input {
     Frame(yawc::Result<Frame>),
-    Live(Result<Arc<Published>, RecvError>),
+    /// `None`: the room dropped our queue (we fell behind) or stopped.
+    Live(Option<Arc<Published>>),
 }
 
-async fn next_live(session: &mut Session) -> Result<Arc<Published>, RecvError> {
+async fn next_live(session: &mut Session) -> Option<Arc<Published>> {
     match session.live() {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -68,14 +68,9 @@ where
                 tracing::debug!(error = %e, "connection ended");
                 break;
             }
-            Input::Live(Ok(p)) => session.on_published(&p),
-            Input::Live(Err(RecvError::Lagged(n))) => {
-                // Doc 11 R3: drop the slow session; the client resyncs from its item index.
-                tracing::warn!(missed = n, "session fell behind the room, closing it");
-                drop(ws.send(Frame::close(CloseCode::Again, "fell behind, reconnect")).await);
-                break;
-            }
-            Input::Live(Err(RecvError::Closed)) => break,
+            Input::Live(Some(p)) => session.on_published(&p),
+            // Doc 11 R3: resync from our cursor; fails only when the room is gone.
+            Input::Live(None) => session.resync().await,
         };
         let Ok(frames) = out else {
             drop(ws.send(Frame::close(CloseCode::Away, "room unavailable")).await);

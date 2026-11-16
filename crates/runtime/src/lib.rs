@@ -17,14 +17,15 @@ use proto::{Command, Epoch, Event, RoomId, Seq, SlotNo, Timestamp};
 use room_core::{CoreError, Ctx, Reply, RoomState, apply};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// What the room publishes to every subscriber, in log order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Published {
-    /// A durable log event.
-    Event(Event),
+    /// One batch's durable log events, in order (one queue entry however large the batch).
+    Events(Arc<[Event]>),
     /// A message one session asked to fan out (chat, bounce). Not durable; each edge decides who
     /// gets it. The body is opaque to the room.
     Ext {
@@ -35,15 +36,20 @@ pub enum Published {
     },
 }
 
-/// A new subscriber's view: every durable event so far, then the live stream from right after
-/// the last one, with no gap and no overlap.
+/// A subscriber's view: the durable events after its cursor, then the live stream from right
+/// after the last one, with no gap and no overlap.
+///
+/// Doc 11 R3: each subscriber has its own bounded queue (`Limits::session_queue` entries). A
+/// subscriber whose queue is full when events are published is dropped: its `live` ends, and it
+/// resubscribes from the last `seq` it applied, so it loses nothing and the room never waits for
+/// it. Non-durable messages (`Ext`, chat) are simply skipped for a full queue.
 #[derive(Debug)]
 pub struct Subscription {
-    /// Durable events from seq 1 to the head at subscribe time.
+    /// Durable events with `seq` above the cursor, up to the head at subscribe time.
     pub history: Vec<Event>,
-    /// Everything published after `history`. A `Lagged` error means the session fell more than
-    /// `Limits::session_queue` behind and must resync from its cursor (doc 11 R3).
-    pub live: broadcast::Receiver<Arc<Published>>,
+    /// Everything published after `history`. `None` from `recv` means: resubscribe from your
+    /// cursor (you fell behind), or the room stopped (then `subscribe` fails).
+    pub live: mpsc::Receiver<Arc<Published>>,
 }
 
 /// Why the room could not serve a request.
@@ -67,7 +73,7 @@ pub type Outcome = Result<Reply, CoreError>;
 #[derive(Debug)]
 enum RoomMsg {
     Commands { cmds: Vec<Command>, reply: oneshot::Sender<Vec<Outcome>> },
-    Subscribe { reply: oneshot::Sender<Result<Subscription, RoomError>> },
+    Subscribe { after: Seq, reply: oneshot::Sender<Result<Subscription, RoomError>> },
     Ext { from: SlotNo, body: Arc<serde_json::Value>, done: oneshot::Sender<()> },
 }
 
@@ -88,8 +94,7 @@ impl RoomHandle {
         limits: Limits,
     ) -> (Self, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(limits.room_mailbox.max(1));
-        let (publish, _) = broadcast::channel(limits.session_queue.max(1));
-        let actor = Actor { room, epoch, state, store, limits, publish };
+        let actor = Actor { room, epoch, state, store, limits, subs: Vec::new() };
         (Self { tx }, tokio::spawn(actor.run(rx)))
     }
 
@@ -112,13 +117,14 @@ impl RoomHandle {
         self.commands(vec![cmd]).await?.pop().ok_or(RoomError::Unavailable)
     }
 
-    /// Join the room's stream (doc 05 7.3 `Subscribe`, from seq 0).
+    /// Join the room's stream after `after` (doc 05 7.3 `Subscribe`; `Seq(0)` for everything).
     ///
     /// # Errors
-    /// [`RoomError::Unavailable`] when the room task has stopped or the log cannot be read.
-    pub async fn subscribe(&self) -> Result<Subscription, RoomError> {
+    /// [`RoomError::Unavailable`] when the room task has stopped, the log cannot be read, or
+    /// `after` is beyond the durable head.
+    pub async fn subscribe(&self, after: Seq) -> Result<Subscription, RoomError> {
         let (reply, rx) = oneshot::channel();
-        self.send(RoomMsg::Subscribe { reply }).await?;
+        self.send(RoomMsg::Subscribe { after, reply }).await?;
         rx.await.map_err(|_| RoomError::Unavailable)?
     }
 
@@ -144,7 +150,8 @@ struct Actor<S> {
     state: RoomState,
     store: Arc<S>,
     limits: Limits,
-    publish: broadcast::Sender<Arc<Published>>,
+    /// One bounded queue per subscriber.
+    subs: Vec<mpsc::Sender<Arc<Published>>>,
 }
 
 fn now() -> Timestamp {
@@ -163,15 +170,24 @@ impl<S: LogStore> Actor<S> {
                     }
                     Err(()) => false,
                 },
-                RoomMsg::Subscribe { reply } => {
-                    let sub = self.subscribe().await;
+                RoomMsg::Subscribe { after, reply } => {
+                    // A cursor beyond the head is the caller's mistake: refuse it, keep serving.
+                    if after > self.state.durable() {
+                        drop(reply.send(Err(RoomError::Unavailable)));
+                        continue;
+                    }
+                    let sub = self.subscribe(after).await;
                     let ok = sub.is_ok();
                     drop(reply.send(sub));
                     ok
                 }
                 RoomMsg::Ext { from, body, done } => {
-                    // No subscribers is not an error.
-                    drop(self.publish.send(Arc::new(Published::Ext { from, body })));
+                    let msg = Arc::new(Published::Ext { from, body });
+                    // A full queue skips the message (chat may be dropped, doc 11 R3); a closed
+                    // one is a subscriber that left.
+                    self.subs.retain(|tx| {
+                        !matches!(tx.try_send(Arc::clone(&msg)), Err(TrySendError::Closed(_)))
+                    });
                     let _ = done.send(());
                     true
                 }
@@ -216,24 +232,40 @@ impl<S: LogStore> Actor<S> {
             tracing::error!(room = self.room.0, wait = wait.0, "reply depends on a lost write");
             return Err(());
         }
-        for e in events {
-            drop(self.publish.send(Arc::new(Published::Event(e))));
+        if !events.is_empty() {
+            self.publish(&Arc::new(Published::Events(events.into())));
         }
         Ok(outcomes)
     }
 
-    async fn subscribe(&self) -> Result<Subscription, RoomError> {
-        let live = self.publish.subscribe();
+    /// Durable events only: a subscriber whose queue is full is dropped and resyncs from its
+    /// cursor, so events are never skipped for it.
+    fn publish(&mut self, msg: &Arc<Published>) {
+        let room = self.room.0;
+        self.subs.retain(|tx| match tx.try_send(Arc::clone(msg)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(room, "subscriber fell behind; it resyncs from its cursor");
+                false
+            }
+            Err(TrySendError::Closed(_)) => false,
+        });
+    }
+
+    async fn subscribe(&mut self, after: Seq) -> Result<Subscription, RoomError> {
+        let durable = self.state.durable();
+        // shortcut: a first subscribe (after = 0) replays the whole log, O(log); upgrade to a
+        // snapshot plus tail when rooms get long or reconnect storms show up in spike S2.
         let history = self
             .store
-            .read_tail(self.room, Seq(0), usize::MAX)
+            .read_tail(self.room, after, usize::MAX)
             .await
             .map_err(|_| RoomError::Unavailable)?;
-        // shortcut: replays the whole log per subscriber, O(log); upgrade to a snapshot plus
-        // tail (doc 05 7.3 `after`) when rooms get long or reconnect storms show up in S2.
-        if history.last().map_or(Seq(0), |e| e.seq) != self.state.durable() {
+        if history.last().map_or(after, |e| e.seq) != durable {
             return Err(RoomError::Unavailable);
         }
+        let (tx, live) = mpsc::channel(self.limits.session_queue.max(1));
+        self.subs.push(tx);
         Ok(Subscription { history, live })
     }
 }

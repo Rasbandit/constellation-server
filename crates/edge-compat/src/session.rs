@@ -7,7 +7,7 @@ use crate::wire::{
     StatusUpdate, TextPart,
 };
 use crate::{CompatRoom, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
-use proto::{Command, Event, EventKind, SlotNo};
+use proto::{Command, Event, EventKind, Seq, SlotNo};
 use runtime::{Published, Subscription};
 use seed_bundle::{Slot, SlotKind};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 /// The session must end: the room is gone or the client fell too far behind. The client
 /// reconnects and resyncs from the protocol's item index.
@@ -70,7 +70,9 @@ struct Joined {
     items: Vec<NetworkItem>,
     checked: BTreeSet<i64>,
     goals: BTreeSet<u32>,
-    live: broadcast::Receiver<Arc<Published>>,
+    live: mpsc::Receiver<Arc<Published>>,
+    /// The last room `seq` folded into this view: where a resync resumes.
+    cursor: Seq,
 }
 
 impl Joined {
@@ -115,7 +117,7 @@ impl Session {
     }
 
     /// The live stream, once connected; the socket loop waits on it.
-    pub const fn live(&mut self) -> Option<&mut broadcast::Receiver<Arc<Published>>> {
+    pub const fn live(&mut self) -> Option<&mut mpsc::Receiver<Arc<Published>>> {
         match &mut self.joined {
             Some(j) => Some(&mut j.live),
             None => None,
@@ -207,7 +209,7 @@ impl Session {
         };
         let first = self.joined.is_none();
         let Subscription { history, live } =
-            self.room.room.subscribe().await.map_err(|_| Step::Closed)?;
+            self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
         let mut j = Joined {
             team,
             slot: slot.id,
@@ -218,6 +220,7 @@ impl Session {
             checked: BTreeSet::new(),
             goals: BTreeSet::new(),
             live,
+            cursor: Seq(0),
         };
         for e in &history {
             fold(&self.room, &mut j, e);
@@ -297,52 +300,42 @@ impl Session {
     pub fn on_published(&mut self, p: &Published) -> Result<Vec<String>, Closed> {
         let room = Arc::clone(&self.room);
         let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
-        let mut packets = Vec::new();
-        match p {
-            Published::Event(e) => {
-                let slot = e.slot.map_or(0, |s| s.0);
-                let was_checked = j.checked.len();
-                let item = fold(&room, j, e);
-                if j.checked.len() != was_checked {
-                    if let EventKind::Checked { location, .. } = e.kind {
-                        let hint_points = hint_points(&room, j);
-                        packets.push(ServerPacket::RoomUpdate {
-                            checked_locations: vec![location],
-                            hint_points,
-                        });
+        let packets = match p {
+            Published::Events(evs) => events_packets(&room, j, evs),
+            Published::Ext { body, .. } => {
+                match serde_json::from_value::<Fanout>((**body).clone()) {
+                    Ok(Fanout::Print { print }) if !j.no_text() => {
+                        vec![ServerPacket::PrintJson(print)]
                     }
-                }
-                match (e.kind, item) {
-                    (EventKind::Item { .. }, Some(it)) => {
-                        if slot == j.slot && j.handling.wants(j.slot, &it) {
-                            packets.push(ServerPacket::ReceivedItems {
-                                index: j.sent,
-                                items: vec![it],
-                            });
-                            j.sent = j.sent.saturating_add(1);
+                    Ok(Fanout::Bounce { team, targets, packet }) => {
+                        if bounce_matches(&room, j, team, &targets) {
+                            return Ok(vec![Value::Array(vec![Value::Object(packet)]).to_string()]);
                         }
-                        if !j.no_text() {
-                            packets.push(item_send(slot, it));
-                        }
+                        Vec::new()
                     }
-                    (EventKind::Goal, _) if !j.no_text() => packets.push(goal_print(j.team, slot)),
-                    _ => {}
+                    Ok(Fanout::Print { .. }) => Vec::new(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "unreadable fan-out body");
+                        Vec::new()
+                    }
                 }
             }
-            Published::Ext { body, .. } => match serde_json::from_value::<Fanout>((**body).clone())
-            {
-                Ok(Fanout::Print { print }) if !j.no_text() => {
-                    packets.push(ServerPacket::PrintJson(print));
-                }
-                Ok(Fanout::Bounce { team, targets, packet }) => {
-                    if bounce_matches(&room, j, team, &targets) {
-                        return Ok(vec![Value::Array(vec![Value::Object(packet)]).to_string()]);
-                    }
-                }
-                Ok(Fanout::Print { .. }) => {}
-                Err(e) => tracing::error!(error = %e, "unreadable fan-out body"),
-            },
-        }
+        };
+        Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })
+    }
+
+    /// The room dropped this session's queue because it fell behind (doc 11 R3): resubscribe
+    /// from the last event applied and send what was missed, with the right item indexes.
+    ///
+    /// # Errors
+    /// [`Closed`] when the room is gone.
+    pub async fn resync(&mut self) -> Result<Vec<String>, Closed> {
+        let room = Arc::clone(&self.room);
+        let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
+        let Subscription { history, live } =
+            room.room.subscribe(j.cursor).await.map_err(|_| Closed)?;
+        j.live = live;
+        let packets = events_packets(&room, j, &history);
         Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })
     }
 
@@ -583,6 +576,7 @@ fn hint_points(room: &CompatRoom, j: &Joined) -> i64 {
 /// Apply a durable event to a session's view of the room. Returns the item an `Item` event
 /// carries, for whoever it went to.
 fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
+    j.cursor = j.cursor.max(e.seq);
     let slot = e.slot?.0;
     match e.kind {
         EventKind::Checked { location, .. } => {
@@ -604,6 +598,44 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
             Some(it)
         }
     }
+}
+
+/// What one batch of durable events means for this client: one `RoomUpdate` for its new
+/// checks, one `ReceivedItems` for its new items (continuing its index), and the prints.
+fn events_packets(room: &CompatRoom, j: &mut Joined, evs: &[Event]) -> Vec<ServerPacket> {
+    let (mut checked, mut items, mut prints) = (Vec::new(), Vec::new(), Vec::new());
+    for e in evs {
+        let slot = e.slot.map_or(0, |s| s.0);
+        let was = j.checked.len();
+        let item = fold(room, j, e);
+        match (e.kind, item) {
+            (EventKind::Checked { location, .. }, _) if j.checked.len() != was => {
+                checked.push(location);
+            }
+            (EventKind::Item { .. }, Some(it)) => {
+                if slot == j.slot && j.handling.wants(j.slot, &it) {
+                    items.push(it);
+                }
+                if !j.no_text() {
+                    prints.push(item_send(slot, it));
+                }
+            }
+            (EventKind::Goal, _) if !j.no_text() => prints.push(goal_print(j.team, slot)),
+            _ => {}
+        }
+    }
+    let mut packets = Vec::new();
+    if !checked.is_empty() {
+        let hint_points = hint_points(room, j);
+        packets.push(ServerPacket::RoomUpdate { checked_locations: checked, hint_points });
+    }
+    if !items.is_empty() {
+        let index = j.sent;
+        j.sent = j.sent.saturating_add(items.len());
+        packets.push(ServerPacket::ReceivedItems { index, items });
+    }
+    packets.extend(prints);
+    packets
 }
 
 fn item_send(receiver: u32, it: NetworkItem) -> ServerPacket {

@@ -6,7 +6,7 @@ use log::MemLogStore;
 use proto::RoomId;
 use room_core::RoomState;
 use serde_json::{Value, json};
-use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::mpsc::error::TryRecvError;
 
 const GAME: &str = "G";
 
@@ -70,8 +70,9 @@ async fn send(s: &mut Session, v: &Value) -> Vec<Value> {
     packets(&s.on_text(&v.to_string()).await.unwrap())
 }
 
-/// Everything the room has published to this session so far.
-fn pump(s: &mut Session) -> Vec<Value> {
+/// Everything the room has published to this session so far, resyncing from the cursor when
+/// the room dropped the queue (as the socket loop does).
+async fn pump(s: &mut Session) -> Vec<Value> {
     let mut frames = Vec::new();
     loop {
         let next = match s.live() {
@@ -81,7 +82,7 @@ fn pump(s: &mut Session) -> Vec<Value> {
         match next {
             Ok(p) => frames.extend(s.on_published(&p).unwrap()),
             Err(TryRecvError::Empty) => return packets(&frames),
-            Err(e) => panic!("live stream: {e:?}"),
+            Err(TryRecvError::Disconnected) => frames.extend(s.resync().await.unwrap()),
         }
     }
 }
@@ -94,7 +95,7 @@ async fn joined(room: &Arc<CompatRoom>, name: &str) -> Session {
     let mut s = Session::new(Arc::clone(room));
     let ps = send(&mut s, &connect_packet(name, &json!(7))).await;
     assert_eq!(ps[0]["cmd"], "Connected", "{ps:?}");
-    pump(&mut s);
+    pump(&mut s).await;
     s
 }
 
@@ -234,9 +235,9 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
     let room = room();
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
-    pump(&mut a);
+    pump(&mut a).await;
     assert_eq!(check(&mut a, &[100]).await, Vec::<Value>::new());
-    let to_b = pump(&mut b);
+    let to_b = pump(&mut b).await;
     let items = of(&to_b, "ReceivedItems");
     assert_eq!(items.len(), 1, "{to_b:?}");
     assert_eq!(
@@ -244,7 +245,7 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
         json!({"cmd": "ReceivedItems", "index": 0,
         "items": [{"item": 7, "location": 100, "player": 1, "flags": 1}]})
     );
-    let to_a = pump(&mut a);
+    let to_a = pump(&mut a).await;
     assert_eq!(of(&to_a, "ReceivedItems"), Vec::<&Value>::new());
     assert_eq!(
         *of(&to_a, "RoomUpdate")[0],
@@ -261,14 +262,14 @@ async fn an_own_item_comes_back_only_to_a_client_that_wants_own_items() {
     let mut a = joined(&room, "A").await;
     let mut remote_only = Session::new(Arc::clone(&room));
     send(&mut remote_only, &connect_packet("A", &json!(1))).await;
-    pump(&mut remote_only);
+    pump(&mut remote_only).await;
     check(&mut a, &[101]).await;
-    let got = pump(&mut a);
+    let got = pump(&mut a).await;
     assert_eq!(
         of(&got, "ReceivedItems")[0]["items"],
         json!([{"item": 8, "location": 101, "player": 1, "flags": 0}])
     );
-    assert_eq!(of(&pump(&mut remote_only), "ReceivedItems"), Vec::<&Value>::new());
+    assert_eq!(of(&pump(&mut remote_only).await, "ReceivedItems"), Vec::<&Value>::new());
 }
 
 #[tokio::test]
@@ -277,10 +278,10 @@ async fn repeated_and_unknown_checks_deliver_nothing() {
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
     check(&mut a, &[100, 100]).await;
-    assert_eq!(of(&pump(&mut b), "ReceivedItems").len(), 1);
+    assert_eq!(of(&pump(&mut b).await, "ReceivedItems").len(), 1);
     check(&mut a, &[100, 999, -1]).await;
-    assert_eq!(pump(&mut b), Vec::<Value>::new());
-    assert_eq!(pump(&mut a).iter().filter(|p| p["cmd"] == "RoomUpdate").count(), 1);
+    assert_eq!(pump(&mut b).await, Vec::<Value>::new());
+    assert_eq!(pump(&mut a).await.iter().filter(|p| p["cmd"] == "RoomUpdate").count(), 1);
 }
 
 #[tokio::test]
@@ -301,7 +302,7 @@ async fn a_reconnect_and_a_sync_resend_every_item_from_index_zero() {
         {"item": 8, "location": 101, "player": 1, "flags": 0},
         {"item": 7, "location": 100, "player": 2, "flags": 4}]})
     );
-    pump(&mut again);
+    pump(&mut again).await;
     let ps = send(&mut again, &json!([{"cmd": "Sync"}])).await;
     assert_eq!(ps, [ps[0].clone()]);
     assert_eq!(ps[0]["index"], 0);
@@ -313,7 +314,7 @@ async fn a_reconnect_and_a_sync_resend_every_item_from_index_zero() {
     check(&mut b2, &[100]).await;
     check(&mut a2, &[101]).await;
     let idx: Vec<_> =
-        of(&pump(&mut a2), "ReceivedItems").iter().map(|p| p["index"].clone()).collect();
+        of(&pump(&mut a2).await, "ReceivedItems").iter().map(|p| p["index"].clone()).collect();
     assert_eq!(idx, [json!(0), json!(1)]);
 }
 
@@ -328,7 +329,7 @@ async fn a_goal_is_recorded_once_announced_and_readable() {
     );
     send(&mut a, &json!([{"cmd": "StatusUpdate", "status": 30}])).await;
     send(&mut a, &json!([{"cmd": "StatusUpdate", "status": 30}])).await;
-    let goals: Vec<_> = pump(&mut b).into_iter().filter(|p| p["type"] == "Goal").collect();
+    let goals: Vec<_> = pump(&mut b).await.into_iter().filter(|p| p["type"] == "Goal").collect();
     assert_eq!(goals.len(), 1);
     assert_eq!((goals[0]["team"].clone(), goals[0]["slot"].clone()), (json!(0), json!(1)));
     let get = json!([{"cmd": "Get", "keys": ["_read_client_status_0_1", "_read_client_status_0_2", "free", "_read_slot_data_1"], "tag": 9}]);
@@ -350,17 +351,17 @@ async fn a_bounce_reaches_only_its_targets() {
     let room = room();
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
-    pump(&mut a);
+    pump(&mut a).await;
     send(&mut a, &json!([{"cmd": "Bounce", "slots": [2], "data": {"x": 1}}])).await;
-    assert_eq!(pump(&mut b), [json!({"cmd": "Bounced", "slots": [2], "data": {"x": 1}})]);
-    assert_eq!(pump(&mut a), Vec::<Value>::new());
+    assert_eq!(pump(&mut b).await, [json!({"cmd": "Bounced", "slots": [2], "data": {"x": 1}})]);
+    assert_eq!(pump(&mut a).await, Vec::<Value>::new());
     // Legacy with only teams names nobody; "or" with the default team reaches everyone.
     send(&mut a, &json!([{"cmd": "Bounce", "teams": [0]}])).await;
-    assert_eq!(pump(&mut b), Vec::<Value>::new());
+    assert_eq!(pump(&mut b).await, Vec::<Value>::new());
     send(&mut a, &json!([{"cmd": "Bounce", "operator": "or", "tags": ["DeathLink"]}])).await;
-    assert_eq!(pump(&mut b).len(), 1);
+    assert_eq!(pump(&mut b).await.len(), 1);
     send(&mut a, &json!([{"cmd": "Bounce", "operator": "and", "games": [GAME], "tags": []}])).await;
-    assert_eq!(pump(&mut b), Vec::<Value>::new());
+    assert_eq!(pump(&mut b).await, Vec::<Value>::new());
     let ps = send(&mut a, &json!([{"cmd": "Bounce", "operator": "xor"}])).await;
     assert_eq!(ps[0]["type"], "arguments");
 }
@@ -373,12 +374,12 @@ async fn chat_reaches_everyone_and_no_text_clients_skip_prints() {
     let mut p = connect_packet("B", &json!(7));
     p[0]["tags"] = json!(["AP", "NoText"]);
     send(&mut quiet, &p).await;
-    pump(&mut a);
+    pump(&mut a).await;
     send(&mut a, &json!([{"cmd": "Say", "text": "hello"}])).await;
-    let chat = pump(&mut a);
+    let chat = pump(&mut a).await;
     assert_eq!(chat[0]["type"], "Chat");
     assert_eq!(chat[0]["message"], "hello");
-    assert_eq!(pump(&mut quiet), Vec::<Value>::new());
+    assert_eq!(pump(&mut quiet).await, Vec::<Value>::new());
     let ps = send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await;
     assert_eq!(ps[0]["type"], "CommandResult");
 }
@@ -412,7 +413,7 @@ async fn connect_update_changes_items_handling_and_resends_items() {
     let mut a = Session::new(Arc::clone(&room));
     send(&mut a, &connect_packet("A", &json!(1))).await;
     check(&mut a, &[101]).await;
-    assert_eq!(of(&pump(&mut a), "ReceivedItems"), Vec::<&Value>::new());
+    assert_eq!(of(&pump(&mut a).await, "ReceivedItems"), Vec::<&Value>::new());
     let ps = send(&mut a, &json!([{"cmd": "ConnectUpdate", "items_handling": 3}])).await;
     assert_eq!(ps[0]["index"], 0);
     assert_eq!(ps[0]["items"][0]["item"], 8);
@@ -436,4 +437,69 @@ fn a_check_cid_is_the_location_and_distinct_per_location() {
     assert_eq!(check_cid(1), Cid(1));
     assert_ne!(check_cid(-1), check_cid(1));
     assert_eq!(check_cid(-1), Cid(u64::MAX));
+}
+
+/// A room where slot A has locations `1000..end` that all send item 7 to B.
+fn big_room(end: i64, limits: config::Limits) -> Arc<CompatRoom> {
+    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let locs: Vec<Value> =
+        (1000..end).map(|l| json!({"location": l, "item": 7, "receiver": 2, "flags": 0})).collect();
+    v["slots"][0]["locations"] = json!(locs);
+    for l in 1000..end {
+        v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
+    }
+    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, limits);
+    Arc::new(CompatRoom::new(b, h, None).unwrap())
+}
+
+fn indexes(ps: &[Value]) -> Vec<u64> {
+    of(ps, "ReceivedItems")
+        .iter()
+        .flat_map(|p| {
+            let first = p["index"].as_u64().unwrap();
+            let n = u64::try_from(p["items"].as_array().unwrap().len()).unwrap();
+            first..first.checked_add(n).unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn two_hundred_checks_in_one_packet_reach_a_bystander_that_stays_connected() {
+    let room = big_room(1200, config::Limits::DESIGN);
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    pump(&mut a).await;
+    let all: Vec<i64> = (1000..1200).collect();
+    check(&mut a, &all).await;
+    let got = pump(&mut b).await;
+    assert_eq!(indexes(&got), (0..200).collect::<Vec<_>>());
+    assert!(b.live().is_some(), "still connected");
+    let mine = pump(&mut a).await;
+    assert_eq!(of(&mine, "RoomUpdate")[0]["checked_locations"].as_array().unwrap().len(), 200);
+}
+
+#[tokio::test]
+async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_order() {
+    // A one-entry queue: B falls behind after the first batch and the room drops its queue.
+    let room = big_room(1030, config::Limits { session_queue: 1, ..config::Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    for chunk in (1000..1030).collect::<Vec<i64>>().chunks(7) {
+        check(&mut a, chunk).await;
+    }
+    let got = pump(&mut b).await;
+    assert_eq!(indexes(&got), (0..30).collect::<Vec<_>>());
+    let locations: Vec<i64> = of(&got, "ReceivedItems")
+        .iter()
+        .flat_map(|p| {
+            p["items"].as_array().unwrap().iter().map(|i| i["location"].as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(locations, (1000..1030).collect::<Vec<_>>());
+    check(&mut a, &[1000]).await;
+    assert_eq!(indexes(&pump(&mut b).await), Vec::<u64>::new(), "nothing twice after the resync");
 }
