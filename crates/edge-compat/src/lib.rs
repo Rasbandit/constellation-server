@@ -6,10 +6,12 @@
 //! [`CompatRoom`] holds one room's fixed data, prepared once; [`Session`] is one connection's
 //! state machine; [`serve`] runs a session over a `yawc` WebSocket.
 
+mod limit;
 mod session;
 mod socket;
 pub mod wire;
 
+use config::Limits;
 use proto::Cid;
 use runtime::RoomHandle;
 use seed_bundle::SeedBundle;
@@ -37,6 +39,7 @@ pub struct CompatRoom {
     flags: BTreeMap<(u32, i64), u8>,
     /// Game name to its data package as JSON, serialized once (R4: no heavy work per request).
     packages: BTreeMap<String, String>,
+    limits: Limits,
 }
 
 impl CompatRoom {
@@ -48,6 +51,7 @@ impl CompatRoom {
         bundle: Arc<SeedBundle>,
         room: RoomHandle,
         password: Option<String>,
+        limits: Limits,
     ) -> Result<Self, String> {
         let flags = bundle
             .slots
@@ -61,7 +65,7 @@ impl CompatRoom {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let password = password.or_else(|| bundle.server_options.password.clone());
-        Ok(Self { bundle, room, password, flags, packages })
+        Ok(Self { bundle, room, password, flags, packages, limits })
     }
 
     fn flags(&self, slot: u32, location: i64) -> u8 {

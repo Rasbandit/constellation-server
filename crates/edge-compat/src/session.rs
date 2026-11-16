@@ -1,6 +1,7 @@
 //! One connection's state machine. Input: text frames from the client and events the room
 //! publishes. Output: text frames to send. The socket loop (`socket.rs`) owns the IO.
 
+use crate::limit::Bucket;
 use crate::wire::{
     self, Bounce, CLIENT_GOAL, Connect, ConnectUpdate, Get, GetDataPackage, Locations, NetVersion,
     NetworkItem, NetworkPlayer, NetworkSlot, Permissions, PrintJson, Say, ServerPacket,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// The session must end: the room is gone or the client fell too far behind. The client
@@ -94,6 +95,9 @@ impl Joined {
 pub struct Session {
     room: Arc<CompatRoom>,
     joined: Option<Joined>,
+    /// Chat and bounce share one bucket (they share the fan-out path).
+    fanout: Bucket,
+    datapackage: Bucket,
 }
 
 fn invalid(kind: &'static str, cmd: Option<&str>, text: impl Into<String>) -> ServerPacket {
@@ -112,8 +116,28 @@ fn parse<T: serde::de::DeserializeOwned>(cmd: &str, v: Value) -> Result<T, Step>
 impl Session {
     /// A new connection to `room`.
     #[must_use]
-    pub const fn new(room: Arc<CompatRoom>) -> Self {
-        Self { room, joined: None }
+    pub fn new(room: Arc<CompatRoom>) -> Self {
+        let l = room.limits;
+        let now = Instant::now();
+        Self {
+            fanout: Bucket::new(l.fanout_burst, l.fanout_refill_milli_per_sec, now),
+            datapackage: Bucket::new(l.datapackage_burst, l.datapackage_refill_milli_per_sec, now),
+            room,
+            joined: None,
+        }
+    }
+
+    /// One token from `bucket`, or the `InvalidPacket` that says the client is over its rate.
+    fn rate(bucket: &mut Bucket, cmd: &str) -> Result<(), Step> {
+        if bucket.take(Instant::now()) {
+            Ok(())
+        } else {
+            Err(Step::from(invalid(
+                "arguments",
+                Some(cmd),
+                format!("{cmd}: rate limited, slow down"),
+            )))
+        }
     }
 
     /// The live stream, once connected; the socket loop waits on it.
@@ -180,7 +204,11 @@ impl Session {
     async fn command(&mut self, cmd: &str, p: Value) -> Result<Vec<String>, Step> {
         match cmd {
             "Connect" => self.connect(parse(cmd, p)?).await,
-            "GetDataPackage" => Ok(vec![self.data_package(&parse::<GetDataPackage>(cmd, p)?)]),
+            "GetDataPackage" => {
+                let req = parse::<GetDataPackage>(cmd, p)?;
+                Self::rate(&mut self.datapackage, cmd)?;
+                Ok(vec![self.data_package(&req)])
+            }
             _ if self.joined.is_none() => {
                 Err(Step::from(invalid("cmd", Some(cmd), format!("{cmd}: connect first"))))
             }
@@ -428,7 +456,11 @@ impl Session {
         Ok(Vec::new())
     }
 
-    async fn say(&self, req: Say) -> Result<Vec<String>, Step> {
+    async fn say(&mut self, req: Say) -> Result<Vec<String>, Step> {
+        if req.text.len() > self.room.limits.chat_max_bytes {
+            return Err(Step::from(invalid("arguments", Some("Say"), "Say: text too long")));
+        }
+        Self::rate(&mut self.fanout, "Say")?;
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
         if req.text.starts_with('!') {
             let print = PrintJson {
@@ -451,7 +483,15 @@ impl Session {
         Ok(Vec::new())
     }
 
-    async fn bounce(&self, p: Value) -> Result<Vec<String>, Step> {
+    async fn bounce(&mut self, p: Value) -> Result<Vec<String>, Step> {
+        if p.to_string().len() > self.room.limits.bounce_max_bytes {
+            return Err(Step::from(invalid(
+                "arguments",
+                Some("Bounce"),
+                "Bounce: packet too large",
+            )));
+        }
+        Self::rate(&mut self.fanout, "Bounce")?;
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
         let targets: Bounce = parse("Bounce", p.clone())?;
         if !matches!(targets.operator.as_deref(), None | Some("legacy" | "or" | "and")) {

@@ -35,6 +35,18 @@ pub struct Limits {
     pub session_queue: usize,
     /// Largest seed bundle file the server will read.
     pub bundle_max_bytes: u64,
+    /// Chat and bounce messages a session may send in a burst (one shared token bucket).
+    pub fanout_burst: u32,
+    /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
+    pub fanout_refill_milli_per_sec: u32,
+    /// Longest chat text, bytes.
+    pub chat_max_bytes: usize,
+    /// Largest bounce packet as received, bytes (JSON).
+    pub bounce_max_bytes: usize,
+    /// Data package requests a session may send in a burst (each can be hundreds of KiB).
+    pub datapackage_burst: u32,
+    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
+    pub datapackage_refill_milli_per_sec: u32,
 }
 
 impl Limits {
@@ -52,6 +64,12 @@ impl Limits {
         room_mailbox: 1024,
         session_queue: 256,
         bundle_max_bytes: 64 * 1024 * 1024,
+        fanout_burst: 10,
+        fanout_refill_milli_per_sec: 2000,
+        chat_max_bytes: 2048,
+        bounce_max_bytes: 16 * 1024,
+        datapackage_burst: 4,
+        datapackage_refill_milli_per_sec: 100,
     };
 }
 
@@ -101,5 +119,13 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
+    }
+
+    #[test]
+    fn session_rate_limits_are_design_values() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.fanout_burst, l.fanout_refill_milli_per_sec), (10, 2000));
+        assert_eq!((l.chat_max_bytes, l.bounce_max_bytes), (2048, 16384));
+        assert_eq!((l.datapackage_burst, l.datapackage_refill_milli_per_sec), (4, 100));
     }
 }

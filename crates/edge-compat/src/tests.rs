@@ -41,8 +41,8 @@ fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
     let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, config::Limits::DESIGN);
-    Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned)).unwrap())
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
+    Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned), Limits::DESIGN).unwrap())
 }
 
 fn room() -> Arc<CompatRoom> {
@@ -440,7 +440,7 @@ fn a_check_cid_is_the_location_and_distinct_per_location() {
 }
 
 /// A room where slot A has locations `1000..end` that all send item 7 to B.
-fn big_room(end: i64, limits: config::Limits) -> Arc<CompatRoom> {
+fn big_room(end: i64, limits: Limits) -> Arc<CompatRoom> {
     let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
     let locs: Vec<Value> =
         (1000..end).map(|l| json!({"location": l, "item": 7, "receiver": 2, "flags": 0})).collect();
@@ -453,7 +453,7 @@ fn big_room(end: i64, limits: config::Limits) -> Arc<CompatRoom> {
     let epoch = store.claim(RoomId(1));
     let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, limits);
-    Arc::new(CompatRoom::new(b, h, None).unwrap())
+    Arc::new(CompatRoom::new(b, h, None, limits).unwrap())
 }
 
 fn indexes(ps: &[Value]) -> Vec<u64> {
@@ -469,7 +469,7 @@ fn indexes(ps: &[Value]) -> Vec<u64> {
 
 #[tokio::test]
 async fn two_hundred_checks_in_one_packet_reach_a_bystander_that_stays_connected() {
-    let room = big_room(1200, config::Limits::DESIGN);
+    let room = big_room(1200, Limits::DESIGN);
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
     pump(&mut a).await;
@@ -485,7 +485,7 @@ async fn two_hundred_checks_in_one_packet_reach_a_bystander_that_stays_connected
 #[tokio::test]
 async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_order() {
     // A one-entry queue: B falls behind after the first batch and the room drops its queue.
-    let room = big_room(1030, config::Limits { session_queue: 1, ..config::Limits::DESIGN });
+    let room = big_room(1030, Limits { session_queue: 1, ..Limits::DESIGN });
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
     for chunk in (1000..1030).collect::<Vec<i64>>().chunks(7) {
@@ -502,4 +502,79 @@ async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_orde
     assert_eq!(locations, (1000..1030).collect::<Vec<_>>());
     check(&mut a, &[1000]).await;
     assert_eq!(indexes(&pump(&mut b).await), Vec::<u64>::new(), "nothing twice after the resync");
+}
+
+fn limited(limits: Limits) -> Arc<CompatRoom> {
+    let b = bundle(&Value::Null);
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, limits);
+    Arc::new(CompatRoom::new(b, h, None, limits).unwrap())
+}
+
+/// A burst of 2 that never refills, so the test does not depend on the clock.
+const TIGHT: Limits = Limits {
+    fanout_burst: 2,
+    fanout_refill_milli_per_sec: 0,
+    datapackage_burst: 1,
+    datapackage_refill_milli_per_sec: 0,
+    chat_max_bytes: 8,
+    bounce_max_bytes: 64,
+    ..Limits::DESIGN
+};
+
+#[tokio::test]
+async fn chat_and_bounce_share_a_rate_limit_and_the_excess_is_refused() {
+    let room = limited(TIGHT);
+    let mut a = joined(&room, "A").await;
+    assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &json!([{"cmd": "Bounce", "slots": [2]}])).await, Vec::<Value>::new());
+    for p in [json!([{"cmd": "Say", "text": "hi"}]), json!([{"cmd": "Bounce", "slots": [2]}])] {
+        let ps = send(&mut a, &p).await;
+        assert_eq!(
+            (ps[0]["cmd"].clone(), ps[0]["type"].clone()),
+            (json!("InvalidPacket"), json!("arguments"))
+        );
+        assert!(ps[0]["text"].as_str().unwrap().contains("rate"), "{ps:?}");
+    }
+}
+
+#[tokio::test]
+async fn oversized_chat_and_bounce_are_refused_before_they_cost_a_token() {
+    let room = limited(TIGHT);
+    let mut a = joined(&room, "A").await;
+    let ps = send(&mut a, &json!([{"cmd": "Say", "text": "123456789"}])).await;
+    assert!(ps[0]["text"].as_str().unwrap().contains("too long"), "{ps:?}");
+    let ps = send(&mut a, &json!([{"cmd": "Bounce", "data": {"x": "y".repeat(64)}}])).await;
+    assert!(ps[0]["text"].as_str().unwrap().contains("too large"), "{ps:?}");
+    // Exactly at the cap is fine, and the refusals took no tokens.
+    assert_eq!(
+        send(&mut a, &json!([{"cmd": "Say", "text": "12345678"}])).await,
+        Vec::<Value>::new()
+    );
+    assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "1"}])).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn get_data_package_is_rate_limited() {
+    let mut s = Session::new(limited(TIGHT));
+    assert_eq!(send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await[0]["cmd"], "DataPackage");
+    let ps = send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await;
+    assert_eq!(ps[0]["original_cmd"], "GetDataPackage");
+    assert!(ps[0]["text"].as_str().unwrap().contains("rate"));
+}
+
+#[test]
+fn a_bucket_refills_at_its_rate_and_never_above_its_burst() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut b = limit::Bucket::new(2, 1000, t0);
+    assert!(b.take(t0) && b.take(t0) && !b.take(t0));
+    assert!(!b.take(t0 + Duration::from_millis(999)));
+    assert!(b.take(t0 + Duration::from_millis(1000)));
+    let later = t0 + Duration::from_secs(3600);
+    assert!(b.take(later) && b.take(later) && !b.take(later), "capped at the burst");
+    let mut never = limit::Bucket::new(0, 1000, t0);
+    assert!(!never.take(later));
 }

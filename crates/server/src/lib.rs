@@ -98,7 +98,7 @@ pub fn app(bundle: SeedBundle, password: Option<String>, limits: Limits) -> Resu
     let state = RoomState::new(bundle.slot_nos(), bundle.placement()).map_err(|e| e.to_string())?;
     // The task ends with the process; a stopped room answers every request with Unavailable.
     let (handle, _task) = RoomHandle::spawn(room_id, epoch, state, store, limits);
-    let room = Arc::new(CompatRoom::new(Arc::new(bundle), handle, password)?);
+    let room = Arc::new(CompatRoom::new(Arc::new(bundle), handle, password, limits)?);
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     Ok(Router::new()
         .route("/", get(upgrade))
