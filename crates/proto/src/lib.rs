@@ -3,6 +3,8 @@
 
 mod error;
 mod ids;
+mod msg;
 
 pub use error::{ErrorCode, Retry};
-pub use ids::{ItemSeq, Seq, SlotNo};
+pub use ids::{Cid, Epoch, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
+pub use msg::{Command, Event, EventKind};
