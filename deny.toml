@@ -1,7 +1,8 @@
 # Doc 05 section 18.2: license allow-list, advisories, banned crates.
 [licenses]
 unused-allowed-license = "allow"
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC"]
+# Zlib: foldhash, a hasher under sqlx (D-98); permissive like MIT, notice kept with the source.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib"]
 # D-97: the owner accepted yawc's MPL-2.0 (2026-11-16, no lawyer review); for yawc only.
 exceptions = [{ name = "yawc", allow = ["MPL-2.0"] }]
 

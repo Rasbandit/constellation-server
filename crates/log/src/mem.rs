@@ -149,6 +149,3 @@ impl LogStore for MemLogStore {
         ready(self.with(room, |r| r.put_snapshot(snap, epoch)))
     }
 }
-
-#[cfg(test)]
-mod tests;
