@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, vec, vec::Vec};
 const NO_EVENTS: [Event; 0] = [];
 
 const LIM: Limits =
-    Limits { conn_mem_bytes: 0, dedupe_window_secs: 100, sim_seeds: 0, sim_replay_seed: None };
+    Limits { conn_mem_bytes: 0, dedupe_window_secs: 100, sim_seeds: 0, ..Limits::DESIGN };
 
 /// Slots 1 and 2. Slot 1's location 10 -> slot 1 item 500, 11 -> slot 2 item 501, 12 -> slot 2
 /// item 502. Slot 2's location 10 (the same id in another world) -> slot 1 item 503.
