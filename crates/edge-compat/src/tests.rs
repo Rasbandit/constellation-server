@@ -440,9 +440,15 @@ fn a_check_cid_is_the_location_and_distinct_per_location() {
 
 /// A room where slot A has locations `1000..end` that all send item 7 to B.
 fn big_room(end: i64, limits: Limits) -> Arc<CompatRoom> {
+    big_room_to(end, 2, limits)
+}
+
+/// As [`big_room`], every item going to `receiver`.
+fn big_room_to(end: i64, receiver: u32, limits: Limits) -> Arc<CompatRoom> {
     let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
-    let locs: Vec<Value> =
-        (1000..end).map(|l| json!({"location": l, "item": 7, "receiver": 2, "flags": 0})).collect();
+    let locs: Vec<Value> = (1000..end)
+        .map(|l| json!({"location": l, "item": 7, "receiver": receiver, "flags": 0}))
+        .collect();
     v["slots"][0]["locations"] = json!(locs);
     for l in 1000..end {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
@@ -802,4 +808,31 @@ fn a_full_rate_table_forgets_idle_keys_and_refuses_while_all_are_limited() {
     assert!(!table.take(2_u32, t0), "key 1 is still limited, so no room for key 2");
     let later = t0 + Duration::from_secs(5);
     assert!(table.take(2_u32, later), "key 1 refilled, so it was forgotten");
+}
+
+#[tokio::test]
+async fn a_slow_checker_resyncs_its_own_checks_and_items_with_nothing_missed_or_doubled() {
+    // A one-entry queue, and A checks without reading: A itself falls behind. The first event A
+    // misses is one of its own checks, so a resync that starts one event late loses a check.
+    let room = big_room_to(1030, 1, Limits { session_queue: 1, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    for chunk in (1000..1030).collect::<Vec<i64>>().chunks(7) {
+        check(&mut a, chunk).await;
+    }
+    let got = pump(&mut a).await;
+    let checked: Vec<i64> = of(&got, "RoomUpdate")
+        .iter()
+        .flat_map(|p| {
+            p["checked_locations"].as_array().unwrap().iter().map(|l| l.as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(checked, (1000..1030).collect::<Vec<_>>(), "every check once, in order");
+    let items: Vec<i64> = of(&got, "ReceivedItems")
+        .iter()
+        .flat_map(|p| {
+            p["items"].as_array().unwrap().iter().map(|i| i["location"].as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(items, (1000..1030).collect::<Vec<_>>(), "every item once, in order");
+    assert_eq!(indexes(&got), (0..30).collect::<Vec<_>>());
 }
