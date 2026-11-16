@@ -38,6 +38,13 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 - Browser end to end (host console, lobby, pairing) uses Playwright against the running server, once the web UI exists.
 - An e2e test that needs a sleep is a missing signal in the product: add the signal (an event, a metric), then wait on it.
 
+## Postgres tests
+
+- The cargo feature `pg-tests` (on `log` and `server`) turns on every test that needs Postgres: the `LogStore` contract suite against `PgLogStore`, the gate G-DB fence race and cancel tests (both in `crates/log/src/contract.rs`, so they also run on `MemLogStore`), and `crates/server/tests/restart.rs`. With the feature on and no `CONSTELLATION_DATABASE_URL`, they fail with a message saying so (rule 5: no silent skip). `just test-pg` runs them; CI's `check` and `coverage` jobs run them against a Postgres 18 service container.
+- Each test creates its own schema (`log::testing::fresh_schema`) and points its connections at it, so tests share one database and run in parallel. Schemas are not dropped; use a throwaway database.
+- The throughput benchmark (feature `pg-bench`, `crates/log/tests/throughput.rs`) runs nightly only and fails below 60 percent of the 20,000 rows per second design value.
+- **Deferred:** the PgBouncer test of gate G-DB (writer behind PgBouncer in transaction mode with prepared statements). Stage 0 and 1 run Postgres on the same box with no pooler (doc 12), so there is nothing to test yet; it comes with the first pooler. `COPY` into a temp table is not benchmarked yet either (only `UNNEST`).
+
 ## Quality bars (CI)
 
 - **Coverage:** line coverage with `cargo-llvm-cov`, floor 90 percent on the workspace; leaf crates (`proto`, `spec-rng`, `rules`, `room-core`) aim for 100 percent of branches that are reachable. A coverage drop needs a reason in the PR.
