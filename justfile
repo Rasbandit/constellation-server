@@ -18,7 +18,16 @@ lint:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 test:
-    cargo test --workspace --all-features --locked
+    cargo test --workspace --all-features --locked --exclude e2e
+
+# The real server binary over real WebSocket connections (crates/e2e; builds the server itself).
+e2e:
+    cargo test -p e2e --locked
+
+# The same core scenario driven by archipelago_rs, a real Archipelago client library. Needs the
+# sibling Archipela-Go checkout, so it is a separate crate outside the workspace (see README).
+e2e-ap:
+    cargo test --manifest-path crates/e2e-ap/Cargo.toml --locked --features ap-interop
 
 # Fast unit tests only; what the pre-commit hook runs.
 unit:

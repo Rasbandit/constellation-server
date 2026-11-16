@@ -238,6 +238,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "e2e"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "seed-bundle",
+ "serde_json",
+ "tokio",
+ "yawc",
+]
+
+[[package]]
 name = "edge-compat"
 version = "0.0.0"
 dependencies = [
