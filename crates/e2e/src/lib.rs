@@ -63,6 +63,10 @@ impl Server {
             .arg(fixture_path())
             .args(["--port", "0"])
             .args(extra)
+            // A scenario says which database it uses; it never inherits one (CI sets the URL
+            // for the Postgres tests, and parallel servers must not share a room).
+            .env_remove("CONSTELLATION_DATABASE_URL")
+            .env_remove("CONSTELLATION_DATABASE_URL_FILE")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -130,6 +134,16 @@ impl Server {
         if !sent.success() {
             return Err("kill -TERM failed".to_owned());
         }
+        self.child.wait().map_err(|e| e.to_string())
+    }
+
+    /// `kill -9`: SIGKILL, no shutdown path runs. Returns once the process is gone.
+    ///
+    /// # Errors
+    /// When the signal cannot be sent or the wait fails.
+    pub fn kill(mut self) -> Res<ExitStatus> {
+        // std's `Child::kill` sends SIGKILL on Unix.
+        self.child.kill().map_err(|e| e.to_string())?;
         self.child.wait().map_err(|e| e.to_string())
     }
 }
@@ -252,6 +266,14 @@ impl Client {
         }
     }
 
+    /// Send one `LocationChecks` for these locations.
+    ///
+    /// # Errors
+    /// When the socket fails.
+    pub async fn check(&mut self, locations: &[i64]) -> Res<()> {
+        self.send(&serde_json::json!([{"cmd": "LocationChecks", "locations": locations}])).await
+    }
+
     /// Close politely.
     ///
     /// # Errors
@@ -262,6 +284,38 @@ impl Client {
             .await
             .map_err(|e| e.to_string())
     }
+}
+
+/// The fixture's locations in `from`'s world whose item goes to `to`, as (location, item,
+/// flags), in fixture order.
+///
+/// # Errors
+/// When the fixture is missing or has no slot `from`.
+pub fn locations_for(from: u32, to: u32) -> Res<Vec<(i64, i64, u8)>> {
+    let b = fixture()?;
+    let slot = b.slot(from).ok_or_else(|| format!("no slot {from}"))?;
+    Ok(slot
+        .locations
+        .iter()
+        .filter(|p| p.receiver == to)
+        .map(|p| (p.location, p.item, p.flags))
+        .collect())
+}
+
+/// Connect to `url` as slot `name` (no password) and return the client, the `Connected`
+/// packet and anything that came before it.
+///
+/// # Errors
+/// When the socket fails or the first packet is not `RoomInfo`.
+pub async fn join(url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
+    let mut c = Client::connect(url).await?;
+    let info = c.next().await?;
+    if info.get("cmd").and_then(Value::as_str) != Some("RoomInfo") {
+        return Err(format!("first packet is not RoomInfo: {info}"));
+    }
+    c.send(&connect_packet(name, None)).await?;
+    let (connected, skipped) = c.next_cmd("Connected").await?;
+    Ok((c, connected, skipped))
 }
 
 /// A `Connect` packet for the fixture's game.

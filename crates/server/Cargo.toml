@@ -15,15 +15,26 @@ categories.workspace = true
 name = "constellation-server"
 path = "src/main.rs"
 
+[[test]]
+name = "restart"
+required-features = ["pg-tests"]
+
+[features]
+# The Postgres restart scenarios (`tests/restart.rs`). Need CONSTELLATION_DATABASE_URL and fail
+# loudly without it (docs/TESTING.md rule 5).
+pg-tests = ["log/pg-tests"]
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
 edge-compat = { path = "../edge-compat" }
-log = { path = "../log" }
+log = { path = "../log", features = ["postgres"] }
 proto = { path = "../proto" }
 room-core = { path = "../room-core" }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
+serde_json.workspace = true
+sha2 = { version = "0.11", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
@@ -31,7 +42,6 @@ yawc.workspace = true
 
 [dev-dependencies]
 e2e = { path = "../e2e" }
-serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
 
 [lints]

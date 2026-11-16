@@ -29,26 +29,15 @@ mod scenarios {
 
     /// Alice's (slot 1) locations whose item goes to `receiver`, from the fixture.
     fn alice_locations_for(receiver: u32) -> Vec<(i64, i64, u8)> {
-        let b = fixture().unwrap();
-        b.slot(1)
-            .unwrap()
-            .locations
-            .iter()
-            .filter(|p| p.receiver == receiver)
-            .map(|p| (p.location, p.item, p.flags))
-            .collect()
+        e2e::locations_for(1, receiver).unwrap()
     }
 
     async fn joined(server: &Server, name: &str) -> (Client, Value, Vec<Value>) {
-        let mut c = Client::connect(&server.url()).await.unwrap();
-        assert_eq!(c.next().await.unwrap()["cmd"], "RoomInfo");
-        c.send(&connect_packet(name, None)).await.unwrap();
-        let (connected, skipped) = c.next_cmd("Connected").await.unwrap();
-        (c, connected, skipped)
+        e2e::join(&server.url(), name).await.unwrap()
     }
 
     async fn check(c: &mut Client, locations: &[i64]) {
-        c.send(&json!([{"cmd": "LocationChecks", "locations": locations}])).await.unwrap();
+        c.check(locations).await.unwrap();
     }
 
     #[tokio::test]
