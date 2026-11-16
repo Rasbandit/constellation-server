@@ -75,6 +75,7 @@ enum RoomMsg {
     Commands { cmds: Vec<Command>, reply: oneshot::Sender<Vec<Outcome>> },
     Subscribe { after: Seq, reply: oneshot::Sender<Result<Subscription, RoomError>> },
     Ext { from: SlotNo, body: Arc<serde_json::Value>, done: oneshot::Sender<()> },
+    Subscribers { reply: oneshot::Sender<usize> },
 }
 
 /// The edge's handle on a room. Cheap to clone.
@@ -139,6 +140,16 @@ impl RoomHandle {
         rx.await.map_err(|_| RoomError::Unavailable)
     }
 
+    /// How many subscriber queues the room holds (a metric, doc 11 R8).
+    ///
+    /// # Errors
+    /// [`RoomError::Unavailable`] when the room task has stopped.
+    pub async fn subscribers(&self) -> Result<usize, RoomError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(RoomMsg::Subscribers { reply }).await?;
+        rx.await.map_err(|_| RoomError::Unavailable)
+    }
+
     async fn send(&self, msg: RoomMsg) -> Result<(), RoomError> {
         self.tx.send(msg).await.map_err(|_| RoomError::Unavailable)
     }
@@ -180,6 +191,10 @@ impl<S: LogStore> Actor<S> {
                     let ok = sub.is_ok();
                     drop(reply.send(sub));
                     ok
+                }
+                RoomMsg::Subscribers { reply } => {
+                    let _ = reply.send(self.subs.len());
+                    true
                 }
                 RoomMsg::Ext { from, body, done } => {
                     let msg = Arc::new(Published::Ext { from, body });
@@ -265,6 +280,8 @@ impl<S: LogStore> Actor<S> {
             return Err(RoomError::Unavailable);
         }
         let (tx, live) = mpsc::channel(self.limits.session_queue.max(1));
+        // Drop queues whose subscriber left, so a quiet room's reconnects cannot pile them up.
+        self.subs.retain(|t| !t.is_closed());
         self.subs.push(tx);
         Ok(Subscription { history, live })
     }

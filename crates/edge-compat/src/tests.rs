@@ -717,3 +717,89 @@ async fn reconnecting_to_another_slot_announces_part_then_join_and_the_same_slot
         pump(&mut watcher).await.iter().map(|p| (p["type"].clone(), p["slot"].clone())).collect();
     assert_eq!(seen, [(json!("Part"), json!(2)), (json!("Join"), json!(1))]);
 }
+
+fn peer(n: u8) -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, n))
+}
+
+#[tokio::test]
+async fn reconnecting_does_not_refill_the_chat_bucket_of_a_slot() {
+    let room = limited(TIGHT);
+    let mut a = joined(&room, "A").await;
+    for _ in 0..2 {
+        assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
+    }
+    drop(a);
+    let mut again = Session::with_peer(Arc::clone(&room), peer(9));
+    send(&mut again, &connect_packet("A", &json!(7))).await;
+    let ps = send(&mut again, &json!([{"cmd": "Say", "text": "hi"}])).await;
+    assert!(
+        ps[0]["text"].as_str().unwrap().contains("rate"),
+        "the slot's bucket is still empty: {ps:?}"
+    );
+    let mut b = joined(&room, "B").await;
+    assert_eq!(
+        send(&mut b, &json!([{"cmd": "Say", "text": "hi"}])).await,
+        Vec::<Value>::new(),
+        "another slot is not limited"
+    );
+}
+
+#[tokio::test]
+async fn the_data_package_limit_follows_the_client_address_across_connections() {
+    let room = limited(TIGHT);
+    let dp = json!([{"cmd": "GetDataPackage"}]);
+    let mut first = Session::with_peer(Arc::clone(&room), peer(1));
+    assert_eq!(send(&mut first, &dp).await[0]["cmd"], "DataPackage");
+    let mut second = Session::with_peer(Arc::clone(&room), peer(1));
+    assert_eq!(send(&mut second, &dp).await[0]["cmd"], "InvalidPacket", "same address, new socket");
+    let mut other = Session::with_peer(Arc::clone(&room), peer(2));
+    assert_eq!(send(&mut other, &dp).await[0]["cmd"], "DataPackage");
+}
+
+#[tokio::test]
+async fn connect_is_rate_limited_per_address() {
+    let room =
+        limited(Limits { connect_burst: 2, connect_refill_milli_per_sec: 0, ..Limits::DESIGN });
+    for _ in 0..2 {
+        let mut s = Session::with_peer(Arc::clone(&room), peer(3));
+        assert_eq!(send(&mut s, &connect_packet("A", &json!(7))).await[0]["cmd"], "Connected");
+    }
+    let mut s = Session::with_peer(Arc::clone(&room), peer(3));
+    let ps = send(&mut s, &connect_packet("A", &json!(7))).await;
+    assert_eq!(
+        (ps[0]["cmd"].clone(), ps[0]["original_cmd"].clone()),
+        (json!("InvalidPacket"), json!("Connect"))
+    );
+    let mut elsewhere = Session::with_peer(Arc::clone(&room), peer(4));
+    assert_eq!(send(&mut elsewhere, &connect_packet("A", &json!(7))).await[0]["cmd"], "Connected");
+}
+
+#[tokio::test]
+async fn many_reconnects_in_a_quiet_room_keep_the_subscriber_count_bounded() {
+    let room = limited(Limits { connect_burst: 1000, ..Limits::DESIGN });
+    let mut s = Session::new(Arc::clone(&room));
+    for _ in 0..50 {
+        // The same slot again announces nothing, so nothing is published to prune on.
+        send(&mut s, &connect_packet("A", &json!(7))).await;
+    }
+    assert_eq!(room.room.subscribers().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn debug_output_never_shows_the_room_password() {
+    let room = room_with(&json!("hunter2"), None);
+    let text = format!("{room:?}");
+    assert!(!text.contains("hunter2") && text.contains("redacted"), "{text}");
+}
+
+#[test]
+fn a_full_rate_table_forgets_idle_keys_and_refuses_while_all_are_limited() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let table = RateTable::new(1, 1000, 1);
+    assert!(table.take(1_u32, t0));
+    assert!(!table.take(2_u32, t0), "key 1 is still limited, so no room for key 2");
+    let later = t0 + Duration::from_secs(5);
+    assert!(table.take(2_u32, later), "key 1 refilled, so it was forgotten");
+}

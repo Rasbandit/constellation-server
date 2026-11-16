@@ -12,10 +12,12 @@ mod socket;
 pub mod wire;
 
 use config::Limits;
+use limit::RateTable;
 use proto::Cid;
 use runtime::RoomHandle;
 use seed_bundle::SeedBundle;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub use session::{Closed, Session};
@@ -34,7 +36,6 @@ const NO_GAME_MIN_VERSION: (u32, u32, u32) = (0, 5, 0);
 const NO_GAME_TAGS: [&str; 3] = ["HintGame", "Tracker", "TextOnly"];
 
 /// One room's data, prepared once and shared by every session.
-#[derive(Debug)]
 pub struct CompatRoom {
     bundle: Arc<SeedBundle>,
     room: RoomHandle,
@@ -44,6 +45,22 @@ pub struct CompatRoom {
     /// Game name to its data package as JSON, serialized once (R4: no heavy work per request).
     packages: BTreeMap<String, String>,
     limits: Limits,
+    /// Chat and bounce, per slot (they share the fan-out path).
+    fanout: RateTable<u32>,
+    /// Data package requests, per client address.
+    datapackage: RateTable<IpAddr>,
+    /// `Connect` packets, per client address.
+    connects: RateTable<IpAddr>,
+}
+
+impl std::fmt::Debug for CompatRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompatRoom")
+            .field("seed", &self.bundle.seed_name)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompatRoom {
@@ -69,7 +86,23 @@ impl CompatRoom {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let password = password.or_else(|| bundle.server_options.password.clone());
-        Ok(Self { bundle, room, password, flags, packages, limits })
+        let l = limits;
+        let keys = l.rate_table_max_keys;
+        Ok(Self {
+            bundle,
+            room,
+            password,
+            flags,
+            packages,
+            limits,
+            fanout: RateTable::new(l.fanout_burst, l.fanout_refill_milli_per_sec, keys),
+            datapackage: RateTable::new(
+                l.datapackage_burst,
+                l.datapackage_refill_milli_per_sec,
+                keys,
+            ),
+            connects: RateTable::new(l.connect_burst, l.connect_refill_milli_per_sec, keys),
+        })
     }
 
     fn flags(&self, slot: u32, location: i64) -> u8 {

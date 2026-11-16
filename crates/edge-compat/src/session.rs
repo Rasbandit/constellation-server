@@ -1,7 +1,7 @@
 //! One connection's state machine. Input: text frames from the client and events the room
 //! publishes. Output: text frames to send. The socket loop (`socket.rs`) owns the IO.
 
-use crate::limit::Bucket;
+use crate::limit::RateTable;
 use crate::wire::{
     self, Bounce, CLIENT_GOAL, Connect, ConnectUpdate, Get, GetDataPackage, Locations, NetVersion,
     NetworkItem, NetworkPlayer, NetworkSlot, Permissions, PrintJson, Say, ServerPacket,
@@ -14,6 +14,7 @@ use seed_bundle::{Slot, SlotKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -97,9 +98,8 @@ impl Joined {
 pub struct Session {
     room: Arc<CompatRoom>,
     joined: Option<Joined>,
-    /// Chat and bounce share one bucket (they share the fan-out path).
-    fanout: Bucket,
-    datapackage: Bucket,
+    /// The client address the room's per-address rate limits are kept by.
+    peer: IpAddr,
 }
 
 fn invalid(kind: &'static str, cmd: Option<&str>, text: impl Into<String>) -> ServerPacket {
@@ -116,22 +116,22 @@ fn parse<T: serde::de::DeserializeOwned>(cmd: &str, v: Value) -> Result<T, Step>
 }
 
 impl Session {
-    /// A new connection to `room`.
+    /// A new connection to `room` from `peer` (the client address rate limits are kept by).
     #[must_use]
-    pub fn new(room: Arc<CompatRoom>) -> Self {
-        let l = room.limits;
-        let now = Instant::now();
-        Self {
-            fanout: Bucket::new(l.fanout_burst, l.fanout_refill_milli_per_sec, now),
-            datapackage: Bucket::new(l.datapackage_burst, l.datapackage_refill_milli_per_sec, now),
-            room,
-            joined: None,
-        }
+    pub const fn with_peer(room: Arc<CompatRoom>, peer: IpAddr) -> Self {
+        Self { room, joined: None, peer }
     }
 
-    /// One token from `bucket`, or the `InvalidPacket` that says the client is over its rate.
-    fn rate(bucket: &mut Bucket, cmd: &str) -> Result<(), Step> {
-        if bucket.take(Instant::now()) {
+    /// A new connection to `room` from loopback.
+    #[must_use]
+    pub const fn new(room: Arc<CompatRoom>) -> Self {
+        Self::with_peer(room, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    /// A token from `table` for `key`, or the `InvalidPacket` that says the client is over its
+    /// rate.
+    fn rate<K: std::hash::Hash + Eq>(table: &RateTable<K>, key: K, cmd: &str) -> Result<(), Step> {
+        if table.take(key, Instant::now()) {
             Ok(())
         } else {
             Err(Step::from(invalid(
@@ -214,7 +214,7 @@ impl Session {
             "Connect" => self.connect(parse(cmd, p)?).await,
             "GetDataPackage" => {
                 let req = parse::<GetDataPackage>(cmd, p)?;
-                Self::rate(&mut self.datapackage, cmd)?;
+                Self::rate(&self.room.datapackage, self.peer, cmd)?;
                 Ok(vec![self.data_package(&req)])
             }
             _ if self.joined.is_none() => {
@@ -239,11 +239,13 @@ impl Session {
 
     async fn connect(&mut self, c: Connect) -> Result<Vec<String>, Step> {
         let room = Arc::clone(&self.room);
+        Self::rate(&room.connects, self.peer, "Connect")?;
         let (errors, ok) = refusals(&room, &c);
         let Some((team, slot, handling)) = ok.filter(|_| errors.is_empty()) else {
             return Ok(vec![wire::frame(&[ServerPacket::ConnectionRefused { errors }])]);
         };
-        let previous = self.joined.as_ref().map(|j| (j.team, j.slot));
+        // Leave the old subscription first, so the room can prune its queue.
+        let previous = self.joined.take().map(|j| (j.team, j.slot));
         let Subscription { history, live } =
             self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
         let mut j = Joined {
@@ -477,12 +479,12 @@ impl Session {
         Ok(Vec::new())
     }
 
-    async fn say(&mut self, req: Say) -> Result<Vec<String>, Step> {
+    async fn say(&self, req: Say) -> Result<Vec<String>, Step> {
         if req.text.len() > self.room.limits.chat_max_bytes {
             return Err(Step::from(invalid("arguments", Some("Say"), "Say: text too long")));
         }
-        Self::rate(&mut self.fanout, "Say")?;
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        Self::rate(&self.room.fanout, j.slot, "Say")?;
         if req.text.starts_with('!') {
             let print = PrintJson {
                 kind: "CommandResult".to_owned(),
@@ -504,7 +506,7 @@ impl Session {
         Ok(Vec::new())
     }
 
-    async fn bounce(&mut self, p: Value) -> Result<Vec<String>, Step> {
+    async fn bounce(&self, p: Value) -> Result<Vec<String>, Step> {
         if p.to_string().len() > self.room.limits.bounce_max_bytes {
             return Err(Step::from(invalid(
                 "arguments",
@@ -512,8 +514,8 @@ impl Session {
                 "Bounce: packet too large",
             )));
         }
-        Self::rate(&mut self.fanout, "Bounce")?;
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        Self::rate(&self.room.fanout, j.slot, "Bounce")?;
         let targets: Bounce = parse("Bounce", p.clone())?;
         if !matches!(targets.operator.as_deref(), None | Some("legacy" | "or" | "and")) {
             return Err(Step::from(invalid(
@@ -724,7 +726,7 @@ fn part_print(team: u32, slot: u32) -> PrintJson {
 
 fn item_send(receiver: u32, it: NetworkItem) -> ServerPacket {
     // Deliberately the same part layout Archipelago clients already display for an item send,
-    // so their logs read the same with us (compatibility, not a copy of their code).
+    // for compatibility (reference behaviour: `json_format_send_event` in MultiServer.py).
     let mut data = vec![TextPart::player(it.player)];
     if it.player == receiver {
         data.extend([TextPart::text(" found their "), TextPart::item(it.item, receiver, it.flags)]);

@@ -9,6 +9,7 @@ use crate::{CompatRoom, Session};
 use config::Limits;
 use futures_util::SinkExt;
 use runtime::Published;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -44,13 +45,13 @@ async fn next_live(session: &mut Session) -> Option<Arc<Published>> {
     }
 }
 
-/// Serve one connection until either side ends it.
-pub async fn serve<S>(mut ws: WebSocket<S>, room: Arc<CompatRoom>)
+/// Serve one connection from `peer` until either side ends it.
+pub async fn serve<S>(mut ws: WebSocket<S>, room: Arc<CompatRoom>, peer: IpAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let limits = room.limits;
-    let mut session = Session::new(room);
+    let mut session = Session::with_peer(room, peer);
     if ws.send(Frame::text(session.hello())).await.is_err() {
         return;
     }

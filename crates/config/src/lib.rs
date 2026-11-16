@@ -47,6 +47,13 @@ pub struct Limits {
     pub datapackage_burst: u32,
     /// Refill of that bucket, thousandths per second (100 = one every 10 s).
     pub datapackage_refill_milli_per_sec: u32,
+    /// `Connect` packets one client address may send in a burst (each re-reads the log).
+    pub connect_burst: u32,
+    /// Refill of that bucket, thousandths per second (1000 = one per second).
+    pub connect_refill_milli_per_sec: u32,
+    /// Most keys (slots, client addresses) a rate table tracks; past it, idle full buckets are
+    /// dropped, and a new key is refused while every tracked one is still limited.
+    pub rate_table_max_keys: usize,
     /// Open WebSocket connections per process; more get HTTP 503 (`CONSTELLATION_MAX_CONNECTIONS`).
     pub max_connections: usize,
     /// A socket that has not connected to a slot within this long is closed
@@ -81,6 +88,9 @@ impl Limits {
         bounce_max_bytes: 16 * 1024,
         datapackage_burst: 4,
         datapackage_refill_milli_per_sec: 100,
+        connect_burst: 10,
+        connect_refill_milli_per_sec: 1000,
+        rate_table_max_keys: 100_000,
         max_connections: 10_000,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
@@ -126,11 +136,19 @@ pub fn load() -> Limits {
 
 /// Values that must not appear on a command line (visible to every local user in `ps`).
 #[cfg(feature = "std")]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secrets {
     /// Room password: `CONSTELLATION_ROOM_PASSWORD`, or the first line of the file named by
     /// `CONSTELLATION_ROOM_PASSWORD_FILE`. `None` keeps the seed's own.
     pub room_password: Option<String>,
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let pw = self.room_password.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Secrets").field("room_password", &pw).finish()
+    }
 }
 
 /// Read [`Secrets`] from the environment.
@@ -217,6 +235,13 @@ mod tests {
     }
 
     #[test]
+    fn secrets_print_redacted() {
+        let s = Secrets { room_password: Some("hunter2".to_owned()) };
+        let text = format!("{s:?}");
+        assert!(!text.contains("hunter2") && text.contains("redacted"), "{text}");
+    }
+
+    #[test]
     fn connection_limits_are_design_values_and_the_ping_beats_the_idle_timeout() {
         let l = Limits::DESIGN;
         assert_eq!(l.max_connections, 10_000);
@@ -233,5 +258,7 @@ mod tests {
         assert_eq!((l.fanout_burst, l.fanout_refill_milli_per_sec), (10, 2000));
         assert_eq!((l.chat_max_bytes, l.bounce_max_bytes), (2048, 16384));
         assert_eq!((l.datapackage_burst, l.datapackage_refill_milli_per_sec), (4, 100));
+        assert_eq!((l.connect_burst, l.connect_refill_milli_per_sec), (10, 1000));
+        assert_eq!(l.rate_table_max_keys, 100_000);
     }
 }

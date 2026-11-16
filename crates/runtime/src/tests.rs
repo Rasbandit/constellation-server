@@ -247,3 +247,14 @@ async fn a_failed_append_publishes_nothing_to_any_subscriber() {
     assert_eq!(a.live.recv().await, None);
     assert_eq!(b.live.recv().await, None);
 }
+
+#[tokio::test]
+async fn subscribers_that_left_are_pruned_on_subscribe_even_in_a_quiet_room() {
+    let (h, _) = start();
+    for _ in 0..50 {
+        drop(h.subscribe(Seq(0)).await.unwrap());
+    }
+    let kept = h.subscribe(Seq(0)).await.unwrap();
+    assert_eq!(h.subscribers().await.unwrap(), 1, "only the live one is kept");
+    drop(kept);
+}

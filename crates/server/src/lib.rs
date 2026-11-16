@@ -3,7 +3,7 @@
 //! a WebSocket at `/` (yawc, D-97) and `GET /healthz` (axum).
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -104,7 +104,11 @@ pub fn app(bundle: SeedBundle, password: Option<String>, limits: Limits) -> Resu
     ))
 }
 
-async fn upgrade(State(s): State<AppState>, ws: IncomingUpgrade) -> Response {
+async fn upgrade(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ws: IncomingUpgrade,
+) -> Response {
     let Ok(permit) = Arc::clone(&s.slots).try_acquire_owned() else {
         tracing::warn!("connection cap reached");
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
@@ -117,7 +121,7 @@ async fn upgrade(State(s): State<AppState>, ws: IncomingUpgrade) -> Response {
     tracing::info!(deflate, "websocket accepted");
     tokio::spawn(async move {
         match fut.await {
-            Ok(socket) => edge_compat::serve(socket, s.room).await,
+            Ok(socket) => edge_compat::serve(socket, s.room, peer.ip()).await,
             Err(e) => tracing::debug!(error = %e, "upgrade did not complete"),
         }
         drop(permit);
@@ -150,7 +154,7 @@ pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), Str
         .map_err(|e| format!("bind: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     tracing::info!(%addr, seed, "listening");
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await
         .map_err(|e| e.to_string())?;
