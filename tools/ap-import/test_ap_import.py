@@ -7,7 +7,9 @@ import enum
 import unittest
 from typing import NamedTuple
 
-from ap_import import FORMAT, convert
+import zlib
+
+from ap_import import FORMAT, convert, inflate
 
 
 class Kind(enum.IntEnum):
@@ -76,6 +78,46 @@ class ConvertTests(unittest.TestCase):
         del md["datapackage"]["G"]
         with self.assertRaisesRegex(ValueError, "no embedded data package"):
             convert(md)
+
+
+    def test_starting_inventory_is_refused_until_supported(self):
+        md = multidata()
+        md["precollected_items"] = {1: [], 2: [8]}
+        with self.assertRaisesRegex(ValueError, "starting inventory"):
+            convert(md)
+        md["precollected_items"] = {1: [], 2: []}
+        convert(md)  # empty lists are fine
+
+    def test_group_slots_are_refused_until_supported(self):
+        md = multidata()
+        md["slot_info"][3] = Slot("Grp", "G", Kind.GROUP, (1, 2))
+        with self.assertRaisesRegex(ValueError, "group slot"):
+            convert(md)
+
+    def test_race_mode_is_carried(self):
+        self.assertEqual(convert(multidata())["race_mode"], 0)
+        md = multidata()
+        md["race_mode"] = 1
+        self.assertEqual(convert(md)["race_mode"], 1)
+
+
+class InflateTests(unittest.TestCase):
+    def test_a_stream_within_the_cap_inflates(self):
+        raw = bytes([3]) + zlib.compress(b"x" * 1000)
+        self.assertEqual(inflate(raw, 1000), b"x" * 1000)
+
+    def test_a_stream_over_the_cap_is_refused_without_inflating_it_all(self):
+        raw = bytes([3]) + zlib.compress(b"x" * 1001)
+        with self.assertRaisesRegex(ValueError, "larger than 1000 bytes"):
+            inflate(raw, 1000)
+
+    def test_a_newer_container_or_garbage_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "newer"):
+            inflate(bytes([4]) + zlib.compress(b"x"), 10)
+        with self.assertRaises((ValueError, zlib.error)):
+            inflate(b"", 10)
+        with self.assertRaises(zlib.error):
+            inflate(bytes([3]) + b"not zlib", 10)
 
 
 if __name__ == "__main__":

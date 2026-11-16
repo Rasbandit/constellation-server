@@ -24,8 +24,12 @@ from typing import Any
 
 FORMAT = 1
 
-# Archipelago's slot type values (docs/network protocol.md, SlotType).
-SLOT_KINDS = {0: "spectator", 1: "player", 2: "group"}
+# Archipelago's slot type values (docs/network protocol.md, SlotType). Groups (item links) are
+# refused until the server supports them.
+SLOT_KINDS = {0: "spectator", 1: "player"}
+
+# Largest decompressed multidata we will unpickle: a guard against a compression bomb.
+MAX_DECOMPRESSED = 512 * 1024 * 1024
 
 # Options the Rust side reads, with the value used when the seed does not record one.
 OPTION_DEFAULTS = {
@@ -63,10 +67,15 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
     client_min = multidata.get("minimum_versions", {}).get("clients", {})
     slot_data = multidata.get("slot_data", {})
     locations = multidata["locations"]
+    with_start = sorted(slot for slot, items in multidata.get("precollected_items", {}).items() if items)
+    if with_start:
+        raise ValueError(f"slots {with_start} have a starting inventory, which is not supported yet")
 
     slots = []
     for slot_id in sorted(multidata["slot_info"]):
         info = multidata["slot_info"][slot_id]
+        if int(info.type) not in SLOT_KINDS:
+            raise ValueError(f"slot {slot_id} is a group slot (item link), which is not supported yet")
         placed = [
             {"location": int(loc), "item": int(item), "receiver": int(receiver), "flags": int(flags)}
             for loc, (item, receiver, flags) in sorted(locations.get(slot_id, {}).items())
@@ -109,7 +118,22 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
         "slots": slots,
         "connect_names": connect_names,
         "games": games,
+        "race_mode": int(multidata.get("race_mode", 0)),
     }
+
+
+def inflate(raw: bytes, limit: int = MAX_DECOMPRESSED) -> bytes:
+    """Unwrap the container: one format byte (3 or older), then a zlib stream, at most `limit`
+    bytes once inflated. Format as read by the reference server's loader (MultiServer.py)."""
+    if not raw:
+        raise ValueError("empty multidata file")
+    if raw[0] > 3:
+        raise ValueError(f"multidata format {raw[0]} is newer than this importer knows")
+    d = zlib.decompressobj()
+    out = d.decompress(raw[1:], limit)
+    if d.unconsumed_tail or len(d.decompress(d.unconsumed_tail, 1)) > 0:
+        raise ValueError(f"multidata is larger than {limit} bytes once decompressed")
+    return out
 
 
 def load_multidata(path: Path) -> dict[str, Any]:
@@ -122,10 +146,7 @@ def load_multidata(path: Path) -> dict[str, Any]:
             raw = zf.read(name)
     else:
         raw = path.read_bytes()
-    # First byte is the container format version; the rest is a zlib stream.
-    if raw[0] > 3:
-        raise ValueError(f"multidata format {raw[0]} is newer than this importer knows")
-    return restricted_loads(zlib.decompress(raw[1:]))
+    return restricted_loads(inflate(raw))
 
 
 def main(argv: list[str]) -> int:

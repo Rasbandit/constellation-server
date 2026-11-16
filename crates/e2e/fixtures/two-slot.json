@@ -12057,6 +12057,7 @@
   "major": 0,
   "minor": 6
  },
+ "race_mode": 0,
  "seed_name": "35931773795037525048",
  "server_options": {
   "collect_mode": "auto",

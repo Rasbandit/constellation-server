@@ -109,8 +109,17 @@ fn ids_at_the_documented_limit_are_accepted() {
 }
 
 #[test]
-fn a_group_must_name_real_slots() {
-    assert!(refused(|v| v["slots"][0]["group_members"] = json!([5])).contains("missing slot 5"));
+fn group_slots_are_refused_until_supported() {
+    let msg = refused(|v| v["slots"][1]["kind"] = json!("group"));
+    assert!(msg.contains("group slot") && msg.contains("not supported"), "{msg}");
+}
+
+#[test]
+fn race_mode_defaults_to_zero_and_is_kept() {
+    assert_eq!(parse(&good()).unwrap().race_mode, 0);
+    let mut v = good();
+    v["race_mode"] = json!(1);
+    assert_eq!(parse(&v).unwrap().race_mode, 1);
 }
 
 /// The importer's real output (`tools/ap-import`) must satisfy this schema: the cross-language

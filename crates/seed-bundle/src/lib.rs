@@ -241,6 +241,11 @@ impl SeedBundle {
                 s.game
             );
             ensure!(s.slot_data.is_object(), "slot {} slot_data is not an object", s.id);
+            ensure!(
+                s.kind != SlotKind::Group,
+                "slot {} is a group slot (item link), which is not supported yet",
+                s.id
+            );
         }
         for (game, g) in &self.games {
             let all = g.item_name_to_id.values().chain(g.location_name_to_id.values());
