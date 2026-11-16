@@ -4,8 +4,11 @@
 //! reaches its goal. Expected values come from the fixture bundle.
 #![forbid(unsafe_code)]
 
-#[cfg(all(test, feature = "ap-interop"))]
+#[cfg(test)]
+#[cfg(feature = "ap-interop")]
 mod tests {
+    use flate2 as _; // only pins the version (see Cargo.toml)
+
     use archipelago_rs::{
         Cache, Client, ClientStatus, ConnectionOptions, Event, ItemHandling, Print,
     };
@@ -34,7 +37,7 @@ mod tests {
     /// Update until `done` holds, sleeping only inside the socket until data arrives. Returns
     /// every event seen; fails on a client error or after the guard timeout.
     fn pump(c: &mut Ap, mut done: impl FnMut(&Ap, &[Event]) -> bool) -> Vec<Event> {
-        let deadline = Instant::now() + GUARD;
+        let deadline = Instant::now().checked_add(GUARD).unwrap();
         let mut seen = Vec::new();
         loop {
             let events = c.update();
@@ -67,7 +70,7 @@ mod tests {
         }
         let accepted: Vec<_> =
             server.log().into_iter().filter(|l| l.contains("websocket accepted")).collect();
-        assert!(!accepted.is_empty());
+        assert_ne!(accepted.len(), 0, "no accepted socket was logged");
         for line in accepted {
             assert!(line.contains("deflate=true"), "{line}");
         }

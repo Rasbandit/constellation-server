@@ -17,7 +17,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle a
 - `crates/edge-compat`: the Archipelago wire protocol as serde types and the per-connection session; the only crate that knows that protocol (doc 05 6.2 rule 2).
 - `crates/server`: the `constellation-server` binary (axum for HTTP, yawc for the WebSocket, D-97).
 - `crates/e2e`: end-to-end tests: the real binary over real WebSocket connections on loopback.
-- `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout and not copied. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one) and CI does not have that checkout.
+- `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
 
 Next crates, in doc 05 section 20 order: `edge-native`, then Postgres behind `LogStore` (D-98).
@@ -26,7 +26,8 @@ Next crates, in doc 05 section 20 order: `edge-native`, then Postgres behind `Lo
 ```sh
 cargo run -p server --bin constellation-server -- --bundle crates/e2e/fixtures/two-slot.json --port 38281
 ```
-Then point a client compatible with Archipelago at `ws://localhost:38281` with slot `Alice` or `Bob` and game `Archipela-Go 2: Electric Boogaloo`. Flags: `--host <ip>` (default 127.0.0.1), `--password <pw>` (overrides the bundle's). `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. SIGTERM or Ctrl-C stops it.
+Then point a client compatible with Archipelago at `ws://localhost:38281` with slot `Alice` or `Bob` and game `Archipela-Go 2: Electric Boogaloo`. Flags: `--host <ip>` (default 127.0.0.1). `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. SIGTERM or Ctrl-C stops it.
+The room password is never a flag (it would show in `ps`): set `CONSTELLATION_ROOM_PASSWORD`, or `CONSTELLATION_ROOM_PASSWORD_FILE` to a file whose first line is the password; it overrides the seed's. Limits come from `crates/config` (design values), some overridable by environment: `CONSTELLATION_MAX_CONNECTIONS` (10 000; over it, HTTP 503), `CONSTELLATION_CONNECT_TIMEOUT_MS` (30 000: a socket with no slot connected by then is closed), `CONSTELLATION_IDLE_TIMEOUT_MS` (60 000) and `CONSTELLATION_PING_INTERVAL_MS` (20 000).
 
 ## Regenerate the fixture
 The fixture is a two-slot seed of the owner's game (player options in `crates/e2e/fixtures/players/`), made with Archipelago's own generator and the Archipela-Go apworld, then converted by `tools/ap-import`. The raw `.archipelago` file is not committed.
@@ -39,6 +40,9 @@ PYTHONPATH=. $PY $ROOT/tools/ap-import/ap_import.py $OUT/AP_*.zip $ROOT/crates/e
 cd $ROOT
 ```
 Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-16). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.
+
+## Licences
+We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo dependencies; none of their source is in this repo. `THIRD_PARTY_NOTICES.md` is not written yet: it becomes required when we distribute a binary (it must then carry the notices of every bundled crate), and is created then.
 
 ## Known deviations from doc 05 7.1 and 7.2
 - `Item` events carry `from` (the checking slot) and no `item_uid`, and events have no ULID id (`seq` is the id). Location and item ids are `i64`, and a location id is only unique within its slot's world, so the placement table is keyed by (slot, location).

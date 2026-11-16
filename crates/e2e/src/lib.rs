@@ -299,3 +299,21 @@ mod tests {
         assert_eq!(listening_addr("listening addr=nonsense"), None);
     }
 }
+
+#[cfg(test)]
+mod lint_copy {
+    /// `crates/e2e-ap` is its own workspace (it needs the sibling checkout) and carries a copy
+    /// of the workspace lints; this keeps the copy honest.
+    #[test]
+    fn the_e2e_ap_lints_match_the_workspace() {
+        let root = include_str!("../../../Cargo.toml");
+        let ap = include_str!("../../e2e-ap/Cargo.toml");
+        let section = |text: &str, start: &str| {
+            text.split_once(start).map(|(_, rest)| rest.trim().to_owned())
+        };
+        let want = section(root, "[workspace.lints.rust]")
+            .unwrap()
+            .replace("[workspace.lints.", "[lints.");
+        assert_eq!(section(ap, "[lints.rust]").unwrap(), want);
+    }
+}
