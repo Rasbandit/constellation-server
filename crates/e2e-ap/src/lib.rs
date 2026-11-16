@@ -13,6 +13,15 @@ mod tests {
         Cache, Client, ClientStatus, ConnectionOptions, Event, ItemHandling, Print,
     };
     use e2e::{GUARD, Server, fixture};
+    use std::path::Path;
+
+    /// The server binary, built by `just e2e-ap` in the main workspace (this crate is its own
+    /// workspace, so cargo cannot hand it the main workspace's binary).
+    const BIN: &str = env!("CONSTELLATION_SERVER_BIN");
+
+    fn start() -> Server {
+        Server::start(Path::new(BIN), &[], &[]).unwrap()
+    }
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -82,7 +91,7 @@ mod tests {
         let alice_world = &b.slot(1).unwrap().locations;
         let to_bob: Vec<_> = alice_world.iter().filter(|p| p.receiver == 2).collect();
         let own = alice_world.iter().find(|p| p.receiver == 1).unwrap();
-        let server = Server::start(&[]).unwrap();
+        let server = start();
         let test = "core";
 
         let mut alice = connect(&server, "Alice", test);
@@ -145,7 +154,7 @@ mod tests {
 
     #[test]
     fn archipelago_rs_is_refused_for_an_unknown_slot() {
-        let server = Server::start(&[]).unwrap();
+        let server = start();
         let options = ConnectionOptions::new().cache(Cache::path(cache_dir("refused")));
         let err = smol::block_on(Client::<serde_json::Value>::connect(
             server.url(),

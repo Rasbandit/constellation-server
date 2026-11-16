@@ -2,7 +2,7 @@
 
 What `edge-compat` supports today, checked against Archipelago's protocol document (`docs/network protocol.md` in the Archipelago repository, read at the 0.6.8 checkout pinned by Archipela-Go, 2026-11-16). Internal note; anything external needs the review in the design repo's `CLAUDE.md`.
 
-Test names: `e2e::` is `crates/e2e/tests/compat.rs` (real binary, yawc client), `ap::` is `crates/e2e-ap/src/lib.rs` (the real binary driven by `archipelago_rs` 3.0.1), `unit::` is `crates/edge-compat/src/tests.rs` (a session over a real room task).
+Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client), `ap::` is `crates/e2e-ap/src/lib.rs` (the real binary driven by `archipelago_rs` 3.0.1), `unit::` is `crates/edge-compat/src/tests.rs` (a session over a real room task).
 
 ## Client to server
 

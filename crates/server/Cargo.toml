@@ -29,5 +29,10 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 yawc.workspace = true
 
+[dev-dependencies]
+e2e = { path = "../e2e" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+
 [lints]
 workspace = true

@@ -176,6 +176,10 @@ async fn shutdown() {
     }
 }
 
+// The integration tests in `tests/` use these; unit tests do not.
+#[cfg(test)]
+use {e2e as _, serde_json as _};
+
 #[cfg(test)]
 mod tests {
     use super::*;

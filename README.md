@@ -16,7 +16,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle a
 - `crates/runtime`: the room actor on tokio (D-99: an in-process seam). Applies command batches, appends them in one fenced write, publishes, then replies (the hold rule).
 - `crates/edge-compat`: the Archipelago wire protocol as serde types and the per-connection session; the only crate that knows that protocol (doc 05 6.2 rule 2).
 - `crates/server`: the `constellation-server` binary (axum for HTTP, yawc for the WebSocket, D-97).
-- `crates/e2e`: end-to-end tests: the real binary over real WebSocket connections on loopback.
+- `crates/e2e`: end-to-end helpers (start the real binary, a yawc client, the fixture) and the fixture itself. The scenarios are integration tests of `server` (`crates/server/tests/compat.rs`), so cargo builds the binary and hands its path over (`CARGO_BIN_EXE_constellation-server`).
 - `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
 
@@ -58,9 +58,9 @@ We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo de
 
 ## Testing
 Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
-- `just check`: the gate (fmt, clippy, typos, unit and integration tests without e2e, docs, cargo-deny).
-- `just e2e`: the end-to-end scenarios (builds the server binary itself).
-- `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`.
+- `just check`: the gate (fmt, clippy, typos, every test including the end-to-end scenarios, docs, cargo-deny).
+- `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
+- `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
 
 ## Dev setup
 Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, unit tests), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, the same gate as CI). Needs `just`, `cargo-deny`, `typos`.

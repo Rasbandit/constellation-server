@@ -24,7 +24,7 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 | Snapshot | `insta` (JSON schema, OpenAPI, headers) | crate tests | every PR |
 | Integration | real crate boundaries, in-memory fakes (`MemLogStore`) | crate `tests/` only when a crate boundary is the thing under test | every PR |
 | Deterministic simulation | the `sim` crate: fake clock, network, store, seeded scheduler, crash injection | `crates/sim` | every PR bounded; nightly 10M schedules |
-| **End to end** | real server binary, real Postgres, real WebSocket clients | `crates/e2e` (created with the first `edge-native` route) | CI only |
+| **End to end** | real server binary, real Postgres, real WebSocket clients | `crates/server/tests/` with helpers in `crates/e2e` | every PR (loopback only, about a second) |
 | Conformance | Autobahn suite, real Archipelago, Python `websockets`, browser clients | CI jobs (gate G-WS) | CI only |
 | Fuzz | `cargo-fuzz` on every parser and decoder | `fuzz/` per crate | continuous in CI, stored corpus |
 | Mutation | `cargo-mutants` on leaf crates | CI | nightly |

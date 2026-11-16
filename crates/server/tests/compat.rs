@@ -1,4 +1,4 @@
-//! End-to-end scenarios for the Archipelago-compatible edge: the real binary, the real fixture
+//! End-to-end scenarios for the Archipelago-compatible edge (`just e2e`): the real binary, the real fixture
 //! seed, real WebSocket connections on loopback. Each test owns its server, so they run in parallel.
 //! Expected values come from the fixture bundle (the importer's output) and the protocol
 //! document's field tables.
@@ -10,6 +10,18 @@
 #[cfg(test)]
 mod scenarios {
     use e2e::{Client, Server, connect_packet, fixture};
+    use std::path::Path;
+
+    /// Built by cargo for this package's integration tests.
+    const BIN: &str = env!("CARGO_BIN_EXE_constellation-server");
+
+    fn start(extra: &[&str]) -> e2e::Res<Server> {
+        Server::start(Path::new(BIN), extra, &[])
+    }
+
+    fn start_env(extra: &[&str], env: &[(&str, &str)]) -> e2e::Res<Server> {
+        Server::start(Path::new(BIN), extra, env)
+    }
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -41,7 +53,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn room_info_arrives_first_and_names_the_fixture_seed() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         let info = c.next().await.unwrap();
         let b = fixture().unwrap();
@@ -55,7 +67,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn get_data_package_returns_the_game_names_and_ids() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         c.next().await.unwrap();
         c.send(&json!([{"cmd": "GetDataPackage", "games": [GAME]}])).await.unwrap();
@@ -70,7 +82,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn connected_lists_the_slot_and_every_location_as_missing() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (_c, connected, _) = joined(&server, "Alice").await;
         let b = fixture().unwrap();
         let mut want: Vec<i64> = b.slot(1).unwrap().locations.iter().map(|p| p.location).collect();
@@ -85,7 +97,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_check_of_another_slots_item_is_delivered_to_that_slot_with_its_index() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let (loc, item, flags) = alice_locations_for(2)[0];
@@ -102,7 +114,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_check_of_an_own_item_comes_back_to_the_sender() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (loc, item, flags) = alice_locations_for(1)[0];
         check(&mut alice, &[loc]).await;
@@ -116,7 +128,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_repeated_check_delivers_nothing_a_second_time() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let to_bob = alice_locations_for(2);
@@ -135,7 +147,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_reconnect_resends_every_item_from_index_zero_and_sync_agrees() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let to_bob: Vec<i64> = alice_locations_for(2).iter().take(3).map(|p| p.0).collect();
         check(&mut alice, &to_bob).await;
@@ -165,7 +177,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_goal_status_update_is_announced_and_readable() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         alice.send(&json!([{"cmd": "StatusUpdate", "status": 30}])).await.unwrap();
@@ -188,7 +200,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_bad_password_is_refused_with_invalid_password() {
-        let server = Server::start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD", "secret")]).unwrap();
+        let server = start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD", "secret")]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         assert_eq!(c.next().await.unwrap()["password"], true);
         c.send(&connect_packet("Alice", Some("wrong"))).await.unwrap();
@@ -202,7 +214,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn an_unknown_slot_name_is_refused_with_invalid_slot() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         c.next().await.unwrap();
         c.send(&connect_packet("Mallory", None)).await.unwrap();
@@ -214,7 +226,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn garbage_gets_invalid_packet_and_the_connection_keeps_working() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         c.next().await.unwrap();
         for text in ["{not json", "{\"cmd\":\"Connect\"}", "[{\"cmd\":\"Fly\"}]"] {
@@ -254,7 +266,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn compression_is_negotiated_when_offered_and_not_otherwise() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let head =
             handshake_headers(&server, Some("permessage-deflate; client_max_window_bits")).await;
         // RFC 6455 section 1.3's sample key and its accept value.
@@ -272,7 +284,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn healthz_answers_ok() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
         tcp.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await
@@ -290,18 +302,18 @@ mod scenarios {
         let path = dir.join("pw");
         std::fs::write(&path, "from-file\n").unwrap();
         let server =
-            Server::start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD_FILE", path.to_str().unwrap())])
+            start_env(&[], &[("CONSTELLATION_ROOM_PASSWORD_FILE", path.to_str().unwrap())])
                 .unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         c.next().await.unwrap();
         c.send(&connect_packet("Alice", Some("from-file"))).await.unwrap();
         assert_eq!(c.next_cmd("Connected").await.unwrap().0["slot"], 1);
-        assert!(Server::start(&["--password", "x"]).is_err(), "the flag is gone");
+        assert!(start(&["--password", "x"]).is_err(), "the flag is gone");
     }
 
     #[tokio::test]
     async fn connections_over_the_cap_get_503_and_a_freed_slot_is_reused() {
-        let server = Server::start_env(&[], &[("CONSTELLATION_MAX_CONNECTIONS", "1")]).unwrap();
+        let server = start_env(&[], &[("CONSTELLATION_MAX_CONNECTIONS", "1")]).unwrap();
         let mut first = Client::connect(&server.url()).await.unwrap();
         first.next().await.unwrap();
         let head = handshake_headers(&server, None).await;
@@ -314,8 +326,7 @@ mod scenarios {
 
     #[tokio::test]
     async fn a_socket_that_never_connects_to_a_slot_is_closed() {
-        let server =
-            Server::start_env(&[], &[("CONSTELLATION_CONNECT_TIMEOUT_MS", "200")]).unwrap();
+        let server = start_env(&[], &[("CONSTELLATION_CONNECT_TIMEOUT_MS", "200")]).unwrap();
         let mut c = Client::connect(&server.url()).await.unwrap();
         assert_eq!(c.next().await.unwrap()["cmd"], "RoomInfo");
         let end = c.next().await.unwrap_err();
@@ -332,7 +343,7 @@ mod scenarios {
     async fn a_peer_that_stops_answering_pings_is_closed_as_idle() {
         let env =
             [("CONSTELLATION_IDLE_TIMEOUT_MS", "300"), ("CONSTELLATION_PING_INTERVAL_MS", "100")];
-        let server = Server::start_env(&[], &env).unwrap();
+        let server = start_env(&[], &env).unwrap();
         // A raw socket: upgraded, then silent; it never answers the server's pings.
         let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
         let req = format!(
@@ -348,7 +359,7 @@ mod scenarios {
 
     #[test]
     fn the_server_stops_cleanly_on_sigterm() {
-        let server = Server::start(&[]).unwrap();
+        let server = start(&[]).unwrap();
         let status = server.stop().unwrap();
         assert!(status.success(), "{status}");
     }

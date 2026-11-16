@@ -1,4 +1,5 @@
-//! End-to-end helpers: start the real `constellation-server` binary on an ephemeral loopback
+//! End-to-end helpers (a dev-dependency of `server`, whose integration tests in
+//! `crates/server/tests/` hold the scenarios): start the real `constellation-server` binary on an ephemeral loopback
 //! port and talk to it over real WebSocket connections (`docs/TESTING.md`, end-to-end rules).
 //!
 //! No sleeps: a server is ready when it logs its bound address, and every wait is on a frame
@@ -13,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use yawc::{Frame, MaybeTlsStream, OpCode, Options, WebSocket};
@@ -39,38 +40,6 @@ pub fn fixture() -> Res<SeedBundle> {
     SeedBundle::from_json(&text).map_err(|e| e.to_string())
 }
 
-/// The server binary, built once per test process with the cargo that built this crate, into
-/// the same target directory and profile (a no-op when it is fresh).
-fn binary() -> Res<PathBuf> {
-    static BUILT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    BUILT
-        .get_or_init(|| {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            // <target>/<profile dir>/deps/<test binary>
-            let profile_dir = exe.parent().and_then(Path::parent).ok_or("odd test path")?;
-            let target = profile_dir.parent().ok_or("odd test path")?;
-            let profile = match profile_dir.file_name().and_then(|n| n.to_str()) {
-                Some("debug") | None => "dev",
-                Some(other) => other,
-            };
-            let status = Command::new(env!("CARGO"))
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args(["build", "--quiet", "--locked", "-p", "server"])
-                .args(["--bin", "constellation-server"])
-                .arg("--profile")
-                .arg(profile)
-                .arg("--target-dir")
-                .arg(target)
-                .status()
-                .map_err(|e| format!("cargo build: {e}"))?;
-            if !status.success() {
-                return Err(format!("cargo build -p server failed: {status}"));
-            }
-            Ok(profile_dir.join("constellation-server"))
-        })
-        .clone()
-}
-
 /// A running server process. Killed on drop if not stopped.
 #[derive(Debug)]
 pub struct Server {
@@ -81,21 +50,15 @@ pub struct Server {
 }
 
 impl Server {
-    /// Start the server on the fixture with extra arguments, and wait until it listens.
+    /// Start the server binary `bin` on the fixture with extra arguments and environment
+    /// variables (how `config` reads limits and secrets), and wait until it listens. Cargo
+    /// builds and names the binary: integration tests of the `server` package pass
+    /// `env!("CARGO_BIN_EXE_constellation-server")`.
     ///
     /// # Errors
-    /// When the binary cannot be built or started, or never logs its address.
-    pub fn start(extra: &[&str]) -> Res<Self> {
-        Self::start_env(extra, &[])
-    }
-
-    /// As [`Server::start`], with environment variables for the server process (how `config`
-    /// reads limits and secrets).
-    ///
-    /// # Errors
-    /// As [`Server::start`].
-    pub fn start_env(extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
-        let mut child = Command::new(binary()?)
+    /// When the binary cannot be started or never logs its address.
+    pub fn start(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
+        let mut child = Command::new(bin)
             .arg("--bundle")
             .arg(fixture_path())
             .args(["--port", "0"])
