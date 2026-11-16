@@ -6,11 +6,14 @@ Design lives in the sibling `constellation` repo, `docs/design/05-rust-architect
 Status: foundation only. Internal, not for external use; text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`.
 
 ## Layout
-- `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO.
+- `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO. Also `Command`, `Event` and the id newtypes (`Cid`, `RoomId`, `Epoch`, `Timestamp`).
 - `crates/spec-rng`: the pinned random stream and sampling rules (doc 01 D3.2), with golden vectors from an independent Python reference.
-- `crates/config`: the only home of limits and the only crate that reads environment variables (doc 05 6.2 rule 5).
+- `crates/config`: the only home of limits and the only crate that reads environment variables (doc 05 6.2 rule 5). `no_std` without the default `std` feature (only `load` needs std).
+- `crates/room-core`: the pure room state machine (`RoomState`, `apply`, `fold`), `no_std` + alloc. No clock, no rng, no IO.
+- `crates/log`: the `LogStore` seam with epoch-fenced append (doc 05 7.2) and `MemLogStore` for tests and the simulator.
+- `crates/sim`: the deterministic simulator. `cargo test -p sim` runs `SIM_SEEDS` seeds (default 64); `SIM_SEED=<n> cargo test -p sim` replays one.
 
-Next crates, in doc 05 section 20 order: `spec-rng`, `room-core`, `log`, `runtime`, `edge-native`, `sim`.
+Next crates, in doc 05 section 20 order: `runtime`, `edge-native`. Decision D-99: start as one process, so the edge talks to the room through an in-process seam and there is no network code yet.
 
 ## Rules (doc 05 6.2)
 1. L0/L1 crates never depend on tokio, sqlx, axum, a clock or an OS RNG.

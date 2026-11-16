@@ -338,6 +338,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "log",
+ "pollster",
+ "proto",
+ "room-core",
+ "serde_json",
+ "spec-rng",
+]
+
+[[package]]
 name = "spec-rng"
 version = "0.0.0"
 dependencies = [
