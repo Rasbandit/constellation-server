@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/config"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85" # shortcut: placeholder MSRV, owner sets the window (design doc 05 section 19)
+
+[workspace.dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = "1"
+
+# Doc 05 section 18.1: no unsafe anywhere unless registered in docs/unsafe-register.md.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }

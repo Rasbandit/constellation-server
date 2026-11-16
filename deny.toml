@@ -1,0 +1,14 @@
+# Doc 05 section 18.2: license allow-list, advisories, banned crates.
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC"]
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+deny = [{ name = "openssl" }, { name = "openssl-sys" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
