@@ -9,10 +9,20 @@ const NO_EVENTS: [Event; 0] = [];
 const LIM: Limits =
     Limits { conn_mem_bytes: 0, dedupe_window_secs: 100, sim_seeds: 0, sim_replay_seed: None };
 
-/// Slots 1 and 2. Location 10 -> slot 1 item 500, 11 -> slot 2 item 501, 12 -> slot 2 item 502.
+/// Slots 1 and 2. Slot 1's location 10 -> slot 1 item 500, 11 -> slot 2 item 501, 12 -> slot 2
+/// item 502. Slot 2's location 10 (the same id in another world) -> slot 1 item 503.
 fn room() -> RoomState {
-    let p =
-        BTreeMap::from([(10, (SlotNo(1), 500)), (11, (SlotNo(2), 501)), (12, (SlotNo(2), 502))]);
+    let p = BTreeMap::from([
+        (
+            SlotNo(1),
+            BTreeMap::from([
+                (10, (SlotNo(1), 500)),
+                (11, (SlotNo(2), 501)),
+                (12, (SlotNo(2), 502)),
+            ]),
+        ),
+        (SlotNo(2), BTreeMap::from([(10, (SlotNo(1), 503))])),
+    ]);
     RoomState::new([SlotNo(1), SlotNo(2)], p).unwrap()
 }
 
@@ -20,7 +30,7 @@ fn at(t: u64) -> Ctx<'static> {
     Ctx { now: Timestamp(t), limits: &LIM }
 }
 
-fn check(slot: u32, cid: u64, location: u32) -> Command {
+fn check(slot: u32, cid: u64, location: i64) -> Command {
     Command::Check { slot: SlotNo(slot), cid: Cid(cid), location }
 }
 
@@ -38,8 +48,82 @@ fn an_empty_room_has_no_head_and_rejects_every_command() {
 
 #[test]
 fn a_placement_naming_a_missing_slot_is_refused() {
-    let p = BTreeMap::from([(1, (SlotNo(9), 1))]);
+    let p = BTreeMap::from([(SlotNo(1), BTreeMap::from([(1, (SlotNo(9), 1))]))]);
     assert_eq!(RoomState::new([SlotNo(1)], p), Err(CoreError::UnknownSlot(SlotNo(9))));
+    let p = BTreeMap::from([(SlotNo(8), BTreeMap::from([(1, (SlotNo(1), 1))]))]);
+    assert_eq!(RoomState::new([SlotNo(1)], p), Err(CoreError::UnknownSlot(SlotNo(8))));
+}
+
+#[test]
+fn the_same_location_id_in_two_slots_is_two_locations() {
+    let mut s = room();
+    apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
+    let other = apply(&mut s, &at(0), check(2, 2, 10)).unwrap();
+    assert_eq!(other.reply, Reply::Checked { seq: Seq(3) });
+    assert_eq!(
+        other.events[1].kind,
+        EventKind::Item { from: SlotNo(2), location: 10, item: 503, item_seq: ItemSeq(2) }
+    );
+}
+
+#[test]
+fn a_location_only_another_slot_has_is_unknown_to_this_slot() {
+    let mut s = room();
+    assert_eq!(apply(&mut s, &at(0), check(2, 1, 11)), Err(CoreError::UnknownLocation(11)));
+    assert_eq!(s, room());
+}
+
+#[test]
+fn ids_at_the_edges_of_i64_are_plain_locations() {
+    let p = BTreeMap::from([(
+        SlotNo(1),
+        BTreeMap::from([(i64::MIN, (SlotNo(1), i64::MAX)), (-1, (SlotNo(1), 0))]),
+    )]);
+    let mut s = RoomState::new([SlotNo(1)], p).unwrap();
+    for (cid, loc) in [(1, i64::MIN), (2, -1)] {
+        assert_eq!(apply(&mut s, &at(0), check(1, cid, loc)).unwrap().events.len(), 2);
+    }
+}
+
+#[test]
+fn a_goal_is_one_event_and_a_repeat_answers_from_it() {
+    let mut s = room();
+    let first = apply(&mut s, &at(0), Command::Goal { slot: SlotNo(2) }).unwrap();
+    assert_eq!(
+        first.events,
+        vec![Event { seq: Seq(1), slot: Some(SlotNo(2)), kind: EventKind::Goal }]
+    );
+    assert_eq!((first.reply, first.depends_on), (Reply::Goal { seq: Seq(1) }, Some(Seq(1))));
+    assert!(s.has_goal(SlotNo(2)) && !s.has_goal(SlotNo(1)));
+    let again = apply(&mut s, &at(0), Command::Goal { slot: SlotNo(2) }).unwrap();
+    assert_eq!((again.reply, again.events), (Reply::Goal { seq: Seq(1) }, vec![]));
+    assert_eq!(again.depends_on, Some(Seq(1)), "the original is not durable yet");
+    s.mark_durable(Seq(1)).unwrap();
+    let later = apply(&mut s, &at(0), Command::Goal { slot: SlotNo(2) }).unwrap();
+    assert_eq!(later.depends_on, None);
+}
+
+#[test]
+fn a_goal_for_an_unknown_slot_is_refused() {
+    let mut s = room();
+    assert_eq!(
+        apply(&mut s, &at(0), Command::Goal { slot: SlotNo(0) }),
+        Err(CoreError::UnknownSlot(SlotNo(0)))
+    );
+    assert_eq!(s, room());
+}
+
+#[test]
+fn checks_and_goals_interleave_and_fold_back_to_the_same_state() {
+    let mut live = room();
+    let mut events = Vec::new();
+    events.extend(apply(&mut live, &at(0), check(1, 1, 11)).unwrap().events);
+    events.extend(apply(&mut live, &at(0), Command::Goal { slot: SlotNo(1) }).unwrap().events);
+    events.extend(apply(&mut live, &at(0), check(2, 2, 10)).unwrap().events);
+    live.mark_durable(live.head()).unwrap();
+    let folded = fold(room(), &LIM, events).unwrap();
+    assert_eq!(folded, live);
+    assert_eq!(folded.validate(Seq(5)), Ok(()));
 }
 
 #[test]
@@ -58,7 +142,12 @@ fn a_first_check_emits_the_check_and_the_item_for_the_receiving_slot() {
             Event {
                 seq: Seq(2),
                 slot: Some(SlotNo(2)),
-                kind: EventKind::Item { location: 11, item: 501, item_seq: ItemSeq(1) }
+                kind: EventKind::Item {
+                    from: SlotNo(1),
+                    location: 11,
+                    item: 501,
+                    item_seq: ItemSeq(1)
+                }
             },
         ]
     );
@@ -103,7 +192,7 @@ fn a_repeated_cid_with_a_different_location_still_returns_the_original() {
 fn the_same_cid_from_another_slot_is_a_different_key() {
     let mut s = room();
     apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
-    let other = apply(&mut s, &at(0), check(2, 1, 11)).unwrap();
+    let other = apply(&mut s, &at(0), check(2, 1, 10)).unwrap();
     assert_eq!(other.events.len(), 2);
 }
 
@@ -140,7 +229,7 @@ fn a_zero_window_disables_dedupe_but_never_double_checks() {
 fn a_new_cid_on_a_checked_location_is_a_normal_reply_with_no_item_event() {
     let mut s = room();
     apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
-    let r = apply(&mut s, &at(1), check(2, 9, 10)).unwrap();
+    let r = apply(&mut s, &at(1), check(1, 9, 10)).unwrap();
     assert_eq!(r.reply, Reply::AlreadyChecked);
     assert_eq!(r.events, NO_EVENTS);
     assert_eq!(s.head(), Seq(2));
@@ -269,7 +358,7 @@ fn fold_refuses_an_item_that_skips_an_item_seq() {
     let e = Event {
         seq: Seq(2),
         slot: Some(SlotNo(1)),
-        kind: EventKind::Item { location: 10, item: 500, item_seq: ItemSeq(2) },
+        kind: EventKind::Item { from: SlotNo(1), location: 10, item: 500, item_seq: ItemSeq(2) },
     };
     assert_eq!(
         fold(room(), &LIM, [checked, e]),
@@ -297,12 +386,13 @@ mod properties {
         let t = 0_u64..400;
         let check = (slot.clone(), 0_u64..6, location())
             .prop_map(|(slot, cid, location)| check(slot, cid, location));
-        let ack = (slot, 0_u64..6).prop_map(|(s, a)| ack(s, a));
-        (t, proptest::prop_oneof![3 => check, 1 => ack])
+        let ack = (slot.clone(), 0_u64..6).prop_map(|(s, a)| ack(s, a));
+        let goal = slot.prop_map(|s| Command::Goal { slot: SlotNo(s) });
+        (t, proptest::prop_oneof![6 => check, 2 => ack, 1 => goal])
     }
 
-    fn location() -> impl Strategy<Value = u32> {
-        proptest::prop_oneof![9 => 10_u32..13, 1 => any::<u32>()]
+    fn location() -> impl Strategy<Value = i64> {
+        proptest::prop_oneof![9 => 10_i64..13, 1 => any::<i64>()]
     }
 
     /// Time never goes backwards in a run, but jumps freely.
@@ -345,11 +435,12 @@ mod properties {
             let (_, events, _) = run(&cmds);
             let mut seen = std::collections::BTreeSet::new();
             for e in &events {
-                let (loc, kind) = match e.kind {
-                    EventKind::Checked { location, .. } => (location, 0),
-                    EventKind::Item { location, .. } => (location, 1),
+                let key = match e.kind {
+                    EventKind::Checked { location, .. } => (e.slot, location, 0),
+                    EventKind::Item { from, location, .. } => (Some(from), location, 1),
+                    EventKind::Goal => (e.slot, 0, 2),
                 };
-                prop_assert!(seen.insert((loc, kind)));
+                prop_assert!(seen.insert(key));
             }
         }
 
@@ -437,13 +528,13 @@ mod hold_rule {
     fn already_checked_by_an_uncommitted_event_must_wait_for_it() {
         let mut s = room();
         apply(&mut s, &at(0), check(1, 1, 10)).unwrap();
-        let r = apply(&mut s, &at(0), check(2, 9, 10)).unwrap();
+        let r = apply(&mut s, &at(0), check(1, 9, 10)).unwrap();
         assert_eq!((r.reply, r.depends_on), (Reply::AlreadyChecked, Some(Seq(2))));
         s.mark_durable(Seq(1)).unwrap();
         // Half durable is still not durable for the whole command.
-        assert_eq!(apply(&mut s, &at(0), check(2, 9, 10)).unwrap().depends_on, Some(Seq(2)));
+        assert_eq!(apply(&mut s, &at(0), check(1, 9, 10)).unwrap().depends_on, Some(Seq(2)));
         s.mark_durable(Seq(2)).unwrap();
-        assert_eq!(apply(&mut s, &at(0), check(2, 9, 10)).unwrap().depends_on, None);
+        assert_eq!(apply(&mut s, &at(0), check(1, 9, 10)).unwrap().depends_on, None);
     }
 
     #[test]
@@ -493,7 +584,7 @@ mod hostile_logs_and_snapshots {
     use super::*;
     use serde_json::{Value, json};
 
-    fn checked(seq: u64, slot: u32, location: u32) -> Event {
+    fn checked(seq: u64, slot: u32, location: i64) -> Event {
         Event {
             seq: Seq(seq),
             slot: Some(SlotNo(slot)),
@@ -501,11 +592,12 @@ mod hostile_logs_and_snapshots {
         }
     }
 
-    fn item(seq: u64, slot: u32, location: u32, item: u32, item_seq: u64) -> Event {
+    /// An item checked by slot 1.
+    fn item(seq: u64, slot: u32, location: i64, item: i64, item_seq: u64) -> Event {
         Event {
             seq: Seq(seq),
             slot: Some(SlotNo(slot)),
-            kind: EventKind::Item { location, item, item_seq: ItemSeq(item_seq) },
+            kind: EventKind::Item { from: SlotNo(1), location, item, item_seq: ItemSeq(item_seq) },
         }
     }
 
@@ -542,6 +634,27 @@ mod hostile_logs_and_snapshots {
     fn fold_refuses_a_location_checked_twice() {
         let ev = [checked(1, 1, 10), item(2, 1, 10, 500, 1), checked(3, 1, 10)];
         assert_eq!(fold(room(), &LIM, ev), Err(CoreError::PlacementMismatch));
+    }
+
+    #[test]
+    fn fold_refuses_a_second_goal_for_a_slot_and_a_goal_between_check_and_item() {
+        let goal = |seq| Event { seq: Seq(seq), slot: Some(SlotNo(1)), kind: EventKind::Goal };
+        assert_eq!(fold(room(), &LIM, [goal(1), goal(2)]), Err(CoreError::RepeatedGoal(SlotNo(1))));
+        assert_eq!(
+            fold(room(), &LIM, [checked(1, 1, 10), goal(2)]),
+            Err(CoreError::PlacementMismatch)
+        );
+    }
+
+    #[test]
+    fn fold_refuses_an_item_from_a_slot_that_did_not_check_it() {
+        let mut stray = item(2, 1, 10, 500, 1);
+        stray.kind =
+            EventKind::Item { from: SlotNo(2), location: 10, item: 500, item_seq: ItemSeq(1) };
+        assert_eq!(
+            fold(room(), &LIM, [checked(1, 1, 10), stray]),
+            Err(CoreError::PlacementMismatch)
+        );
     }
 
     #[test]
@@ -584,16 +697,17 @@ mod hostile_logs_and_snapshots {
 
     #[test]
     fn inconsistent_snapshots_are_errors_not_panics() {
-        let cases: [(&str, Value); 6] = [
+        let cases: [(&str, Value); 7] = [
             ("applied above item_head", json!({"slots": {"2": {"item_head": 1, "applied": 5}}})),
             ("dedupe for a slot that does not exist", json!({"dedupe": {"9": {}}})),
             ("dedupe entry from the future", json!({"dedupe": {"1": {"7": {"seq": 99, "at": 0}}}})),
-            ("checked location outside the placement", json!({"checked": {"99": 1}})),
+            ("checked location outside the placement", json!({"checked": {"1": {"99": 1}}})),
+            ("goal for a slot that does not exist", json!({"goals": {"9": 1}})),
             (
                 "item_head that matches no checks",
                 json!({"slots": {"1": {"item_head": 4, "applied": 0}}}),
             ),
-            ("stopped between a check and its item", json!({"awaiting": 11})),
+            ("stopped between a check and its item", json!({"awaiting": [1, 11]})),
         ];
         for (name, patch) in cases {
             let s = tampered(|v| {

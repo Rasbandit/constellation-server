@@ -19,7 +19,7 @@ pub(super) fn check_log(events: &[Event], placement: &Placement) -> Result<(), S
     let mut expected_seq = 1_u64;
     let mut item_seq: BTreeMap<SlotNo, u64> = BTreeMap::new();
     let (mut checked, mut delivered) = (BTreeSet::new(), BTreeSet::new());
-    let mut last_checked: Option<u32> = None;
+    let mut last_checked: Option<(SlotNo, i64)> = None;
     for e in events {
         ensure!(
             e.seq == Seq(expected_seq),
@@ -29,23 +29,24 @@ pub(super) fn check_log(events: &[Event], placement: &Placement) -> Result<(), S
         expected_seq = expected_seq.saturating_add(1);
         let slot = e.slot.ok_or_else(|| format!("event {} has no slot", e.seq.0))?;
         match e.kind {
+            EventKind::Goal => {}
             EventKind::Checked { location, .. } => {
                 ensure!(
-                    checked.insert(location),
+                    checked.insert((slot, location)),
                     "location {location} checked twice (seq {})",
                     e.seq.0
                 );
-                last_checked = Some(location);
+                last_checked = Some((slot, location));
             }
-            EventKind::Item { location, item, item_seq: got } => {
+            EventKind::Item { from, location, item, item_seq: got } => {
                 ensure!(
-                    last_checked == Some(location),
+                    last_checked == Some((from, location)),
                     "item at seq {} does not follow its check",
                     e.seq.0
                 );
-                ensure!(delivered.insert(location), "location {location} delivered twice");
+                ensure!(delivered.insert((from, location)), "location {location} delivered twice");
                 ensure!(
-                    placement.get(&location) == Some(&(slot, item)),
+                    placement.get(&from).and_then(|m| m.get(&location)) == Some(&(slot, item)),
                     "item at seq {} disagrees with the placement table",
                     e.seq.0
                 );
@@ -69,10 +70,10 @@ mod tests {
     use proto::{Cid, Timestamp};
 
     fn placement() -> Placement {
-        Placement::from([(1, (SlotNo(1), 50)), (2, (SlotNo(1), 51))])
+        Placement::from([(SlotNo(2), [(1, (SlotNo(1), 50)), (2, (SlotNo(1), 51))].into())])
     }
 
-    fn checked(seq: u64, location: u32) -> Event {
+    fn checked(seq: u64, location: i64) -> Event {
         Event {
             seq: Seq(seq),
             slot: Some(SlotNo(2)),
@@ -80,11 +81,12 @@ mod tests {
         }
     }
 
-    fn item(seq: u64, location: u32, item: u32, item_seq: u64) -> Event {
+    /// An item slot 2 found for slot 1.
+    fn item(seq: u64, location: i64, item: i64, item_seq: u64) -> Event {
         Event {
             seq: Seq(seq),
             slot: Some(SlotNo(1)),
-            kind: EventKind::Item { location, item, item_seq: ItemSeq(item_seq) },
+            kind: EventKind::Item { from: SlotNo(2), location, item, item_seq: ItemSeq(item_seq) },
         }
     }
 

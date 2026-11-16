@@ -1,6 +1,7 @@
 //! The pure room state machine (doc 05 7.1, doc 02 D3). No clock, no OS rng, no IO.
 //!
-//! A room is created from a fixed placement table (location to receiving slot and item). `apply`
+//! A room is created from a fixed placement table (checking slot and location to receiving slot
+//! and item; a location id is only unique within its slot's world). `apply`
 //! turns a command into events and one reply; `fold` rebuilds state from a snapshot and a log
 //! tail. Both go through `RoomState::record`, so live state and rehydrated state cannot drift.
 //!
@@ -23,8 +24,9 @@ use core::fmt;
 use proto::{Cid, Command, Event, EventKind, ItemSeq, Seq, SlotNo, Timestamp};
 use serde::{Deserialize, Serialize};
 
-/// Location id to (receiving slot, item id). Fixed for the life of the room.
-pub type Placement = BTreeMap<u32, (SlotNo, u32)>;
+/// Checking slot, then location id in that slot's world, to (receiving slot, item id). Fixed for
+/// the life of the room. Nested rather than keyed by a pair so a snapshot encodes as JSON.
+pub type Placement = BTreeMap<SlotNo, BTreeMap<i64, (SlotNo, i64)>>;
 
 /// Values the runtime supplies; the core never reads a clock (doc 05 7.1).
 #[derive(Debug, Clone, Copy)]
@@ -57,10 +59,12 @@ pub struct RoomState {
     head: Seq,
     /// Highest `seq` known to be in the log. Live states lag `head` until `mark_durable`.
     durable: Seq,
-    /// Checked locations and the `seq` of their `Checked` event.
-    checked: BTreeMap<u32, Seq>,
+    /// Checked locations per checking slot and the `seq` of their `Checked` event.
+    checked: BTreeMap<SlotNo, BTreeMap<i64, Seq>>,
     /// A `Checked` event whose `Item` has not been folded yet (only between the two events).
-    awaiting: Option<u32>,
+    awaiting: Option<(SlotNo, i64)>,
+    /// Slots that reached their goal and the `seq` of their `Goal` event.
+    goals: BTreeMap<SlotNo, Seq>,
     slots: BTreeMap<SlotNo, SlotCursor>,
     /// `(slot, cid)` index, expiring after `dedupe_window_secs` (D-13).
     dedupe: BTreeMap<SlotNo, BTreeMap<Cid, Dedupe>>,
@@ -76,6 +80,11 @@ pub enum Reply {
     },
     /// The location was already checked; nothing was emitted.
     AlreadyChecked,
+    /// The goal is recorded (now or by an earlier command); `seq` is its `Goal` event.
+    Goal {
+        /// Seq of the `Goal` event.
+        seq: Seq,
+    },
     /// The ack was accepted or was a harmless repeat.
     Acked {
         /// The slot's applied cursor after the ack.
@@ -106,8 +115,8 @@ pub struct Applied {
 pub enum CoreError {
     /// The slot is not in this room.
     UnknownSlot(SlotNo),
-    /// The location is not in the placement table.
-    UnknownLocation(u32),
+    /// The location is not in the checking slot's placement table.
+    UnknownLocation(i64),
     /// An ack above the slot's `item_head`.
     AckAhead {
         /// The slot's current `item_head`.
@@ -133,6 +142,8 @@ pub enum CoreError {
     BadEvent,
     /// A folded event disagrees with the placement table or breaks the check-then-item pairing.
     PlacementMismatch,
+    /// A folded `Goal` for a slot that already has one.
+    RepeatedGoal(SlotNo),
     /// A snapshot failed [`RoomState::validate`]; the text names the rule.
     BadSnapshot(&'static str),
     /// `mark_durable` above the head.
@@ -177,7 +188,11 @@ impl RoomState {
             .into_iter()
             .map(|s| (s, SlotCursor { item_head: ItemSeq(0), applied: ItemSeq(0) }))
             .collect();
-        if let Some((slot, _)) = placement.values().find(|(s, _)| !slots.contains_key(s)) {
+        if let Some(slot) = placement
+            .iter()
+            .flat_map(|(from, m)| core::iter::once(from).chain(m.values().map(|(to, _)| to)))
+            .find(|s| !slots.contains_key(s))
+        {
             return Err(CoreError::UnknownSlot(*slot));
         }
         Ok(Self {
@@ -186,6 +201,7 @@ impl RoomState {
             durable: Seq(0),
             checked: BTreeMap::new(),
             awaiting: None,
+            goals: BTreeMap::new(),
             slots,
             dedupe: BTreeMap::new(),
         })
@@ -208,7 +224,9 @@ impl RoomState {
         if self.awaiting.is_some() {
             return bad("snapshot stops between a check and its item");
         }
-        if self.placement.values().any(|(s, _)| !self.slots.contains_key(s)) {
+        if self.placement.iter().any(|(from, m)| {
+            !self.slots.contains_key(from) || m.values().any(|(s, _)| !self.slots.contains_key(s))
+        }) {
             return bad("placement names a missing slot");
         }
         if self.slots.values().any(|c| c.applied > c.item_head) {
@@ -220,24 +238,47 @@ impl RoomState {
         if self.dedupe.values().flat_map(BTreeMap::values).any(|d| d.seq > self.head) {
             return bad("dedupe entry beyond the head");
         }
-        if self.checked.iter().any(|(l, s)| !self.placement.contains_key(l) || *s > self.head) {
+        if self.checked_pairs().any(|(from, l, s)| self.place(from, l).is_none() || s > self.head) {
             return bad("checked location outside the placement or beyond the head");
         }
-        let checks = u64::try_from(self.checked.len()).unwrap_or(u64::MAX);
-        if self.head.0 != checks.saturating_mul(2) {
-            return bad("head is not two events per check");
+        if self.goals.iter().any(|(slot, s)| !self.slots.contains_key(slot) || *s > self.head) {
+            return bad("goal for a missing slot or beyond the head");
+        }
+        let checks = u64::try_from(self.checked_pairs().count()).unwrap_or(u64::MAX);
+        let goals = u64::try_from(self.goals.len()).unwrap_or(u64::MAX);
+        if self.head.0 != checks.saturating_mul(2).saturating_add(goals) {
+            return bad("head is not two events per check plus one per goal");
         }
         for (slot, c) in &self.slots {
             let items = self
-                .checked
-                .keys()
-                .filter(|l| self.placement.get(l).is_some_and(|(s, _)| s == slot))
+                .checked_pairs()
+                .filter(|&(from, l, _)| self.place(from, l).is_some_and(|(s, _)| s == *slot))
                 .count();
             if c.item_head.0 != u64::try_from(items).unwrap_or(u64::MAX) {
                 return bad("item_head does not match the checks placed at the slot");
             }
         }
         Ok(())
+    }
+
+    /// Every checked `(checking slot, location, seq)`.
+    fn checked_pairs(&self) -> impl Iterator<Item = (SlotNo, i64, Seq)> + '_ {
+        self.checked.iter().flat_map(|(&from, m)| m.iter().map(move |(&l, &s)| (from, l, s)))
+    }
+
+    /// Where `from`'s location `location` sends its item.
+    fn place(&self, from: SlotNo, location: i64) -> Option<(SlotNo, i64)> {
+        self.placement.get(&from).and_then(|m| m.get(&location)).copied()
+    }
+
+    fn checked_at(&self, from: SlotNo, location: i64) -> Option<Seq> {
+        self.checked.get(&from).and_then(|m| m.get(&location)).copied()
+    }
+
+    /// Whether `slot` has reached its goal.
+    #[must_use]
+    pub fn has_goal(&self, slot: SlotNo) -> bool {
+        self.goals.contains_key(&slot)
     }
 
     /// Highest `seq` known durable. Equals `head` for a state rebuilt by `fold`.
@@ -318,9 +359,18 @@ impl RoomState {
         // Every check is validated against the placement table before anything changes, so a
         // hostile or corrupt log is an error and never a half-applied state.
         match ev.kind {
-            EventKind::Item { location, item, item_seq } => {
-                if self.awaiting != Some(location)
-                    || self.placement.get(&location) != Some(&(slot, item))
+            EventKind::Goal => {
+                if self.awaiting.is_some() {
+                    return Err(CoreError::PlacementMismatch);
+                }
+                if self.goals.contains_key(&slot) {
+                    return Err(CoreError::RepeatedGoal(slot));
+                }
+                self.goals.insert(slot, ev.seq);
+            }
+            EventKind::Item { from, location, item, item_seq } => {
+                if self.awaiting != Some((from, location))
+                    || self.place(from, location) != Some((slot, item))
                 {
                     return Err(CoreError::PlacementMismatch);
                 }
@@ -333,14 +383,14 @@ impl RoomState {
                 self.awaiting = None;
             }
             EventKind::Checked { cid, location, at } => {
-                if !self.placement.contains_key(&location) {
+                if self.place(slot, location).is_none() {
                     return Err(CoreError::UnknownLocation(location));
                 }
-                if self.awaiting.is_some() || self.checked.contains_key(&location) {
+                if self.awaiting.is_some() || self.checked_at(slot, location).is_some() {
                     return Err(CoreError::PlacementMismatch);
                 }
-                self.checked.insert(location, ev.seq);
-                self.awaiting = Some(location);
+                self.checked.entry(slot).or_default().insert(location, ev.seq);
+                self.awaiting = Some((slot, location));
                 let index = self.dedupe.entry(slot).or_default();
                 // shortcut: prunes this slot's whole index on each new check, O(entries);
                 // upgrade to a time-ordered index when a room's 24 h window gets large.
@@ -363,6 +413,21 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
             let applied = state.restore_applied(slot, applied)?;
             Ok(Applied { events: Vec::new(), reply: Reply::Acked { applied }, depends_on: None })
         }
+        Command::Goal { slot } => {
+            if !state.slots.contains_key(&slot) {
+                return Err(CoreError::UnknownSlot(slot));
+            }
+            if let Some(&seq) = state.goals.get(&slot) {
+                let depends_on = state.wait_for(seq.0);
+                return Ok(Applied { events: Vec::new(), reply: Reply::Goal { seq }, depends_on });
+            }
+            let seq = next_seq(state.head)?;
+            let events = vec![Event { seq, slot: Some(slot), kind: EventKind::Goal }];
+            for e in &events {
+                state.record(e, ctx.limits)?;
+            }
+            Ok(Applied { events, reply: Reply::Goal { seq }, depends_on: Some(seq) })
+        }
         Command::Check { slot, cid, location } => {
             if !state.slots.contains_key(&slot) {
                 return Err(CoreError::UnknownSlot(slot));
@@ -378,9 +443,9 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
                     });
                 }
             }
-            let &(receiver, item) =
-                state.placement.get(&location).ok_or(CoreError::UnknownLocation(location))?;
-            if let Some(&at_seq) = state.checked.get(&location) {
+            let (receiver, item) =
+                state.place(slot, location).ok_or(CoreError::UnknownLocation(location))?;
+            if let Some(at_seq) = state.checked_at(slot, location) {
                 let depends_on = state.wait_for(at_seq.0.saturating_add(1));
                 return Ok(Applied {
                     events: Vec::new(),
@@ -403,7 +468,7 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
                 Event {
                     seq: item_event_seq,
                     slot: Some(receiver),
-                    kind: EventKind::Item { location, item, item_seq },
+                    kind: EventKind::Item { from: slot, location, item, item_seq },
                 },
             ];
             for e in &events {

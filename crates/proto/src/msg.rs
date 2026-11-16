@@ -1,4 +1,8 @@
-//! Commands in, events out (doc 05 7.1). Minimal: `Check` and `Ack` only; `Ext` and `Host` come later.
+//! Commands in, events out (doc 05 7.1). Minimal: `Check`, `Ack` and `Goal`; `Ext` and `Host` come later.
+//!
+//! Location and item ids are `i64`: worlds made by other generators use ids up to 2^53 - 1 and
+//! reserve negative ids, and a location id is only unique within the world of the slot that
+//! checks it (two slots of the same game share ids).
 use crate::{Cid, ItemSeq, Seq, SlotNo, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -11,8 +15,13 @@ pub enum Command {
         slot: SlotNo,
         /// Client message id.
         cid: Cid,
-        /// Location id.
-        location: u32,
+        /// Location id in the checking slot's world.
+        location: i64,
+    },
+    /// The slot reached its goal. Once per slot; a repeat is answered from the first.
+    Goal {
+        /// The slot.
+        slot: SlotNo,
     },
     /// Cumulative item ack: a cursor update, not a log event (D-02).
     Ack {
@@ -45,20 +54,24 @@ pub enum EventKind {
     Checked {
         /// The checker's message id.
         cid: Cid,
-        /// Location id.
-        location: u32,
+        /// Location id in the checking slot's world.
+        location: i64,
         /// Time the command was applied.
         at: Timestamp,
     },
     /// An item was delivered to the event's slot.
     Item {
-        /// Location that produced it.
-        location: u32,
-        /// Item id.
-        item: u32,
+        /// The slot whose location produced it (the checker).
+        from: SlotNo,
+        /// Location in `from`'s world that produced it.
+        location: i64,
+        /// Item id in the receiving slot's world.
+        item: i64,
         /// Per-slot, contiguous from 1.
         item_seq: ItemSeq,
     },
+    /// The event's slot reached its goal.
+    Goal,
 }
 
 #[cfg(test)]
@@ -67,7 +80,7 @@ mod tests {
 
     #[test]
     fn a_command_survives_a_json_round_trip() {
-        let c = Command::Check { slot: SlotNo(1), cid: Cid(7), location: 9 };
+        let c = Command::Check { slot: SlotNo(1), cid: Cid(7), location: -9 };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Command>(&s).unwrap(), c);
     }
@@ -77,7 +90,12 @@ mod tests {
         let e = Event {
             seq: Seq(u64::MAX),
             slot: None,
-            kind: EventKind::Item { location: 0, item: u32::MAX, item_seq: ItemSeq(0) },
+            kind: EventKind::Item {
+                from: SlotNo(2),
+                location: i64::MIN,
+                item: i64::MAX,
+                item_seq: ItemSeq(0),
+            },
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);

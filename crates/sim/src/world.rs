@@ -15,6 +15,9 @@ const ROOM: RoomId = RoomId(1);
 const SLOTS: u32 = 3;
 const LOCATIONS: u32 = 40;
 
+/// A location in one slot's world: (checking slot, location id).
+type Loc = (SlotNo, i64);
+
 type Res<T = ()> = Result<T, String>;
 
 /// What a run exercised, so a test can prove the faults were really injected.
@@ -56,9 +59,9 @@ struct Owner {
 struct Client {
     last_applied: u64,
     /// Locations applied, in order.
-    got: Vec<u32>,
+    got: Vec<Loc>,
     /// Network: items on the way, delivered in random order, some twice.
-    inbox: Vec<(ItemSeq, u32)>,
+    inbox: Vec<(ItemSeq, Loc)>,
 }
 
 /// One simulated room. Drive it with [`World::step`], finish with [`World::finish`]; [`crate::run_seed`] does both.
@@ -72,7 +75,7 @@ pub struct World {
     owner: Owner,
     zombie: Option<Owner>,
     inflight: Vec<(Command, bool)>,
-    sent: Vec<(SlotNo, Cid, u32)>,
+    sent: Vec<(SlotNo, Cid, i64)>,
     next_cid: BTreeMap<SlotNo, u64>,
     /// Applied to the live state, not yet appended: the group-commit window.
     pending: Vec<Event>,
@@ -81,10 +84,10 @@ pub struct World {
     release_early: bool,
     replies: BTreeMap<(SlotNo, Cid), (Seq, u64)>,
     /// Released `Checked` replies: seq, slot, cid, and the location when the command was fresh.
-    acked: Vec<(Seq, SlotNo, Cid, Option<u32>)>,
+    acked: Vec<(Seq, SlotNo, Cid, Option<i64>)>,
     committed_head: u64,
     committed_items: BTreeMap<SlotNo, u64>,
-    checked: BTreeSet<u32>,
+    checked: BTreeSet<Loc>,
     durable_applied: BTreeMap<SlotNo, ItemSeq>,
     seen_applied: BTreeMap<SlotNo, ItemSeq>,
     clients: BTreeMap<SlotNo, Client>,
@@ -111,12 +114,16 @@ impl World {
     /// A message when the room cannot be built.
     pub fn new(seed: u64, limits: Limits) -> Res<Self> {
         let mut rng = Rng::new(seed);
-        let placement: Placement = (0..LOCATIONS)
-            .map(|l| {
-                let slot = u32::try_from(rng.below(3)).unwrap_or(0).saturating_add(1);
-                (l, (SlotNo(slot), l.saturating_add(1000)))
-            })
-            .collect();
+        // Every slot's world has locations 0..LOCATIONS (the same ids, different locations).
+        let mut placement = Placement::new();
+        for from in slot_ids() {
+            let world = placement.entry(from).or_default();
+            for l in 0..LOCATIONS {
+                let to = u32::try_from(rng.below(3)).unwrap_or(0).saturating_add(1);
+                let item = i64::from(l).saturating_add(i64::from(from.0).saturating_mul(1000));
+                world.insert(i64::from(l), (SlotNo(to), item));
+            }
+        }
         let state = RoomState::new(slot_ids(), placement.clone()).map_err(dbg)?;
         let store = MemLogStore::new();
         let epoch = store.claim(ROOM);
@@ -181,7 +188,7 @@ impl World {
         match self.rng.weighted(&W) {
             0 => {
                 let slot = self.random_slot();
-                let location = self.rng.below_u32(LOCATIONS);
+                let location = i64::from(self.rng.below_u32(LOCATIONS));
                 let cid = self.fresh_cid(slot);
                 self.sent.push((slot, cid, location));
                 self.inflight.push((Command::Check { slot, cid, location }, false));
@@ -193,7 +200,7 @@ impl World {
                     let location = if self.rng.chance(50) {
                         location
                     } else {
-                        location.saturating_add(1) % LOCATIONS
+                        location.saturating_add(1).rem_euclid(i64::from(LOCATIONS))
                     };
                     self.inflight.push((Command::Check { slot, cid, location }, false));
                 }
@@ -238,7 +245,7 @@ impl World {
             1 => Command::Check {
                 slot,
                 cid: Cid(u64::MAX),
-                location: LOCATIONS.saturating_add(self.rng.below_u32(5)),
+                location: i64::from(LOCATIONS.saturating_add(self.rng.below_u32(5))),
             },
             2 => Command::Ack { slot: SlotNo(SLOTS.saturating_add(1)), applied: ItemSeq(0) },
             _ => Command::Ack {
@@ -272,7 +279,7 @@ impl World {
                 .get(&(slot, cid))
                 .filter(|(_, at)| self.now < at.saturating_add(self.limits.dedupe_window_secs))
                 .map(|(seq, _)| *seq),
-            Command::Ack { .. } => None,
+            Command::Ack { .. } | Command::Goal { .. } => None,
         };
         let before = self.owner.state.clone();
         let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits };
@@ -343,8 +350,8 @@ impl World {
             (Command::Check { slot, cid, location }, Reply::Checked { seq }) => {
                 self.acked.push((seq, slot, cid, h.fresh.then_some(location)));
             }
-            (Command::Check { location, .. }, Reply::AlreadyChecked) => ensure!(
-                self.checked.contains(&location),
+            (Command::Check { slot, location, .. }, Reply::AlreadyChecked) => ensure!(
+                self.checked.contains(&(slot, location)),
                 "AlreadyChecked released for location {location} the log never checked"
             ),
             _ => {}
@@ -375,13 +382,18 @@ impl World {
         for e in &events {
             match e.kind {
                 EventKind::Checked { location, .. } => {
-                    ensure!(self.checked.insert(location), "location {location} committed twice");
+                    let slot = e.slot.ok_or("check without slot")?;
+                    ensure!(
+                        self.checked.insert((slot, location)),
+                        "location {location} committed twice"
+                    );
                 }
-                EventKind::Item { location, item_seq, .. } => {
+                EventKind::Item { from, location, item_seq, .. } => {
                     let slot = e.slot.ok_or("item without slot")?;
                     self.committed_items.insert(slot, item_seq.0);
-                    self.clients.entry(slot).or_default().inbox.push((item_seq, location));
+                    self.clients.entry(slot).or_default().inbox.push((item_seq, (from, location)));
                 }
+                EventKind::Goal => {}
             }
         }
         self.owner.state.mark_durable(Seq(self.committed_head)).map_err(dbg)?;
@@ -483,7 +495,7 @@ impl World {
     fn zombie_write(&mut self) -> Res {
         let Some(mut z) = self.zombie.take() else { return Ok(()) };
         let slot = self.random_slot();
-        let location = self.rng.below_u32(LOCATIONS);
+        let location = i64::from(self.rng.below_u32(LOCATIONS));
         let cid = self.fresh_cid(slot);
         let cmd = Command::Check { slot, cid, location };
         let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits };
@@ -527,12 +539,12 @@ impl World {
     }
 
     /// The receiver rule (doc 02 D3): apply only `last_applied + 1`; drop duplicates; resync on a gap.
-    fn receive(&mut self, slot: SlotNo, item_seq: ItemSeq, location: u32) -> Res {
+    fn receive(&mut self, slot: SlotNo, item_seq: ItemSeq, location: Loc) -> Res {
         let c = self.clients.get_mut(&slot).ok_or("client")?;
         if item_seq.0 == c.last_applied.saturating_add(1) {
             ensure!(
                 !c.got.contains(&location),
-                "item for location {location} delivered twice to slot {}",
+                "item for location {location:?} delivered twice to slot {}",
                 slot.0
             );
             c.got.push(location);
@@ -550,9 +562,9 @@ impl World {
         let events = self.all_events()?;
         let c = self.clients.get_mut(&slot).ok_or("client")?;
         for e in events.iter().filter(|e| e.slot == Some(slot)) {
-            if let EventKind::Item { location, item_seq, .. } = e.kind {
+            if let EventKind::Item { from, location, item_seq, .. } = e.kind {
                 if item_seq.0 > c.last_applied {
-                    c.inbox.push((item_seq, location));
+                    c.inbox.push((item_seq, (from, location)));
                 }
             }
         }
@@ -600,12 +612,12 @@ impl World {
             );
         }
         for (slot, c) in &self.clients {
-            let items: Vec<u32> = events
+            let items: Vec<Loc> = events
                 .iter()
                 .filter(|e| e.slot == Some(*slot))
                 .filter_map(|e| match e.kind {
-                    EventKind::Item { location, .. } => Some(location),
-                    EventKind::Checked { .. } => None,
+                    EventKind::Item { from, location, .. } => Some((from, location)),
+                    EventKind::Checked { .. } | EventKind::Goal => None,
                 })
                 .collect();
             ensure!(
