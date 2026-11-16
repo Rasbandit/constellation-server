@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/config", "crates/spec-rng", "crates/room-core", "crates/log", "crates/sim", "crates/seed-bundle"]
+members = ["crates/proto", "crates/config", "crates/spec-rng", "crates/room-core", "crates/log", "crates/sim", "crates/seed-bundle", "crates/runtime"]
 
 [workspace.package]
 edition = "2024"
@@ -16,6 +16,8 @@ categories = ["network-programming"]
 [workspace.dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = "1"
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
 
 [workspace.lints.rust]
 # Doc 05 18.1: unsafe only via docs/unsafe-register.md, then a per-crate override.
