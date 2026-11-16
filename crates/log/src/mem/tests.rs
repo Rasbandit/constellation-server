@@ -151,3 +151,16 @@ fn no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch() {
         assert_eq!(append(&s, new, &[ev(committed + 1)]).unwrap().head, Seq(committed + 1));
     });
 }
+
+#[test]
+fn an_older_snapshot_never_replaces_a_newer_one() {
+    let s = MemLogStore::new();
+    let e = s.claim(R);
+    append(&s, e, &[ev(1), ev(2)]).unwrap();
+    let snap = |seq| Snapshot { seq: Seq(seq), data: vec![u8::try_from(seq).unwrap()] };
+    block_on(s.snapshot_put(R, snap(2), e)).unwrap();
+    assert!(matches!(block_on(s.snapshot_put(R, snap(1), e)), Err(AppendError::Corrupt(_))));
+    assert_eq!(block_on(s.snapshot_get(R)).unwrap(), Some(snap(2)));
+    // The same position may be rewritten (its cursors can have moved).
+    block_on(s.snapshot_put(R, Snapshot { seq: Seq(2), data: vec![9] }, e)).unwrap();
+}

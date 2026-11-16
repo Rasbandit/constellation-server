@@ -85,6 +85,9 @@ impl Room {
         if snap.seq > self.head() {
             return Err(AppendError::Corrupt("snapshot ahead of the log head".into()));
         }
+        if self.snapshot.as_ref().is_some_and(|old| snap.seq < old.seq) {
+            return Err(AppendError::Corrupt("snapshot older than the stored one".into()));
+        }
         self.snapshot = Some(snap);
         Ok(())
     }
