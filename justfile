@@ -20,6 +20,10 @@ lint:
 test:
     cargo test --workspace --all-features --locked
 
+# Fast unit tests only; what the pre-commit hook runs.
+unit:
+    cargo test --workspace --lib --locked
+
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 
