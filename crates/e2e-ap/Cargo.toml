@@ -1,0 +1,28 @@
+# Interop test against archipelago_rs (MIT), a real Archipelago client library, used as a path
+# dependency from the sibling Archipela-Go checkout, not copied. Cargo must find every path
+# dependency to resolve a workspace, even an optional one, so this crate is its own workspace
+# (excluded from the main one) and the main CI never needs the sibling repo. Run: `just e2e-ap`.
+[package]
+name = "e2e-ap"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "End-to-end interop test with archipelago_rs (dev only)"
+
+[workspace]
+
+[features]
+default = ["ap-interop"]
+# The real-client scenario. On by default here: this crate exists only to run it.
+ap-interop = ["dep:archipelago_rs"]
+
+[dependencies]
+archipelago_rs = { path = "../../../Archipela-Go/core/vendor/archipelago_rs", default-features = false, optional = true }
+e2e = { path = "../e2e" }
+serde_json = "1"
+smol = "2"
+# soketto 0.8.1 inflates each permessage-deflate message by finishing a stream that has no
+# final block; flate2 1.1.11 started rejecting that ("incomplete deflate stream"), so every
+# compressed frame fails. 1.1.10 is what the Archipela-Go app locks. Found by this test.
+flate2 = "=1.1.10"

@@ -27,7 +27,7 @@ e2e:
 # The same core scenario driven by archipelago_rs, a real Archipelago client library. Needs the
 # sibling Archipela-Go checkout, so it is a separate crate outside the workspace (see README).
 e2e-ap:
-    cargo test --manifest-path crates/e2e-ap/Cargo.toml --locked --features ap-interop
+    cargo test --manifest-path crates/e2e-ap/Cargo.toml --target-dir target --locked --features ap-interop
 
 # Fast unit tests only; what the pre-commit hook runs.
 unit:
