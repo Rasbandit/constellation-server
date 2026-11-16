@@ -1,0 +1,11 @@
+name: Alice
+game: "Archipela-Go 2: Electric Boogaloo"
+"Archipela-Go 2: Electric Boogaloo":
+  goal_selection: [Letter Hunt]
+  goal_requirement: require_any_one_goal
+  goals_required: 1
+  number_of_trips: 15
+  zone_modes: [walk]
+  easy_share: 50
+  medium_share: 35
+  hard_share: 15
