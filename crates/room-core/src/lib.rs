@@ -54,6 +54,8 @@ pub struct RoomState {
     durable: Seq,
     /// Checked locations and the `seq` of their `Checked` event.
     checked: BTreeMap<u32, Seq>,
+    /// A `Checked` event whose `Item` has not been folded yet (only between the two events).
+    awaiting: Option<u32>,
     slots: BTreeMap<SlotNo, SlotCursor>,
     /// `(slot, cid)` index, expiring after `dedupe_window_secs` (D-13).
     dedupe: BTreeMap<SlotNo, BTreeMap<Cid, Dedupe>>,
@@ -124,6 +126,10 @@ pub enum CoreError {
     },
     /// A folded event has no slot.
     BadEvent,
+    /// A folded event disagrees with the placement table or breaks the check-then-item pairing.
+    PlacementMismatch,
+    /// A snapshot failed [`RoomState::validate`]; the text names the rule.
+    BadSnapshot(&'static str),
     /// `mark_durable` above the head.
     DurableAhead {
         /// The current head.
@@ -174,9 +180,59 @@ impl RoomState {
             head: Seq(0),
             durable: Seq(0),
             checked: BTreeMap::new(),
+            awaiting: None,
             slots,
             dedupe: BTreeMap::new(),
         })
+    }
+
+    /// Check a state loaded from storage before trusting it: a snapshot is input, and a corrupt
+    /// or hostile one must be an error, never a panic or a silently wrong room. `snapshot_seq` is
+    /// the log position the store recorded for it.
+    ///
+    /// # Errors
+    /// `BadSnapshot` naming the first rule that fails.
+    pub fn validate(&self, snapshot_seq: Seq) -> Result<(), CoreError> {
+        let bad = |why| Err(CoreError::BadSnapshot(why));
+        if self.head != snapshot_seq {
+            return bad("head differs from the snapshot seq");
+        }
+        if self.durable != self.head {
+            return bad("snapshot taken before its events were durable");
+        }
+        if self.awaiting.is_some() {
+            return bad("snapshot stops between a check and its item");
+        }
+        if self.placement.values().any(|(s, _)| !self.slots.contains_key(s)) {
+            return bad("placement names a missing slot");
+        }
+        if self.slots.values().any(|c| c.applied > c.item_head) {
+            return bad("applied is above item_head");
+        }
+        if self.dedupe.keys().any(|s| !self.slots.contains_key(s)) {
+            return bad("dedupe entry for a missing slot");
+        }
+        if self.dedupe.values().flat_map(BTreeMap::values).any(|d| d.seq > self.head) {
+            return bad("dedupe entry beyond the head");
+        }
+        if self.checked.iter().any(|(l, s)| !self.placement.contains_key(l) || *s > self.head) {
+            return bad("checked location outside the placement or beyond the head");
+        }
+        let checks = u64::try_from(self.checked.len()).unwrap_or(u64::MAX);
+        if self.head.0 != checks.saturating_mul(2) {
+            return bad("head is not two events per check");
+        }
+        for (slot, c) in &self.slots {
+            let items = self
+                .checked
+                .keys()
+                .filter(|l| self.placement.get(l).is_some_and(|(s, _)| s == slot))
+                .count();
+            if c.item_head.0 != u64::try_from(items).unwrap_or(u64::MAX) {
+                return bad("item_head does not match the checks placed at the slot");
+            }
+        }
+        Ok(())
     }
 
     /// Highest `seq` known durable. Equals `head` for a state rebuilt by `fold`.
@@ -251,17 +307,35 @@ impl RoomState {
             return Err(CoreError::LogGap { expected, got: ev.seq });
         }
         let slot = ev.slot.ok_or(CoreError::BadEvent)?;
-        let cursor = self.slots.get_mut(&slot).ok_or(CoreError::UnknownSlot(slot))?;
+        if !self.slots.contains_key(&slot) {
+            return Err(CoreError::UnknownSlot(slot));
+        }
+        // Every check is validated against the placement table before anything changes, so a
+        // hostile or corrupt log is an error and never a half-applied state.
         match ev.kind {
-            EventKind::Item { item_seq, .. } => {
+            EventKind::Item { location, item, item_seq } => {
+                if self.awaiting != Some(location)
+                    || self.placement.get(&location) != Some(&(slot, item))
+                {
+                    return Err(CoreError::PlacementMismatch);
+                }
+                let cursor = self.slots.get_mut(&slot).ok_or(CoreError::UnknownSlot(slot))?;
                 let expected = next_item_seq(cursor.item_head)?;
                 if item_seq != expected {
                     return Err(CoreError::ItemGap { expected, got: item_seq });
                 }
                 cursor.item_head = item_seq;
+                self.awaiting = None;
             }
             EventKind::Checked { cid, location, at } => {
+                if !self.placement.contains_key(&location) {
+                    return Err(CoreError::UnknownLocation(location));
+                }
+                if self.awaiting.is_some() || self.checked.contains_key(&location) {
+                    return Err(CoreError::PlacementMismatch);
+                }
                 self.checked.insert(location, ev.seq);
+                self.awaiting = Some(location);
                 let index = self.dedupe.entry(slot).or_default();
                 // shortcut: prunes this slot's whole index on each new check, O(entries);
                 // upgrade to a time-ordered index when a room's 24 h window gets large.

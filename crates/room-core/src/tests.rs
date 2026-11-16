@@ -259,13 +259,20 @@ fn fold_refuses_a_gap_a_replay_and_a_slotless_event() {
 
 #[test]
 fn fold_refuses_an_item_that_skips_an_item_seq() {
-    let e = Event {
+    // The Checked event is valid, so only the item_seq is wrong (this test used to send a bare
+    // Item; fold now rejects that as a placement error, see below).
+    let checked = Event {
         seq: Seq(1),
+        slot: Some(SlotNo(1)),
+        kind: EventKind::Checked { cid: Cid(1), location: 10, at: Timestamp(0) },
+    };
+    let e = Event {
+        seq: Seq(2),
         slot: Some(SlotNo(1)),
         kind: EventKind::Item { location: 10, item: 500, item_seq: ItemSeq(2) },
     };
     assert_eq!(
-        fold(room(), &LIM, [e]),
+        fold(room(), &LIM, [checked, e]),
         Err(CoreError::ItemGap { expected: ItemSeq(1), got: ItemSeq(2) })
     );
 }
@@ -480,4 +487,131 @@ fn expired_dedupe_entries_are_pruned() {
     apply(&mut z, &ctx, check(1, 1, 10)).unwrap();
     apply(&mut z, &ctx, check(1, 2, 11)).unwrap();
     assert_eq!(z.dedupe_len(), 1, "a zero window keeps only the newest entry");
+}
+
+mod hostile_logs_and_snapshots {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn checked(seq: u64, slot: u32, location: u32) -> Event {
+        Event {
+            seq: Seq(seq),
+            slot: Some(SlotNo(slot)),
+            kind: EventKind::Checked { cid: Cid(seq), location, at: Timestamp(0) },
+        }
+    }
+
+    fn item(seq: u64, slot: u32, location: u32, item: u32, item_seq: u64) -> Event {
+        Event {
+            seq: Seq(seq),
+            slot: Some(SlotNo(slot)),
+            kind: EventKind::Item { location, item, item_seq: ItemSeq(item_seq) },
+        }
+    }
+
+    #[test]
+    fn fold_refuses_a_check_for_a_location_outside_the_placement() {
+        assert_eq!(fold(room(), &LIM, [checked(1, 1, 99)]), Err(CoreError::UnknownLocation(99)));
+    }
+
+    #[test]
+    fn fold_refuses_a_check_that_is_never_followed_by_its_item() {
+        assert_eq!(
+            fold(room(), &LIM, [checked(1, 1, 10), checked(2, 1, 11)]),
+            Err(CoreError::PlacementMismatch)
+        );
+    }
+
+    #[test]
+    fn fold_refuses_an_item_with_no_check_before_it() {
+        assert_eq!(fold(room(), &LIM, [item(1, 1, 10, 500, 1)]), Err(CoreError::PlacementMismatch));
+    }
+
+    #[test]
+    fn fold_refuses_an_item_that_disagrees_with_the_placement() {
+        for bad in [item(2, 2, 10, 500, 1), item(2, 1, 10, 777, 1), item(2, 1, 11, 500, 1)] {
+            assert_eq!(
+                fold(room(), &LIM, [checked(1, 1, 10), bad]),
+                Err(CoreError::PlacementMismatch),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_refuses_a_location_checked_twice() {
+        let ev = [checked(1, 1, 10), item(2, 1, 10, 500, 1), checked(3, 1, 10)];
+        assert_eq!(fold(room(), &LIM, ev), Err(CoreError::PlacementMismatch));
+    }
+
+    #[test]
+    fn fold_refuses_an_event_for_an_unknown_slot() {
+        assert_eq!(fold(room(), &LIM, [checked(1, 9, 10)]), Err(CoreError::UnknownSlot(SlotNo(9))));
+    }
+
+    fn live() -> RoomState {
+        let mut s = room();
+        apply(&mut s, &at(1), check(1, 1, 11)).unwrap();
+        apply(&mut s, &at(1), ack(2, 1)).unwrap();
+        s.mark_durable(s.head()).unwrap();
+        s
+    }
+
+    fn tampered(edit: impl FnOnce(&mut Value)) -> RoomState {
+        let mut v = serde_json::to_value(live()).unwrap();
+        edit(&mut v);
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_good_snapshot_validates() {
+        assert_eq!(live().validate(Seq(2)), Ok(()));
+        assert_eq!(room().validate(Seq(0)), Ok(()));
+    }
+
+    #[test]
+    fn a_snapshot_whose_seq_is_not_its_head_is_refused() {
+        assert!(matches!(live().validate(Seq(1)), Err(CoreError::BadSnapshot(_))));
+        assert!(matches!(live().validate(Seq(3)), Err(CoreError::BadSnapshot(_))));
+    }
+
+    #[test]
+    fn a_snapshot_that_was_not_durable_when_taken_is_refused() {
+        let mut s = room();
+        apply(&mut s, &at(1), check(1, 1, 11)).unwrap();
+        assert!(matches!(s.validate(Seq(2)), Err(CoreError::BadSnapshot(_))));
+    }
+
+    #[test]
+    fn inconsistent_snapshots_are_errors_not_panics() {
+        let cases: [(&str, Value); 6] = [
+            ("applied above item_head", json!({"slots": {"2": {"item_head": 1, "applied": 5}}})),
+            ("dedupe for a slot that does not exist", json!({"dedupe": {"9": {}}})),
+            ("dedupe entry from the future", json!({"dedupe": {"1": {"7": {"seq": 99, "at": 0}}}})),
+            ("checked location outside the placement", json!({"checked": {"99": 1}})),
+            (
+                "item_head that matches no checks",
+                json!({"slots": {"1": {"item_head": 4, "applied": 0}}}),
+            ),
+            ("stopped between a check and its item", json!({"awaiting": 11})),
+        ];
+        for (name, patch) in cases {
+            let s = tampered(|v| {
+                for (k, new) in patch.as_object().unwrap() {
+                    let slot = v.get_mut(k).unwrap();
+                    match (slot.as_object_mut(), new.as_object()) {
+                        (Some(old), Some(new)) => old.extend(new.clone()),
+                        _ => *slot = new.clone(),
+                    }
+                }
+            });
+            assert!(matches!(s.validate(Seq(2)), Err(CoreError::BadSnapshot(_))), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_head_that_does_not_match_the_checks_is_refused() {
+        let s = tampered(|v| v["head"] = json!(7));
+        assert!(matches!(s.validate(Seq(7)), Err(CoreError::BadSnapshot(_))));
+    }
 }
