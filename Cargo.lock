@@ -284,6 +284,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "seed-bundle"
+version = "0.0.0"
+dependencies = [
+ "proto",
+ "room-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"

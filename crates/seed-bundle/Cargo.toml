@@ -1,0 +1,21 @@
+[package]
+name = "seed-bundle"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+room-core = { path = "../room-core" }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
