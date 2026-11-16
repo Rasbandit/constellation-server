@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fast checks only (seconds). The full gate runs in pre-push and CI. Fix findings; never --no-verify.
+set -euo pipefail
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+typos

@@ -1,3 +1,4 @@
+//! Position and slot identifiers.
 use serde::{Deserialize, Serialize};
 
 /// Room-wide event log position, gapless.
@@ -8,5 +9,6 @@ pub struct Seq(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ItemSeq(pub u64);
 
+/// Slot number within a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SlotNo(pub u32);

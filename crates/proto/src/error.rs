@@ -4,24 +4,36 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Retry hint carried by every error frame (doc 01 D1.7).
 pub enum Retry {
+    /// Retrying will not help.
     Never,
+    /// Retry with exponential backoff and full jitter (doc 01 D1.7).
     Backoff,
+    /// Retry after the `after_ms` the server sent.
     After,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Registered error codes (initial set from doc 01 D1.7).
 pub enum ErrorCode {
+    /// `capability.missing`
     CapabilityMissing,
+    /// `auth.token_revoked`
     AuthTokenRevoked,
+    /// `auth.step_up_required`
     AuthStepUpRequired,
+    /// `room.rolled_back`
     RoomRolledBack,
+    /// `resume.too_old`
     ResumeTooOld,
+    /// `room.unavailable`
     RoomUnavailable,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 6] = [
+    /// Every registered code, for registry tests and docs generation.
+    pub const ALL: [Self; 6] = [
         Self::CapabilityMissing,
         Self::AuthTokenRevoked,
         Self::AuthStepUpRequired,
@@ -30,6 +42,8 @@ impl ErrorCode {
         Self::RoomUnavailable,
     ];
 
+    /// Numeric code (provisional, see module docs).
+    #[must_use]
     pub const fn code(self) -> u16 {
         match self {
             Self::CapabilityMissing => 1001,
@@ -41,6 +55,8 @@ impl ErrorCode {
         }
     }
 
+    /// Normative dotted key; clients localize from this.
+    #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
             Self::CapabilityMissing => "capability.missing",
@@ -52,10 +68,16 @@ impl ErrorCode {
         }
     }
 
+    /// Retry hint the server must send with this error.
+    #[must_use]
     pub const fn retry(self) -> Retry {
         match self {
             Self::RoomUnavailable => Retry::Backoff,
-            _ => Retry::Never,
+            Self::CapabilityMissing
+            | Self::AuthTokenRevoked
+            | Self::AuthStepUpRequired
+            | Self::RoomRolledBack
+            | Self::ResumeTooOld => Retry::Never,
         }
     }
 }
@@ -63,6 +85,7 @@ impl ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
     use alloc::collections::BTreeSet;
 
     #[test]
@@ -74,8 +97,7 @@ mod tests {
         for k in keys {
             assert!(
                 k.contains('.')
-                    && k.bytes()
-                        .all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'_')
+                    && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'_')
             );
         }
     }
@@ -97,10 +119,6 @@ mod tests {
 
     #[test]
     fn retry_serializes_lowercase() {
-        extern crate std;
-        assert_eq!(
-            serde_json::to_string(&Retry::Backoff).unwrap(),
-            "\"backoff\""
-        );
+        assert_eq!(serde_json::to_string(&Retry::Backoff).unwrap(), "\"backoff\"");
     }
 }

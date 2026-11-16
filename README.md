@@ -15,3 +15,7 @@ Next crates, in doc 05 section 20 order: `spec-rng`, `room-core`, `log`, `runtim
 1. L0/L1 crates never depend on tokio, sqlx, axum, a clock or an OS RNG.
 2. `unsafe` is forbidden workspace-wide; exceptions go in `docs/unsafe-register.md`.
 3. Only `config` reads env vars.
+
+## Dev setup
+Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, seconds), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, the same gate as CI). Needs `just`, `cargo-deny`, `typos`.
+Lints: every rustc and clippy group is `deny` (see `[workspace.lints]` in `Cargo.toml`), plus warnings as errors in CI. A new `allow` needs a `reason = "..."`.

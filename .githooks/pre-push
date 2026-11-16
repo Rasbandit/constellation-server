@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Same gate as CI, so a push that passes here should pass there.
+set -euo pipefail
+exec just check
