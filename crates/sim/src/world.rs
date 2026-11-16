@@ -562,10 +562,10 @@ impl World {
         let events = self.all_events()?;
         let c = self.clients.get_mut(&slot).ok_or("client")?;
         for e in events.iter().filter(|e| e.slot == Some(slot)) {
-            if let EventKind::Item { from, location, item_seq, .. } = e.kind {
-                if item_seq.0 > c.last_applied {
-                    c.inbox.push((item_seq, (from, location)));
-                }
+            if let EventKind::Item { from, location, item_seq, .. } = e.kind
+                && item_seq.0 > c.last_applied
+            {
+                c.inbox.push((item_seq, (from, location)));
             }
         }
         Ok(())
