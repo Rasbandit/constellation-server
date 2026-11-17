@@ -5,7 +5,7 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first; everything there applies to you
 ## Where the work is
 The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROADMAP.md) explains the goals and links the milestones.
 - Milestones: `M0` to `M4`.
-- Lane labels: `lane:compat`, `lane:native`, `lane:games`, `lane:reliability`.
+- Lane labels: `lane:compat`, `lane:native`, `lane:games`, `lane:reliability`, `lane:web`.
 - `human-only`: never claim these (spending money, posting outside this repo, playtests).
 - `status:claimed`: someone holds it.
 - `finding`: something that surprised us; see the roadmap.

@@ -31,77 +31,31 @@ M1, M2 and M3 run in parallel. M4 collects them.
 
 ## Workstreams
 
-Four lanes, one owner each. A lane owns its crates, so two people rarely edit the same files. With three people, merge lanes C and D: D's tasks are short and mostly at the end.
+**The GitHub issues are the source of truth for tasks.** This file holds the goals; each task, its "Done when" and its "Blocked by" line live in an issue with a lane label and a milestone ([milestones](https://github.com/Rasbandit/constellation-server/milestones)). How to claim one is in [`AGENTS.md`](../AGENTS.md).
 
-### Lane A: compatibility with existing clients (M1)
+Five lanes, one owner each. A lane owns its crates, so two people rarely edit the same files. With three people, merge lanes C and D: D's tasks are short and mostly at the end.
 
-Owns `crates/edge-compat`, `crates/seed-bundle`, `tools/ap-import`, `docs/compat-status.md`.
+- **Lane A: compatibility with existing clients (M1).** Owns `crates/edge-compat`, `crates/seed-bundle`, `tools/ap-import`, `docs/compat-status.md`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:compat)
+- **Lane B: the native standard (M2).** Owns `crates/proto`, the new `crates/edge-native`, the new `crates/sdk-core`, `crates/runtime`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:native)
+- **Lane C: games on the standard (M3).** Owns the new `crates/cgm` (manifest types and validator), `crates/rules`, later `crates/fill`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:games)
+- **Lane D: reliability and hosting (M1 playtests, M4).** Owns `crates/sim`, `.github/workflows`, deploy files, `docs/TESTING.md`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:reliability)
+- **Lane E: web UI (M1, M2 stretch).** Owns a new `crates/web` (or `crates/server/src/web`), `templates/`, `static/`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:web)
 
-| Task | What | Needs |
-|---|---|---|
-| A-1. Client matrix | Pick 5 existing games and tools across client styles (a text client, a tracker, an emulator-based game, a PC mod, Archipela-Go). Record in `compat-status.md` which connect, play and goal. | Nothing; start here |
-| A-2. Data storage | `Set`, `SetNotify`, `SetReply`, and `Get` for stored keys and the other `_read_` keys (`item_name_groups_*`, `location_name_groups_*`). | Room-core command for key writes |
-| A-3. Hints | `CreateHints`, `UpdateHint`, `LocationScouts` with `create_as_hint`, hint points spending, `!hint`, `_read_hints_*` | A-2 (hint changes reach watchers as `SetReply` on `_read_hints_*`) |
-| A-4. Release, collect, remaining | The three actions, their `!` commands, and their permissions in `RoomInfo` | Room-core commands |
-| A-5. Client statuses and `TagsChanged` | Statuses other than goal; the `TagsChanged` print | Nothing to store them; A-2 for `SetReply` on `_read_client_status_*` |
-| A-6. Starting inventory and item links | Importer and bundle accept them instead of refusing the seed | Seed-bundle schema change |
-| A-7. Importer coverage | Run `ap-import` over seeds from every game in A-1; fix what it refuses | A-1 |
-| A-8. Upstream report | The deflate interop finding (bottom of `compat-status.md`): build a minimal reproduction outside our server, find which project owns the behavior (`soketto`'s inflate or `flate2` 1.1.11's stricter check), report it there, then tell the `archipelago_rs` maintainers about the `flate2` pin as downstream users | Nothing; see the rules below first |
+## Tech choices
 
-### Lane B: the native standard (M2)
+The web UI is server-rendered HTML from the existing server binary: axum (already used) with Askama templates, htmx (one vendored JS file) for interactivity, server-sent events (SSE) from axum for live updates, and plain CSS. Why: it is the fastest path, it ships as one binary, and contributors install nothing beyond Rust (no Node, no build step). This is a POC choice; design decision D-70 (Leptos SSR) stays open for later.
 
-Owns `crates/proto`, the new `crates/edge-native`, the new `crates/sdk-core`, `crates/runtime`.
-
-| Task | What | Needs |
-|---|---|---|
-| B-1. CWP v1 schema | JSON schema generated from `proto` types, a snapshot test, golden transcripts (doc 01 section 7 step 1) | Nothing; start here |
-| B-2. Applied cursors | Persist each slot's applied cursor (the known deviation in `compat-status.md`), batched into the room's append | Nothing |
-| B-3. Token auth | Per-slot tokens (doc 01 D1.2) | B-1 |
-| B-4. `edge-native` | WebSocket edge speaking CWP: hello and capabilities, event log with `seq`, one ack (D1.3, D1.4) | B-1, B-2, B-3 |
-| B-5. `sdk-core` (Rust) and a demo bot | The minimal client from doc 01 D5.4; the bot plays a room end to end | B-4 |
-| B-6. Mixed room test | Native bot and an existing client in one room, in `crates/server/tests`, with a `kill -9` in the middle | B-5, lane A's e2e helpers |
-| B-7. JS SDK (stretch) | Same minimal client in TypeScript, same golden transcripts | B-5 |
-
-### Lane C: games on the standard (M3)
-
-Owns the new `crates/cgm` (manifest types and validator), `crates/rules`, later `crates/fill`.
-
-| Task | What | Needs |
-|---|---|---|
-| C-1. Manifest types and validator | CGM v1 types (doc 01 D2.1 to D2.4), the ID ledger rules (D2.6), the Moss Cave sample from doc 01 section 4.1 as the first fixture | Nothing; start here |
-| C-2. Rule evaluator | The closed rule language (D2.5) in Rust, with shared test vectors | C-1 |
-| C-3. Archipela-Go manifest | Our own game first: write its manifest, check IDs and pools against its apworld | C-1, C-2 |
-| C-4. Two more worlds | Two of the three from doc 07 section 8.2 (musedash, faxanadu, lingo), ported by hand on a branch. Record every construct as "data", "needs a primitive" or "residue" | C-3 |
-| C-5. Equivalence harness | Compare a port to the original: names, IDs, options, pool multisets over 50 option sets, beatability | C-1; runs the original via Archipelago's generator like the fixture script in `README.md` |
-| C-6. Fill v1 (stretch) | Generate a seed from a manifest without Python (CFill v1) and load it as a bundle | C-2, C-4 |
-
-C-4 reads other people's worlds. Describe what they do in our own words; do not copy code or data into this repo without an owner decision and a license check (rules below).
-
-### Lane D: reliability and hosting (M1 playtests, M4)
-
-Owns `crates/sim`, `.github/workflows`, deploy files, `docs/TESTING.md`.
-
-| Task | What | Needs |
-|---|---|---|
-| D-1. Friends server | One small box, TLS terminator in front, systemd unit from `README.md`, Postgres with nightly backup | Owner approves the spend |
-| D-2. Playtest loop | One session every week or two on D-1; each pitfall becomes an issue labeled `finding` | D-1, A-1 |
-| D-3. Chaos run | `kill -9` every 30 s for one hour with zero acknowledged loss and zero duplicates (gate 0 c) | Nothing (runs in CI or on D-1, never on a shared dev box) |
-| D-4. Restore drill | Restore D-1's backup to a fresh database and replay the room (gate 0 d) | D-1 |
-| D-5. Simulator scale | 10M schedules clean (gate 0 a), run nightly in CI | Nothing |
-| D-6. Load numbers | Measured connection memory and room rehydrate time, replacing design values | B-4 for native connections |
-
-## Start order for four people
+## Start order
 
 Each person can start on day one without waiting for anyone:
 
-| Person | First task | Then |
-|---|---|---|
-| 1 | A-1 client matrix | A-2, A-3 |
-| 2 | B-1 schema, B-2 cursors | B-3, B-4 |
-| 3 | C-1 validator | C-2, C-3 |
-| 4 | D-3 chaos run, D-5 simulator | D-1 once approved, then A-4, A-5 or C-5 wherever is behind |
+1. Lane A: #19 client matrix, then #20 and #21.
+2. Lane B: #12 schema and #13 cursors, then #14 and #15.
+3. Lane C: #27 validator, then #28 and #29.
+4. Lane D: #35 chaos run and #37 simulator, then #33 once approved, then #22, #23 or #31 wherever is behind.
+5. Lane E (if a fifth person joins): #39 web skeleton, then #40 and #41.
 
-Cross-lane handoffs to watch: B-6 needs lane A's test helpers (`crates/e2e`); C-6 needs lane A's bundle loading (`seed-bundle`) unchanged; A-2 and B-2 both touch `room-core` and `runtime`, so agree on the command shape first in the issue.
+Cross-lane handoffs to watch: #17 needs lane A's test helpers (`crates/e2e`); #32 needs lane A's bundle loading (`seed-bundle`) unchanged; #20 and #13 both touch `room-core` and `runtime`, so agree on the command shape first in the issue.
 
 ## Findings
 
