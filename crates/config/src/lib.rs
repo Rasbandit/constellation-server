@@ -368,6 +368,65 @@ mod tests {
         }
     }
 
+    /// `load` and `load_secrets` read the real process environment, which a test may not
+    /// change (no `unsafe` for `set_var`). So this test runs its own binary again with a set
+    /// environment, and the child (`env_probe`) prints what the two functions read.
+    #[test]
+    fn load_and_load_secrets_read_the_process_environment() {
+        let dir = std::env::temp_dir().join(format!("config-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url_file = dir.join("url");
+        std::fs::write(&url_file, "postgres://probe@h/db\nignored\n").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::env_probe", "--nocapture", "--test-threads=1"])
+            .env("CONFIG_ENV_PROBE", "1")
+            .env("CONSTELLATION_DEDUPE_WINDOW_SECS", "77")
+            .env("SIM_SEEDS", "5")
+            .env("SIM_SEED", "9")
+            .env("CONSTELLATION_MAX_CONNECTIONS", "3")
+            .env("CONSTELLATION_CONNECT_TIMEOUT_MS", "11")
+            .env("CONSTELLATION_IDLE_TIMEOUT_MS", "not-a-number")
+            .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
+            .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
+            .env("CONSTELLATION_DATABASE_URL_FILE", &url_file)
+            .env_remove("CONSTELLATION_ROOM_PASSWORD_FILE")
+            .env_remove("CONSTELLATION_DATABASE_URL")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}");
+        let d = Limits::DESIGN;
+        // Bad numbers keep the design value.
+        let want =
+            format!("probe limits 77 5 Some(9) 3 11 {} {}", d.idle_timeout_ms, d.ping_interval_ms);
+        assert!(text.contains(&want), "want {want:?} in {text}");
+        assert!(
+            text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
+            "{text}"
+        );
+    }
+
+    /// The child half of the test above; does nothing unless that test started it.
+    #[test]
+    fn env_probe() {
+        if std::env::var("CONFIG_ENV_PROBE").is_err() {
+            return;
+        }
+        let l = load();
+        println!(
+            "probe limits {} {} {:?} {} {} {} {}",
+            l.dedupe_window_secs,
+            l.sim_seeds,
+            l.sim_replay_seed,
+            l.max_connections,
+            l.connect_timeout_ms,
+            l.idle_timeout_ms,
+            l.ping_interval_ms
+        );
+        let s = load_secrets().unwrap();
+        println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
+    }
+
     #[test]
     fn secrets_print_redacted() {
         let s = Secrets { room_password: Some("hunter2".to_owned()), database_url: None };

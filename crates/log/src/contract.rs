@@ -255,9 +255,21 @@ async fn rooms_do_not_see_each_other<S: Store>(s: Arc<S>) {
 async fn no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch<S: Store>(
     s: Arc<S>,
 ) {
+    fence_race(s, false, 1000).await;
+}
+
+/// The same race against a room's first claim: the writer uses epoch 0 on a room nobody
+/// claimed yet (allowed, as in `MemLogStore`), so on Postgres there is no owner row to lock
+/// until the writer creates one. A writer that skipped that and wrote unlocked could commit
+/// after the first claim returned.
+async fn no_epoch_0_append_commits_after_the_first_claim_returns<S: Store>(s: Arc<S>) {
+    fence_race(s, true, 2000).await;
+}
+
+async fn fence_race<S: Store>(s: Arc<S>, unclaimed: bool, base: u64) {
     for i in 0..100_u64 {
-        let room = RoomId(1000 + i);
-        let old = s.bump(room).await;
+        let room = RoomId(base + i);
+        let old = if unclaimed { Epoch(0) } else { s.bump(room).await };
         let claimed = Arc::new(AtomicBool::new(false));
         let first = Arc::new(Notify::new());
         let writer = tokio::spawn({
@@ -390,6 +402,7 @@ macro_rules! contract {
                 an_older_snapshot_never_replaces_a_newer_one,
                 rooms_do_not_see_each_other,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
+                no_epoch_0_append_commits_after_the_first_claim_returns,
                 a_cancelled_append_lands_whole_or_not_at_all_and_the_next_one_works,
             ]
         );
@@ -460,6 +473,54 @@ mod pg_only {
         s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
         assert_eq!(s.open_room(R, "seed", 1, &[1, 3]).await, Err(OpenError::OtherBundle));
         s.open_room(RoomId(2), "seed", 1, &[1, 3]).await.unwrap();
+    }
+
+    /// Two writers with the same epoch (a bug upstream, but the store must say so): both pass
+    /// the shared fence lock and read head 0, both insert seq 1. The loser hits the primary
+    /// key and must get `Corrupt`, never `Unavailable` (which would invite a blind retry).
+    /// Deterministic: a test transaction holds `slot_cursors` locked, so the first writer
+    /// stops after its events insert and the second waits on the first's seq 1 row; only then
+    /// is the lock released.
+    #[tokio::test]
+    async fn two_same_epoch_writers_on_one_seq_leave_one_ok_and_one_corrupt() {
+        use sqlx::Connection;
+        let url = schema().await;
+        let app = format!("dup_{}", url.rsplit('=').next().unwrap_or("x"));
+        let s = Arc::new(
+            PgLogStore::connect(&format!("{url}&application_name={app}"), &pool(2)).await.unwrap(),
+        );
+        let e = s.claim(R).await.unwrap();
+        let mut gate = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE slot_cursors IN EXCLUSIVE MODE")
+            .execute(&mut gate)
+            .await
+            .unwrap();
+        let racer = |s: Arc<PgLogStore>| {
+            tokio::spawn(async move { put(&*s, R, e, &[ev(1)], &[cur(1, 1)]).await })
+        };
+        let (first, second) = (racer(Arc::clone(&s)), racer(Arc::clone(&s)));
+        // Polled: Postgres has no event for "a session started waiting on a lock".
+        let waiting = "SELECT count(*) FROM pg_stat_activity \
+                       WHERE application_name = $1 AND wait_event_type = 'Lock'";
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let n: i64 = sqlx::query_scalar(waiting).bind(&app).fetch_one(&mut gate).await.unwrap();
+            if n == 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the writers never both waited ({n})");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sqlx::raw_sql("ROLLBACK").execute(&mut gate).await.unwrap();
+        let mut got = [first.await.unwrap(), second.await.unwrap()];
+        got.sort_by_key(Result::is_err);
+        assert_eq!(got[0], Ok(AppendReceipt { head: Seq(1) }));
+        assert!(
+            matches!(&got[1], Err(AppendError::Corrupt(why)) if why.contains("duplicate")),
+            "{:?}",
+            got[1]
+        );
+        assert_eq!(log(&*s, R).await, [ev(1)]);
     }
 
     /// Issue 2805 workaround: a failed call never hands its connection back to the pool.
