@@ -20,15 +20,15 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 |---|---|---|---|
 | Unit | `cargo test`, `#[cfg(test)] mod tests` in the crate | next to the code | every commit (pre-commit runs `--lib`) |
 | Golden vectors | fixed inputs with outputs from an independent source | `src/tests.rs` plus the reference in the crate's `reference/` | every commit |
-| Property | `proptest` | `mod properties` in the same file | every PR with default cases; nightly with `PROPTEST_CASES=50000` |
+| Property | `proptest` | `mod properties` in the same file | every PR with default cases; manual `nightly` with `PROPTEST_CASES=50000` |
 | Snapshot | `insta` (JSON schema, OpenAPI, headers) | crate tests | every PR |
 | Integration | real crate boundaries, in-memory fakes (`MemLogStore`) | crate `tests/` only when a crate boundary is the thing under test | every PR |
-| Deterministic simulation | the `sim` crate: fake clock, network, store, seeded scheduler, crash injection | `crates/sim` | every PR bounded; nightly 10M schedules |
+| Deterministic simulation | the `sim` crate: fake clock, network, store, seeded scheduler, crash injection | `crates/sim` | every PR bounded; manual `nightly` 10M schedules |
 | **End to end** | real server binary, real Postgres, real WebSocket clients | `crates/server/tests/` with helpers in `crates/e2e` | every PR (loopback only, about a second) |
 | Conformance | Autobahn suite, real Archipelago, Python `websockets`, browser clients | CI jobs (gate G-WS) | CI only |
 | Fuzz | `cargo-fuzz` on every parser and decoder | `fuzz/` per crate | continuous in CI, stored corpus |
-| Mutation | `cargo-mutants` on leaf crates | CI | nightly |
-| Load, soak, chaos | `sim` load generator, `kill -9` script | test rig | nightly or on demand |
+| Mutation | `cargo-mutants` on leaf crates | manual `nightly` workflow | on demand |
+| Load, soak, chaos | `sim` load generator, `kill -9` script | test rig | on demand |
 
 ## End-to-end rules
 

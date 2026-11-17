@@ -4,10 +4,10 @@ name: ci
 # The push to main keeps the build cache warm; PRs can only restore main's cache.
 on:
   pull_request:
-    paths-ignore: &docs ["**.md", "docs/**", "LICENSE*"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE*"]
   push:
     branches: [main]
-    paths-ignore: *docs
+    paths-ignore: ["**.md", "docs/**", "LICENSE*"]
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
