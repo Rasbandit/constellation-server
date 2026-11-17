@@ -5,6 +5,8 @@ unused-allowed-license = "allow"
 allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib"]
 # D-97: the owner accepted yawc's MPL-2.0 (2026-11-16, no lawyer review); for yawc only.
 exceptions = [{ name = "yawc", allow = ["MPL-2.0"] }]
+# Our own crates (publish = false) carry the repo licence, PolyForm Strict, which is not on the allow-list.
+private = { ignore = true }
 
 [advisories]
 yanked = "deny"
