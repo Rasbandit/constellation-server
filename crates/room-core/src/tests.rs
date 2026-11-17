@@ -695,21 +695,76 @@ mod hostile_logs_and_snapshots {
         assert!(matches!(s.validate(Seq(2)), Err(CoreError::BadSnapshot(_))));
     }
 
+    /// Each case names the rule that must refuse it, so a weakened rule cannot hide behind a
+    /// later one. A check's item event always follows it, so a check (and its dedupe entry) can
+    /// never sit at the head of a valid snapshot; a goal can.
     #[test]
     fn inconsistent_snapshots_are_errors_not_panics() {
-        let cases: [(&str, Value); 7] = [
-            ("applied above item_head", json!({"slots": {"2": {"item_head": 1, "applied": 5}}})),
-            ("dedupe for a slot that does not exist", json!({"dedupe": {"9": {}}})),
-            ("dedupe entry from the future", json!({"dedupe": {"1": {"7": {"seq": 99, "at": 0}}}})),
-            ("checked location outside the placement", json!({"checked": {"1": {"99": 1}}})),
-            ("goal for a slot that does not exist", json!({"goals": {"9": 1}})),
+        const BEYOND: &str = "checked location outside the placement or at or beyond the head";
+        let cases: [(&str, Value, &str); 13] = [
+            (
+                "applied above item_head",
+                json!({"slots": {"2": {"item_head": 1, "applied": 5}}}),
+                "applied is above item_head",
+            ),
+            (
+                "dedupe for a slot that does not exist",
+                json!({"dedupe": {"9": {}}}),
+                "dedupe entry for a missing slot",
+            ),
+            (
+                "dedupe entry from the future",
+                json!({"dedupe": {"1": {"7": {"seq": 99, "at": 0}}}}),
+                "dedupe entry at or beyond the head",
+            ),
+            (
+                "dedupe entry at the head, where only an item event can be",
+                json!({"dedupe": {"1": {"1": {"seq": 2, "at": 1}}}}),
+                "dedupe entry at or beyond the head",
+            ),
+            (
+                "checked location outside the placement",
+                json!({"checked": {"1": {"99": 1}}}),
+                BEYOND,
+            ),
+            ("check at the head, its item missing", json!({"checked": {"1": {"11": 2}}}), BEYOND),
+            (
+                "placement from a slot that does not exist",
+                json!({"placement": {"9": {"13": [2, 503]}}}),
+                "placement names a missing slot",
+            ),
+            (
+                "placement to a slot that does not exist",
+                json!({"placement": {"1": {"11": [9, 501]}}}),
+                "placement names a missing slot",
+            ),
+            (
+                "goal for a slot that does not exist",
+                json!({"goals": {"9": 1}}),
+                "goal for a missing slot or beyond the head",
+            ),
+            (
+                "goal beyond the head",
+                json!({"goals": {"1": 3}}),
+                "goal for a missing slot or beyond the head",
+            ),
             (
                 "item_head that matches no checks",
                 json!({"slots": {"1": {"item_head": 4, "applied": 0}}}),
+                "item_head does not match the checks placed at the slot",
             ),
-            ("stopped between a check and its item", json!({"awaiting": [1, 11]})),
+            (
+                "stopped between a check and its item",
+                json!({"awaiting": [1, 11]}),
+                "snapshot stops between a check and its item",
+            ),
+            (
+                "head that matches no checks",
+                json!({"checked": {"1": {}}}),
+                "head is not two events per check plus one per goal",
+            ),
         ];
-        for (name, patch) in cases {
+        for (name, patch, why) in cases {
             let s = tampered(|v| {
                 for (k, new) in patch.as_object().unwrap() {
                     let slot = v.get_mut(k).unwrap();
@@ -719,8 +774,22 @@ mod hostile_logs_and_snapshots {
                     }
                 }
             });
-            assert!(matches!(s.validate(Seq(2)), Err(CoreError::BadSnapshot(_))), "{name}");
+            assert_eq!(s.validate(Seq(2)), Err(CoreError::BadSnapshot(why)), "{name}");
         }
+    }
+
+    #[test]
+    fn a_snapshot_whose_last_event_is_a_goal_validates() {
+        let mut s = live();
+        apply(&mut s, &at(1), Command::Goal { slot: SlotNo(1) }).unwrap();
+        s.mark_durable(s.head()).unwrap();
+        assert_eq!(s.head(), Seq(3));
+        assert_eq!(s.validate(Seq(3)), Ok(()));
+    }
+
+    #[test]
+    fn errors_display_their_variant() {
+        assert_eq!(std::format!("{}", CoreError::SeqOverflow), "SeqOverflow");
     }
 
     #[test]
