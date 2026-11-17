@@ -58,10 +58,14 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
+      # Mutated bodies leave unused variables and imports; with -D warnings (and the workspace's
+      # deny lints) almost every mutant failed to build and counted as unviable (755 of 761 on
+      # 2026-11-16). Lints are the other jobs' business; here they are capped (--cap-lints).
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-mutants }
-      - run: cargo mutants --workspace --cargo-arg=--locked --features log/pg-tests --features server/pg-tests --in-place --no-shuffle
+      - run: cargo mutants --workspace --cap-lints=true --cargo-arg=--locked --features log/pg-tests --features server/pg-tests --in-place --no-shuffle

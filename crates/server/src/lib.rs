@@ -421,6 +421,18 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_exactly_at_the_cap_loads_and_one_byte_over_does_not() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+        let len = std::fs::metadata(&fixture).unwrap().len();
+        let at = Limits { bundle_max_bytes: len, ..Limits::DESIGN };
+        assert!(load_bundle(&fixture, &at).is_ok(), "a file of exactly the cap is allowed");
+        let under = Limits { bundle_max_bytes: len - 1, ..Limits::DESIGN };
+        let e = load_bundle(&fixture, &under).unwrap_err();
+        assert!(e.contains(&format!("larger than {} bytes", len - 1)), "{e}");
+    }
+
+    #[test]
     fn the_room_id_is_the_seed_names_sha256_prefix() {
         // The first 8 bytes of the published SHA-256 digests of "" and of "abc"
         // (FIPS 180-2 appendix B.1 and the well-known empty-string digest).
