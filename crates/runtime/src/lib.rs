@@ -150,6 +150,18 @@ impl RoomHandle {
         rx.await.map_err(|_| RoomError::Unavailable)
     }
 
+    /// Whether the room task is still running (a liveness probe, `/healthz`).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// Resolves once the room task has stopped (fenced, store failure or panic), so the host
+    /// can exit and let its supervisor restart it from the log.
+    pub async fn stopped(&self) {
+        self.tx.closed().await;
+    }
+
     async fn send(&self, msg: RoomMsg) -> Result<(), RoomError> {
         self.tx.send(msg).await.map_err(|_| RoomError::Unavailable)
     }

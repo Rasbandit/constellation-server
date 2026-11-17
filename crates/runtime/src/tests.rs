@@ -111,8 +111,11 @@ async fn an_empty_batch_and_a_refused_command_leave_the_room_serving() {
 #[tokio::test]
 async fn a_fenced_room_stops_and_every_handle_then_reports_unavailable() {
     let (h, store) = start();
+    assert!(h.is_running());
     store.claim(ROOM); // another owner took the room
     assert_eq!(h.command(check(1, 10)).await, Err(RoomError::Unavailable));
+    h.stopped().await;
+    assert!(!h.is_running(), "a stopped room must not report itself running");
     assert_eq!(log_len(&store).await, 0, "a fenced writer must not land anything");
     assert_eq!(h.clone().subscribe(Seq(0)).await.err(), Some(RoomError::Unavailable));
     assert_eq!(
@@ -243,6 +246,8 @@ async fn a_failed_append_publishes_nothing_to_any_subscriber() {
     let mut b = h.subscribe(Seq(0)).await.unwrap();
     assert_eq!(h.command(check(1, 10)).await, Err(RoomError::Unavailable));
     store.started.notified().await;
+    h.stopped().await;
+    assert!(!h.is_running());
     // The room stopped, so the queues end, and they end empty.
     assert_eq!(a.live.recv().await, None);
     assert_eq!(b.live.recv().await, None);
