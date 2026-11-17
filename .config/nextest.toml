@@ -1,0 +1,6 @@
+# Used only by the nightly mutants job (NEXTEST_PROFILE=mutants); `just test` stays on cargo test.
+# A mutant that makes a test hang (an endless rejection loop, a wait for an event that never
+# comes) must fail, not time out: stop at the first failure, and end a test stuck for 60 s.
+[profile.mutants]
+fail-fast = true
+slow-timeout = { period = "20s", terminate-after = 3 }
