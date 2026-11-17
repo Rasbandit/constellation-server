@@ -3,7 +3,7 @@
 Rust server for Constellation, compatible with Archipelago clients through a single compat crate (`edge-compat`).
 Design lives in the sibling `constellation` repo, `docs/design/05-rust-architecture.md` (workspace, section 6) and `DECISIONS.md` (D-78: all Rust).
 
-Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. Internal, not for external use; text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
+Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. A proof of concept, not for production use; the plan is [`docs/ROADMAP.md`](docs/ROADMAP.md) and how to help is [`CONTRIBUTING.md`](CONTRIBUTING.md). Text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
 
 ## Layout
 - `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO. Also `Command`, `Event` and the id newtypes (`Cid`, `RoomId`, `Epoch`, `Timestamp`).
