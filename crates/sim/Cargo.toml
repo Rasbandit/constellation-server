@@ -14,7 +14,7 @@ categories.workspace = true
 [dependencies]
 config = { path = "../config" }
 log = { path = "../log" }
-pollster = "0.4"
+pollster = "1.0"
 proto = { path = "../proto" }
 room-core = { path = "../room-core" }
 serde_json.workspace = true
