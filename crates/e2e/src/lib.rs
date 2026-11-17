@@ -61,21 +61,8 @@ impl Server {
     /// # Errors
     /// When the binary cannot be started or never logs its address.
     pub fn start(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
-        let mut child = Command::new(bin)
-            .arg("--bundle")
-            .arg(fixture_path())
-            .args(["--port", "0"])
-            .args(extra)
-            // A scenario says which database it uses; it never inherits one (CI sets the URL
-            // for the Postgres tests, and parallel servers must not share a room).
-            .env_remove("CONSTELLATION_DATABASE_URL")
-            .env_remove("CONSTELLATION_DATABASE_URL_FILE")
-            .envs(env.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn server: {e}"))?;
+        let mut child =
+            command(bin, extra, env).spawn().map_err(|e| format!("spawn server: {e}"))?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
         let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
@@ -136,12 +123,7 @@ impl Server {
     /// # Errors
     /// When the signal cannot be sent or the process does not exit.
     pub fn stop(mut self) -> Res<ExitStatus> {
-        let pid = self.child.id().to_string();
-        let sent =
-            Command::new("kill").args(["-TERM", &pid]).status().map_err(|e| e.to_string())?;
-        if !sent.success() {
-            return Err("kill -TERM failed".to_owned());
-        }
+        sigterm(self.child.id())?;
         self.child.wait().map_err(|e| e.to_string())
     }
 
@@ -182,6 +164,39 @@ impl Drop for Server {
         drop(self.child.kill());
         drop(self.child.wait());
     }
+}
+
+/// The server command `Server::start` runs: the fixture on an ephemeral port, `extra`
+/// arguments, only the database variables in `env`, stderr piped. For a scenario that must
+/// not wait for the server to listen.
+#[must_use]
+pub fn command(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Command {
+    let mut c = Command::new(bin);
+    c.arg("--bundle")
+        .arg(fixture_path())
+        .args(["--port", "0"])
+        .args(extra)
+        // A scenario says which database it uses; it never inherits one (CI sets the URL
+        // for the Postgres tests, and parallel servers must not share a room).
+        .env_remove("CONSTELLATION_DATABASE_URL")
+        .env_remove("CONSTELLATION_DATABASE_URL_FILE")
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    c
+}
+
+/// Send SIGTERM to process `pid` (what a supervisor's stop does).
+///
+/// # Errors
+/// When `kill` cannot run or fails.
+pub fn sigterm(pid: u32) -> Res<()> {
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if sent.success() { Ok(()) } else { Err("kill -TERM failed".to_owned()) }
 }
 
 fn listening_addr(line: &str) -> Option<SocketAddr> {

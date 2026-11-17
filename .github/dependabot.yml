@@ -1,8 +1,11 @@
 version: 2
+# Monthly and grouped: one PR per ecosystem, so one CI run each.
 updates:
   - package-ecosystem: cargo
     directory: /
-    schedule: { interval: weekly }
+    schedule: { interval: monthly }
+    groups: { all: { patterns: ["*"] } }
   - package-ecosystem: github-actions
     directory: /
-    schedule: { interval: weekly }
+    schedule: { interval: monthly }
+    groups: { all: { patterns: ["*"] } }

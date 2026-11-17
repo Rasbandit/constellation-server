@@ -32,7 +32,7 @@ The room password is never a flag (it would show in `ps`): set `CONSTELLATION_RO
 ### With Postgres (the room survives restarts)
 Set `CONSTELLATION_DATABASE_URL` (or `CONSTELLATION_DATABASE_URL_FILE`, a file whose first line is the URL; never a flag, since the URL can hold a password) to a database the server may create tables in, for example `postgres://constellation@localhost/constellation`. At Stage 0 and 1 Postgres runs on the same box (doc 12), no pooler in between. On start the server applies the migrations, claims the room (bumping its owner epoch, so an older process still running can no longer write), and rebuilds it from the log before it listens; the log line `room loaded ... events=<n>` says how much it read. The room id comes from the seed name; a restart with a different bundle under the same seed name is refused. Without a URL the server logs `log store: IN MEMORY` as a warning and a restart loses the room. Pool size and session timeouts come from `crates/config` (design values): `db_pool_connections` 8, `statement_timeout` 10 s, `lock_timeout` 5 s, `idle_in_transaction_session_timeout` 10 s. A URL parameter sqlx does not recognise is refused at start (sqlx would log it with its value). If the room stops (its log refused or failed a write) the process exits non-zero so a supervisor restarts it and the room reloads; `GET /healthz` answers 503 `room stopped` meanwhile.
 
-Exit status: 0 after SIGTERM or Ctrl-C; 3 when a newer owner took the room (the log line says `fenced by a newer owner current=<epoch>`): do not restart it, or two instances on one database fence each other in a loop; 1 for every other failure, including a room whose log write failed: restart it, it reloads from the log. A systemd unit (example, not shipped yet):
+Exit status: 0 after SIGTERM or Ctrl-C, also during startup (it abandons startup); 3 when a newer owner took the room (the log line says `fenced by a newer owner current=<epoch>`): do not restart it, or two instances on one database fence each other in a loop; 1 for every other failure, including a room whose log write failed: restart it, it reloads from the log. A systemd unit (example, not shipped yet):
 ```ini
 [Service]
 ExecStart=/usr/local/bin/constellation-server --bundle /srv/constellation/seed.json --port 38281
@@ -75,10 +75,10 @@ We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo de
 Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
 - `just check`: the gate (fmt, clippy, typos, every test that needs no database including the end-to-end scenarios, docs, cargo-deny).
 - `just test-pg`: adds the Postgres tests (the store contract suite on Postgres, the gate G-DB fence race and cancel tests, and the `kill -9` restart scenarios in `crates/server/tests/restart.rs`). Needs `CONSTELLATION_DATABASE_URL`; each test makes its own schema. Without the URL they fail, they never skip. CI runs them against a Postgres 18 service container.
-- `just bench-pg`: the gate G-DB throughput benchmark (nightly CI; not for a shared developer box).
+- `just bench-pg`: the gate G-DB throughput benchmark (the manual `nightly` workflow; not for a shared developer box).
 - `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
 - `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
 
 ## Dev setup
-Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, unit tests), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, the same gate as CI). Needs `just`, `cargo-deny`, `typos`.
+Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, unit tests), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, a superset of CI). Needs `just`, `cargo-deny`, `typos`.
 Lints: every rustc and clippy group is `deny` (see `[workspace.lints]` in `Cargo.toml`), plus warnings as errors in CI. A new `allow` needs a `reason = "..."`.

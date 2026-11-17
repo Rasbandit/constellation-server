@@ -372,4 +372,22 @@ mod scenarios {
         let status = server.stop().unwrap();
         assert!(status.success(), "{status}");
     }
+
+    /// A supervisor may stop the server before it listens. Startup is held at its database
+    /// connection (a socket that accepts and never answers); SIGTERM there is a clean stop,
+    /// not a death by signal and not a wait for the database.
+    #[tokio::test]
+    async fn sigterm_during_startup_is_a_clean_stop() {
+        let db = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("postgres://u:p@{}/d", db.local_addr().unwrap());
+        let cmd = e2e::command(Path::new(BIN), &[], &[("CONSTELLATION_DATABASE_URL", &url)]);
+        let child = tokio::process::Command::from(cmd).kill_on_drop(true).spawn().unwrap();
+        let _held = tokio::time::timeout(e2e::GUARD, db.accept()).await.unwrap().unwrap();
+        e2e::sigterm(child.id().unwrap()).unwrap();
+        let out =
+            tokio::time::timeout(e2e::GUARD, child.wait_with_output()).await.unwrap().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{}; log:\n{log}", out.status);
+        assert!(log.contains("SIGTERM"), "{log}");
+    }
 }
