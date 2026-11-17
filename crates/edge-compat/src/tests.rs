@@ -1040,3 +1040,12 @@ async fn a_bounce_to_games_reaches_only_clients_of_those_games() {
     send(&mut a, &json!([{"cmd": "Bounce", "games": [GAME]}])).await;
     assert_eq!(pump(&mut b).await, [json!({"cmd": "Bounced", "games": [GAME]})]);
 }
+
+#[tokio::test]
+async fn slot_data_is_sent_when_connect_leaves_the_flag_out() {
+    // The reference server defaults the flag to true (MultiServer.py, `args.get("slot_data", True)`).
+    let mut s = Session::new(room());
+    let mut p = connect_packet("A", &json!(7));
+    p[0].as_object_mut().unwrap().remove("slot_data");
+    assert_eq!(send(&mut s, &p).await[0]["slot_data"], json!({"answer": 42}));
+}

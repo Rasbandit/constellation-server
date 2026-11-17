@@ -278,3 +278,8 @@ async fn subscribers_that_left_are_pruned_on_subscribe_even_in_a_quiet_room() {
     assert_eq!(h.subscribers().await.unwrap(), 1, "only the live one is kept");
     drop(kept);
 }
+
+#[test]
+fn a_room_error_displays_what_happened() {
+    assert_eq!(RoomError::Unavailable.to_string(), "room unavailable");
+}

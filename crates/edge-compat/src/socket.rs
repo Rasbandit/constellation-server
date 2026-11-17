@@ -30,6 +30,9 @@ pub fn ws_options(limits: &Limits, pool: DeflatePool) -> Options {
         .with_utf8()
 }
 
+/// Stands in for "no deadline" when the configured one is too far to represent.
+const A_YEAR: Duration = Duration::from_hours(8760);
+
 enum Input {
     Frame(yawc::Result<Frame>),
     ConnectTimeout,
@@ -59,7 +62,7 @@ where
     // A deadline too far to represent means: no deadline (a year is far enough).
     let connect_by = start
         .checked_add(Duration::from_millis(limits.connect_timeout_ms))
-        .unwrap_or_else(|| start.checked_add(Duration::from_hours(365 * 24)).unwrap_or(start));
+        .unwrap_or_else(|| start.checked_add(A_YEAR).unwrap_or(start));
     let idle = Duration::from_millis(limits.idle_timeout_ms);
     let mut ping = tokio::time::interval(Duration::from_millis(limits.ping_interval_ms.max(1)));
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
