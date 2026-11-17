@@ -59,7 +59,7 @@ jobs:
     env:
       CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
       # Mutated bodies leave unused variables and imports; with -D warnings (and the workspace's
-      # deny lints) almost every mutant failed to build and counted as unviable (755 of 761 on
+      # deny lints) such mutants fail to build and count as unviable (reproduced locally on
       # 2026-11-16). Lints are the other jobs' business; here they are capped (--cap-lints).
       RUSTFLAGS: ""
     steps:
@@ -68,4 +68,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-mutants }
-      - run: cargo mutants --workspace --cap-lints=true --cargo-arg=--locked --features log/pg-tests --features server/pg-tests --in-place --no-shuffle
+      # cargo-mutants builds each mutant with -p <its package>, so a workspace-style
+      # `--features log/pg-tests` made every build fail ("package does not contain this
+      # feature"): two runs, the Postgres crates with their own `pg-tests` feature, then the rest.
+      # crates/e2e is test helpers only (mutating them tests nothing in the product).
+      - run: cargo mutants --package log --package server --features pg-tests --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
+      - run: cargo mutants --workspace -e 'crates/log/**' -e 'crates/server/**' -e 'crates/e2e/**' --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
+        if: success() || failure()
