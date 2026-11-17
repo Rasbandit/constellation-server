@@ -50,6 +50,7 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 
 - **Coverage:** line coverage with `cargo-llvm-cov`, floor 90 percent on the workspace; leaf crates (`proto`, `spec-rng`, `rules`, `room-core`) aim for 100 percent of branches that are reachable. A coverage drop needs a reason in the PR.
 - **Mutation score:** nightly `cargo-mutants` on leaf crates; surviving mutants are triaged, not ignored. A survivor usually means a missing assertion.
+- **Mutation runs:** `.github/workflows/nightly.yml`, sharded (`mutants-pg` for `log` and `server` with Postgres, `mutants` for the rest). Each mutant runs the whole workspace's tests under nextest's `mutants` profile (`.config/nextest.toml`), so a test that hangs on a mutant fails instead of timing out; a test that can hang must still fail fast on its own where it can (wait on a signal, not a timer). The harness crates `e2e` and `sim` are not mutated. An equivalent mutant is excluded by name in the workflow, with its reason in a comment at the code.
 - **Test time:** a unit test over 1 second is a smell; the full unit suite should stay under about a minute.
 - **Nightly runs** use larger property case counts and longer simulations than PR runs. A nightly failure blocks the next release, not just the next PR.
 
