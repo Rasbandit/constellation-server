@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
@@ -47,6 +48,8 @@ pub struct Server {
     /// Where it listens.
     pub addr: SocketAddr,
     log: Arc<(Mutex<Vec<String>>, Condvar)>,
+    /// Set when the server's stderr closes (it exited), notified on the log's condvar.
+    closed: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -77,6 +80,8 @@ impl Server {
         let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
         let sink = Arc::clone(&log);
+        let closed = Arc::new(AtomicBool::new(false));
+        let eof = Arc::clone(&closed);
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Some(addr) = listening_addr(&line) {
@@ -85,12 +90,15 @@ impl Server {
                 sink.0.lock().unwrap_or_else(PoisonError::into_inner).push(line);
                 sink.1.notify_all();
             }
+            let _guard = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
+            eof.store(true, Ordering::SeqCst);
+            sink.1.notify_all();
         });
         let addr = rx.recv_timeout(GUARD).map_err(|_| {
             let lines = log.0.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
             format!("server never logged its address; log:\n{lines}")
         })?;
-        Ok(Self { child, addr, log })
+        Ok(Self { child, addr, log, closed })
     }
 
     /// `ws://` URL of the edge.
@@ -133,6 +141,26 @@ impl Server {
             Command::new("kill").args(["-TERM", &pid]).status().map_err(|e| e.to_string())?;
         if !sent.success() {
             return Err("kill -TERM failed".to_owned());
+        }
+        self.child.wait().map_err(|e| e.to_string())
+    }
+
+    /// Wait for the server to exit on its own (its stderr closing is the signal) and return
+    /// the status.
+    ///
+    /// # Errors
+    /// When it is still running after the guard timeout, with its log.
+    pub fn wait_exit(mut self) -> Res<ExitStatus> {
+        let (lines, cv) = &*self.log;
+        let (guard, _) = cv
+            .wait_timeout_while(lines.lock().unwrap_or_else(PoisonError::into_inner), GUARD, |_| {
+                !self.closed.load(Ordering::SeqCst)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let all = guard.join("\n");
+        drop(guard);
+        if !self.closed.load(Ordering::SeqCst) {
+            return Err(format!("server still running after {GUARD:?}; log:\n{all}"));
         }
         self.child.wait().map_err(|e| e.to_string())
     }

@@ -185,6 +185,68 @@ mod restart {
         assert_eq!((inv["index"].clone(), items(&inv)), (json!(0), want));
     }
 
+    /// Run one statement in the test's schema (fault injection and fence reads).
+    async fn sql(db: &str, q: &'static str) {
+        use sqlx::Connection;
+        let mut c = sqlx::PgConnection::connect(db).await.unwrap();
+        sqlx::raw_sql(q).execute(&mut c).await.unwrap();
+    }
+
+    async fn epoch(db: &str) -> i64 {
+        use sqlx::Connection;
+        let mut c = sqlx::PgConnection::connect(db).await.unwrap();
+        sqlx::query_scalar("SELECT epoch FROM room_owner").fetch_one(&mut c).await.unwrap()
+    }
+
+    /// Liveness: a room whose append fails stops, and so does the process (non-zero), so the
+    /// supervisor restarts it; the restart rebuilds from the log, nothing acknowledged is lost
+    /// and the refused check can be made again.
+    #[tokio::test]
+    async fn a_failed_append_exits_the_process_and_a_restart_recovers() {
+        let db = database().await;
+        let server = start(&db);
+        let own: Vec<i64> = locations_for(1, 1).unwrap().iter().take(2).map(|p| p.0).collect();
+        let (mut alice, _, _) = join(&server.url(), "Alice").await.unwrap();
+        alice.check(&own[..1]).await.unwrap();
+        alice.next_cmd("RoomUpdate").await.unwrap();
+        // The log holds seq 1 and 2 (a Checked and its Item); the next append must fail.
+        sql(&db, "ALTER TABLE events ADD CONSTRAINT fail_next CHECK (seq <= 2)").await;
+        alice.check(&own[1..]).await.unwrap();
+        let status = server.wait_exit().unwrap();
+        assert!(!status.success(), "a stopped room must stop the process: {status}");
+        sql(&db, "ALTER TABLE events DROP CONSTRAINT fail_next").await;
+        let server = start(&db);
+        let (mut alice, connected, _) = join(&server.url(), "Alice").await.unwrap();
+        assert_eq!(locations(&connected["checked_locations"]), own[..1]);
+        let (inv, _) = alice.next_cmd("ReceivedItems").await.unwrap();
+        assert_eq!(items(&inv), [(own[0], 1)]);
+        alice.check(&own[1..]).await.unwrap();
+        let (u, _) = alice.next_cmd("RoomUpdate").await.unwrap();
+        assert_eq!(locations(&u["checked_locations"]), own[1..]);
+    }
+
+    /// A mistaken second instance (same database, port already taken) must fail before it
+    /// claims the room: the epoch stays put and the live room keeps serving.
+    #[tokio::test]
+    async fn a_second_instance_on_a_taken_port_exits_without_fencing_the_live_room() {
+        let db = database().await;
+        let live = start(&db);
+        assert_eq!(epoch(&db).await, 1);
+        let port = live.addr.port().to_string();
+        let second = Server::start(
+            Path::new(BIN),
+            &["--port", &port],
+            &[("CONSTELLATION_DATABASE_URL", &db)],
+        );
+        assert!(second.is_err(), "the second instance must not listen");
+        assert_eq!(epoch(&db).await, 1, "the second instance claimed the room");
+        let (mut alice, _, _) = join(&live.url(), "Alice").await.unwrap();
+        let loc = locations_for(1, 1).unwrap()[0].0;
+        alice.check(&[loc]).await.unwrap();
+        let (u, _) = alice.next_cmd("RoomUpdate").await.unwrap();
+        assert_eq!(locations(&u["checked_locations"]), [loc]);
+    }
+
     #[tokio::test]
     async fn a_restart_with_a_different_bundle_for_the_same_room_is_refused() {
         let db = database().await;

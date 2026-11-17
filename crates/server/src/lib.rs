@@ -267,7 +267,7 @@ async fn shutdown() {
 
 // The integration tests in `tests/` use it; unit tests do not.
 #[cfg(test)]
-use e2e as _;
+use {e2e as _, sqlx as _};
 
 #[cfg(test)]
 mod tests {

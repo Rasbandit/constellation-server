@@ -424,6 +424,38 @@ mod pg_only {
         s.open_room(RoomId(2), "seed", &[1, 3]).await.unwrap();
     }
 
+    /// Issue 2805 workaround: a failed call never hands its connection back to the pool.
+    /// With one pooled connection, a success keeps the same backend and a failure replaces it.
+    #[tokio::test]
+    async fn an_error_closes_its_connection_instead_of_pooling_it() {
+        let url = crate::testing::fresh_schema(
+            &config::load_secrets().unwrap().database_url.expect("CONSTELLATION_DATABASE_URL"),
+        )
+        .await
+        .unwrap();
+        let s = PgLogStore::connect(&url, 1).await.unwrap();
+        let backend = || async {
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(s.pool_for_tests())
+                .await
+                .unwrap()
+        };
+        let e = s.claim(R).await.unwrap();
+        append(&s, e, &[ev(1)]).await.unwrap();
+        let before = backend().await;
+        append(&s, e, &[ev(2)]).await.unwrap();
+        assert_eq!(backend().await, before, "a success must keep its pooled connection");
+        assert!(matches!(
+            append(&s, Epoch(e.0 + 1), &[ev(3)]).await,
+            Err(AppendError::Fenced { .. })
+        ));
+        assert_ne!(backend().await, before, "the failed append's connection went back to the pool");
+        assert!(matches!(append(&s, e, &[ev(9)]).await, Err(AppendError::Corrupt(_))));
+        let after_corrupt = backend().await;
+        append(&s, e, &[ev(3)]).await.unwrap();
+        assert_eq!(backend().await, after_corrupt);
+    }
+
     #[tokio::test]
     async fn the_store_survives_a_reconnect_with_its_log_and_epoch() {
         let url = crate::testing::fresh_schema(

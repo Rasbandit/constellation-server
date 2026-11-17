@@ -130,6 +130,13 @@ impl PgLogStore {
         Ok(Self { pool })
     }
 
+    /// The pool, for tests that look at connections directly.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn pool_for_tests(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Run `body` on one pooled connection in its own task. Dropping the returned future does
     /// not cancel `body`; an error closes the connection rather than pooling it (issue 2805).
     async fn isolated<T, E>(

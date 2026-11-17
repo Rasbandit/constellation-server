@@ -42,6 +42,8 @@ yawc.workspace = true
 
 [dev-dependencies]
 e2e = { path = "../e2e" }
+# The restart scenarios inject faults and read the fence straight from the database.
+sqlx.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
 
 [lints]
