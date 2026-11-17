@@ -21,7 +21,7 @@ jobs:
     env:
       CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked --features log/pg-tests,server/pg-tests
@@ -42,7 +42,7 @@ jobs:
     env:
       CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked -p log@0.0.0 --features pg-bench --test throughput -- --nocapture
@@ -74,7 +74,7 @@ jobs:
       # 2026-11-16). Lints are the other jobs' business; here they are capped (--cap-lints).
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2

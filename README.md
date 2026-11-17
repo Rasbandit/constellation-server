@@ -3,7 +3,7 @@
 Rust server for Constellation, compatible with Archipelago clients through a single compat crate (`edge-compat`).
 Design lives in the sibling `constellation` repo, `docs/design/05-rust-architecture.md` (workspace, section 6) and `DECISIONS.md` (D-78: all Rust).
 
-Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. Internal, not for external use; text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
+Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. A proof of concept, not for production use; the plan is [`docs/ROADMAP.md`](docs/ROADMAP.md) and how to help is [`CONTRIBUTING.md`](CONTRIBUTING.md). Text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
 
 ## Layout
 - `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO. Also `Command`, `Event` and the id newtypes (`Cid`, `RoomId`, `Epoch`, `Timestamp`).
@@ -54,6 +54,8 @@ cd $ROOT
 Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-16). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.
 
 ## Licences
+This repo is source-available, not open source: [PolyForm Strict 1.0.0](LICENSE.md). You may read, run and test it for noncommercial purposes; commercial use, redistribution and derived works need a written license from the owner. Contributors get the extra permissions in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo dependencies; none of their source is in this repo. `THIRD_PARTY_NOTICES.md` is not written yet: it becomes required when we distribute a binary (it must then carry the notices of every bundled crate), and is created then.
 
 ## Known deviations from doc 05 7.1 and 7.2
