@@ -17,7 +17,7 @@ use edge_compat::CompatRoom;
 use log::{LogStore, MemLogStore, OpenError, PgLogStore};
 use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
-use runtime::RoomHandle;
+use runtime::{Mailbox, RoomHandle, Stopped};
 use seed_bundle::SeedBundle;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -25,6 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use yawc::{DeflatePool, IncomingUpgrade, Options};
 
 /// Command line settings.
@@ -139,14 +140,15 @@ async fn healthz(State(s): State<AppState>) -> (StatusCode, &'static str) {
 }
 
 /// Rebuild the room from `store` (snapshot, then the tail through `fold`, then the stored
-/// cursors) and start its task. `epoch` must be the claim just made.
+/// cursors) and start its task on `mailbox`. `epoch` must be the claim just made.
 async fn start_room<S: LogStore>(
+    mailbox: Mailbox,
     room: RoomId,
     epoch: Epoch,
     fresh: RoomState,
     store: Arc<S>,
     limits: Limits,
-) -> Result<RoomHandle, String> {
+) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
         Some(snap) => {
             let state: RoomState = serde_json::from_slice(&snap.data)
@@ -163,15 +165,15 @@ async fn start_room<S: LogStore>(
         state.restore_applied(c.slot, c.applied).map_err(|e| e.to_string())?;
     }
     tracing::info!(room = room.0, epoch = epoch.0, events, head = state.durable().0, "room loaded");
-    // The task ends with the process; a stopped room answers every request with Unavailable.
-    let (handle, _task) = RoomHandle::spawn(room, epoch, state, store, limits);
-    Ok(handle)
+    Ok(mailbox.spawn(room, epoch, state, store, limits))
 }
 
 /// Start the room for `loaded` and build the router.
 ///
-/// Also returns the room's handle: the caller exits when the room stops (see [`run`]). With `database_url` the log is in
-/// Postgres and the room is rebuilt from it; without, it is in memory and a restart loses it.
+/// Also returns the room task, whose value says why it stopped (see [`run`]). With
+/// `database_url` the log is in Postgres and the room is rebuilt from it; without, it is in
+/// memory and a restart loses it. Everything that can fail on the bundle alone runs before the
+/// room is claimed, so a bad bundle never fences a live room.
 ///
 /// # Errors
 /// A message when the bundle does not make a valid room, the database fails, or the stored
@@ -181,48 +183,48 @@ pub async fn app(
     password: Option<String>,
     database_url: Option<&str>,
     limits: Limits,
-) -> Result<(Router, RoomHandle), String> {
+) -> Result<(Router, JoinHandle<Stopped>), String> {
     let Loaded { bundle, hash } = loaded;
     let room = room_id(&bundle.seed_name);
     let fresh = RoomState::new(bundle.slot_nos(), bundle.placement()).map_err(|e| e.to_string())?;
-    let handle = if let Some(url) = database_url {
+    let (live, mailbox) = RoomHandle::mailbox(&limits);
+    let (seed_name, format) = (bundle.seed_name.clone(), bundle.format);
+    let compat = Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password, limits)?);
+    let task = if let Some(url) = database_url {
         let store = PgLogStore::connect(url, &limits)
             .await
             .map_err(|e| format!("postgres: {e:?} (see the log above)"))?;
-        match store.open_room(room, &bundle.seed_name, bundle.format, &hash).await {
+        match store.open_room(room, &seed_name, format, &hash).await {
             Ok(()) => {}
             Err(OpenError::OtherBundle) => {
                 return Err(format!(
-                    "the database holds room {:?} made from a different bundle with this seed \
-                     name; refusing to start",
-                    bundle.seed_name
+                    "the database holds room {seed_name:?} made from a different bundle with \
+                     this seed name; refusing to start"
                 ));
             }
             Err(OpenError::Store(e)) => return Err(format!("postgres: {e:?}")),
         }
         let epoch = store.claim(room).await.map_err(|e| format!("postgres: {e:?}"))?;
         tracing::info!("log store: postgres");
-        start_room(room, epoch, fresh, Arc::new(store), limits).await?
+        start_room(mailbox, room, epoch, fresh, Arc::new(store), limits).await?
     } else {
         tracing::warn!(
             "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the room"
         );
         let store = Arc::new(MemLogStore::new());
         let epoch = store.claim(room);
-        start_room(room, epoch, fresh, store, limits).await?
+        start_room(mailbox, room, epoch, fresh, store, limits).await?
     };
-    let live = handle.clone();
-    let room = Arc::new(CompatRoom::new(Arc::new(bundle), handle, password, limits)?);
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     let state = AppState {
-        room,
-        live: live.clone(),
+        room: compat,
+        live,
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
     let router =
         Router::new().route("/", get(upgrade)).route("/healthz", get(healthz)).with_state(state);
-    Ok((router, live))
+    Ok((router, task))
 }
 
 async fn upgrade(
@@ -262,17 +264,79 @@ pub fn init_logging() {
         .init();
 }
 
+/// Exit status when a newer owner fenced this process.
+///
+/// A supervisor must not restart it
+/// (systemd: `RestartPreventExitStatus=3`), or two instances on one database would fence each
+/// other in a loop. Every other failure exits 1 and should be restarted.
+pub const EXIT_FENCED: u8 = 3;
+
+/// Why [`run`] ended with an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// A newer owner holds the room ([`EXIT_FENCED`]).
+    Fenced {
+        /// The store's current epoch.
+        current: Epoch,
+    },
+    /// Anything else (exit 1): bad input, the socket, the database, a room that stopped.
+    Failed(String),
+}
+
+impl RunError {
+    /// The process exit status for this error.
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Fenced { .. } => EXIT_FENCED,
+            Self::Failed(_) => 1,
+        }
+    }
+}
+
+impl From<String> for RunError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl core::fmt::Display for RunError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fenced { current } => write!(
+                f,
+                "room fenced by a newer owner current={}; exiting with {EXIT_FENCED}, do not restart",
+                current.0
+            ),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// What the room task's end means for the process.
+fn room_ended(r: Result<Stopped, tokio::task::JoinError>) -> RunError {
+    match r {
+        Ok(Stopped::Fenced { current }) => RunError::Fenced { current },
+        Ok(Stopped::Failed) => RunError::Failed(
+            "the room stopped (see the log above); exiting so it restarts from the log".to_owned(),
+        ),
+        Ok(Stopped::Closed) => RunError::Failed("the room closed unexpectedly".to_owned()),
+        Err(e) => RunError::Failed(format!("the room task panicked or was cancelled: {e}")),
+    }
+}
+
 /// Bind, start the room, log the address, and serve until SIGTERM or Ctrl-C, or until the
 /// room stops.
 ///
 /// The port is bound before the room is claimed, so a mistaken second instance fails before
-/// it can fence the live one. A room that stops (its log refused or failed a write) ends the
-/// process with an error: the supervisor restarts it and the room reloads from the log,
-/// instead of answering every client with "unavailable" until someone notices.
+/// it can fence the live one. A room that stops ends the process: fenced by a newer owner
+/// with [`EXIT_FENCED`] (do not restart), otherwise with 1, so the supervisor restarts it and
+/// the room reloads from the log instead of answering every client with "unavailable".
 ///
 /// # Errors
-/// A message when the bundle, the socket or the database fails, or the room stopped.
-pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), String> {
+/// [`RunError::Fenced`], or [`RunError::Failed`] when the bundle, the socket or the database
+/// fails or the room stopped.
+pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), RunError> {
     let loaded = load_bundle(&args.bundle, &limits)?;
     let seed = loaded.bundle.seed_name.clone();
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
@@ -286,9 +350,7 @@ pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), Str
         .with_graceful_shutdown(shutdown());
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
-        () = room.stopped() => {
-            return Err("the room stopped (see the log above); exiting so it restarts from the log".to_owned());
-        }
+        r = room => return Err(room_ended(r)),
     }
     tracing::info!("stopped");
     Ok(())
@@ -403,6 +465,16 @@ mod tests {
         assert_ne!(bundle_hash(&text).unwrap(), bundle_hash(&v.to_string()).unwrap());
         assert_eq!(bundle_hash(&text).unwrap().len(), 32);
         assert!(bundle_hash("{not json").is_err());
+    }
+
+    #[test]
+    fn a_fence_exits_3_and_every_other_room_end_exits_1() {
+        let fenced = room_ended(Ok(Stopped::Fenced { current: Epoch(7) }));
+        assert_eq!(fenced.exit_code(), 3);
+        assert!(fenced.to_string().contains("fenced by a newer owner current=7"), "{fenced}");
+        assert_eq!(room_ended(Ok(Stopped::Failed)).exit_code(), 1);
+        assert_eq!(room_ended(Ok(Stopped::Closed)).exit_code(), 1);
+        assert_eq!(RunError::from("bind: in use".to_owned()).exit_code(), 1);
     }
 
     #[test]

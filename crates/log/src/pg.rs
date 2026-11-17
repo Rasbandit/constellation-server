@@ -124,6 +124,7 @@ impl PgLogStore {
     /// `Unavailable` when the URL is invalid, the database cannot be reached or a migration
     /// fails.
     pub async fn connect(url: &str, limits: &Limits) -> Result<Self, StoreError> {
+        // These session settings apply to the migrations below too (a stuck migration lock errors).
         let options = PgConnectOptions::from_str(url).map_err(|e| db::<StoreError>(&e))?.options([
             ("statement_timeout", limits.db_statement_timeout_ms),
             ("lock_timeout", limits.db_lock_timeout_ms),

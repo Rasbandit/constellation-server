@@ -12,7 +12,7 @@
 //! written to the store.
 
 use config::Limits;
-use log::{AppendBatch, LogStore};
+use log::{AppendBatch, AppendError, LogStore};
 use proto::{Command, Epoch, Event, RoomId, Seq, SlotNo, Timestamp};
 use room_core::{CoreError, Ctx, Reply, RoomState, apply};
 use std::sync::Arc;
@@ -78,6 +78,45 @@ enum RoomMsg {
     Subscribers { reply: oneshot::Sender<usize> },
 }
 
+/// Why a room task ended (the value of its `JoinHandle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// A newer owner holds the room (the store fenced an append). Do not restart this owner:
+    /// it would fence the new one in turn.
+    Fenced {
+        /// The store's current epoch.
+        current: Epoch,
+    },
+    /// The log failed or refused a write, or a read failed. Restart and reload from the log.
+    Failed,
+    /// Every handle was dropped.
+    Closed,
+}
+
+/// A room's mailbox before its task runs: lets the host build what needs a [`RoomHandle`]
+/// (and can fail) before it claims the room.
+#[derive(Debug)]
+pub struct Mailbox {
+    rx: mpsc::Receiver<RoomMsg>,
+}
+
+impl Mailbox {
+    /// Start the room task on this mailbox. `epoch` must be the owner epoch the store holds
+    /// for `room`. The task's value says why it stopped.
+    #[must_use]
+    pub fn spawn<S: LogStore>(
+        self,
+        room: RoomId,
+        epoch: Epoch,
+        state: RoomState,
+        store: Arc<S>,
+        limits: Limits,
+    ) -> JoinHandle<Stopped> {
+        let actor = Actor { room, epoch, state, store, limits, subs: Vec::new() };
+        tokio::spawn(actor.run(self.rx))
+    }
+}
+
 /// The edge's handle on a room. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct RoomHandle {
@@ -85,6 +124,13 @@ pub struct RoomHandle {
 }
 
 impl RoomHandle {
+    /// A handle and the mailbox it sends to; the room runs once [`Mailbox::spawn`] is called.
+    #[must_use]
+    pub fn mailbox(limits: &Limits) -> (Self, Mailbox) {
+        let (tx, rx) = mpsc::channel(limits.room_mailbox.max(1));
+        (Self { tx }, Mailbox { rx })
+    }
+
     /// Start the room task. `epoch` must be the owner epoch the store holds for `room`.
     #[must_use]
     pub fn spawn<S: LogStore>(
@@ -93,10 +139,9 @@ impl RoomHandle {
         state: RoomState,
         store: Arc<S>,
         limits: Limits,
-    ) -> (Self, JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel(limits.room_mailbox.max(1));
-        let actor = Actor { room, epoch, state, store, limits, subs: Vec::new() };
-        (Self { tx }, tokio::spawn(actor.run(rx)))
+    ) -> (Self, JoinHandle<Stopped>) {
+        let (handle, mailbox) = Self::mailbox(&limits);
+        (handle, mailbox.spawn(room, epoch, state, store, limits))
     }
 
     /// Apply commands in order as one durable batch. Each gets its own outcome; the whole reply
@@ -182,16 +227,16 @@ fn now() -> Timestamp {
 }
 
 impl<S: LogStore> Actor<S> {
-    async fn run(mut self, mut rx: mpsc::Receiver<RoomMsg>) {
+    async fn run(mut self, mut rx: mpsc::Receiver<RoomMsg>) -> Stopped {
         while let Some(msg) = rx.recv().await {
             let ok = match msg {
                 RoomMsg::Commands { cmds, reply } => match self.batch(cmds).await {
                     Ok(outcomes) => {
                         // A caller that went away does not stop the room.
                         drop(reply.send(outcomes));
-                        true
+                        Ok(())
                     }
-                    Err(()) => false,
+                    Err(why) => Err(why),
                 },
                 RoomMsg::Subscribe { after, reply } => {
                     // A cursor beyond the head is the caller's mistake: refuse it, keep serving.
@@ -200,13 +245,13 @@ impl<S: LogStore> Actor<S> {
                         continue;
                     }
                     let sub = self.subscribe(after).await;
-                    let ok = sub.is_ok();
+                    let ok = if sub.is_ok() { Ok(()) } else { Err(Stopped::Failed) };
                     drop(reply.send(sub));
                     ok
                 }
                 RoomMsg::Subscribers { reply } => {
                     let _ = reply.send(self.subs.len());
-                    true
+                    Ok(())
                 }
                 RoomMsg::Ext { from, body, done } => {
                     let msg = Arc::new(Published::Ext { from, body });
@@ -216,19 +261,24 @@ impl<S: LogStore> Actor<S> {
                         !matches!(tx.try_send(Arc::clone(&msg)), Err(TrySendError::Closed(_)))
                     });
                     let _ = done.send(());
-                    true
+                    Ok(())
                 }
             };
-            if !ok {
+            if let Err(why) = ok {
                 // The in-memory state may now be ahead of the log: stop rather than serve it.
-                tracing::error!(room = self.room.0, "room stopped: the log refused or failed");
-                return;
+                tracing::error!(
+                    room = self.room.0,
+                    ?why,
+                    "room stopped: the log refused or failed"
+                );
+                return why;
             }
         }
+        Stopped::Closed
     }
 
     /// Apply, append once, mark durable, publish, then reply. `Err` means the room must stop.
-    async fn batch(&mut self, cmds: Vec<Command>) -> Result<Vec<Outcome>, ()> {
+    async fn batch(&mut self, cmds: Vec<Command>) -> Result<Vec<Outcome>, Stopped> {
         let ctx = Ctx { now: now(), limits: &self.limits };
         let mut events = Vec::new();
         let mut outcomes = Vec::with_capacity(cmds.len());
@@ -248,16 +298,19 @@ impl<S: LogStore> Actor<S> {
                 AppendBatch { room: self.room, epoch: self.epoch, events: &events, cursors: &[] };
             if let Err(e) = self.store.append(batch).await {
                 tracing::error!(room = self.room.0, error = ?e, "append failed");
-                return Err(());
+                return Err(match e {
+                    AppendError::Fenced { current } => Stopped::Fenced { current },
+                    AppendError::Unavailable | AppendError::Corrupt(_) => Stopped::Failed,
+                });
             }
             if self.state.mark_durable(self.state.head()).is_err() {
-                return Err(());
+                return Err(Stopped::Failed);
             }
         }
         // Hold rule: every reply rests on something durable by now; if not, a bug lost a write.
         if wait > self.state.durable() {
             tracing::error!(room = self.room.0, wait = wait.0, "reply depends on a lost write");
-            return Err(());
+            return Err(Stopped::Failed);
         }
         if !events.is_empty() {
             self.publish(&Arc::new(Published::Events(events.into())));
