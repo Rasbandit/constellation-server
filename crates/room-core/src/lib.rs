@@ -433,15 +433,15 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
                 return Err(CoreError::UnknownSlot(slot));
             }
             let window = ctx.limits.dedupe_window_secs;
-            if let Some(d) = state.dedupe.get(&slot).and_then(|m| m.get(&cid)) {
-                if live(d.at, ctx.now, window) {
-                    let depends_on = state.wait_for(d.seq.0.saturating_add(1));
-                    return Ok(Applied {
-                        events: Vec::new(),
-                        reply: Reply::Checked { seq: d.seq },
-                        depends_on,
-                    });
-                }
+            if let Some(d) = state.dedupe.get(&slot).and_then(|m| m.get(&cid))
+                && live(d.at, ctx.now, window)
+            {
+                let depends_on = state.wait_for(d.seq.0.saturating_add(1));
+                return Ok(Applied {
+                    events: Vec::new(),
+                    reply: Reply::Checked { seq: d.seq },
+                    depends_on,
+                });
             }
             let (receiver, item) =
                 state.place(slot, location).ok_or(CoreError::UnknownLocation(location))?;

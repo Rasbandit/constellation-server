@@ -59,7 +59,7 @@ where
     // A deadline too far to represent means: no deadline (a year is far enough).
     let connect_by = start
         .checked_add(Duration::from_millis(limits.connect_timeout_ms))
-        .unwrap_or_else(|| start.checked_add(Duration::from_secs(365 * 86_400)).unwrap_or(start));
+        .unwrap_or_else(|| start.checked_add(Duration::from_hours(365 * 24)).unwrap_or(start));
     let idle = Duration::from_millis(limits.idle_timeout_ms);
     let mut ping = tokio::time::interval(Duration::from_millis(limits.ping_interval_ms.max(1)));
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);

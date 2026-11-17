@@ -1,16 +1,23 @@
 //! The log seam (doc 05 7.2, doc 02 D4): every read and write of a room's log goes through
 //! [`LogStore`]. `MemLogStore` is the in-memory implementation for tests and the simulator;
-//! Postgres comes later behind the same trait.
+//! `PgLogStore` (feature `postgres`, D-98) is the durable one. One contract suite
+//! (`src/contract.rs`) runs against both, so they cannot drift.
 //!
 //! Deviations from the doc sketch, both deliberate: no outbox rows yet, and `read_cursors`
 //! exists because rehydration needs the stored applied cursors (D-02) and snapshots hold only
 //! what the caller encodes.
 
 mod mem;
+#[cfg(feature = "postgres")]
+mod pg;
 
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 
 pub use mem::MemLogStore;
+#[cfg(feature = "pg-tests")]
+pub use pg::testing;
+#[cfg(feature = "postgres")]
+pub use pg::{OpenError, PgLogStore};
 
 /// Opaque snapshot of room state as of room `seq` `seq` (the caller owns the encoding).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,3 +124,6 @@ pub trait LogStore: Send + Sync + 'static {
         epoch: Epoch,
     ) -> impl Future<Output = Result<(), AppendError>> + Send;
 }
+
+#[cfg(test)]
+mod contract;

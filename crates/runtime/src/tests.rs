@@ -1,7 +1,7 @@
 // Expected events are read off the placement table below by hand.
 use super::*;
 use log::MemLogStore;
-use log::{AppendError, AppendReceipt, CursorUpdate, Snapshot, StoreError};
+use log::{AppendReceipt, CursorUpdate, Snapshot, StoreError};
 use proto::{Cid, EventKind, ItemSeq};
 use room_core::Placement;
 use std::collections::BTreeMap;
@@ -110,15 +110,32 @@ async fn an_empty_batch_and_a_refused_command_leave_the_room_serving() {
 
 #[tokio::test]
 async fn a_fenced_room_stops_and_every_handle_then_reports_unavailable() {
-    let (h, store) = start();
-    store.claim(ROOM); // another owner took the room
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(ROOM);
+    let (h, task) = RoomHandle::spawn(ROOM, epoch, state(), Arc::clone(&store), Limits::DESIGN);
+    assert!(h.is_running());
+    let current = store.claim(ROOM); // another owner took the room
     assert_eq!(h.command(check(1, 10)).await, Err(RoomError::Unavailable));
+    assert_eq!(task.await.unwrap(), Stopped::Fenced { current }, "the reason is reported");
+    h.stopped().await;
+    assert!(!h.is_running(), "a stopped room must not report itself running");
     assert_eq!(log_len(&store).await, 0, "a fenced writer must not land anything");
     assert_eq!(h.clone().subscribe(Seq(0)).await.err(), Some(RoomError::Unavailable));
     assert_eq!(
         h.ext(SlotNo(1), Arc::new(serde_json::json!({}))).await,
         Err(RoomError::Unavailable)
     );
+}
+
+#[tokio::test]
+async fn a_room_whose_handles_are_all_dropped_reports_closed() {
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(ROOM);
+    let (h, mailbox) = RoomHandle::mailbox(&Limits::DESIGN);
+    let task = mailbox.spawn(ROOM, epoch, state(), store, Limits::DESIGN);
+    assert!(h.command(check(1, 10)).await.unwrap().is_ok(), "a handle made before spawn works");
+    drop(h);
+    assert_eq!(task.await.unwrap(), Stopped::Closed);
 }
 
 #[tokio::test]
@@ -211,18 +228,18 @@ impl LogStore for GatedStore {
     }
 }
 
-fn gated(fail: bool) -> (RoomHandle, Arc<GatedStore>) {
+fn gated(fail: bool) -> (RoomHandle, Arc<GatedStore>, JoinHandle<Stopped>) {
     let inner = MemLogStore::new();
     let epoch = inner.claim(ROOM);
     let store =
         Arc::new(GatedStore { inner, fail, started: Notify::new(), release: Notify::new() });
-    let (h, _task) = RoomHandle::spawn(ROOM, epoch, state(), Arc::clone(&store), Limits::DESIGN);
-    (h, store)
+    let (h, task) = RoomHandle::spawn(ROOM, epoch, state(), Arc::clone(&store), Limits::DESIGN);
+    (h, store, task)
 }
 
 #[tokio::test]
 async fn nothing_is_published_or_replied_while_the_append_is_in_flight() {
-    let (h, store) = gated(false);
+    let (h, store, _task) = gated(false);
     let mut sub = h.subscribe(Seq(0)).await.unwrap();
     let pending = tokio::spawn({
         let h = h.clone();
@@ -238,11 +255,14 @@ async fn nothing_is_published_or_replied_while_the_append_is_in_flight() {
 
 #[tokio::test]
 async fn a_failed_append_publishes_nothing_to_any_subscriber() {
-    let (h, store) = gated(true);
+    let (h, store, task) = gated(true);
     let mut a = h.subscribe(Seq(0)).await.unwrap();
     let mut b = h.subscribe(Seq(0)).await.unwrap();
     assert_eq!(h.command(check(1, 10)).await, Err(RoomError::Unavailable));
     store.started.notified().await;
+    h.stopped().await;
+    assert!(!h.is_running());
+    assert_eq!(task.await.unwrap(), Stopped::Failed, "a store failure is not a fence");
     // The room stopped, so the queues end, and they end empty.
     assert_eq!(a.live.recv().await, None);
     assert_eq!(b.live.recv().await, None);

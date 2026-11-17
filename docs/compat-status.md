@@ -2,7 +2,7 @@
 
 What `edge-compat` supports today, checked against Archipelago's protocol document (`docs/network protocol.md` in the Archipelago repository, read at the 0.6.8 checkout pinned by Archipela-Go, 2026-11-16). Internal note; anything external needs the review in the design repo's `CLAUDE.md`.
 
-Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client), `ap::` is `crates/e2e-ap/src/lib.rs` (the real binary driven by `archipelago_rs` 3.0.1), `unit::` is `crates/edge-compat/src/tests.rs` (a session over a real room task).
+Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client), `restart::` is `crates/server/tests/restart.rs` (real binary on Postgres, killed and restarted), `ap::` is `crates/e2e-ap/src/lib.rs` (the real binary driven by `archipelago_rs` 3.0.1), `unit::` is `crates/edge-compat/src/tests.rs` (a session over a real room task).
 
 ## Client to server
 
@@ -46,10 +46,15 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 | Connection cap, timeouts | Over `max_connections`, HTTP 503. No slot connected within 30 s: closed. Pinged every 20 s; nothing heard for 60 s: closed. All from `config`. | `e2e::connections_over_the_cap_get_503_and_a_freed_slot_is_reused`, `e2e::a_socket_that_never_connects_to_a_slot_is_closed_and_a_connected_one_is_not`, `e2e::a_peer_that_stops_answering_pings_is_closed_as_idle`, `e2e::a_quiet_client_that_answers_pings_stays_open_past_the_idle_timeout` |
 | Room password | From `CONSTELLATION_ROOM_PASSWORD` or a file, never a flag. | `e2e::a_bad_password_is_refused_with_invalid_password`, `e2e::the_password_can_come_from_a_file_and_never_from_the_command_line` |
 | `/healthz`, SIGTERM | `ok`; a clean exit. | `e2e::healthz_answers_ok`, `e2e::the_server_stops_cleanly_on_sigterm` |
+| Restart durability | With `CONSTELLATION_DATABASE_URL` the room is in Postgres: after `kill -9` or SIGTERM and a restart, each slot's checked locations, its whole inventory from index 0 exactly once, and the goal are kept; a repeated check still delivers nothing and the next item continues the index. A check whose `RoomUpdate` reached the client before the crash is never lost. A different bundle under the same seed name is refused. Without a URL the log is in memory and a restart loses the room (logged as a warning). | `restart::a_room_survives_kill_9_with_every_item_once_and_its_goal`, `restart::a_room_survives_a_graceful_sigterm_restart`, `restart::a_check_acknowledged_before_kill_9_is_never_lost`, `restart::a_restart_with_a_different_bundle_for_the_same_room_is_refused` |
 
 ## Not implemented yet
 
 Release, collect and remaining (and their `!` commands); hints and hint points spending; data storage (`Set`, `SetNotify`, `SetReply`); starting inventory and group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; client statuses other than the goal; `TagsChanged` prints; TLS (put a terminator in front).
+
+## Known deviation: applied cursors are not persisted
+
+Doc 02 D3 asks for each slot's applied cursor (`applied_seq`, what the client confirmed) to be persisted at most once a second. Today the runtime does not write acks to the store (`crates/runtime/src/lib.rs`, module docs), so `slot_cursors` stays empty and a restart starts every slot's applied cursor at 0. Nothing a client sees depends on it yet: the compatible edge resends the whole inventory from index 0 on every connect, which is what the protocol document asks for. Follow-up: batch acks into the room's next append (`AppendBatch::cursors`, already stored and restored on start) or a once-a-second flush, before any feature reads the applied cursor (resume from a cursor, delivery metrics).
 
 ## Known interop finding (not a defect of our server)
 

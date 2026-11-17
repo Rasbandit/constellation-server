@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
@@ -47,6 +48,8 @@ pub struct Server {
     /// Where it listens.
     pub addr: SocketAddr,
     log: Arc<(Mutex<Vec<String>>, Condvar)>,
+    /// Set when the server's stderr closes (it exited), notified on the log's condvar.
+    closed: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -63,6 +66,10 @@ impl Server {
             .arg(fixture_path())
             .args(["--port", "0"])
             .args(extra)
+            // A scenario says which database it uses; it never inherits one (CI sets the URL
+            // for the Postgres tests, and parallel servers must not share a room).
+            .env_remove("CONSTELLATION_DATABASE_URL")
+            .env_remove("CONSTELLATION_DATABASE_URL_FILE")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -73,6 +80,8 @@ impl Server {
         let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
         let sink = Arc::clone(&log);
+        let closed = Arc::new(AtomicBool::new(false));
+        let eof = Arc::clone(&closed);
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Some(addr) = listening_addr(&line) {
@@ -81,12 +90,15 @@ impl Server {
                 sink.0.lock().unwrap_or_else(PoisonError::into_inner).push(line);
                 sink.1.notify_all();
             }
+            let _guard = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
+            eof.store(true, Ordering::SeqCst);
+            sink.1.notify_all();
         });
         let addr = rx.recv_timeout(GUARD).map_err(|_| {
             let lines = log.0.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
             format!("server never logged its address; log:\n{lines}")
         })?;
-        Ok(Self { child, addr, log })
+        Ok(Self { child, addr, log, closed })
     }
 
     /// `ws://` URL of the edge.
@@ -130,6 +142,36 @@ impl Server {
         if !sent.success() {
             return Err("kill -TERM failed".to_owned());
         }
+        self.child.wait().map_err(|e| e.to_string())
+    }
+
+    /// Wait for the server to exit on its own (its stderr closing is the signal) and return
+    /// the status.
+    ///
+    /// # Errors
+    /// When it is still running after the guard timeout, with its log.
+    pub fn wait_exit(mut self) -> Res<ExitStatus> {
+        let (lines, cv) = &*self.log;
+        let (guard, _) = cv
+            .wait_timeout_while(lines.lock().unwrap_or_else(PoisonError::into_inner), GUARD, |_| {
+                !self.closed.load(Ordering::SeqCst)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let all = guard.join("\n");
+        drop(guard);
+        if !self.closed.load(Ordering::SeqCst) {
+            return Err(format!("server still running after {GUARD:?}; log:\n{all}"));
+        }
+        self.child.wait().map_err(|e| e.to_string())
+    }
+
+    /// `kill -9`: SIGKILL, no shutdown path runs. Returns once the process is gone.
+    ///
+    /// # Errors
+    /// When the signal cannot be sent or the wait fails.
+    pub fn kill(mut self) -> Res<ExitStatus> {
+        // std's `Child::kill` sends SIGKILL on Unix.
+        self.child.kill().map_err(|e| e.to_string())?;
         self.child.wait().map_err(|e| e.to_string())
     }
 }
@@ -252,6 +294,14 @@ impl Client {
         }
     }
 
+    /// Send one `LocationChecks` for these locations.
+    ///
+    /// # Errors
+    /// When the socket fails.
+    pub async fn check(&mut self, locations: &[i64]) -> Res<()> {
+        self.send(&serde_json::json!([{"cmd": "LocationChecks", "locations": locations}])).await
+    }
+
     /// Close politely.
     ///
     /// # Errors
@@ -262,6 +312,38 @@ impl Client {
             .await
             .map_err(|e| e.to_string())
     }
+}
+
+/// The fixture's locations in `from`'s world whose item goes to `to`, as (location, item,
+/// flags), in fixture order.
+///
+/// # Errors
+/// When the fixture is missing or has no slot `from`.
+pub fn locations_for(from: u32, to: u32) -> Res<Vec<(i64, i64, u8)>> {
+    let b = fixture()?;
+    let slot = b.slot(from).ok_or_else(|| format!("no slot {from}"))?;
+    Ok(slot
+        .locations
+        .iter()
+        .filter(|p| p.receiver == to)
+        .map(|p| (p.location, p.item, p.flags))
+        .collect())
+}
+
+/// Connect to `url` as slot `name` (no password) and return the client, the `Connected`
+/// packet and anything that came before it.
+///
+/// # Errors
+/// When the socket fails or the first packet is not `RoomInfo`.
+pub async fn join(url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
+    let mut c = Client::connect(url).await?;
+    let info = c.next().await?;
+    if info.get("cmd").and_then(Value::as_str) != Some("RoomInfo") {
+        return Err(format!("first packet is not RoomInfo: {info}"));
+    }
+    c.send(&connect_packet(name, None)).await?;
+    let (connected, skipped) = c.next_cmd("Connected").await?;
+    Ok((c, connected, skipped))
 }
 
 /// A `Connect` packet for the fixture's game.

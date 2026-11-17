@@ -1,0 +1,178 @@
+//! Gate G-DB throughput microbenchmark (doc 11 section 4.8): 1,000 rooms, 20 ms windows,
+//! reporting committed rows per second. Nightly CI only (`--features pg-bench`), never the PR
+//! gate: runner variance would make it flaky.
+//!
+//! Two writers, both fenced the way `PgLogStore` fences (owner rows locked `FOR SHARE`):
+//! - **store** (gated): `PgLogStore::append`, the shipped writer, one transaction per room
+//!   batch, all rooms concurrently each window. Floor: 1,000 rows per second, 1.5 times the
+//!   Stage 1 peak of 666 rows per second that doc 12 section 3.3 estimates for 5,900 games a
+//!   day (estimated there, not measured). Not 3 times: this path is one commit (one fsync)
+//!   per room batch, and GitHub runners measured 4,881, 5,130 and 1,780 rows per second on
+//!   2026-11-16 for unchanged writer code, so a 2,000 floor would fail on runner variance.
+//! - **group** (reported, not gated): one transaction per window for every room's events with
+//!   `UNNEST`, hand-written here. It is the target for the cross-room group-commit writer of
+//!   doc 02 section 5.4, which is not built yet; its bar will be 60 percent of the 20,000 rows
+//!   per second design value (12,000) once that writer exists.
+//!
+//! `COPY` into a temp table is not measured: it needs a second statement per window and only
+//! pays off for much larger batches than 1,000 to 2,000 rows (deferred, docs/TESTING.md).
+#![allow(
+    unused_crate_dependencies,
+    reason = "an integration test sees every dependency of the log crate"
+)]
+#![allow(clippy::arithmetic_side_effects, reason = "benchmark counters stay small")]
+#![allow(clippy::print_stdout, reason = "the benchmark prints its numbers for the CI log")]
+
+#[cfg(test)]
+mod bench {
+    use log::{AppendBatch, LogStore, PgLogStore};
+    use proto::{Cid, Epoch, Event, EventKind, RoomId, Seq, SlotNo, Timestamp};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const ROOMS: u64 = 1_000;
+    const WINDOW: Duration = Duration::from_millis(20);
+    /// Events per room per window offered to the group writer: 2,000 rows per 20 ms window is
+    /// 100,000 rows per second offered, five times the design value, so the writer is the limit.
+    const ROWS_PER_ROOM: u64 = 2;
+    const RUN: Duration = Duration::from_secs(10);
+    const DESIGN_ROWS_PER_SEC: f64 = 20_000.0;
+    /// Target for the future group-commit writer (G-DB): 60 percent of the design value.
+    const GROUP_TARGET: f64 = 0.6 * DESIGN_ROWS_PER_SEC;
+    /// Gate for the shipped writer: 1.5 times doc 12 section 3.3's Stage 1 peak (666/s), below
+    /// the slowest runner seen (1,780/s).
+    const STORE_FLOOR: f64 = 1_000.0;
+
+    fn ev(seq: u64) -> Event {
+        Event {
+            seq: Seq(seq),
+            slot: Some(SlotNo(1)),
+            kind: EventKind::Checked {
+                cid: Cid(seq),
+                location: 123_456,
+                at: Timestamp(1_763_000_000),
+            },
+        }
+    }
+
+    async fn setup() -> (PgLogStore, sqlx::PgPool, Vec<Epoch>) {
+        let base = config::load_secrets()
+            .unwrap()
+            .database_url
+            .expect("pg-bench needs CONSTELLATION_DATABASE_URL (no silent skip)");
+        let url = log::testing::fresh_schema(&base).await.unwrap();
+        let store = PgLogStore::connect(&url, &config::Limits::DESIGN).await.unwrap();
+        let pool =
+            sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await.unwrap();
+        // One bulk claim for every room (epoch 1, as a first `claim` returns).
+        sqlx::query(
+            "INSERT INTO room_owner (room_id, epoch) SELECT r, 1 FROM generate_series(1, $1) r",
+        )
+        .bind(i64::try_from(ROOMS).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        (store, pool, (0..ROOMS).map(|_| Epoch(1)).collect())
+    }
+
+    fn report(name: &str, rows: u64, elapsed: Duration, bar: f64) -> f64 {
+        let rate = f64::from(u32::try_from(rows).unwrap()) / elapsed.as_secs_f64();
+        println!(
+            "G-DB throughput [{name}]: {rows} rows in {elapsed:.2?} = {rate:.0} rows/s (bar {bar:.0}; measured on this runner)"
+        );
+        rate
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_shipped_writer_commits_at_least_the_stage_1_floor_of_rows_per_second() {
+        let (store, pool, _) = setup().await;
+        let rooms: Vec<i64> = (1..=i64::try_from(ROOMS).unwrap()).collect();
+        let body = serde_json::to_vec(&ev(1)).unwrap();
+
+        // Group commit: every room's window in one fenced transaction.
+        let start = Instant::now();
+        let (mut window, mut rows) = (0_u64, 0_u64);
+        while start.elapsed() < RUN {
+            let tick = Instant::now();
+            let (mut room_col, mut seq_col) = (Vec::new(), Vec::new());
+            for &r in &rooms {
+                for k in 1..=ROWS_PER_ROOM {
+                    room_col.push(r);
+                    seq_col.push(i64::try_from(window * ROWS_PER_ROOM + k).unwrap());
+                }
+            }
+            let bodies = vec![body.clone(); room_col.len()];
+            let mut tx = pool.begin().await.unwrap();
+            let fenced: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM (SELECT 1 FROM room_owner \
+                 WHERE room_id = ANY($1) AND epoch = 1 FOR SHARE) t",
+            )
+            .bind(&rooms)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(fenced, i64::try_from(ROOMS).unwrap(), "every room's epoch is current");
+            sqlx::query(
+                "INSERT INTO events (room_id, seq, body) \
+                 SELECT * FROM UNNEST($1::int8[], $2::int8[], $3::bytea[])",
+            )
+            .bind(&room_col)
+            .bind(&seq_col)
+            .bind(&bodies)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            rows += u64::try_from(room_col.len()).unwrap();
+            window += 1;
+            if let Some(rest) = WINDOW.checked_sub(tick.elapsed()) {
+                tokio::time::sleep(rest).await; // pacing the windows, not waiting for a result
+            }
+        }
+        report(
+            "group commit target, UNNEST, writer not built",
+            rows,
+            start.elapsed(),
+            GROUP_TARGET,
+        );
+
+        // The store as the server uses it: one transaction per room per window, rooms in
+        // parallel. These rooms start fresh (ids above the group rooms).
+        let store = Arc::new(store);
+        let start = Instant::now();
+        let (mut window, mut rows) = (0_u64, 0_u64);
+        while start.elapsed() < RUN {
+            let tick = Instant::now();
+            let tasks: Vec<_> = (0..ROOMS)
+                .map(|r| {
+                    let s = Arc::clone(&store);
+                    tokio::spawn(async move {
+                        let room = RoomId(ROOMS + 1 + r);
+                        let events = [ev(window + 1)];
+                        s.append(AppendBatch {
+                            room,
+                            epoch: Epoch(0),
+                            events: &events,
+                            cursors: &[],
+                        })
+                        .await
+                        .unwrap();
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            rows += ROOMS;
+            window += 1;
+            if let Some(rest) = WINDOW.checked_sub(tick.elapsed()) {
+                tokio::time::sleep(rest).await;
+            }
+        }
+        let rate = report("PgLogStore::append per room, gated", rows, start.elapsed(), STORE_FLOOR);
+        assert!(
+            rate >= STORE_FLOOR,
+            "PgLogStore::append {rate:.0} rows/s is below the Stage 1 floor {STORE_FLOOR:.0}"
+        );
+    }
+}

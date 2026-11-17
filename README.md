@@ -3,14 +3,14 @@
 Rust server for Constellation, compatible with Archipelago clients through a single compat crate (`edge-compat`).
 Design lives in the sibling `constellation` repo, `docs/design/05-rust-architecture.md` (workspace, section 6) and `DECISIONS.md` (D-78: all Rust).
 
-Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in memory (Postgres follows, D-98). Internal, not for external use; text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
+Status: first milestone (D-100). One process hosts one room from a seed bundle and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. Internal, not for external use; text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
 
 ## Layout
 - `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO. Also `Command`, `Event` and the id newtypes (`Cid`, `RoomId`, `Epoch`, `Timestamp`).
 - `crates/spec-rng`: the pinned random stream and sampling rules (doc 01 D3.2), with golden vectors from an independent Python reference.
 - `crates/config`: the only home of limits and the only crate that reads environment variables (doc 05 6.2 rule 5). `no_std` without the default `std` feature (only `load` needs std).
 - `crates/room-core`: the pure room state machine (`RoomState`, `apply`, `fold`), `no_std` + alloc. No clock, no rng, no IO.
-- `crates/log`: the `LogStore` seam with epoch-fenced append (doc 05 7.2) and `MemLogStore` for tests and the simulator.
+- `crates/log`: the `LogStore` seam with epoch-fenced append (doc 05 7.2), `MemLogStore` for tests and the simulator, and `PgLogStore` (feature `postgres`, sqlx, D-98). One contract suite (`src/contract.rs`) runs against both stores. Migrations are plain SQL in `migrations/`, applied by the server at start.
 - `crates/sim`: the deterministic simulator. `cargo test -p sim` runs `SIM_SEEDS` seeds (default 64); `SIM_SEED=<n> cargo test -p sim` replays one.
 - `crates/seed-bundle`: the JSON seed bundle schema (one room's slots, placements, data packages, `slot_data`, options) and its validation on load.
 - `crates/runtime`: the room actor on tokio (D-99: an in-process seam). Applies command batches, appends them in one fenced write, publishes, then replies (the hold rule).
@@ -20,7 +20,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle a
 - `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
 
-Next crates, in doc 05 section 20 order: `edge-native`, then Postgres behind `LogStore` (D-98).
+Next crates, in doc 05 section 20 order: `edge-native`.
 
 ## Run the server
 ```sh
@@ -28,6 +28,18 @@ cargo run -p server --bin constellation-server -- --bundle crates/e2e/fixtures/t
 ```
 Then point a client compatible with Archipelago at `ws://localhost:38281` with slot `Alice` or `Bob` and game `Archipela-Go 2: Electric Boogaloo`. Flags: `--host <ip>` (default 127.0.0.1). `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. SIGTERM or Ctrl-C stops it.
 The room password is never a flag (it would show in `ps`): set `CONSTELLATION_ROOM_PASSWORD`, or `CONSTELLATION_ROOM_PASSWORD_FILE` to a file whose first line is the password; it overrides the seed's. Limits come from `crates/config` (design values), some overridable by environment: `CONSTELLATION_MAX_CONNECTIONS` (10 000; over it, HTTP 503), `CONSTELLATION_CONNECT_TIMEOUT_MS` (30 000: a socket with no slot connected by then is closed), `CONSTELLATION_IDLE_TIMEOUT_MS` (60 000) and `CONSTELLATION_PING_INTERVAL_MS` (20 000).
+
+### With Postgres (the room survives restarts)
+Set `CONSTELLATION_DATABASE_URL` (or `CONSTELLATION_DATABASE_URL_FILE`, a file whose first line is the URL; never a flag, since the URL can hold a password) to a database the server may create tables in, for example `postgres://constellation@localhost/constellation`. At Stage 0 and 1 Postgres runs on the same box (doc 12), no pooler in between. On start the server applies the migrations, claims the room (bumping its owner epoch, so an older process still running can no longer write), and rebuilds it from the log before it listens; the log line `room loaded ... events=<n>` says how much it read. The room id comes from the seed name; a restart with a different bundle under the same seed name is refused. Without a URL the server logs `log store: IN MEMORY` as a warning and a restart loses the room. Pool size and session timeouts come from `crates/config` (design values): `db_pool_connections` 8, `statement_timeout` 10 s, `lock_timeout` 5 s, `idle_in_transaction_session_timeout` 10 s. A URL parameter sqlx does not recognise is refused at start (sqlx would log it with its value). If the room stops (its log refused or failed a write) the process exits non-zero so a supervisor restarts it and the room reloads; `GET /healthz` answers 503 `room stopped` meanwhile.
+
+Exit status: 0 after SIGTERM or Ctrl-C; 3 when a newer owner took the room (the log line says `fenced by a newer owner current=<epoch>`): do not restart it, or two instances on one database fence each other in a loop; 1 for every other failure, including a room whose log write failed: restart it, it reloads from the log. A systemd unit (example, not shipped yet):
+```ini
+[Service]
+ExecStart=/usr/local/bin/constellation-server --bundle /srv/constellation/seed.json --port 38281
+EnvironmentFile=/etc/constellation/env
+Restart=on-failure
+RestartPreventExitStatus=3
+```
 
 ## Regenerate the fixture
 The fixture is a two-slot seed of the owner's game (player options in `crates/e2e/fixtures/players/`), made with Archipelago's own generator and the Archipela-Go apworld, then converted by `tools/ap-import`. The raw `.archipelago` file is not committed.
@@ -50,6 +62,7 @@ We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo de
 - `fold(snapshot, limits, tail)` takes the limits and returns `Result`; `Ctx::limits` is a borrow.
 - `Applied` has one `reply` plus `depends_on` (the hold rule: do not release a reply until that `seq` is durable), and no `effects`.
 - `LogStore` has `read_cursors` and no outbox rows yet. `Cid` and `RoomId` are integers.
+- The Postgres schema (`migrations/0001_log.sql`) is doc 02 section 5.5 cut down: no foreign keys, unencrypted event bodies, the latest snapshot only, cursors in `slot_cursors`. `seq`, `item_seq` and epochs above `i64::MAX` are refused by `PgLogStore` (Postgres has no unsigned 64-bit type).
 
 ## Rules (doc 05 6.2)
 1. L0/L1 crates never depend on tokio, sqlx, axum, a clock or an OS RNG.
@@ -58,7 +71,9 @@ We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo de
 
 ## Testing
 Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
-- `just check`: the gate (fmt, clippy, typos, every test including the end-to-end scenarios, docs, cargo-deny).
+- `just check`: the gate (fmt, clippy, typos, every test that needs no database including the end-to-end scenarios, docs, cargo-deny).
+- `just test-pg`: adds the Postgres tests (the store contract suite on Postgres, the gate G-DB fence race and cancel tests, and the `kill -9` restart scenarios in `crates/server/tests/restart.rs`). Needs `CONSTELLATION_DATABASE_URL`; each test makes its own schema. Without the URL they fail, they never skip. CI runs them against a Postgres 18 service container.
+- `just bench-pg`: the gate G-DB throughput benchmark (nightly CI; not for a shared developer box).
 - `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
 - `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
 

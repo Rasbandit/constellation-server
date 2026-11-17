@@ -7,7 +7,7 @@ members = ["crates/proto", "crates/config", "crates/spec-rng", "crates/room-core
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85" # shortcut: placeholder MSRV, owner sets the window (design doc 05 section 19)
+rust-version = "1.94" # sqlx 0.9.0 needs 1.94 (D-98). shortcut: placeholder MSRV, owner sets the window (doc 05 section 19)
 publish = false # published crates flip this per crate (doc 05 6.1)
 description = "Constellation server workspace"
 repository = "https://github.com/Rasbandit/constellation-server"
@@ -22,6 +22,9 @@ tokio = { version = "1", default-features = false }
 tracing = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # D-97: yawc pinned to a master commit past 0.5.0 (multi-offer and split-header fixes); no TLS.
+# D-98: sqlx 0.9.0 with workarounds for issue 2805 (see crates/log/src/pg.rs), no ORM.
+# `macros` only for `migrate!`; no `query!` macros (they need a database at compile time).
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "migrate", "macros"] }
 yawc = { git = "https://github.com/infinitefield/yawc", rev = "91ed74f47622ca3b18ebba8b75b66ded56c7fdfd", default-features = false, features = ["axum"] }
 
 [workspace.lints.rust]
