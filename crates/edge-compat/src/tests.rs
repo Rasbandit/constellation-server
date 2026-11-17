@@ -74,6 +74,7 @@ async fn send(s: &mut Session, v: &Value) -> Vec<Value> {
 /// the room dropped the queue (as the socket loop does).
 async fn pump(s: &mut Session) -> Vec<Value> {
     let mut frames = Vec::new();
+    let mut resyncs = 0..100;
     loop {
         let next = match s.live() {
             Some(rx) => rx.try_recv(),
@@ -82,7 +83,11 @@ async fn pump(s: &mut Session) -> Vec<Value> {
         match next {
             Ok(p) => frames.extend(s.on_published(&p).unwrap()),
             Err(TryRecvError::Empty) => return packets(&frames),
-            Err(TryRecvError::Disconnected) => frames.extend(s.resync().await.unwrap()),
+            Err(TryRecvError::Disconnected) => {
+                // A resync that does not resubscribe leaves the queue closed: fail, do not spin.
+                assert!(resyncs.next().is_some(), "resync did not give the session a live queue");
+                frames.extend(s.resync().await.unwrap());
+            }
         }
     }
 }
@@ -856,4 +861,182 @@ async fn items_handling_is_read_as_bits_like_the_reference_so_minus_one_and_true
     assert_eq!(of(&pump(&mut all).await, "ReceivedItems").len(), 1);
     assert_eq!(of(&pump(&mut remote).await, "ReceivedItems").len(), 0);
     assert_eq!(of(&pump(&mut none).await, "ReceivedItems").len(), 0);
+}
+
+// The tests below pin behaviour the nightly mutation run showed was unasserted. Packet shapes
+// follow the protocol document's PrintJSON table (which fields each type carries) and its
+// JSONMessagePart table (a `player_id` part carries the slot id as a decimal string).
+
+#[test]
+fn polling_a_bucket_often_does_not_stop_it_refilling() {
+    use std::time::{Duration, Instant};
+    // 500 milli-tokens a second: one token every 2 s (hand calculation: 1000 / 500).
+    let t0 = Instant::now();
+    let mut b = limit::Bucket::new(1, 500, t0);
+    assert!(b.take(t0));
+    // Asked every millisecond, each call alone gains less than one milli-token.
+    let mut refilled_at = None;
+    for ms in 1..=2000 {
+        if b.take(t0 + Duration::from_millis(ms)) {
+            refilled_at = Some(ms);
+            break;
+        }
+    }
+    assert_eq!(refilled_at, Some(2000), "small gains must accumulate, not be dropped");
+}
+
+#[test]
+fn a_known_key_in_a_full_rate_table_keeps_its_own_tokens() {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let table = RateTable::new(2, 0, 1);
+    assert!(table.take(1_u32, t0));
+    assert!(table.take(1_u32, t0), "the table is full, but key 1 is already in it");
+    assert!(!table.take(1_u32, t0), "and its burst of 2 is spent");
+}
+
+#[tokio::test]
+async fn a_session_is_joined_only_after_a_successful_connect() {
+    let mut s = Session::new(room());
+    assert!(!s.is_joined());
+    send(&mut s, &connect_packet("Nobody", &json!(7))).await;
+    assert!(!s.is_joined(), "a refused Connect does not join");
+    send(&mut s, &connect_packet("A", &json!(7))).await;
+    assert!(s.is_joined());
+}
+
+#[tokio::test]
+async fn a_join_print_carries_the_joiners_team_slot_and_tags() {
+    let room = room();
+    let mut watcher = joined(&room, "A").await;
+    pump(&mut watcher).await;
+    let mut b = Session::new(Arc::clone(&room));
+    send(&mut b, &connect_packet("B", &json!(7))).await;
+    assert_eq!(
+        pump(&mut watcher).await,
+        [json!({"cmd": "PrintJSON", "type": "Join",
+            "data": [{"type": "player_id", "text": "2"}, {"text": " joined the room."}],
+            "team": 0, "slot": 2, "tags": ["AP"]})]
+    );
+}
+
+#[tokio::test]
+async fn leaving_tells_the_others_with_a_part_print() {
+    let room = room();
+    let mut watcher = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    pump(&mut watcher).await;
+    b.leave().await;
+    assert!(!b.is_joined());
+    assert_eq!(
+        pump(&mut watcher).await,
+        [json!({"cmd": "PrintJSON", "type": "Part",
+            "data": [{"type": "player_id", "text": "2"}, {"text": " left the room."}],
+            "team": 0, "slot": 2})]
+    );
+    b.leave().await;
+    assert_eq!(pump(&mut watcher).await, Vec::<Value>::new(), "a second leave says nothing");
+}
+
+#[tokio::test]
+async fn a_status_other_than_goal_announces_no_goal() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    pump(&mut b).await;
+    // CLIENT_READY (10) and CLIENT_PLAYING (20) are not CLIENT_GOAL (30).
+    for status in [10, 20] {
+        send(&mut a, &json!([{"cmd": "StatusUpdate", "status": status}])).await;
+    }
+    assert_eq!(pump(&mut b).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn a_goal_print_names_the_player_and_skips_no_text_clients() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    let mut quiet = Session::new(Arc::clone(&room));
+    let mut p = connect_packet("B", &json!(7));
+    p[0]["tags"] = json!(["AP", "NoText"]);
+    send(&mut quiet, &p).await;
+    pump(&mut b).await;
+    pump(&mut quiet).await;
+    send(&mut a, &json!([{"cmd": "StatusUpdate", "status": 30}])).await;
+    assert_eq!(
+        pump(&mut b).await,
+        [json!({"cmd": "PrintJSON", "type": "Goal",
+            "data": [{"type": "player_id", "text": "1"}, {"text": " reached their goal."}],
+            "team": 0, "slot": 1})]
+    );
+    assert_eq!(pump(&mut quiet).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn chat_and_command_prints_have_the_shape_clients_display() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    send(&mut a, &json!([{"cmd": "Say", "text": "hello"}])).await;
+    // The reference server prefixes the sender's alias (MultiServer.py, ClientMessageProcessor).
+    assert_eq!(
+        pump(&mut a).await,
+        [json!({"cmd": "PrintJSON", "type": "Chat", "data": [{"text": "A: hello"}],
+            "team": 0, "slot": 1, "message": "hello"})]
+    );
+    assert_eq!(
+        send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await,
+        [json!({"cmd": "PrintJSON", "type": "CommandResult",
+            "data": [{"text": "Commands are not supported by this server yet."}]})]
+    );
+}
+
+#[tokio::test]
+async fn a_bounce_exactly_at_the_size_cap_is_accepted() {
+    let mut a = joined(&limited(TIGHT), "A").await;
+    let mut p = json!({"cmd": "Bounce", "data": ""});
+    let pad = TIGHT.bounce_max_bytes - p.to_string().len();
+    p["data"] = json!("y".repeat(pad));
+    assert_eq!(p.to_string().len(), TIGHT.bounce_max_bytes);
+    assert_eq!(send(&mut a, &json!([p])).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn a_client_without_a_game_or_a_no_game_tag_is_refused_invalid_game() {
+    // The reference waives the game check only for an empty game with a no-game tag.
+    let mut s = Session::new(room());
+    let mut p = connect_packet("A", &json!(7));
+    p[0]["game"] = json!("");
+    assert_eq!(send(&mut s, &p).await[0]["errors"], json!(["InvalidGame"]));
+}
+
+#[tokio::test]
+async fn a_client_at_exactly_the_minimum_version_connects() {
+    // Slot A's minimum is 0.5.0; the reference refuses only a version below it.
+    let mut s = Session::new(room());
+    let mut p = connect_packet("A", &json!(7));
+    p[0]["version"] = json!({"major": 0, "minor": 5, "build": 0});
+    assert_eq!(send(&mut s, &p).await[0]["cmd"], "Connected");
+}
+
+#[tokio::test]
+async fn another_slots_check_sends_no_room_update() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    pump(&mut a).await;
+    check(&mut b, &[100]).await;
+    // RoomUpdate's checked_locations are the receiving client's own new checks.
+    assert_eq!(of(&pump(&mut a).await, "RoomUpdate"), Vec::<&Value>::new());
+}
+
+#[tokio::test]
+async fn a_bounce_to_games_reaches_only_clients_of_those_games() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    pump(&mut b).await;
+    send(&mut a, &json!([{"cmd": "Bounce", "games": ["Other"]}])).await;
+    assert_eq!(pump(&mut b).await, Vec::<Value>::new(), "B plays G, not Other");
+    send(&mut a, &json!([{"cmd": "Bounce", "games": [GAME]}])).await;
+    assert_eq!(pump(&mut b).await, [json!({"cmd": "Bounced", "games": [GAME]})]);
 }
