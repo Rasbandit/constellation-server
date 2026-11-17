@@ -213,7 +213,8 @@ mod restart {
         sql(&db, "ALTER TABLE events ADD CONSTRAINT fail_next CHECK (seq <= 2)").await;
         alice.check(&own[1..]).await.unwrap();
         let status = server.wait_exit().unwrap();
-        assert!(!status.success(), "a stopped room must stop the process: {status}");
+        // 1 is the generic failure: restart me (3 is reserved for "fenced", below).
+        assert_eq!(status.code(), Some(1), "a stopped room must stop the process: {status}");
         sql(&db, "ALTER TABLE events DROP CONSTRAINT fail_next").await;
         let server = start(&db);
         let (mut alice, connected, _) = join(&server.url(), "Alice").await.unwrap();
@@ -238,13 +239,31 @@ mod restart {
             &["--port", &port],
             &[("CONSTELLATION_DATABASE_URL", &db)],
         );
-        assert!(second.is_err(), "the second instance must not listen");
+        let err = second.unwrap_err();
+        assert!(err.contains("bind:"), "the second instance must fail on the port: {err}");
         assert_eq!(epoch(&db).await, 1, "the second instance claimed the room");
         let (mut alice, _, _) = join(&live.url(), "Alice").await.unwrap();
         let loc = locations_for(1, 1).unwrap()[0].0;
         alice.check(&[loc]).await.unwrap();
         let (u, _) = alice.next_cmd("RoomUpdate").await.unwrap();
         assert_eq!(locations(&u["checked_locations"]), [loc]);
+    }
+
+    /// A newer owner took the room: the old process exits with its own code (3, the
+    /// documented do-not-restart status) and says so, so a supervisor does not bring it back
+    /// to fence the new owner in turn.
+    #[tokio::test]
+    async fn a_fenced_server_exits_with_the_fenced_code_and_says_why() {
+        let db = database().await;
+        let server = start(&db);
+        let (mut alice, _, _) = join(&server.url(), "Alice").await.unwrap();
+        // What a second instance's claim does.
+        sql(&db, "UPDATE room_owner SET epoch = epoch + 1").await;
+        alice.check(&[locations_for(1, 1).unwrap()[0].0]).await.unwrap();
+        let line = server.wait_for_log("fenced by a newer owner").unwrap();
+        assert!(line.contains("current=2"), "{line}");
+        let status = server.wait_exit().unwrap();
+        assert_eq!(status.code(), Some(3), "{status}");
     }
 
     #[tokio::test]
