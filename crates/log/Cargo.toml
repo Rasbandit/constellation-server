@@ -13,7 +13,7 @@ categories.workspace = true
 
 [features]
 # The Postgres store (D-98). Off for crates that only need the trait and `MemLogStore`.
-postgres = ["dep:sqlx", "dep:tokio", "dep:serde_json", "dep:tracing"]
+postgres = ["dep:config", "dep:sqlx", "dep:tokio", "dep:serde_json", "dep:tracing"]
 # Runs the contract suite and the G-DB tests against a real Postgres. Needs
 # CONSTELLATION_DATABASE_URL and fails loudly without it (docs/TESTING.md rule 5).
 pg-tests = ["postgres"]
@@ -25,6 +25,7 @@ name = "throughput"
 required-features = ["pg-bench"]
 
 [dependencies]
+config = { path = "../config", optional = true }
 proto = { path = "../proto" }
 serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

@@ -68,6 +68,14 @@ pub struct Limits {
     /// Postgres connections the log store's pool may open (one box, Postgres on the same
     /// box, doc 12 Stage 0 and 1; design value, not measured).
     pub db_pool_connections: u32,
+    /// Postgres `statement_timeout` for the log store's sessions (design value).
+    pub db_statement_timeout_ms: u64,
+    /// Postgres `lock_timeout`: a claim or a write waiting on a row lock held by a stuck
+    /// writer errors after this instead of hanging (design value).
+    pub db_lock_timeout_ms: u64,
+    /// Postgres `idle_in_transaction_session_timeout`: the server ends a session that sits in
+    /// an open transaction this long, releasing its locks (design value).
+    pub db_idle_in_transaction_timeout_ms: u64,
 }
 
 impl Limits {
@@ -99,6 +107,9 @@ impl Limits {
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
         db_pool_connections: 8,
+        db_statement_timeout_ms: 10_000,
+        db_lock_timeout_ms: 5_000,
+        db_idle_in_transaction_timeout_ms: 10_000,
     };
 }
 
@@ -196,10 +207,61 @@ fn secrets_from(
     var: impl Fn(&str) -> Option<String>,
     read: impl Fn(&std::path::Path) -> std::io::Result<String>,
 ) -> Result<Secrets, String> {
+    let database_url = var_or_file("CONSTELLATION_DATABASE_URL", &var, &read)?;
+    if let Some(url) = &database_url {
+        check_database_url(url)?;
+    }
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
-        database_url: var_or_file("CONSTELLATION_DATABASE_URL", &var, &read)?,
+        database_url,
     })
+}
+
+/// URL parameters sqlx 0.9.0 understands (`sqlx-postgres` `options/parse.rs`), plus
+/// `options[<setting>]`. sqlx logs any other one with its value, so those are refused.
+#[cfg(feature = "std")]
+const DATABASE_URL_PARAMS: &[&str] = &[
+    "sslmode",
+    "ssl-mode",
+    "sslrootcert",
+    "ssl-root-cert",
+    "ssl-ca",
+    "sslcert",
+    "ssl-cert",
+    "sslkey",
+    "ssl-key",
+    "statement-cache-capacity",
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "password",
+    "application_name",
+    "options",
+];
+
+/// Refuse a parameter sqlx would ignore and log. The error never shows the URL or the key: a
+/// misplaced secret must not reach the log.
+#[cfg(feature = "std")]
+fn check_database_url(url: &str) -> Result<(), String> {
+    let query = url.split_once('?').map_or("", |(_, q)| q);
+    let query = query.split_once('#').map_or(query, |(q, _)| q);
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+        let bracketed = key
+            .strip_prefix("options[")
+            .and_then(|k| k.strip_suffix(']'))
+            .is_some_and(|k| !k.is_empty());
+        if !(bracketed || DATABASE_URL_PARAMS.contains(&key)) {
+            return Err(format!(
+                "CONSTELLATION_DATABASE_URL has a parameter sqlx does not recognise (not \
+                 shown, so it cannot leak into the log); allowed: {}, options[<setting>]",
+                DATABASE_URL_PARAMS.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -277,6 +339,35 @@ mod tests {
         assert!(!format!("{s:?}").contains("hunter2"), "the URL can hold a password");
     }
 
+    /// sqlx logs a connect parameter it does not know, value included, so such URLs are
+    /// refused here, and the error never echoes the URL. Known names are sqlx 0.9.0's
+    /// (`sqlx-postgres` `options/parse.rs`).
+    #[test]
+    fn a_database_url_with_a_parameter_sqlx_ignores_is_refused_without_echoing_it() {
+        let url = |u: &'static str| {
+            secrets_from(
+                move |k: &str| (k == "CONSTELLATION_DATABASE_URL").then(|| u.to_owned()),
+                |_| Ok(String::new()),
+            )
+        };
+        for bad in [
+            "postgres://h/db?pasword=s3cret",
+            "postgres://h/db?sslmode=require&s3cret=1",
+            "postgres://h/db?=s3cret",
+            "postgres://h/db?options[=s3cret",
+        ] {
+            let e = url(bad).unwrap_err();
+            assert!(e.contains("parameter") && !e.contains("s3cret"), "{bad}: {e}");
+        }
+        for good in [
+            "postgres://u:p@h:5432/db",
+            "postgres://h/db?sslmode=require&application_name=c&options[search_path]=t_1",
+            "postgres://h/db?options=-c%20x%3D1&user=u&password=p&port=1&dbname=d",
+        ] {
+            assert_eq!(url(good).unwrap().database_url.as_deref(), Some(good), "{good}");
+        }
+    }
+
     #[test]
     fn secrets_print_redacted() {
         let s = Secrets { room_password: Some("hunter2".to_owned()), database_url: None };
@@ -304,5 +395,9 @@ mod tests {
         assert_eq!((l.connect_burst, l.connect_refill_milli_per_sec), (10, 1000));
         assert_eq!(l.rate_table_max_keys, 100_000);
         assert_eq!(l.db_pool_connections, 8);
+        assert_eq!(
+            (l.db_statement_timeout_ms, l.db_lock_timeout_ms, l.db_idle_in_transaction_timeout_ms),
+            (10_000, 5_000, 10_000)
+        );
     }
 }

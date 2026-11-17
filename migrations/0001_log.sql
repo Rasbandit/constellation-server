@@ -6,9 +6,13 @@
 
 CREATE TABLE rooms (
     room_id     bigint PRIMARY KEY,
-    seed_name   text        NOT NULL,
-    -- SHA-256 of the seed bundle the room was made from; a restart with another bundle is refused.
-    bundle_hash bytea       NOT NULL,
+    seed_name     text        NOT NULL,
+    -- The bundle schema version (`seed_bundle::FORMAT`) the room was made from.
+    bundle_format integer     NOT NULL CHECK (bundle_format >= 0),
+    -- SHA-256 of the bundle file's canonical JSON (keys sorted, no whitespace); a restart
+    -- with another bundle is refused. It hashes the file, not our Rust type, so a compatible
+    -- change to the bundle type keeps stored rooms.
+    bundle_hash   bytea       NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 

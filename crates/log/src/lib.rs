@@ -127,7 +127,3 @@ pub trait LogStore: Send + Sync + 'static {
 
 #[cfg(test)]
 mod contract;
-
-// Only the Postgres half of the contract suite reads the database URL from `config`.
-#[cfg(all(test, not(feature = "pg-tests")))]
-use config as _;

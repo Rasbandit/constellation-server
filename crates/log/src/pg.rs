@@ -23,12 +23,14 @@
 use crate::{
     AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, Snapshot, StoreError,
 };
+use config::Limits;
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{PgPool, Postgres};
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::str::FromStr;
 
 /// The embedded migrations (`migrations/` at the workspace root).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -113,14 +115,23 @@ fn decode(seq: i64, body: &[u8]) -> Result<Event, StoreError> {
 }
 
 impl PgLogStore {
-    /// Connect with a pool of `connections` and apply any pending migrations.
+    /// Connect with the pool size and session timeouts from `limits`, and apply any pending
+    /// migrations. The timeouts bound every wait: a writer that hangs mid-transaction is ended
+    /// by the server (`idle_in_transaction_session_timeout`), and a claim or write queued
+    /// behind it errors (`lock_timeout`) rather than blocking startup or the room forever.
     ///
     /// # Errors
-    /// `Unavailable` when the database cannot be reached or a migration fails.
-    pub async fn connect(url: &str, connections: u32) -> Result<Self, StoreError> {
+    /// `Unavailable` when the URL is invalid, the database cannot be reached or a migration
+    /// fails.
+    pub async fn connect(url: &str, limits: &Limits) -> Result<Self, StoreError> {
+        let options = PgConnectOptions::from_str(url).map_err(|e| db::<StoreError>(&e))?.options([
+            ("statement_timeout", limits.db_statement_timeout_ms),
+            ("lock_timeout", limits.db_lock_timeout_ms),
+            ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
+        ]);
         let pool = PgPoolOptions::new()
-            .max_connections(connections.max(1))
-            .connect(url)
+            .max_connections(limits.db_pool_connections.max(1))
+            .connect_with(options)
             .await
             .map_err(|e| db::<StoreError>(&e))?;
         MIGRATOR.run(&pool).await.map_err(|e| {
@@ -161,7 +172,8 @@ impl PgLogStore {
         task.await.unwrap_or_else(|_| Err(E::unavailable()))
     }
 
-    /// Record which bundle made `room`, or check it against the record.
+    /// Record which bundle made `room` (its format version and content hash), or check the
+    /// hash against the record.
     ///
     /// # Errors
     /// `OtherBundle` when the room was created from a different bundle, `Store` on failure.
@@ -169,6 +181,7 @@ impl PgLogStore {
         &self,
         room: RoomId,
         seed_name: &str,
+        bundle_format: u32,
         bundle_hash: &[u8],
     ) -> Result<(), OpenError> {
         let (seed, hash) = (seed_name.to_owned(), bundle_hash.to_vec());
@@ -176,11 +189,12 @@ impl PgLogStore {
             .isolated(move |c| {
                 Box::pin(async move {
                     sqlx::query(
-                        "INSERT INTO rooms (room_id, seed_name, bundle_hash) VALUES ($1, $2, $3) \
-                         ON CONFLICT (room_id) DO NOTHING",
+                        "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash) \
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (room_id) DO NOTHING",
                     )
                     .bind(room_key(room))
                     .bind(seed)
+                    .bind(i64::from(bundle_format))
                     .bind(&hash)
                     .execute(&mut *c)
                     .await

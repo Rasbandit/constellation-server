@@ -407,33 +407,67 @@ mod pg_only {
     use super::*;
     use crate::{OpenError, PgLogStore};
 
+    fn pool(connections: u32) -> config::Limits {
+        config::Limits { db_pool_connections: connections, ..config::Limits::DESIGN }
+    }
+
+    async fn schema() -> String {
+        crate::testing::fresh_schema(
+            &config::load_secrets().unwrap().database_url.expect("CONSTELLATION_DATABASE_URL"),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Gate G-DB: a writer stuck inside a transaction while holding the owner row lock must
+    /// not block a claim forever; with `lock_timeout` the claim errors, and once the stuck
+    /// session ends the claim works.
+    #[tokio::test]
+    async fn a_claim_behind_a_stuck_lock_holder_errors_at_the_lock_timeout() {
+        use sqlx::Connection;
+        let url = schema().await;
+        let limits = config::Limits { db_lock_timeout_ms: 200, ..pool(2) };
+        let s = PgLogStore::connect(&url, &limits).await.unwrap();
+        assert_eq!(s.claim(R).await.unwrap(), Epoch(1));
+        let mut stuck = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql("BEGIN; SELECT epoch FROM room_owner FOR SHARE")
+            .execute(&mut stuck)
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(10), s.claim(R)).await;
+        assert_eq!(
+            r.expect("the claim hung past its lock timeout"),
+            Err(crate::StoreError::Unavailable)
+        );
+        sqlx::raw_sql("ROLLBACK").execute(&mut stuck).await.unwrap();
+        assert_eq!(s.claim(R).await.unwrap(), Epoch(2));
+    }
+
     /// A store on a fresh schema of the database at `CONSTELLATION_DATABASE_URL`.
     pub(super) async fn pg_store() -> PgLogStore {
         let url = config::load_secrets().unwrap().database_url.expect(
             "pg-tests needs CONSTELLATION_DATABASE_URL (docs/TESTING.md rule 5: no silent skip)",
         );
-        PgLogStore::connect(&crate::testing::fresh_schema(&url).await.unwrap(), 4).await.unwrap()
+        PgLogStore::connect(&crate::testing::fresh_schema(&url).await.unwrap(), &pool(4))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn a_room_reopens_with_its_bundle_and_refuses_another() {
         let s = pg_store().await;
-        s.open_room(R, "seed", &[1, 2]).await.unwrap();
-        s.open_room(R, "seed", &[1, 2]).await.unwrap();
-        assert_eq!(s.open_room(R, "seed", &[1, 3]).await, Err(OpenError::OtherBundle));
-        s.open_room(RoomId(2), "seed", &[1, 3]).await.unwrap();
+        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
+        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
+        assert_eq!(s.open_room(R, "seed", 1, &[1, 3]).await, Err(OpenError::OtherBundle));
+        s.open_room(RoomId(2), "seed", 1, &[1, 3]).await.unwrap();
     }
 
     /// Issue 2805 workaround: a failed call never hands its connection back to the pool.
     /// With one pooled connection, a success keeps the same backend and a failure replaces it.
     #[tokio::test]
     async fn an_error_closes_its_connection_instead_of_pooling_it() {
-        let url = crate::testing::fresh_schema(
-            &config::load_secrets().unwrap().database_url.expect("CONSTELLATION_DATABASE_URL"),
-        )
-        .await
-        .unwrap();
-        let s = PgLogStore::connect(&url, 1).await.unwrap();
+        let url = schema().await;
+        let s = PgLogStore::connect(&url, &pool(1)).await.unwrap();
         let backend = || async {
             sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
                 .fetch_one(s.pool_for_tests())
@@ -458,17 +492,13 @@ mod pg_only {
 
     #[tokio::test]
     async fn the_store_survives_a_reconnect_with_its_log_and_epoch() {
-        let url = crate::testing::fresh_schema(
-            &config::load_secrets().unwrap().database_url.expect("CONSTELLATION_DATABASE_URL"),
-        )
-        .await
-        .unwrap();
-        let a = PgLogStore::connect(&url, 1).await.unwrap();
+        let url = schema().await;
+        let a = PgLogStore::connect(&url, &pool(1)).await.unwrap();
         let e = a.claim(R).await.unwrap();
         put(&a, R, e, &evs(1..=2), &[cur(2, 1)]).await.unwrap();
         drop(a);
         // A second connect runs the migrations again (a no-op) and sees everything.
-        let b = PgLogStore::connect(&url, 1).await.unwrap();
+        let b = PgLogStore::connect(&url, &pool(1)).await.unwrap();
         assert_eq!(log(&b, R).await, evs(1..=2));
         assert_eq!(b.read_cursors(R).await.unwrap(), [cur(2, 1)]);
         assert_eq!(b.claim(R).await.unwrap(), Epoch(2));
