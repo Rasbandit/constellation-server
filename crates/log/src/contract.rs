@@ -272,7 +272,7 @@ async fn fence_race<S: Store>(s: Arc<S>, unclaimed: bool, base: u64) {
         let old = if unclaimed { Epoch(0) } else { s.bump(room).await };
         let claimed = Arc::new(AtomicBool::new(false));
         let first = Arc::new(Notify::new());
-        let writer = tokio::spawn({
+        let mut writer = tokio::spawn({
             let (s, claimed, first) = (Arc::clone(&s), Arc::clone(&claimed), Arc::clone(&first));
             async move {
                 let mut next = 1_u64;
@@ -294,8 +294,13 @@ async fn fence_race<S: Store>(s: Arc<S>, unclaimed: bool, base: u64) {
             }
         });
         // Half the rounds claim mid-stream, half as early as possible.
+        // A writer that ends (fenced, or panicking) before its first commit would leave this
+        // wait hanging; it is a failure, so it must fail fast.
         if i % 2 == 0 {
-            first.notified().await;
+            tokio::select! {
+                () = first.notified() => {}
+                r = &mut writer => panic!("room {room:?}: writer ended before committing: {r:?}"),
+            }
         }
         let new = s.bump(room).await;
         claimed.store(true, Ordering::SeqCst);

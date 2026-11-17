@@ -1,3 +1,4 @@
 /target
 __pycache__/
 /crates/e2e-ap/target
+/mutants.out*

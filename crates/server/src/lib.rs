@@ -402,6 +402,15 @@ use {e2e as _, sqlx as _};
 mod tests {
     use super::*;
 
+    // Without a subscriber the server never logs its listening line, and every end-to-end
+    // test would wait out its guard timeout instead of failing here in milliseconds.
+    #[test]
+    fn init_logging_installs_the_global_subscriber() {
+        assert!(!tracing::dispatcher::has_been_set(), "no other unit test installs one");
+        init_logging();
+        assert!(tracing::dispatcher::has_been_set());
+    }
+
     fn parse(s: &str) -> Result<Args, String> {
         Args::parse(s.split_whitespace().map(str::to_owned))
     }

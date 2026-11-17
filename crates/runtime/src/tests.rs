@@ -278,3 +278,38 @@ async fn subscribers_that_left_are_pruned_on_subscribe_even_in_a_quiet_room() {
     assert_eq!(h.subscribers().await.unwrap(), 1, "only the live one is kept");
     drop(kept);
 }
+
+#[test]
+fn a_room_error_displays_what_happened() {
+    assert_eq!(RoomError::Unavailable.to_string(), "room unavailable");
+}
+
+#[tokio::test]
+async fn a_later_batch_that_writes_nothing_is_still_answered() {
+    let (h, _) = start();
+    h.command(check(1, 10)).await.unwrap().unwrap();
+    // Both replies rest on writes that are already durable, so nothing new is appended.
+    let ack = Command::Ack { slot: SlotNo(2), applied: ItemSeq(1) };
+    assert_eq!(h.command(ack).await.unwrap(), Ok(Reply::Acked { applied: ItemSeq(1) }));
+    assert_eq!(h.command(check(1, 10)).await.unwrap(), Ok(Reply::Checked { seq: Seq(1) }));
+    assert!(h.is_running());
+}
+
+#[tokio::test]
+async fn the_subscriber_count_is_the_number_of_live_subscriptions() {
+    let (h, _) = start();
+    assert_eq!(h.subscribers().await.unwrap(), 0);
+    let (a, b) = (h.subscribe(Seq(0)).await.unwrap(), h.subscribe(Seq(0)).await.unwrap());
+    assert_eq!(h.subscribers().await.unwrap(), 2);
+    drop((a, b));
+}
+
+#[tokio::test]
+async fn stopped_stays_pending_while_the_room_runs() {
+    let (h, _) = start();
+    tokio::select! {
+        biased;
+        () = h.stopped() => panic!("stopped resolved for a running room"),
+        () = std::future::ready(()) => {}
+    }
+}

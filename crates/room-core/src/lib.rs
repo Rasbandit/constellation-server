@@ -235,11 +235,14 @@ impl RoomState {
         if self.dedupe.keys().any(|s| !self.slots.contains_key(s)) {
             return bad("dedupe entry for a missing slot");
         }
-        if self.dedupe.values().flat_map(BTreeMap::values).any(|d| d.seq > self.head) {
-            return bad("dedupe entry beyond the head");
+        // A dedupe entry and a check record the `Checked` event, which its `Item` event always
+        // follows, so in a valid snapshot both sit below the head.
+        if self.dedupe.values().flat_map(BTreeMap::values).any(|d| d.seq >= self.head) {
+            return bad("dedupe entry at or beyond the head");
         }
-        if self.checked_pairs().any(|(from, l, s)| self.place(from, l).is_none() || s > self.head) {
-            return bad("checked location outside the placement or beyond the head");
+        if self.checked_pairs().any(|(from, l, s)| self.place(from, l).is_none() || s >= self.head)
+        {
+            return bad("checked location outside the placement or at or beyond the head");
         }
         if self.goals.iter().any(|(slot, s)| !self.slots.contains_key(slot) || *s > self.head) {
             return bad("goal for a missing slot or beyond the head");

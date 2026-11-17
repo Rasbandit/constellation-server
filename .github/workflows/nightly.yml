@@ -46,8 +46,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked -p log@0.0.0 --features pg-bench --test throughput -- --nocapture
-  mutants:
+  # cargo-mutants, sharded (`--shard k/n`, round-robin so slow mutants spread out). One run over
+  # the whole workspace did not fit a runner: 600-odd mutants, some of them hanging tests until
+  # their timeout. Each shard runs the unmutated baseline, then its share of the mutants.
+  # cargo-mutants builds each mutant with -p <its package>, so a workspace-style
+  # `--features log/pg-tests` made every build fail ("package does not contain this feature"):
+  # the Postgres crates run in their own job with their own `pg-tests` feature.
+  mutants-pg:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     # Postgres for the log store's contract suite and the restart scenarios (D-98, gate G-DB).
     # A throwaway container; the password is not a secret.
     services:
@@ -62,16 +73,63 @@ jobs:
       # deny lints) such mutants fail to build and count as unviable (reproduced locally on
       # 2026-11-16). Lints are the other jobs' business; here they are capped (--cap-lints).
       RUSTFLAGS: ""
+      # As in `mutants`: a test that hangs on a mutant fails (.config/nextest.toml).
+      NEXTEST_PROFILE: mutants
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
-        with: { tool: cargo-mutants }
-      # cargo-mutants builds each mutant with -p <its package>, so a workspace-style
-      # `--features log/pg-tests` made every build fail ("package does not contain this
-      # feature"): two runs, the Postgres crates with their own `pg-tests` feature, then the rest.
-      # crates/e2e is test helpers only (mutating them tests nothing in the product).
-      - run: cargo mutants --package log --package server --features pg-tests --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
-      - run: cargo mutants --workspace -e 'crates/log/**' -e 'crates/server/**' -e 'crates/e2e/**' --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
-        if: success() || failure()
+        with: { tool: "cargo-mutants,cargo-nextest" }
+      # Excluded: one equivalent mutant, `&&` to `||` in log's `fence` (reasoning in the comment
+      # above that line in crates/log/src/pg.rs). Matched by name, not line number; the unit test
+      # `fence_has_exactly_the_one_and_the_mutants_exclusion_names` fails if `fence` gains a
+      # second `&&` that this pattern would also hide.
+      - run: >-
+          cargo mutants --package log --package server --features pg-tests
+          --exclude-re 'pg\.rs:[0-9]+:[0-9]+: replace && with \|\| in fence$'
+          --test-tool nextest --minimum-test-timeout 120
+          --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
+          --sharding round-robin --shard ${{ matrix.shard }}/3
+      # The per-mutant logs, to triage a survivor without rerunning the job.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-pg-shard-${{ matrix.shard }}
+          path: mutants.out
+          retention-days: 14
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      # As in mutants-pg: lints capped for mutants only.
+      RUSTFLAGS: ""
+      NEXTEST_PROFILE: mutants
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-mutants,cargo-nextest" }
+      # The rest of the workspace; no Postgres needed. Excluded: crates/e2e and crates/sim, the
+      # test harnesses (nothing depends on them; docs/TESTING.md mutates leaf crates, and a
+      # harness mutant weakens a test, not the product). Their worth shows as the product
+      # mutants they kill, so every mutant runs the whole workspace's tests (--test-workspace):
+      # the socket loop is tested by the server's end-to-end tests, room-core by the simulator.
+      # nextest with .config/nextest.toml turns a hanging test into a failure.
+      - run: >-
+          cargo mutants --workspace -e 'crates/log/**' -e 'crates/server/**' -e 'crates/e2e/**'
+          -e 'crates/sim/**' --test-workspace=true --test-tool nextest --minimum-test-timeout 120
+          --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
+          --sharding round-robin --shard ${{ matrix.shard }}/4
+      # The per-mutant logs, to triage a survivor without rerunning the job.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          retention-days: 14

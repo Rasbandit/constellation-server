@@ -134,3 +134,9 @@ fn the_imported_fixture_bundle_is_valid() {
     let cross = b.slots[0].locations.iter().filter(|p| p.receiver == 2).count();
     assert!(cross > 0, "the fixture must send items across slots");
 }
+
+#[test]
+fn bundle_errors_display_which_check_failed() {
+    assert_eq!(BundleError::Parse("eof".into()).to_string(), "seed bundle does not parse: eof");
+    assert_eq!(BundleError::Invalid("x".into()).to_string(), "seed bundle is invalid: x");
+}

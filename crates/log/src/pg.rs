@@ -250,6 +250,9 @@ async fn fence(c: &mut PgConnection, room: i64, epoch: Epoch) -> Result<(), Appe
         .fetch_optional(&mut *c)
         .await
         .map_err(|e| db::<AppendError>(&e))?;
+    // `||` here would be an equivalent mutant (excluded in nightly.yml): the extra insert either
+    // hits an existing row (`DO NOTHING`) or adds epoch 0 for a non-zero epoch, which is then
+    // fenced, and every caller rolls the transaction back on that error.
     if current.is_none() && epoch.0 == 0 {
         sqlx::query(
             "INSERT INTO room_owner (room_id, epoch) VALUES ($1, 0) ON CONFLICT DO NOTHING",
@@ -522,4 +525,15 @@ pub mod testing {
         let sep = if url.contains('?') { '&' } else { '?' };
         Ok(format!("{url}{sep}options[search_path]={schema}"))
     }
+}
+
+/// The nightly workflow excludes `fence`'s `&&` to `||` mutant by name (equivalent, see the
+/// comment in `fence`). A second `&&` in `fence` would be excluded silently with it, so this
+/// fails first: whoever adds one must narrow the exclusion in nightly.yml.
+#[cfg(test)]
+#[test]
+fn fence_has_exactly_the_one_and_the_mutants_exclusion_names() {
+    let (_, from_fence) = include_str!("pg.rs").split_once("async fn fence(").expect("fence");
+    let (body, _) = from_fence.split_once("\n}\n").expect("fence ends");
+    assert_eq!(body.matches("&&").count(), 1, "narrow the fence exclusion in nightly.yml");
 }
