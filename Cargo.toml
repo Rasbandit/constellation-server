@@ -6,7 +6,7 @@ members = ["crates/proto", "crates/config", "crates/spec-rng", "crates/room-core
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+license = "LicenseRef-PolyForm-Strict-1.0.0"
 rust-version = "1.94" # sqlx 0.9.0 needs 1.94 (D-98). shortcut: placeholder MSRV, owner sets the window (doc 05 section 19)
 publish = false # published crates flip this per crate (doc 05 6.1)
 description = "Constellation server workspace"

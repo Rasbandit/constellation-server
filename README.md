@@ -54,6 +54,8 @@ cd $ROOT
 Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-16). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.
 
 ## Licences
+This repo is source-available, not open source: [PolyForm Strict 1.0.0](LICENSE.md). You may read, run and test it for noncommercial purposes; commercial use, redistribution and derived works need a written license from the owner. Contributors get the extra permissions in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo dependencies; none of their source is in this repo. `THIRD_PARTY_NOTICES.md` is not written yet: it becomes required when we distribute a binary (it must then carry the notices of every bundled crate), and is created then.
 
 ## Known deviations from doc 05 7.1 and 7.2

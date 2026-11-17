@@ -2,6 +2,14 @@
 
 Pick a task from [`docs/ROADMAP.md`](docs/ROADMAP.md) or an open issue, say in the issue that you are on it, and open one PR per task.
 
+## License and contributor terms
+This repo is under [PolyForm Strict 1.0.0](LICENSE.md): source-available for noncommercial use, no redistribution, no derived works. The owner plans to make it private later.
+
+By opening a pull request you agree that:
+- The owner (Rasbandit) gives you permission to clone this repo and change it, only to prepare contributions to it. You may not publish or share your changes anywhere else.
+- You grant the owner a perpetual, worldwide, royalty-free, irrevocable license to use, change, sublicense and relicense your contribution under any terms, including commercial and closed-source ones.
+- The contribution is your own work, or you have the right to grant that license, and it contains no code, text or data copied from other projects without the owner's written OK.
+
 ## Setup
 - Rust from `rust-toolchain.toml` (rustup picks it up), `just`, `cargo-deny`, `typos`.
 - `just setup` once: it turns on the git hooks (fmt, clippy, typos and unit tests before a commit; the full gate before a push).
