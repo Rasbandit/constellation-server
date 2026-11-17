@@ -52,6 +52,10 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 
 Release, collect and remaining (and their `!` commands); hints and hint points spending; data storage (`Set`, `SetNotify`, `SetReply`); starting inventory and group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; client statuses other than the goal; `TagsChanged` prints; TLS (put a terminator in front).
 
+## Known deviation: applied cursors are not persisted
+
+Doc 02 D3 asks for each slot's applied cursor (`applied_seq`, what the client confirmed) to be persisted at most once a second. Today the runtime does not write acks to the store (`crates/runtime/src/lib.rs`, module docs), so `slot_cursors` stays empty and a restart starts every slot's applied cursor at 0. Nothing a client sees depends on it yet: the compatible edge resends the whole inventory from index 0 on every connect, which is what the protocol document asks for. Follow-up: batch acks into the room's next append (`AppendBatch::cursors`, already stored and restored on start) or a once-a-second flush, before any feature reads the applied cursor (resume from a cursor, delivery metrics).
+
 ## Known interop finding (not a defect of our server)
 
 `archipelago_rs` 3.0.1 as vendored uses `soketto` 0.8.1, which inflates each compressed message by finishing a deflate stream that has no final block. `flate2` 1.1.11 rejects that ("incomplete deflate stream"), so with `flate2` 1.1.11 every compressed frame fails, against any compressing server. `crates/e2e-ap` pins `flate2 = "=1.1.10"`, the version the Archipela-Go app locks. Inferred from `flate2` 1.1.11's own tests and reproduced here; not checked against Archipelago's server.

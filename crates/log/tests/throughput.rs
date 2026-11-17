@@ -1,13 +1,16 @@
 //! Gate G-DB throughput microbenchmark (doc 11 section 4.8): 1,000 rooms, 20 ms windows,
 //! reporting committed rows per second. Nightly CI only (`--features pg-bench`), never the PR
-//! gate: runner variance would make it flaky. Fails below 60 percent of the 20,000 rows per
-//! second design value (doc 02 section 5.4, an assumption to benchmark).
+//! gate: runner variance would make it flaky.
 //!
 //! Two writers, both fenced the way `PgLogStore` fences (owner rows locked `FOR SHARE`):
-//! - **group**: one transaction per window for every room's events, inserted with `UNNEST`.
-//!   This is the design's batching (group commit across rooms); gated.
-//! - **store**: `PgLogStore::append` per room, all rooms concurrently each window (what the
-//!   server runs today, one transaction per room batch). Reported, not gated.
+//! - **store** (gated): `PgLogStore::append`, the shipped writer, one transaction per room
+//!   batch, all rooms concurrently each window. Floor: 2,000 rows per second, about 3 times
+//!   the Stage 1 peak of 666 rows per second that doc 12 section 3.3 estimates for 5,900 games
+//!   a day (estimated there, not measured).
+//! - **group** (reported, not gated): one transaction per window for every room's events with
+//!   `UNNEST`, hand-written here. It is the target for the cross-room group-commit writer of
+//!   doc 02 section 5.4, which is not built yet; its bar will be 60 percent of the 20,000 rows
+//!   per second design value (12,000) once that writer exists.
 //!
 //! `COPY` into a temp table is not measured: it needs a second statement per window and only
 //! pays off for much larger batches than 1,000 to 2,000 rows (deferred, docs/TESTING.md).
@@ -32,7 +35,10 @@ mod bench {
     const ROWS_PER_ROOM: u64 = 2;
     const RUN: Duration = Duration::from_secs(10);
     const DESIGN_ROWS_PER_SEC: f64 = 20_000.0;
-    const FLOOR: f64 = 0.6 * DESIGN_ROWS_PER_SEC;
+    /// Target for the future group-commit writer (G-DB): 60 percent of the design value.
+    const GROUP_TARGET: f64 = 0.6 * DESIGN_ROWS_PER_SEC;
+    /// Gate for the shipped writer: about 3 times doc 12 section 3.3's Stage 1 peak (666/s).
+    const STORE_FLOOR: f64 = 2_000.0;
 
     fn ev(seq: u64) -> Event {
         Event {
@@ -52,7 +58,7 @@ mod bench {
             .database_url
             .expect("pg-bench needs CONSTELLATION_DATABASE_URL (no silent skip)");
         let url = log::testing::fresh_schema(&base).await.unwrap();
-        let store = PgLogStore::connect(&url, 8).await.unwrap();
+        let store = PgLogStore::connect(&url, &config::Limits::DESIGN).await.unwrap();
         let pool =
             sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await.unwrap();
         // One bulk claim for every room (epoch 1, as a first `claim` returns).
@@ -66,16 +72,16 @@ mod bench {
         (store, pool, (0..ROOMS).map(|_| Epoch(1)).collect())
     }
 
-    fn report(name: &str, rows: u64, elapsed: Duration) -> f64 {
+    fn report(name: &str, rows: u64, elapsed: Duration, bar: f64) -> f64 {
         let rate = f64::from(u32::try_from(rows).unwrap()) / elapsed.as_secs_f64();
         println!(
-            "G-DB throughput [{name}]: {rows} rows in {elapsed:.2?} = {rate:.0} rows/s (floor {FLOOR:.0}, design {DESIGN_ROWS_PER_SEC:.0}; measured on this runner)"
+            "G-DB throughput [{name}]: {rows} rows in {elapsed:.2?} = {rate:.0} rows/s (bar {bar:.0}; measured on this runner)"
         );
         rate
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_writer_commits_at_least_60_percent_of_the_design_rows_per_second() {
+    async fn the_shipped_writer_commits_at_least_the_stage_1_floor_of_rows_per_second() {
         let (store, pool, _) = setup().await;
         let rooms: Vec<i64> = (1..=i64::try_from(ROOMS).unwrap()).collect();
         let body = serde_json::to_vec(&ev(1)).unwrap();
@@ -120,7 +126,12 @@ mod bench {
                 tokio::time::sleep(rest).await; // pacing the windows, not waiting for a result
             }
         }
-        let group = report("group commit, UNNEST", rows, start.elapsed());
+        report(
+            "group commit target, UNNEST, writer not built",
+            rows,
+            start.elapsed(),
+            GROUP_TARGET,
+        );
 
         // The store as the server uses it: one transaction per room per window, rooms in
         // parallel. These rooms start fresh (ids above the group rooms).
@@ -155,11 +166,10 @@ mod bench {
                 tokio::time::sleep(rest).await;
             }
         }
-        report("PgLogStore::append per room", rows, start.elapsed());
-
+        let rate = report("PgLogStore::append per room, gated", rows, start.elapsed(), STORE_FLOOR);
         assert!(
-            group >= FLOOR,
-            "group commit {group:.0} rows/s is below the G-DB floor {FLOOR:.0}"
+            rate >= STORE_FLOOR,
+            "PgLogStore::append {rate:.0} rows/s is below the Stage 1 floor {STORE_FLOOR:.0}"
         );
     }
 }
