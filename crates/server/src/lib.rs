@@ -329,8 +329,9 @@ fn room_ended(r: Result<Stopped, tokio::task::JoinError>) -> RunError {
 /// room stops.
 ///
 /// The signal handlers are installed first, so a stop at any point is clean: before the
-/// server listens it abandons startup (an open claim transaction rolls back with its
-/// connection) and returns `Ok`. The port is bound before the room is claimed, so a mistaken
+/// server listens it abandons startup and returns `Ok`. Nothing is left half-written: each
+/// startup write (a migration, the room record, the claim) is its own transaction, and a claim
+/// already sent may still commit, which only bumps the epoch as a crash after it would. The port is bound before the room is claimed, so a mistaken
 /// second instance fails before it can fence the live one. A room that stops ends the process:
 /// fenced by a newer owner with [`EXIT_FENCED`] (do not restart), otherwise with 1, so the
 /// supervisor restarts it and the room reloads from the log instead of answering every client
