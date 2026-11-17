@@ -1,5 +1,8 @@
 //! CWP wire types shared by server, SDK and tools. Leaf crate: no IO, no clock, no rng.
 #![no_std]
+extern crate alloc;
+
+pub mod cwp;
 
 mod error;
 mod ids;

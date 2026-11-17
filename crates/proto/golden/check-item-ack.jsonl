@@ -1,0 +1,12 @@
+{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_token_for_slot_one","want":{"items":{"from_others":true,"own":true,"starting":true},"slot_data":false}}}
+{"dir":"s2c","frame":{"op":"welcome","proto":1,"exts":{},"limits":{"hb_ms":30000,"max_frame":65536},"epoch":1,"head":0,"slot":1,"role":"play","names":{"Moss Cave":"5f1c0a"}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"c-1","type":"check","data":{"location":104}}}
+{"dir":"s2c","frame":{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":104}}}
+{"dir":"s2c","frame":{"op":"event","seq":2,"type":"item.grant","slot":1,"data":{"from":1,"location":104,"item":7,"item_seq":1}}}
+{"dir":"s2c","frame":{"op":"result","cid":"c-1","ok":{}}}
+{"dir":"c2s","frame":{"op":"ack","applied":1}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"c-2","type":"goal","data":{}}}
+{"dir":"s2c","frame":{"op":"event","seq":3,"type":"slot.goal","slot":1,"data":{}}}
+{"dir":"s2c","frame":{"op":"result","cid":"c-2","ok":{}}}
+{"dir":"c2s","frame":{"op":"ping"}}
+{"dir":"s2c","frame":{"op":"pong"}}

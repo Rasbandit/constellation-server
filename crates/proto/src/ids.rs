@@ -5,16 +5,19 @@ use serde::{Deserialize, Serialize};
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Seq(pub u64);
 
 /// Per-slot delivery index (doc 05 7.1, D-02).
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ItemSeq(pub u64);
 
 /// Slot number within a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SlotNo(pub u32);
 
 /// Client message id, the idempotency key, unique per slot (doc 05 7.1).
@@ -30,6 +33,7 @@ pub struct RoomId(pub u64);
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Epoch(pub u64);
 
 /// Seconds since the Unix epoch. Supplied by the runtime; core crates never read a clock.

@@ -1,0 +1,945 @@
+{
+  "client_frame": {
+    "$defs": {
+      "Ack": {
+        "description": "Cumulative item ack (doc 01 D1.4, D-02).",
+        "properties": {
+          "applied": {
+            "$ref": "#/$defs/ItemSeq",
+            "description": "Highest `item_seq` the game has applied."
+          }
+        },
+        "required": [
+          "applied"
+        ],
+        "type": "object"
+      },
+      "Cmd": {
+        "description": "A command (doc 01 D1.10 rule 2).",
+        "properties": {
+          "cid": {
+            "$ref": "#/$defs/CmdId",
+            "description": "Idempotency key, echoed in the `result`."
+          },
+          "data": {
+            "default": {},
+            "description": "Payload, checked against the type's schema."
+          },
+          "type": {
+            "$ref": "#/$defs/TypeName",
+            "description": "Registered type (`check`, `org.cwp.deathlink/death`)."
+          }
+        },
+        "required": [
+          "cid",
+          "type"
+        ],
+        "type": "object"
+      },
+      "CmdId": {
+        "description": "Client-chosen command id, the idempotency key, unique per slot (doc 01 D1.4): 1 to 64 bytes.",
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^.+$",
+        "type": "string"
+      },
+      "Epoch": {
+        "description": "Owner epoch, the fence token bumped on every room move (doc 02 D5).",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "Get": {
+        "description": "Read one state path.",
+        "properties": {
+          "cid": {
+            "$ref": "#/$defs/CmdId",
+            "description": "Echoed in the `result`."
+          },
+          "path": {
+            "$ref": "#/$defs/StatePath",
+            "description": "The path (`slot/3/status`)."
+          }
+        },
+        "required": [
+          "cid",
+          "path"
+        ],
+        "type": "object"
+      },
+      "Hello": {
+        "description": "What the client wants, sent once in `hello`.",
+        "properties": {
+          "exts": {
+            "additionalProperties": false,
+            "default": {},
+            "description": "Extensions the client enables, each with the majors it accepts.",
+            "patternProperties": {
+              "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$": {
+                "items": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "proto": {
+            "description": "Protocol majors the client speaks, for example `[1]`.",
+            "items": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "resume": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Resume"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where to resume the room log; absent on a first connect."
+          },
+          "token": {
+            "description": "The slot token (`cst1_...`, doc 01 D1.2). Never in the URL.",
+            "type": "string"
+          },
+          "want": {
+            "$ref": "#/$defs/Want",
+            "default": {
+              "items": {
+                "from_others": true,
+                "own": true,
+                "starting": true
+              },
+              "slot_data": false
+            },
+            "description": "Which deliveries the session wants."
+          }
+        },
+        "required": [
+          "proto",
+          "token"
+        ],
+        "type": "object"
+      },
+      "ItemSeq": {
+        "description": "Per-slot delivery index (doc 05 7.1, D-02).",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "Resume": {
+        "description": "Resume cursor (doc 01 D1.4).",
+        "properties": {
+          "after": {
+            "$ref": "#/$defs/Seq",
+            "description": "Last room `seq` the client saw."
+          },
+          "epoch": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Epoch"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Room epoch of that cursor, if known."
+          }
+        },
+        "required": [
+          "after"
+        ],
+        "type": "object"
+      },
+      "Seq": {
+        "description": "Room-wide event log position, gapless.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "StatePath": {
+        "description": "A path in the room's state tree (`slot/3/status`, `kv/legacy/EnergyLink0`). Doc 01 D1.10\nrule 4. Only the syntax is checked here; which paths exist is the server's registry.",
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._~%-]+(/[A-Za-z0-9._~%-]+)*$",
+        "type": "string"
+      },
+      "TypeName": {
+        "description": "Type of a command or event: a core name (`check`, `item.grant`) or `<extension id>/<name>`\n(`org.cwp.deathlink/death`). Doc 01 D1.10 rule 1.",
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+/)?[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$",
+        "type": "string"
+      },
+      "Want": {
+        "description": "Typed wants (doc 01 D1.10 rule 6); replaces bit fields and behaviour-changing tags.",
+        "properties": {
+          "items": {
+            "$ref": "#/$defs/WantItems",
+            "default": {
+              "from_others": true,
+              "own": true,
+              "starting": true
+            },
+            "description": "Which item grants to deliver."
+          },
+          "slot_data": {
+            "default": false,
+            "description": "Include the slot's generator data in `welcome`.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "WantItems": {
+        "description": "Which item grants a session receives. All on by default: a new client gets every item it is\nowed unless it opts out.",
+        "properties": {
+          "from_others": {
+            "default": true,
+            "description": "Items found in other slots' worlds.",
+            "type": "boolean"
+          },
+          "own": {
+            "default": true,
+            "description": "Items the slot found in its own world.",
+            "type": "boolean"
+          },
+          "starting": {
+            "default": true,
+            "description": "The slot's starting inventory.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "Watch": {
+        "description": "Follow state paths.",
+        "properties": {
+          "cid": {
+            "$ref": "#/$defs/CmdId",
+            "description": "Echoed in the `result`."
+          },
+          "paths": {
+            "description": "Paths to follow.",
+            "items": {
+              "$ref": "#/$defs/StatePath"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cid",
+          "paths"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Everything a client may send.",
+    "oneOf": [
+      {
+        "$ref": "#/$defs/Hello",
+        "description": "First frame of a session.",
+        "properties": {
+          "op": {
+            "const": "hello",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Cmd",
+        "description": "A command; answered by exactly one `result`.",
+        "properties": {
+          "op": {
+            "const": "cmd",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Get",
+        "description": "Read one state path; answered by a `result`.",
+        "properties": {
+          "op": {
+            "const": "get",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Watch",
+        "description": "Follow state paths; answered by a `result`, then `state.changed` events.",
+        "properties": {
+          "op": {
+            "const": "watch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/Ack",
+        "description": "The game has applied every item up to `applied`.",
+        "properties": {
+          "op": {
+            "const": "ack",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Liveness check; answered by `pong`.",
+        "properties": {
+          "op": {
+            "const": "ping",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Answer to a server `ping`.",
+        "properties": {
+          "op": {
+            "const": "pong",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ClientFrame"
+  },
+  "errors": [
+    {
+      "code": 1001,
+      "key": "capability.missing",
+      "retry": "never"
+    },
+    {
+      "code": 1002,
+      "key": "type.unknown",
+      "retry": "never"
+    },
+    {
+      "code": 1003,
+      "key": "data.invalid",
+      "retry": "never"
+    },
+    {
+      "code": 2012,
+      "key": "auth.token_revoked",
+      "retry": "never"
+    },
+    {
+      "code": 2013,
+      "key": "auth.step_up_required",
+      "retry": "never"
+    },
+    {
+      "code": 3001,
+      "key": "room.rolled_back",
+      "retry": "never"
+    },
+    {
+      "code": 3002,
+      "key": "resume.too_old",
+      "retry": "never"
+    },
+    {
+      "code": 5001,
+      "key": "room.unavailable",
+      "retry": "backoff"
+    }
+  ],
+  "server_frame": {
+    "$defs": {
+      "CmdId": {
+        "description": "Client-chosen command id, the idempotency key, unique per slot (doc 01 D1.4): 1 to 64 bytes.",
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^.+$",
+        "type": "string"
+      },
+      "CmdResult": {
+        "description": "The answer to one `cmd`, `get` or `watch`: `{\"cid\": ..., \"ok\": ...}` or\n`{\"cid\": ..., \"error\": ...}`.",
+        "oneOf": [
+          {
+            "description": "Done; the value depends on the command (`{}` when there is nothing to say).",
+            "properties": {
+              "ok": true
+            },
+            "required": [
+              "ok"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Refused.",
+            "properties": {
+              "error": {
+                "$ref": "#/$defs/ErrorBody"
+              }
+            },
+            "required": [
+              "error"
+            ],
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "cid": {
+            "$ref": "#/$defs/CmdId",
+            "description": "The `cid` of the frame this answers."
+          }
+        },
+        "required": [
+          "cid"
+        ],
+        "type": "object"
+      },
+      "Epoch": {
+        "description": "Owner epoch, the fence token bumped on every room move (doc 02 D5).",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "ErrorBody": {
+        "description": "The error shape of doc 01 D1.7.",
+        "properties": {
+          "after_ms": {
+            "description": "Wait this long first, when `retry` is `after`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "code": {
+            "description": "Registered numeric code.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "detail": {
+            "default": {},
+            "description": "Key-specific details."
+          },
+          "key": {
+            "description": "Registered dotted key; clients localize from it.",
+            "type": "string"
+          },
+          "retry": {
+            "$ref": "#/$defs/Retry",
+            "description": "Whether and how to retry."
+          }
+        },
+        "required": [
+          "code",
+          "key",
+          "retry"
+        ],
+        "type": "object"
+      },
+      "EventFrame": {
+        "description": "One event (doc 01 D1.10 rule 3): durable ones carry `seq`, ephemeral ones do not.",
+        "properties": {
+          "data": {
+            "default": {},
+            "description": "Payload, shaped by the type's schema."
+          },
+          "seq": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Seq"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Room-wide position, present only for durable events."
+          },
+          "slot": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SlotNo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The slot the event is about, or absent for room-wide events."
+          },
+          "type": {
+            "$ref": "#/$defs/TypeName",
+            "description": "Registered type."
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      "Limits": {
+        "description": "Server limits announced in `welcome`.",
+        "properties": {
+          "hb_ms": {
+            "description": "Ping interval in milliseconds.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_frame": {
+            "description": "Largest frame the server accepts, in bytes.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "hb_ms",
+          "max_frame"
+        ],
+        "type": "object"
+      },
+      "Retry": {
+        "description": "Retry hint carried by every error frame (doc 01 D1.7).",
+        "oneOf": [
+          {
+            "const": "never",
+            "description": "Retrying will not help.",
+            "type": "string"
+          },
+          {
+            "const": "backoff",
+            "description": "Retry with exponential backoff and full jitter (doc 01 D1.7).",
+            "type": "string"
+          },
+          {
+            "const": "after",
+            "description": "Retry after the `after_ms` the server sent.",
+            "type": "string"
+          }
+        ]
+      },
+      "Role": {
+        "description": "The session's role, from the token's scope (doc 01 D1.2), never from a client claim.",
+        "oneOf": [
+          {
+            "const": "play",
+            "description": "Sends checks, receives items.",
+            "type": "string"
+          },
+          {
+            "const": "observe",
+            "description": "Reads the player-visible log only.",
+            "type": "string"
+          }
+        ]
+      },
+      "Seq": {
+        "description": "Room-wide event log position, gapless.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "SlotNo": {
+        "description": "Slot number within a room.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "TypeName": {
+        "description": "Type of a command or event: a core name (`check`, `item.grant`) or `<extension id>/<name>`\n(`org.cwp.deathlink/death`). Doc 01 D1.10 rule 1.",
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+/)?[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$",
+        "type": "string"
+      },
+      "Welcome": {
+        "description": "The server's answer to `hello`.",
+        "properties": {
+          "epoch": {
+            "$ref": "#/$defs/Epoch",
+            "description": "Current room epoch."
+          },
+          "exts": {
+            "additionalProperties": false,
+            "default": {},
+            "description": "Enabled extensions, each with the major chosen. Anything absent is off.",
+            "patternProperties": {
+              "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "head": {
+            "$ref": "#/$defs/Seq",
+            "description": "Room `seq` of the last durable event."
+          },
+          "limits": {
+            "$ref": "#/$defs/Limits",
+            "description": "Limits the client must respect."
+          },
+          "names": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Name-table checksum per game in the room; tables are served at\n`/games/{game}/names/{checksum}.json` (doc 01 D1.10 rule 5).",
+            "type": "object"
+          },
+          "proto": {
+            "description": "The protocol major chosen.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "$ref": "#/$defs/Role",
+            "description": "What the token allows."
+          },
+          "slot": {
+            "$ref": "#/$defs/SlotNo",
+            "description": "The session's slot."
+          },
+          "slot_data": {
+            "description": "The slot's generator data, when `want.slot_data` asked for it."
+          }
+        },
+        "required": [
+          "proto",
+          "limits",
+          "epoch",
+          "head",
+          "slot",
+          "role"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Everything a server may send.",
+    "oneOf": [
+      {
+        "$ref": "#/$defs/Welcome",
+        "description": "Answer to `hello`.",
+        "properties": {
+          "op": {
+            "const": "welcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/CmdResult",
+        "description": "Answer to one `cmd`, `get` or `watch`.",
+        "properties": {
+          "op": {
+            "const": "result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/EventFrame",
+        "description": "Something happened in the room.",
+        "properties": {
+          "op": {
+            "const": "event",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "$ref": "#/$defs/ErrorBody",
+        "description": "A problem with a frame that has no usable `cid` (it did not parse, or came before `hello`).",
+        "properties": {
+          "op": {
+            "const": "error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Liveness check; answered by `pong`.",
+        "properties": {
+          "op": {
+            "const": "ping",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Answer to a client `ping`.",
+        "properties": {
+          "op": {
+            "const": "pong",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ServerFrame"
+  },
+  "title": "CWP v1 (design doc 01 D1.10, proposal D-123). Generated by `cargo test -p proto`; do not edit.",
+  "types": {
+    "check": {
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`check` payload.",
+        "properties": {
+          "location": {
+            "description": "Location id in the slot's own world.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "title": "Check",
+        "type": "object"
+      },
+      "kind": "cmd",
+      "name": "check",
+      "scopes": [
+        "play"
+      ],
+      "stability": "experimental",
+      "summary": "Report a checked location in the slot's own world."
+    },
+    "goal": {
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`goal` payload (empty).",
+        "title": "Goal",
+        "type": "object"
+      },
+      "kind": "cmd",
+      "name": "goal",
+      "scopes": [
+        "play"
+      ],
+      "stability": "experimental",
+      "summary": "The slot reached its goal. Repeats are answered from the first."
+    },
+    "item.grant": {
+      "data": {
+        "$defs": {
+          "ItemSeq": {
+            "description": "Per-slot delivery index (doc 05 7.1, D-02).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "SlotNo": {
+            "description": "Slot number within a room.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`item.grant` payload; the frame's `slot` is the receiver.",
+        "properties": {
+          "from": {
+            "$ref": "#/$defs/SlotNo",
+            "description": "The slot whose location held the item."
+          },
+          "item": {
+            "description": "Item id in the receiver's world.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "item_seq": {
+            "$ref": "#/$defs/ItemSeq",
+            "description": "The receiver's delivery index, contiguous from 1; what `ack` confirms."
+          },
+          "location": {
+            "description": "That location, in `from`'s world.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "from",
+          "location",
+          "item",
+          "item_seq"
+        ],
+        "title": "ItemGrant",
+        "type": "object"
+      },
+      "delivery": "durable",
+      "kind": "event",
+      "name": "item.grant",
+      "scopes": [
+        "play",
+        "observe"
+      ],
+      "stability": "experimental",
+      "summary": "An item was delivered to the event's slot, with its per-slot `item_seq`.",
+      "template": "{from} sent {item} to {slot}"
+    },
+    "location.checked": {
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`location.checked` payload; the frame's `slot` is the checker.",
+        "properties": {
+          "location": {
+            "description": "Location id in the checker's world.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "title": "LocationChecked",
+        "type": "object"
+      },
+      "delivery": "durable",
+      "kind": "event",
+      "name": "location.checked",
+      "scopes": [
+        "play",
+        "observe"
+      ],
+      "stability": "experimental",
+      "summary": "A slot checked a location."
+    },
+    "slot.goal": {
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`slot.goal` payload (empty); the frame's `slot` reached its goal.",
+        "title": "SlotGoal",
+        "type": "object"
+      },
+      "delivery": "durable",
+      "kind": "event",
+      "name": "slot.goal",
+      "scopes": [
+        "play",
+        "observe"
+      ],
+      "stability": "experimental",
+      "summary": "The event's slot reached its goal.",
+      "template": "{slot} reached their goal"
+    },
+    "state.changed": {
+      "data": {
+        "$defs": {
+          "Seq": {
+            "description": "Room-wide event log position, gapless.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "StatePath": {
+            "description": "A path in the room's state tree (`slot/3/status`, `kv/legacy/EnergyLink0`). Doc 01 D1.10\nrule 4. Only the syntax is checked here; which paths exist is the server's registry.",
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._~%-]+(/[A-Za-z0-9._~%-]+)*$",
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`state.changed` payload.",
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/StatePath",
+            "description": "The watched path."
+          },
+          "value": {
+            "description": "Its new value."
+          },
+          "ver": {
+            "$ref": "#/$defs/Seq",
+            "description": "The `seq` that last changed it."
+          }
+        },
+        "required": [
+          "path",
+          "value",
+          "ver"
+        ],
+        "title": "StateChanged",
+        "type": "object"
+      },
+      "delivery": "ephemeral",
+      "kind": "event",
+      "name": "state.changed",
+      "scopes": [
+        "play",
+        "observe"
+      ],
+      "stability": "experimental",
+      "summary": "A watched state path changed; after a reconnect, `get` it again."
+    }
+  }
+}

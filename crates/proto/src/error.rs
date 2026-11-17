@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 /// Retry hint carried by every error frame (doc 01 D1.7).
 pub enum Retry {
     /// Retrying will not help.
@@ -19,6 +20,10 @@ pub enum Retry {
 pub enum ErrorCode {
     /// `capability.missing`
     CapabilityMissing,
+    /// `type.unknown`: a command type that is not registered or not enabled.
+    TypeUnknown,
+    /// `data.invalid`: a payload that does not match its type's schema.
+    DataInvalid,
     /// `auth.token_revoked`
     AuthTokenRevoked,
     /// `auth.step_up_required`
@@ -33,8 +38,10 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every registered code, for registry tests and docs generation.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::CapabilityMissing,
+        Self::TypeUnknown,
+        Self::DataInvalid,
         Self::AuthTokenRevoked,
         Self::AuthStepUpRequired,
         Self::RoomRolledBack,
@@ -47,6 +54,8 @@ impl ErrorCode {
     pub const fn code(self) -> u16 {
         match self {
             Self::CapabilityMissing => 1001,
+            Self::TypeUnknown => 1002,
+            Self::DataInvalid => 1003,
             Self::AuthTokenRevoked => 2012,
             Self::AuthStepUpRequired => 2013,
             Self::RoomRolledBack => 3001,
@@ -60,6 +69,8 @@ impl ErrorCode {
     pub const fn key(self) -> &'static str {
         match self {
             Self::CapabilityMissing => "capability.missing",
+            Self::TypeUnknown => "type.unknown",
+            Self::DataInvalid => "data.invalid",
             Self::AuthTokenRevoked => "auth.token_revoked",
             Self::AuthStepUpRequired => "auth.step_up_required",
             Self::RoomRolledBack => "room.rolled_back",
@@ -74,6 +85,8 @@ impl ErrorCode {
         match self {
             Self::RoomUnavailable => Retry::Backoff,
             Self::CapabilityMissing
+            | Self::TypeUnknown
+            | Self::DataInvalid
             | Self::AuthTokenRevoked
             | Self::AuthStepUpRequired
             | Self::RoomRolledBack
@@ -107,7 +120,7 @@ mod tests {
         // 1xxx framing, 2xxx auth, 3xxx room, 5xxx server fault (doc 01 D1.7)
         for e in ErrorCode::ALL {
             let area = match e.key().split('.').next().unwrap() {
-                "capability" => 1,
+                "capability" | "type" | "data" => 1,
                 "auth" => 2,
                 "room" | "resume" if e == ErrorCode::RoomUnavailable => 5,
                 "room" | "resume" => 3,

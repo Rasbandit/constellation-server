@@ -1,0 +1,11 @@
+{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_token_for_slot_two","exts":{"org.cwp.deathlink":[1]},"want":{"items":{"from_others":true,"own":false,"starting":true},"slot_data":true},"resume":{"after":2,"epoch":1}}}
+{"dir":"s2c","frame":{"op":"welcome","proto":1,"exts":{"org.cwp.deathlink":1},"limits":{"hb_ms":30000,"max_frame":65536},"epoch":1,"head":3,"slot":2,"role":"play","names":{"Moss Cave":"5f1c0a"},"slot_data":{"goal":"boss"}}}
+{"dir":"s2c","frame":{"op":"event","seq":3,"type":"slot.goal","slot":1,"data":{}}}
+{"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"slot/1/status"}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-1","ok":{"path":"slot/1/status","value":"goal","ver":3}}}
+{"dir":"c2s","frame":{"op":"watch","cid":"w-1","paths":["slot/1/status","kv/legacy/EnergyLink0"]}}
+{"dir":"s2c","frame":{"op":"result","cid":"w-1","ok":{}}}
+{"dir":"s2c","frame":{"op":"event","type":"state.changed","data":{"path":"kv/legacy/EnergyLink0","value":1200,"ver":4}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"d-1","type":"org.cwp.deathlink/death","data":{"cause":"fell in a pit"}}}
+{"dir":"s2c","frame":{"op":"result","cid":"d-1","ok":{}}}
+{"dir":"s2c","frame":{"op":"event","type":"org.cwp.deathlink/death","slot":2,"data":{"cause":"fell in a pit"}}}
