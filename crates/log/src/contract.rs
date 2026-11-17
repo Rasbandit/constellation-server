@@ -499,12 +499,16 @@ mod pg_only {
             tokio::spawn(async move { put(&*s, R, e, &[ev(1)], &[cur(1, 1)]).await })
         };
         let (first, second) = (racer(Arc::clone(&s)), racer(Arc::clone(&s)));
-        // Polled: Postgres has no event for "a session started waiting on a lock".
+        // Polled: Postgres has no event for "a session started waiting on a lock". From its own
+        // connection: inside `gate`'s transaction pg_stat_activity would stay frozen at the
+        // first poll (it is snapshotted once per transaction).
+        let mut watch = sqlx::PgConnection::connect(&url).await.unwrap();
         let waiting = "SELECT count(*) FROM pg_stat_activity \
                        WHERE application_name = $1 AND wait_event_type = 'Lock'";
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let n: i64 = sqlx::query_scalar(waiting).bind(&app).fetch_one(&mut gate).await.unwrap();
+            let n: i64 =
+                sqlx::query_scalar(waiting).bind(&app).fetch_one(&mut watch).await.unwrap();
             if n == 2 {
                 break;
             }
