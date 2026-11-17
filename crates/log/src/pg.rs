@@ -250,6 +250,9 @@ async fn fence(c: &mut PgConnection, room: i64, epoch: Epoch) -> Result<(), Appe
         .fetch_optional(&mut *c)
         .await
         .map_err(|e| db::<AppendError>(&e))?;
+    // `||` here would be an equivalent mutant (excluded in nightly.yml): the extra insert either
+    // hits an existing row (`DO NOTHING`) or adds epoch 0 for a non-zero epoch, which is then
+    // fenced, and every caller rolls the transaction back on that error.
     if current.is_none() && epoch.0 == 0 {
         sqlx::query(
             "INSERT INTO room_owner (room_id, epoch) VALUES ($1, 0) ON CONFLICT DO NOTHING",
