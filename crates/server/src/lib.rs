@@ -328,26 +328,41 @@ fn room_ended(r: Result<Stopped, tokio::task::JoinError>) -> RunError {
 /// Bind, start the room, log the address, and serve until SIGTERM or Ctrl-C, or until the
 /// room stops.
 ///
-/// The port is bound before the room is claimed, so a mistaken second instance fails before
-/// it can fence the live one. A room that stops ends the process: fenced by a newer owner
-/// with [`EXIT_FENCED`] (do not restart), otherwise with 1, so the supervisor restarts it and
-/// the room reloads from the log instead of answering every client with "unavailable".
+/// The signal handlers are installed first, so a stop at any point is clean: before the
+/// server listens it abandons startup and returns `Ok`. Nothing is left half-written: each
+/// startup write (a migration, the room record, the claim) is its own transaction, and a claim
+/// already sent may still commit, which only bumps the epoch as a crash after it would. The port is bound before the room is claimed, so a mistaken
+/// second instance fails before it can fence the live one. A room that stops ends the process:
+/// fenced by a newer owner with [`EXIT_FENCED`] (do not restart), otherwise with 1, so the
+/// supervisor restarts it and the room reloads from the log instead of answering every client
+/// with "unavailable".
 ///
 /// # Errors
 /// [`RunError::Fenced`], or [`RunError::Failed`] when the bundle, the socket or the database
 /// fails or the room stopped.
 pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), RunError> {
-    let loaded = load_bundle(&args.bundle, &limits)?;
-    let seed = loaded.bundle.seed_name.clone();
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
-        .await
-        .map_err(|e| format!("bind: {e}"))?;
-    let (router, room) =
-        app(loaded, secrets.room_password, secrets.database_url.as_deref(), limits).await?;
-    let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    tracing::info!(%addr, seed, "listening");
+    let mut stop = shutdown();
+    let startup = async {
+        let loaded = load_bundle(&args.bundle, &limits)?;
+        let seed = loaded.bundle.seed_name.clone();
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
+            .await
+            .map_err(|e| format!("bind: {e}"))?;
+        let (router, room) =
+            app(loaded, secrets.room_password, secrets.database_url.as_deref(), limits).await?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        tracing::info!(%addr, seed, "listening");
+        Ok::<_, RunError>((listener, router, room))
+    };
+    let (listener, router, room) = tokio::select! {
+        r = startup => r?,
+        () = &mut stop => {
+            tracing::info!("stopped before listening");
+            return Ok(());
+        }
+    };
     let serve = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown());
+        .with_graceful_shutdown(stop);
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
         r = room => return Err(room_ended(r)),
@@ -356,21 +371,26 @@ pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), Run
     Ok(())
 }
 
-async fn shutdown() {
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "no SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
+/// Resolves on the first SIGTERM or Ctrl-C. The handlers are registered here, not when the
+/// future is first polled: until then the default action kills the process.
+fn shutdown() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (term, int) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()));
+    Box::pin(async move {
+        tokio::select! {
+            () = recv(term) => tracing::info!("SIGTERM, shutting down"),
+            () = recv(int) => tracing::info!("Ctrl-C, shutting down"),
         }
-    };
-    tokio::select! {
-        () = term => tracing::info!("SIGTERM, shutting down"),
-        r = tokio::signal::ctrl_c() => tracing::info!(ok = r.is_ok(), "Ctrl-C, shutting down"),
+    })
+}
+
+async fn recv(s: std::io::Result<tokio::signal::unix::Signal>) {
+    match s {
+        Ok(mut s) => drop(s.recv().await),
+        Err(e) => {
+            tracing::error!(error = %e, "no signal handler");
+            std::future::pending::<()>().await;
+        }
     }
 }
 
