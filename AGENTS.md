@@ -10,6 +10,8 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
 - `status:claimed`: someone holds it.
 - `finding`: something that surprised us; see the roadmap.
 
+**Every to-do is an issue.** No `TODO`, `FIXME` or "follow-up" lists in code, docs, commit messages or PR bodies. Open an issue (`gh issue create`, with a lane label and milestone) and reference it: a code comment that defers work says `see #<n>`. A PR that leaves work undone links the issues it opened.
+
 ## Claiming a ticket
 1. **Pick** an issue that is open, has no assignee, no `status:claimed` and no `human-only`, and whose "Blocked by" issues are all closed. Prefer your human's lane.
 2. **Claim** it in one go:

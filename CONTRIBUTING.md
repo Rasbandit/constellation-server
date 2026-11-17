@@ -17,6 +17,7 @@ By opening a pull request you agree that:
 - The design docs live in the sibling `constellation` repo. Clone it next to this one.
 
 ## Workflow
+- Every to-do is a GitHub issue. No `TODO` or `FIXME` in code or docs; open an issue and write `see #<n>` where the work is deferred.
 - Branch off `main`: `feat/...`, `fix/...`, `docs/...`.
 - Conventional commits, subject at most 50 characters (the hook checks).
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
