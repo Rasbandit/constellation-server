@@ -69,11 +69,15 @@ mod restart {
     async fn play(server: &Server) -> Played {
         let a_to_b: Vec<i64> = locations_for(1, 2).unwrap().iter().take(3).map(|p| p.0).collect();
         let a_own = locations_for(1, 1).unwrap()[0].0;
-        let b_to_a: Vec<i64> = locations_for(2, 1).unwrap().iter().take(2).map(|p| p.0).collect();
+        let mut b_to_a: Vec<i64> =
+            locations_for(2, 1).unwrap().iter().take(2).map(|p| p.0).collect();
         let (mut alice, _, _) = join(&server.url(), "Alice").await.unwrap();
         let (mut bob, _, _) = join(&server.url(), "Bob").await.unwrap();
         let mut alice_checked = a_to_b.clone();
         alice_checked.push(a_own);
+        // The server applies one packet's locations in ascending order.
+        alice_checked.sort_unstable();
+        b_to_a.sort_unstable();
         alice.check(&alice_checked).await.unwrap();
         let (u, _) = alice.next_cmd("RoomUpdate").await.unwrap();
         assert_eq!(locations(&u["checked_locations"]), alice_checked);
@@ -82,7 +86,8 @@ mod restart {
         assert_eq!(locations(&u["checked_locations"]), b_to_a);
         alice.send(&json!([{"cmd": "StatusUpdate", "status": 30}])).await.unwrap();
         wait_goal_print(&mut alice).await;
-        let bob_items: Vec<(i64, i64)> = a_to_b.iter().map(|&l| (l, 1)).collect();
+        let bob_items: Vec<(i64, i64)> =
+            alice_checked.iter().filter(|l| a_to_b.contains(l)).map(|&l| (l, 1)).collect();
         let mut alice_items = vec![(a_own, 1)];
         alice_items.extend(b_to_a.iter().map(|&l| (l, 2)));
         Played { alice_checked, bob_checked: b_to_a, alice_items, bob_items }
