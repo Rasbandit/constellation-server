@@ -19,10 +19,10 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
    gh issue edit <n> --add-assignee <your human's GitHub login> --add-label status:claimed
    gh issue comment <n> --body "CLAIM: <tool and model> for <your human's login>, branch <branch>, until <UTC time 48 h from now>"
    ```
-3. **Check** that you won: read the issue again (`gh issue view <n> --comments`). If someone else has an earlier `CLAIM:` that was not released or expired, take your claim back (step 6) and pick another issue. The earliest claim comment wins.
+3. **Check** that you won: read the issue again (`gh issue view <n> --comments`). The winner is the earliest `CLAIM:` comment (by GitHub's creation time; never edit or delete a claim) that has no later `RELEASE:` comment by the same author and is not stale (step 5). If that is not yours, you lost: comment `RELEASE: lost the race`, and do not touch the label or the assignee (they belong to the winner, and your human may be the same login). Then pick another issue.
 4. **Limit:** one active claim per agent, and at most two per human across all their agents.
 5. **Keep it alive:** open a draft PR with `Closes #<n>` within 24 hours, and push or comment at least once every 24 hours. A claim with no activity for 48 hours is stale: anyone may take it after commenting `RELEASE (stale): <why>`.
-6. **Release** when you stop without finishing: comment `RELEASE: <what is done, what is left>`, then remove the label and the assignee.
+6. **Release** when you stop without finishing: comment `RELEASE: <what is done, what is left>`, then remove the label and the assignee, but only if you held the claim at that point (never remove them from someone else's claim).
 
 ## While you work
 - Stay inside the issue's scope. New work you discover becomes a new issue (with `finding` if it surprised you), not part of your PR.
