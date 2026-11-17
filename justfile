@@ -1,4 +1,4 @@
-# One entry point for local checks. CI runs the same commands (see .github/workflows/ci.yml).
+# One entry point for local checks. CI runs fmt, clippy and the tests (see .github/workflows/ci.yml).
 default: check
 
 setup:
@@ -28,7 +28,7 @@ test-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --workspace --locked --features log/pg-tests,server/pg-tests
 
-# Gate G-DB throughput benchmark (nightly CI). Heavy: never on a shared developer box.
+# Gate G-DB throughput benchmark (manual nightly workflow). Heavy: never on a shared developer box.
 bench-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --release --locked -p log@0.0.0 --features pg-bench --test throughput -- --nocapture

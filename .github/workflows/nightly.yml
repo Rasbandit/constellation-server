@@ -1,7 +1,7 @@
 name: nightly
+# Manual only while this is a POC: run it from the Actions tab before a release or after
+# touching the log store.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 permissions:
   contents: read
