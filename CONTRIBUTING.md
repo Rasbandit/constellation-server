@@ -18,4 +18,4 @@ Pick a task from [`docs/ROADMAP.md`](docs/ROADMAP.md) or an open issue, say in t
 - Limits and environment variables live only in `crates/config`.
 
 ## Talking about Archipelago
-We build on Archipelago and want to stay good neighbours. Read the design repo's `CLAUDE.md` before writing any issue, PR or doc that mentions it. In short: be accurate and cite sources, credit their work, critique designs and never people, report a suspected bug to its maintainers before mentioning it anywhere public, and never copy their code, text or data into this repo.
+We build on Archipelago and want to stay good neighbours. Read the design repo's `CLAUDE.md` before writing any issue, PR or doc that mentions it. In short: be accurate and cite sources, credit their work, critique designs and never people, report a suspected bug to its maintainers before mentioning it anywhere public, and never copy their code, text or data into this repo. Text that mentions Archipelago gets a review against that file by someone other than its author before it is posted.
