@@ -4,9 +4,11 @@
 //!
 //! Two writers, both fenced the way `PgLogStore` fences (owner rows locked `FOR SHARE`):
 //! - **store** (gated): `PgLogStore::append`, the shipped writer, one transaction per room
-//!   batch, all rooms concurrently each window. Floor: 2,000 rows per second, about 3 times
-//!   the Stage 1 peak of 666 rows per second that doc 12 section 3.3 estimates for 5,900 games
-//!   a day (estimated there, not measured).
+//!   batch, all rooms concurrently each window. Floor: 1,000 rows per second, 1.5 times the
+//!   Stage 1 peak of 666 rows per second that doc 12 section 3.3 estimates for 5,900 games a
+//!   day (estimated there, not measured). Not 3 times: this path is one commit (one fsync)
+//!   per room batch, and GitHub runners measured 4,881, 5,130 and 1,780 rows per second on
+//!   2026-11-16 for unchanged writer code, so a 2,000 floor would fail on runner variance.
 //! - **group** (reported, not gated): one transaction per window for every room's events with
 //!   `UNNEST`, hand-written here. It is the target for the cross-room group-commit writer of
 //!   doc 02 section 5.4, which is not built yet; its bar will be 60 percent of the 20,000 rows
@@ -37,8 +39,9 @@ mod bench {
     const DESIGN_ROWS_PER_SEC: f64 = 20_000.0;
     /// Target for the future group-commit writer (G-DB): 60 percent of the design value.
     const GROUP_TARGET: f64 = 0.6 * DESIGN_ROWS_PER_SEC;
-    /// Gate for the shipped writer: about 3 times doc 12 section 3.3's Stage 1 peak (666/s).
-    const STORE_FLOOR: f64 = 2_000.0;
+    /// Gate for the shipped writer: 1.5 times doc 12 section 3.3's Stage 1 peak (666/s), below
+    /// the slowest runner seen (1,780/s).
+    const STORE_FLOOR: f64 = 1_000.0;
 
     fn ev(seq: u64) -> Event {
         Event {
