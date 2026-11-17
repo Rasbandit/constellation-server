@@ -526,3 +526,14 @@ pub mod testing {
         Ok(format!("{url}{sep}options[search_path]={schema}"))
     }
 }
+
+/// The nightly workflow excludes `fence`'s `&&` to `||` mutant by name (equivalent, see the
+/// comment in `fence`). A second `&&` in `fence` would be excluded silently with it, so this
+/// fails first: whoever adds one must narrow the exclusion in nightly.yml.
+#[cfg(test)]
+#[test]
+fn fence_has_exactly_the_one_and_the_mutants_exclusion_names() {
+    let (_, from_fence) = include_str!("pg.rs").split_once("async fn fence(").expect("fence");
+    let (body, _) = from_fence.split_once("\n}\n").expect("fence ends");
+    assert_eq!(body.matches("&&").count(), 1, "narrow the fence exclusion in nightly.yml");
+}

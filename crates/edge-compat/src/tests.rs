@@ -866,6 +866,10 @@ async fn items_handling_is_read_as_bits_like_the_reference_so_minus_one_and_true
 // The tests below pin behaviour the nightly mutation run showed was unasserted. Packet shapes
 // follow the protocol document's PrintJSON table (which fields each type carries) and its
 // JSONMessagePart table (a `player_id` part carries the slot id as a decimal string).
+// In the Join, Part and Goal prints below, `type`, `team`, `slot` and `tags` (and that `data`
+// is a list of parts naming the player with a `player_id` part) come from the protocol doc.
+// The text wording (" joined the room.", " left the room.", " reached their goal.") is ours,
+// not Archipelago's; clients show `data` as given, so wording is free.
 
 #[test]
 fn polling_a_bucket_often_does_not_stop_it_refilling() {
