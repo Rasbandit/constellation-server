@@ -183,19 +183,7 @@ fn worlds_api(
     worlds::router(dir, token, generation, limits).map(Some)
 }
 
-/// SHA-256 of the bundle file's canonical JSON.
-///
-/// Canonical: parsed as plain JSON, every object's keys sorted, no whitespace. It depends on the file's content only, never on the `SeedBundle`
-/// type, so a new defaulted field in the type does not change a stored room's hash.
-///
-/// # Errors
-/// When the text is not JSON.
-pub fn bundle_hash(text: &str) -> Result<Vec<u8>, String> {
-    let mut v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    v.sort_all_objects();
-    let canonical = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
-    Ok(Sha256::digest(&canonical).to_vec())
-}
+pub use seed_bundle::bundle_hash;
 
 /// `/healthz`: 200 while the room task runs, 503 once it stopped.
 const fn health(running: bool) -> (StatusCode, &'static str) {
@@ -218,7 +206,7 @@ async fn start_room<S: LogStore>(
 ) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
         Some(snap) => {
-            let state: RoomState = serde_json::from_slice(&snap.data)
+            let state = RoomState::from_snapshot(fresh.world(), &snap.data)
                 .map_err(|e| format!("stored snapshot at {}: {e}", snap.seq.0))?;
             state.validate(snap.seq).map_err(|e| e.to_string())?;
             (state, snap.seq)
