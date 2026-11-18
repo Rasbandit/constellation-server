@@ -30,6 +30,8 @@ pub fn placements(w: &World, filled: &Filled, progression: &[bool]) -> Vec<seed_
                 item: w.item_id(u16::try_from(i).unwrap_or(0)),
                 receiver: 1,
                 flags: u8::from(progression.get(i).copied().unwrap_or(false)),
+                // The fill does not record spheres in its placements (`fill_spheres` reports them).
+                sphere: None,
             })
         })
         .collect()
