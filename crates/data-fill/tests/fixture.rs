@@ -431,6 +431,23 @@ fn a_def_chain_nested_too_deep_does_not_compile() {
     assert!(err.contains("nested"), "{err}");
 }
 
+/// Start counts are instance data: negative ones and ones above the location count are
+/// refused before any solve allocates or loops by them, and sums cannot overflow.
+#[test]
+fn start_counts_out_of_range_are_rejected() {
+    let w = world(&manifest());
+    for n in [-1, 1_000_000_000_000, i64::MAX] {
+        let mut inst = instance(ALL);
+        inst.logic_start = HashMap::from([("lamp".to_owned(), n)]);
+        inst.start_inventory = vec!["lamp".to_owned()];
+        let err = Plan::new(&w, &inst).unwrap_err();
+        assert!(matches!(&err, data_fill::FillError::Instance(m) if m.contains("lamp")), "{err:?}");
+    }
+    let mut inst = instance(ALL);
+    inst.logic_start = HashMap::from([("lamp".to_owned(), 6)]);
+    assert!(Plan::new(&w, &inst).is_ok(), "as many as there are locations");
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());

@@ -104,7 +104,7 @@ impl Plan {
     /// Resolve an instance against a world.
     ///
     /// # Errors
-    /// Unknown keys.
+    /// Unknown keys, and start counts below 0 or above the location count.
     pub fn new(w: &World, inst: &Instance) -> Result<Self, FillError> {
         let e = FillError::Instance;
         let mut opts = Vec::with_capacity(w.options());
@@ -130,7 +130,12 @@ impl Plan {
         let item = |k: &str| w.item(k).map_err(e);
         let loc = |k: &str| w.loc(k).map_err(e);
         let mut start = Vec::new();
+        // Solves allocate and loop by held counts, so bound them by what a seed can place.
+        let most = i64::try_from(w.locations()).unwrap_or(i64::MAX);
         for (k, n) in &inst.logic_start {
+            if !(0..=most).contains(n) {
+                return Err(e(format!("logic_start {k:?}: {n} is not in 0 to {most} (locations)")));
+            }
             start.push((item(k)?, *n));
         }
         for k in &inst.start_inventory {
@@ -199,8 +204,19 @@ impl Plan {
         let mut copies = vec![0i64; w.items()];
         let placed = plan.progression.iter().chain(&plan.rest);
         let fixed = plan.locked.iter().chain(&plan.self_grants).map(|x| &x.1);
-        placed.chain(fixed).for_each(|i| copies[*i as usize] += 1);
-        plan.start.iter().for_each(|(i, n)| copies[*i as usize] += n);
+        let mut add = |i: u16, n: i64| {
+            let c = &mut copies[usize::from(i)];
+            *c = c
+                .checked_add(n)
+                .ok_or_else(|| e(format!("item {:?}: too many copies", w.item_key(i))))?;
+            Ok::<_, FillError>(())
+        };
+        for i in placed.chain(fixed) {
+            add(*i, 1)?;
+        }
+        for (i, n) in &plan.start {
+            add(*i, *n)?;
+        }
         let mut kinds = plan.progression.clone();
         kinds.sort_unstable();
         kinds.dedup();
