@@ -26,5 +26,13 @@ By opening a pull request you agree that:
 - Lints are default (POC mode). No `unsafe`.
 - Limits and environment variables live only in `crates/config`.
 
+## Concurrency
+Write every crate as if it runs on many cores, so scaling out never needs a rewrite.
+- Shared data is immutable and shared by reference (`&T`, `Arc<T>`). Mutable state is owned by one task and passed in, never global. No `static mut`, no `Rc`/`RefCell` in library types; core types must be `Send + Sync`.
+- Results never depend on thread count or scheduling. Each task gets its own RNG stream from `spec_rng::derive`, and parallel results are merged in a fixed order.
+- Parallelise across independent units (seeds, rooms, worlds, checks), not inside one inherently sequential step such as a single fill.
+- CPU-heavy work (generation, compiling worlds, bulk checks) runs on a blocking or worker pool, never on the async runtime's I/O threads.
+- Locks guard small, short critical sections only. Never hold a lock across an `.await` or across I/O.
+
 ## Talking about Archipelago
 We build on Archipelago and want to stay good neighbours. Read the design repo's `CLAUDE.md` before writing any issue, PR or doc that mentions it. In short: be accurate and cite sources, credit their work, critique designs and never people, report a suspected bug to its maintainers before mentioning it anywhere public, and never copy their code, text or data into this repo. Text that mentions Archipelago gets a review against that file by someone other than its author before it is posted.
