@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Real end-to-end generation through the server's admin API (`just ap-gen-check`): start the
+# server with a throwaway --data-dir, upload one apworld and one player yaml, generate in the
+# sandbox with a local Archipelago checkout, and wait for the bundle. Local only.
+#
+#   check.sh <apworld> <yaml> <archipelago checkout> <python with its dependencies>
+set -euo pipefail
+apworld=$1 yaml=$2 ap=$3 python=$4
+root=$(cd "$(dirname "$0")/../.." && pwd)
+work=$(mktemp -d)
+pid=
+trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$work"' EXIT
+
+token=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+# The header goes to curl from a file, so the token never shows in `ps`.
+printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
+CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHON=$python \
+    CONSTELLATION_AP_GEN_SCRIPT=$root/tools/ap-gen/ap_gen.py \
+    "${CARGO_TARGET_DIR:-$root/target}/debug/constellation-server" --bundle "$root/crates/e2e/fixtures/two-slot.json" \
+    --port 0 --data-dir "$work/data" 2>"$work/log" &
+pid=$!
+for _ in $(seq 100); do
+    addr=$(grep -o 'listening addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2) && [ -n "$addr" ] && break
+    sleep 0.1
+done
+[ -n "${addr:-}" ] || { cat "$work/log"; exit 1; }
+
+api() { curl -sS --fail-with-body -H @"$work/auth" "$@"; }
+urlname() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$(basename "$1")"; }
+w=$(api -X PUT --data-binary @"$apworld" "http://$addr/api/apworlds?name=$(urlname "$apworld")")
+y=$(api -X PUT --data-binary @"$yaml" "http://$addr/api/yamls?name=$(urlname "$yaml")")
+echo "apworld: $w"
+echo "yaml: $y"
+idof() { python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])'; }
+body=$(printf '{"apworlds":["%s"],"yamls":["%s"]}' "$(idof <<<"$w")" "$(idof <<<"$y")")
+job=$(api -X POST --data-binary "$body" "http://$addr/api/worlds" | idof)
+start=$(date +%s)
+while :; do
+    status=$(api "http://$addr/api/worlds/$job")
+    case $status in
+    *'"status":"done"'*) break ;;
+    *'"status":"failed"'*) echo "$status"; exit 1 ;;
+    esac
+    sleep 1
+done
+echo "done in $(($(date +%s) - start)) s (queue to done, as seen by polling)"
+python3 -c '
+import json, sys
+s = json.loads(sys.argv[1])
+b = json.load(open(s["bundle"]))
+locations = sum(len(x["locations"]) for x in b["slots"])
+print("seed", s["seed_name"], "-", s["slots"], "slots,", locations, "locations, sidecar",
+      s["generation"]["seconds"], "s; load_bundle accepted it (status done)")
+' "$status"

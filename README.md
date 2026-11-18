@@ -19,6 +19,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle a
 - `crates/e2e`: end-to-end helpers (start the real binary, a yawc client, the fixture) and the fixture itself. The scenarios are integration tests of `server` (`crates/server/tests/compat.rs`), so cargo builds the binary and hands its path over (`CARGO_BIN_EXE_constellation-server`).
 - `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
+- `tools/ap-gen`: the generation sidecar the server runs in its sandbox: inspects uploaded `.apworld` and player `.yaml` files, and generates a seed with an Archipelago checkout, converted by `tools/ap-import` (see "Uploads and seed generation").
 - `tools/ap-client-check`: drives the real server with Archipelago's own `CommonClient` from the sibling checkout (connect, `SetNotify`, `Set`, `Get`, start items, client status). Local only: `just ap-client-check`.
 
 Next crates, in doc 05 section 20 order: `edge-native`.
@@ -41,6 +42,19 @@ EnvironmentFile=/etc/constellation/env
 Restart=on-failure
 RestartPreventExitStatus=3
 ```
+
+### Uploads and seed generation (admin API)
+With `--data-dir <path>` the server also serves an admin API that stores uploaded worlds and player files and generates a seed bundle from a chosen set of them. Hosting that bundle as a room is a separate step. The server refuses to start with `--data-dir` unless all of these are set: `CONSTELLATION_ADMIN_TOKEN` (or `CONSTELLATION_ADMIN_TOKEN_FILE`), `CONSTELLATION_AP_DIR` (an Archipelago checkout), `CONSTELLATION_AP_PYTHON` (a Python with its dependencies) and `CONSTELLATION_AP_GEN_SCRIPT` (`tools/ap-gen/ap_gen.py`, absolute path). Every route needs `Authorization: Bearer <token>`. Uploads are raw request bodies, not multipart:
+- `PUT /api/apworlds?name=<file>` and `PUT /api/yamls?name=<file>` (percent-encode the name): the body is checked by the sandboxed sidecar, then stored as `<data-dir>/apworlds/<sha256>.apworld` or `<data-dir>/yamls/<sha256>.yaml` with a `<sha256>.json` record beside it. Replies `201` with `{id, name, bytes, ...}` (for an apworld its `module`, `game`, `world_version` and other manifest fields; for a yaml its `players`). The same content again replies `200` with the stored record. Caps: 64 MiB per apworld, 1 MiB per yaml.
+- `GET /api/apworlds`, `GET /api/yamls`: the stored records.
+- `POST /api/worlds` with `{"apworlds": [ids], "yamls": [ids]}`: replies `202` with `{id, status: "queued"}`. Generations run one at a time.
+- `GET /api/worlds/<id>`: `{status: queued|running|done|failed, ...}`, with `error` on failure, and `bundle` (the path of `<data-dir>/worlds/<id>/out/bundle.json`), `seed_name`, `slots` and `bundle_hash` once done. The status is kept on disk, so a restarted server still reports it. A job that was queued or running when the server stopped is marked failed.
+
+Generation follows Archipelago's own flow (`Generate.py` rolls the player settings from the yamls, `Main.py` writes the multidata; `WebHostLib/generate.py` does the same for the web host) with spoilers off. Patch files are still written, because Archipelago's `--skip_output` also skips the multidata, but we ignore them. Limits come from `crates/config`: `CONSTELLATION_GEN_TIMEOUT_MS` (15 minutes, then the job is killed) and `CONSTELLATION_GEN_MEMORY_BYTES` (4 GiB address space).
+
+**Security model.** An `.apworld` is Python code, and generating runs it, so anyone who can upload and generate can run code on this machine. That is why the API is admin-only and every sidecar call (inspect and generate) runs in bubblewrap (`crates/server/src/sandbox.rs`; needs `bwrap` and `prlimit`). Inside the sandbox there is no network and nothing from the host environment. `/usr`, the Python install and `tools/` are read-only. The checkout is a throwaway overlay, so Archipelago's own writes (logs, settings) vanish. The only host folder it can write is the job's `out/`. It sees only the job's chosen apworlds (mounted as the checkout's `custom_worlds/`) and yamls. The process has a memory cap and a wall-clock limit, and it dies with the server. Inspect reads the zip and yaml as data and never imports world code. It refuses absolute paths, `..`, symlinks, more than 20 000 entries and more than 256 MiB unpacked. Yamls are read with `yaml.safe_load_all`. Known gaps: CPU is not capped beyond the time limit, the overlay's scratch space has no size cap (`/tmp` is capped at 256 MiB), and the sandbox shares the server's user, so a kernel escape from bubblewrap would reach the data folder.
+
+Real end to end with your own files (they are never committed): `just ap-gen-check [<apworld>] [<yaml>]` (defaults: `~/Downloads/mm_2ship.apworld` and `~/Downloads/Majoras Mask.yaml`). It needs `../Archipela-Go/.ap` and its `apworld/.venv`, and prints the seed, slots, locations and timing.
 
 ## Regenerate the fixture
 The fixture is a two-slot seed of the owner's game (player options in `crates/e2e/fixtures/players/`), made with Archipelago's own generator and the Archipela-Go apworld, then converted by `tools/ap-import`. The raw `.archipelago` file is not committed.
@@ -80,6 +94,8 @@ Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
 - `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
 - `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
 - `just ap-client-check`: Archipelago's `CommonClient` against the real server; needs `../Archipela-Go` and its `apworld/.venv`. Run it before merging edge changes, like `just e2e-ap`.
+- `cargo test -p server --test worlds`: the upload and generation API through the real sandbox, with a fake sidecar (`crates/server/tests/fake_ap_gen.py`); needs `bwrap` and `python3`, no Archipelago. Sidecar inspect tests: `python -m pytest tools/ap-gen/test_ap_gen.py` (needs PyYAML).
+- `just ap-gen-check`: a real generation through the API (see "Uploads and seed generation").
 
 ## Dev setup
 Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt check), commit-msg (conventional commits, subject at most 50 chars). `just check` also needs `cargo-deny` and `typos`.

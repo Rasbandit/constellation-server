@@ -3,7 +3,7 @@
 The server runs every call inside its sandbox (crates/server/src/sandbox.rs). It prints one JSON
 value to stdout; on failure it prints the reason to stderr and exits non-zero.
 
-    ap_gen.py inspect-apworld <path>
+    ap_gen.py inspect-apworld <path> --max-unpacked <bytes> --max-entries <n>
     ap_gen.py inspect-yaml <path>
     ap_gen.py generate --ap <checkout> --apworlds <dir> --yamls <dir> --out <dir>
 
@@ -41,10 +41,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ap-import"))
 import ap_import  # noqa: E402  (needs the sys.path entry above; the sidecar runs with -I)
 
-# Design values, not measurements: big enough for large real worlds (a 2 MB world unpacks to
-# about 2 MB; the largest bundled worlds are tens of MB), small enough to refuse a zip bomb.
-MAX_APWORLD_UNPACKED = 256 * 1024 * 1024
-MAX_APWORLD_ENTRIES = 20_000
+# The unpacked size and entry caps come from the server (crates/config, `Limits`).
 MAX_MANIFEST_BYTES = 64 * 1024
 # A world's module name: what `worlds.<name>` imports, so a Python identifier.
 MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -54,7 +51,7 @@ class Refused(Exception):
     """Input we will not accept; the message is shown to the uploader."""
 
 
-def inspect_apworld(path: Path) -> dict[str, Any]:
+def inspect_apworld(path: Path, max_unpacked: int, max_entries: int) -> dict[str, Any]:
     """Validate an apworld zip and read its manifest without running any of its code."""
     try:
         zf = zipfile.ZipFile(path)
@@ -64,8 +61,8 @@ def inspect_apworld(path: Path) -> dict[str, Any]:
         infos = zf.infolist()
         if not infos:
             raise Refused("empty zip")
-        if len(infos) > MAX_APWORLD_ENTRIES:
-            raise Refused(f"more than {MAX_APWORLD_ENTRIES} entries")
+        if len(infos) > max_entries:
+            raise Refused(f"more than {max_entries} entries")
         total = 0
         tops = set()
         manifest_info = None
@@ -77,8 +74,8 @@ def inspect_apworld(path: Path) -> dict[str, Any]:
             if stat.S_ISLNK(info.external_attr >> 16):
                 raise Refused(f"symlink in zip: {name!r}")
             total += info.file_size
-            if total > MAX_APWORLD_UNPACKED:
-                raise Refused(f"larger than {MAX_APWORLD_UNPACKED} bytes unpacked")
+            if total > max_unpacked:
+                raise Refused(f"larger than {max_unpacked} bytes unpacked")
             if len(parts) > 1 or info.is_dir():
                 tops.add(parts[0])
             # The manifest Archipelago reads (worlds/Files.py, APContainer.read_contents).
@@ -188,7 +185,10 @@ def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="ap_gen.py")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("inspect-apworld").add_argument("path", type=Path)
+    ia = sub.add_parser("inspect-apworld")
+    ia.add_argument("path", type=Path)
+    ia.add_argument("--max-unpacked", type=int, required=True)
+    ia.add_argument("--max-entries", type=int, required=True)
     sub.add_parser("inspect-yaml").add_argument("path", type=Path)
     g = sub.add_parser("generate")
     for flag in ("--ap", "--apworlds", "--yamls", "--out"):
@@ -196,7 +196,7 @@ def main(argv: list[str]) -> int:
     a = p.parse_args(argv)
     try:
         if a.cmd == "inspect-apworld":
-            result: Any = inspect_apworld(a.path)
+            result: Any = inspect_apworld(a.path, a.max_unpacked, a.max_entries)
         elif a.cmd == "inspect-yaml":
             result = inspect_yaml(a.path)
         else:

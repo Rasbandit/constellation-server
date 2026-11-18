@@ -242,15 +242,19 @@ async fn inspect_and_store(
     let file = format!("upload.{}", kind.ext());
     std::fs::create_dir_all(tmp).map_err(internal)?;
     std::fs::write(tmp.join(&file), body).map_err(internal)?;
-    let sub = match kind {
-        Kind::Apworld => "inspect-apworld",
-        Kind::Yaml => "inspect-yaml",
-    };
     let inside = format!("{JOB}/{file}");
+    let (unpacked, entries) =
+        (w.limits.apworld_max_unpacked_bytes.to_string(), w.limits.apworld_max_entries.to_string());
+    let args: Vec<&str> = match kind {
+        Kind::Apworld => {
+            vec!["inspect-apworld", &inside, "--max-unpacked", &unpacked, "--max-entries", &entries]
+        }
+        Kind::Yaml => vec!["inspect-yaml", &inside],
+    };
     let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
     let found = w
         .sandbox
-        .run(false, &[Mount::ro(tmp, JOB)], &[sub, &inside], timeout)
+        .run(false, &[Mount::ro(tmp, JOB)], &args, timeout)
         .await
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let mut meta = json!({"id": id, "name": name, "bytes": body.len()});
@@ -472,7 +476,7 @@ mod tests {
             content_id(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_ne!(content_id(b"abc"), content_id(b"abd"));
+        assert_ne!(content_id(b"abc"), content_id(b"abx"));
     }
 
     fn headers(auth: &str) -> HeaderMap {

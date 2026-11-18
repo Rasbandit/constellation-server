@@ -11,7 +11,13 @@ import zipfile
 from pathlib import Path
 
 import ap_gen
-from ap_gen import Refused, inspect_apworld, inspect_yaml
+from ap_gen import Refused, inspect_yaml
+
+UNPACKED, ENTRIES = 1 << 20, 100
+
+
+def inspect_apworld(path, max_unpacked=UNPACKED, max_entries=ENTRIES):
+    return ap_gen.inspect_apworld(path, max_unpacked, max_entries)
 
 
 def build_zip(path: Path, entries: dict[str, bytes], symlinks: tuple[str, ...] = ()) -> Path:
@@ -58,23 +64,14 @@ class InspectApworld(unittest.TestCase):
             inspect_apworld(self.zip({"w/__init__.py": b""}, symlinks=("w/link",)))
 
     def test_over_the_unpacked_size_cap_is_refused_and_at_it_is_accepted(self):
-        old = ap_gen.MAX_APWORLD_UNPACKED
-        ap_gen.MAX_APWORLD_UNPACKED = 100
-        try:
-            inspect_apworld(self.zip({"w/__init__.py": b"x" * 100}))
-            with self.assertRaisesRegex(Refused, "larger than 100"):
-                inspect_apworld(self.zip({"w/__init__.py": b"x" * 101}))
-        finally:
-            ap_gen.MAX_APWORLD_UNPACKED = old
+        inspect_apworld(self.zip({"w/__init__.py": b"x" * 100}), max_unpacked=100)
+        with self.assertRaisesRegex(Refused, "larger than 100"):
+            inspect_apworld(self.zip({"w/__init__.py": b"x" * 101}), max_unpacked=100)
 
     def test_too_many_entries_is_refused(self):
-        old = ap_gen.MAX_APWORLD_ENTRIES
-        ap_gen.MAX_APWORLD_ENTRIES = 2
-        try:
-            with self.assertRaisesRegex(Refused, "more than 2 entries"):
-                inspect_apworld(self.zip({f"w/{i}.py": b"" for i in range(3)}))
-        finally:
-            ap_gen.MAX_APWORLD_ENTRIES = old
+        inspect_apworld(self.zip({f"w/{i}.py": b"" for i in range(2)}), max_entries=2)
+        with self.assertRaisesRegex(Refused, "more than 2 entries"):
+            inspect_apworld(self.zip({f"w/{i}.py": b"" for i in range(3)}), max_entries=2)
 
     def test_empty_two_top_folders_bad_module_and_not_a_zip_are_refused(self):
         with self.assertRaisesRegex(Refused, "empty zip"):
@@ -130,7 +127,8 @@ class InspectYaml(unittest.TestCase):
 
 class Cli(unittest.TestCase):
     def test_a_refusal_exits_1(self):
-        self.assertEqual(ap_gen.main(["inspect-apworld", "/nonexistent/x.apworld"]), 1)
+        self.assertEqual(ap_gen.main(["inspect-apworld", "/nonexistent/x.apworld",
+                                      "--max-unpacked", "1", "--max-entries", "1"]), 1)
 
 
 if __name__ == "__main__":

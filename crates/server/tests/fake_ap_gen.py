@@ -30,6 +30,10 @@ def probe_write(path: str) -> str:
 def main(argv):
     cmd = argv[0]
     if cmd == "inspect-apworld":
+        # The caps come from the server's config (Limits::DESIGN).
+        if argv[2:] != ["--max-unpacked", str(256 << 20), "--max-entries", "20000"]:
+            print(f"bad caps {argv[2:]}", file=sys.stderr)
+            return 2
         data = Path(argv[1]).read_bytes()
         if data.startswith(b"BAD"):
             print("refused: not a zip file", file=sys.stderr)
