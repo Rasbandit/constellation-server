@@ -150,6 +150,9 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let to_bob: Vec<i64> = alice_locations_for(2).iter().take(3).map(|p| p.0).collect();
         check(&mut alice, &to_bob).await;
+        // The signal that the checks are durable, so Bob's first list holds them: his start
+        // items always make a first list now, so it must not race the checks.
+        alice.next_cmd("RoomUpdate").await.unwrap();
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let start = e2e::start_items(2).unwrap();
         let (first, _) = bob.next_cmd("ReceivedItems").await.unwrap();
