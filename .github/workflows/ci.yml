@@ -1,7 +1,7 @@
 name: ci
-# POC mode: fmt and the tests only, docs-only changes skip it. Clippy, deny, typos and docs are
-# local (`just check`); coverage, mutants and benchmarks are manual (nightly.yml).
-# The push to main keeps the build cache warm; PRs only restore it (saving costs ~8 s).
+# POC mode: fmt and the unit tests only, docs-only changes skip it. No database, no end-to-end.
+# The full suite with Postgres is the manual `properties` job in nightly.yml; locally `just check`.
+# The push to main keeps the build cache warm; PRs only restore it.
 on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE*"]
@@ -19,22 +19,11 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Postgres for the log store's contract suite and the restart scenarios (D-98, gate G-DB).
-    # A throwaway container; the password is not a secret.
-    services:
-      postgres:
-        image: postgres:18
-        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: constellation_test }
-        ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
-    env:
-      CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       # No toolchain action: the runner's rustup reads rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - run: cargo fmt --all --check
-      # The Postgres tests run here (`pg-tests`; they fail, never skip, without the database).
-      # Not `--all-features`: that would pull the nightly-only throughput benchmark into the gate.
-      - run: cargo test --workspace --locked --features log/pg-tests,server/pg-tests
+      - run: cargo test --workspace --lib --locked
