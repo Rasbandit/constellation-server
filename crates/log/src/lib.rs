@@ -17,7 +17,7 @@ pub use mem::MemLogStore;
 #[cfg(feature = "pg-tests")]
 pub use pg::testing;
 #[cfg(feature = "postgres")]
-pub use pg::{Listed, OpenError, Opened, PgLogStore};
+pub use pg::{Listed, OpenError, Opened, PgLogStore, World};
 
 /// Opaque snapshot of room state as of room `seq` `seq` (the caller owns the encoding).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +124,8 @@ pub trait LogStore: Send + Sync + 'static {
         epoch: Epoch,
     ) -> impl Future<Output = Result<(), AppendError>> + Send;
 
-    /// Store a room's seed. Write once: a room that has a seed keeps it.
+    /// Store a room's seed. Write once: storing the seed a room already has is a no-op, and a
+    /// different one is refused ([`StoreError::Corrupt`]), never silently dropped.
     fn seed_put(
         &self,
         room: RoomId,
@@ -142,21 +143,75 @@ pub trait LogStore: Send + Sync + 'static {
 pub type BlobKey = [u8; 32];
 
 /// Content-addressed immutable blobs (game packages): the seam a Postgres table, memory, or
-/// later an object store with a local cache sit behind. Read through [`blob_get`], the one
-/// place a blob is checked against its key.
-pub trait BlobStore: Send + Sync + 'static {
-    /// Store `bytes` under `key` (their SHA-256). Idempotent: a stored key keeps its bytes.
+/// later an object store with a local cache sit behind. Both directions check the key: [`put`]
+/// refuses bytes that do not hash to it, [`get`] refuses stored bytes that do not (a tampered
+/// or torn row). Implementations live in this crate (the raw side is not public).
+///
+/// [`put`]: BlobStore::put
+/// [`get`]: BlobStore::get
+pub trait BlobStore: raw::RawBlobs + Send + Sync + 'static {
+    /// Store `bytes` under `key`, their SHA-256 ([`blob_key`]). Idempotent.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when `key` is not the hash of `bytes`; the store failing.
     fn put(
         &self,
         key: &BlobKey,
         bytes: &[u8],
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let put = (blob_key(bytes) == *key).then(|| self.put_raw(key, bytes));
+        async move {
+            match put {
+                Some(put) => put.await,
+                None => {
+                    Err(StoreError::Corrupt("a blob put under a key it does not hash to".into()))
+                }
+            }
+        }
+    }
 
-    /// The bytes stored under `key`, as stored; use [`blob_get`], which checks them.
-    fn get_unchecked(
+    /// The blob stored under `key`, checked against it.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the stored bytes do not hash to `key`; the store failing.
+    fn get(
         &self,
         key: &BlobKey,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let raw = self.get_raw(key);
+        let key = *key;
+        async move {
+            match raw.await? {
+                Some(bytes) if blob_key(&bytes) != key => {
+                    Err(StoreError::Corrupt("a stored blob does not match its key".to_owned()))
+                }
+                found => Ok(found),
+            }
+        }
+    }
+}
+
+impl<T: raw::RawBlobs + Send + Sync + 'static> BlobStore for T {}
+
+/// The unchecked side of a blob store: nameable only inside this crate, so every read and
+/// write outside it goes through [`BlobStore`]'s checks.
+pub(crate) mod raw {
+    use super::{BlobKey, StoreError};
+
+    /// Raw blob IO, unchecked.
+    pub trait RawBlobs {
+        /// Store the bytes, write once (a stored key keeps its bytes unless they were torn).
+        fn put_raw(
+            &self,
+            key: &BlobKey,
+            bytes: &[u8],
+        ) -> impl Future<Output = Result<(), StoreError>> + Send;
+        /// The bytes as stored.
+        fn get_raw(
+            &self,
+            key: &BlobKey,
+        ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+    }
 }
 
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
@@ -164,20 +219,6 @@ pub trait BlobStore: Send + Sync + 'static {
 pub fn blob_key(bytes: &[u8]) -> BlobKey {
     use sha2::Digest;
     sha2::Sha256::digest(bytes).into()
-}
-
-/// The blob stored under `key`, checked: bytes that do not hash to `key` (a tampered or torn
-/// row) are [`StoreError::Corrupt`], never returned.
-///
-/// # Errors
-/// When the store fails or the stored bytes do not match the key.
-pub async fn blob_get<B: BlobStore>(b: &B, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
-    match b.get_unchecked(key).await? {
-        Some(bytes) if blob_key(&bytes) != *key => {
-            Err(StoreError::Corrupt("a stored blob does not match its key".to_owned()))
-        }
-        found => Ok(found),
-    }
 }
 
 #[cfg(test)]
