@@ -1,3 +1,4 @@
+import { toRoom, type RoomView } from './roomView';
 import { toApWorld, toPlayers, type ApWorldRecord, type YamlRecord } from './uploads';
 import type {
   ApiError,
@@ -55,6 +56,12 @@ const enc = encodeURIComponent;
 declare const __CONSTELLATION_ADMIN_API__: boolean | undefined;
 const adminApi = typeof __CONSTELLATION_ADMIN_API__ !== 'undefined' && __CONSTELLATION_ADMIN_API__;
 
+/**
+ * True when the pages show a real room from the server (the admin proxy is on): rooms are
+ * generated worlds, by world id, read through `/api/worlds/:id/room`. False: the stub's demo data.
+ */
+export const liveRooms = adminApi;
+
 /** `GET /api/worlds/:id` (crates/server/src/worlds.rs). */
 interface WorldStatus {
   id: string;
@@ -102,17 +109,24 @@ export const api = {
 
   rooms: () => call<RoomSummary[]>('GET', '/api/rooms'),
   resolveCode: (code: string) => call<{ roomId: string }>('GET', `/api/codes/${enc(code)}`),
-  /** With the admin API, the server generates and hosts the world first; the room page stays the stub's. */
-  createRoom: async (req: CreateRoomRequest) =>
-    call<Room>('POST', '/api/rooms', { body: adminApi ? { ...req, world: await generateWorld(req) } : req }),
-  room: (id: string, adminKey?: string) =>
-    call<Room>('GET', `/api/rooms/${enc(id)}`, { headers: adminKey ? { 'X-Admin-Key': adminKey } : {} }),
-  feed: (id: string, after = 0) => call<FeedItem[]>('GET', `/api/rooms/${enc(id)}/feed?after=${after}`),
-  hints: (id: string) => call<Hint[]>('GET', `/api/rooms/${enc(id)}/hints`),
+  /** With the admin API, the server generates and hosts the world, and the room is that world. */
+  createRoom: (req: CreateRoomRequest): Promise<Room> =>
+    adminApi ? generateWorld(req).then((w) => api.room(w.id)) : call<Room>('POST', '/api/rooms', { body: req }),
+  room: (id: string, adminKey?: string): Promise<Room> =>
+    adminApi
+      ? call<RoomView>('GET', `/api/worlds/${enc(id)}/room`).then((v) => toRoom(id, v))
+      : call<Room>('GET', `/api/rooms/${enc(id)}`, { headers: adminKey ? { 'X-Admin-Key': adminKey } : {} }),
+  /** Live rooms: the event stream itself carries the history (and resumes with Last-Event-ID). */
+  feed: (id: string, after = 0): Promise<FeedItem[]> =>
+    adminApi ? Promise.resolve([]) : call<FeedItem[]>('GET', `/api/rooms/${enc(id)}/feed?after=${after}`),
+  /** Live rooms: the server stores no hints yet, so there are none to show. */
+  hints: (id: string): Promise<Hint[]> => (adminApi ? Promise.resolve([]) : call<Hint[]>('GET', `/api/rooms/${enc(id)}/hints`)),
   chat: (id: string, slot: SlotNo, text: string) => call<FeedItem>('POST', `/api/rooms/${enc(id)}/chat`, { body: { slot, text } }),
   setHintStatus: (id: string, hint: string, status: HintStatus) =>
     call<Hint>('POST', `/api/rooms/${enc(id)}/hints/${enc(hint)}`, { body: { status } }),
-  streamUrl: (id: string) => `/api/rooms/${enc(id)}/stream`,
+  streamUrl: (id: string) => (adminApi ? `/api/worlds/${enc(id)}/room/events` : `/api/rooms/${enc(id)}/stream`),
+  /** The SSE event name: the server's stream uses the default one, the stub names its entries `feed`. */
+  streamEvent: adminApi ? 'message' : 'feed',
 
   admin: (id: string, key: string) => {
     const h = { 'X-Admin-Key': key };

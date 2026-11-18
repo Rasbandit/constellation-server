@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { api } from '../api/client';
+import { api, liveRooms } from '../api/client';
 import type { RoomState, RoomSummary } from '../api/types';
 import { Card, Empty, RoomStatePill } from '../components/ui';
 import { ago } from '../lib/format';
@@ -8,7 +8,8 @@ import { joinPath } from '../lib/join';
 import { useLoad } from '../lib/live';
 
 export function Home() {
-  const rooms = useLoad(() => api.rooms(), []);
+  // A live server has no room list yet; the stub's list is demo data.
+  const rooms = useLoad(() => (liveRooms ? Promise.resolve([]) : api.rooms()), []);
   const [join, setJoin] = useState('');
   const [tab, setTab] = useState<'active' | 'closed'>('active');
   const nav = useNavigate();
@@ -65,7 +66,8 @@ export function Home() {
       >
         {rooms.error && <p className="error-text">Could not load rooms: {rooms.error.message}</p>}
         {!rooms.data && !rooms.error && <p className="muted">Loading rooms...</p>}
-        {rooms.data && list.length === 0 && (
+        {liveRooms && <p className="muted">Not available yet: the server has no room list. Open a room from its link, or create one.</p>}
+        {!liveRooms && rooms.data && list.length === 0 && (
           <Empty>{tab === 'active' ? 'No active rooms. Create one to get started.' : 'No closed rooms.'}</Empty>
         )}
         <ul className="room-list">

@@ -72,18 +72,6 @@ describe('stub API', () => {
     expect(room.adminKey).toBeTruthy();
   });
 
-  it('a room from a world the server hosts shows its join address and skips generating', async () => {
-    const req: CreateRoomRequest = {
-      name: 'Real',
-      apworlds: [],
-      players: [{ id: 'p', fileName: 'a.yaml', name: 'Alice', game: 'Archipela-Go' }],
-      rules: { hintCostPct: 10, releaseMode: 'goal', collectMode: 'goal', password: '', spoilerLog: true },
-      world: { id: 'w', seed: '0189', roomKey: 'ilypozn5hc', address: 'ilypozn5hc.localhost:46345' },
-    };
-    const room = (await (await json('POST', '/api/rooms', req)).json()) as Room;
-    expect(room).toMatchObject({ host: 'ilypozn5hc.localhost', port: 46345, seed: '0189', state: 'lobby' });
-  });
-
   it('needs the admin key for admin actions, and records them', async () => {
     const path = '/api/rooms/friday-7k2q/admin/items';
     expect((await json('POST', path, { to: 1, item: 'Moonlit Key' })).status).toBe(403);

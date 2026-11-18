@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api/client';
+import { api, liveRooms } from '../api/client';
+import { toFeed, type RoomEvent } from '../api/roomView';
 import type { FeedItem, Hint, Room } from '../api/types';
 
 /** Loads a value once and on demand; keeps the last good value while reloading. */
@@ -61,8 +62,11 @@ export function useLiveRoom(id: string, adminKey?: string) {
       api.feed(id, lastSeq.current).then((items) => !cancelled && add(items), () => undefined);
     };
     es.onerror = () => setLink('retrying');
-    es.addEventListener('feed', (e) => {
-      add([JSON.parse((e as MessageEvent).data) as FeedItem]);
+    es.addEventListener(api.streamEvent, (e) => {
+      const data: unknown = JSON.parse((e as MessageEvent).data);
+      // A live room's events become feed lines numbered in stream order.
+      const item = liveRooms ? toFeed(data as RoomEvent, lastSeq.current + 1) : (data as FeedItem);
+      if (item) add([item]);
       refresh();
     });
     return () => {

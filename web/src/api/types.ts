@@ -56,8 +56,6 @@ export interface CreateRoomRequest {
   apworlds: ApWorld[];
   players: PlayerFile[];
   rules: RoomRules;
-  /** A world the server generated and hosts; the room shows its join address. */
-  world?: GeneratedWorld;
 }
 
 /** A generated world the server runs as a room (`GET /api/worlds/:id` once it has `room_key`). */
@@ -77,9 +75,10 @@ export interface Slot {
   checksDone: number;
   checksTotal: number;
   itemsReceived: number;
-  hintPoints: number;
-  /** ISO time of the last packet from this slot, or null if it never connected. */
-  lastSeen: string | null;
+  /** Null where the server does not track them (the real room view). */
+  hintPoints: number | null;
+  /** ISO time of the last packet from this slot, null if it never connected, undefined where not tracked. */
+  lastSeen?: string | null;
   clients: number;
 }
 

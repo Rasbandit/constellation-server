@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, HttpError } from '../api/client';
+import { api, liveRooms, HttpError } from '../api/client';
 import type { ApWorld, CollectMode, PlayerFile, ReadinessCheck, ReleaseMode, RoomRules } from '../api/types';
 import { Phases } from '../components/phases';
 import { Card, Dropzone, Empty, Modal, useToast } from '../components/ui';
@@ -104,9 +104,12 @@ export function CreateRoom() {
           <h1>Create a room</h1>
           <p className="muted">Add files in any order. The checklist on the right shows what is left.</p>
         </div>
-        <button type="button" className="btn btn-ghost" onClick={loadSample}>
-          Try with sample files
-        </button>
+        {/* The sample files exist only in the stub; the server would refuse them. */}
+        {!liveRooms && (
+          <button type="button" className="btn btn-ghost" onClick={loadSample}>
+            Try with sample files
+          </button>
+        )}
       </div>
 
       <Phases state="create" />
