@@ -46,6 +46,12 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 - G-DB status: fence (`FOR SHARE` on `room_owner`) and fence race test done; cancel safety (own task per call, connection closed on error) done and tested; session timeouts (`statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout` from `config`) set on every connection; store throughput gated at 1,000 rows per second; group-commit writer, PgBouncer and `COPY` open.
 - **Deferred:** the PgBouncer test of gate G-DB (writer behind PgBouncer in transaction mode with prepared statements). Stage 0 and 1 run Postgres on the same box with no pooler (doc 12), so there is nothing to test yet; it comes with the first pooler. `COPY` into a temp table is not benchmarked yet either (only `UNNEST`).
 
+## Sandbox tests
+
+- The cargo feature `sandbox-tests` (on `server`) turns on `crates/server/tests/worlds.rs`: the upload and generation API through the real bubblewrap sandbox, with a fake sidecar (`crates/server/tests/fake_ap_gen.py`) in place of Archipelago. It checks what the sandbox allows from the inside (no network, no host environment or folders, read-only tree, capped tmpfs, process cap, no user namespaces) and the flood, timeout and queue paths. With the feature on and no `bwrap`, the tests fail with a message saying so (rule 5: no silent skip). `just test-sandbox` runs them. No workflow runs them yet: GitHub's Ubuntu runners would need bubblewrap installed and unprivileged user namespaces allowed (not verified).
+- The sidecar's Python tests (`tools/ap-gen`, `tools/ap-import`) need only Python and PyYAML: `just test-py`, and CI runs them on every PR.
+- A real generation with Archipelago and your own files: `just ap-gen-check` (local only, see the README).
+
 ## Quality bars (CI)
 
 - **Coverage:** line coverage with `cargo-llvm-cov` (`cargo llvm-cov --workspace`, on demand; not in CI while this is a POC), target 90 percent on the workspace; leaf crates (`proto`, `spec-rng`, `rules`, `room-core`) aim for 100 percent of branches that are reachable. A coverage drop needs a reason in the PR.
