@@ -120,9 +120,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Six: with four, each shard had about 270 mutants and two ran past the 60 minutes
-        # (2026-11-18); the other two took 44 and 48.
-        shard: [0, 1, 2, 3, 4, 5]
+        # Twenty: the hints and world format v2 made about 2,600 mutants (880 in seed-bundle's
+        # v2.rs alone). With six shards of 435 each, run 44306155761 (2026-11-18) did 200 to
+        # 270 per shard in the 60 minutes, 13 to 18 s a mutant: about 130 here, 30 to 40 min.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     env:
       # As in mutants-pg: lints capped for mutants only.
       RUSTFLAGS: ""
@@ -133,17 +134,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with: { tool: "cargo-mutants,cargo-nextest" }
+      - uses: ./.github/actions/user-systemd
       # The rest of the workspace; no Postgres needed. Excluded: crates/e2e and crates/sim, the
       # test harnesses (nothing depends on them; docs/TESTING.md mutates leaf crates, and a
       # harness mutant weakens a test, not the product). Their worth shows as the product
       # mutants they kill, so every mutant runs the whole workspace's tests (--test-workspace):
       # the socket loop is tested by the server's end-to-end tests, room-core by the simulator.
       # nextest with .config/nextest.toml turns a hanging test into a failure.
+      # A mutant can also allocate without end (bits' `ones` never ending, kv's `mul` size
+      # check turned around): most likely why three shards of run 44306155761 lost their runner.
+      # The cap (the runner has 16 GB) makes the kernel kill the test, so the mutant counts as
+      # caught; no swap, so it dies fast. Without OOMPolicy=continue systemd stops the whole
+      # scope, cargo-mutants included, on the first such kill (checked on systemd 259).
       - run: >-
+          systemd-run --user --scope --quiet --collect
+          -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue --
           cargo mutants --workspace -e 'crates/log/**' -e 'crates/server/**' -e 'crates/e2e/**'
           -e 'crates/sim/**' --test-workspace=true --test-tool nextest --minimum-test-timeout 120
           --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
-          --sharding round-robin --shard ${{ matrix.shard }}/6
+          --sharding round-robin --shard ${{ matrix.shard }}/20
       # The per-mutant logs, to triage a survivor without rerunning the job.
       - uses: actions/upload-artifact@v7
         if: always()
