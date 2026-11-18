@@ -54,7 +54,8 @@ yawc.workspace = true
 e2e = { path = "../e2e" }
 # The restart scenarios inject faults and read the fence straight from the database.
 sqlx.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "process"] }
+# test-util: the paused clock, so a test of a timer never waits for real time.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "process", "test-util"] }
 
 [lints]
 workspace = true
