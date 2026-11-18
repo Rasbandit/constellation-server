@@ -46,6 +46,11 @@ mod restart {
             .collect()
     }
 
+    /// The fixture's start items for `slot` as (location -2, player 0) pairs.
+    fn start_items(slot: u32) -> Vec<(i64, i64)> {
+        e2e::start_items(slot).unwrap().iter().map(|_| (-2, 0)).collect()
+    }
+
     async fn wait_goal_print(c: &mut Client) {
         loop {
             let (p, _) = c.next_cmd("PrintJSON").await.unwrap();
@@ -84,10 +89,18 @@ mod restart {
         bob.check(&b_to_a).await.unwrap();
         let (u, _) = bob.next_cmd("RoomUpdate").await.unwrap();
         assert_eq!(locations(&u["checked_locations"]), b_to_a);
+        // Two writes to the data storage; the reply to the second means both are durable.
+        for v in [2, 3] {
+            let set = json!([{"cmd": "Set", "key": "saved", "want_reply": true,
+                "operations": [{"operation": "add", "value": v}]}]);
+            alice.send(&set).await.unwrap();
+            alice.next_cmd("SetReply").await.unwrap();
+        }
         alice.send(&json!([{"cmd": "StatusUpdate", "status": 30}])).await.unwrap();
         wait_goal_print(&mut alice).await;
-        let bob_items: Vec<(i64, i64)> =
-            alice_checked.iter().filter(|l| a_to_b.contains(l)).map(|&l| (l, 1)).collect();
+        // Bob asks for his starting inventory (bit 2), so it leads his list.
+        let mut bob_items = start_items(2);
+        bob_items.extend(alice_checked.iter().filter(|l| a_to_b.contains(l)).map(|&l| (l, 1)));
         let mut alice_items = vec![(a_own, 1)];
         alice_items.extend(b_to_a.iter().map(|&l| (l, 2)));
         Played { alice_checked, bob_checked: b_to_a, alice_items, bob_items }
@@ -106,9 +119,12 @@ mod restart {
         assert_eq!(got, p.bob_checked.iter().copied().collect());
         let (inv, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!((inv["index"].clone(), items(&inv)), (json!(0), p.bob_items.clone()));
-        bob.send(&json!([{"cmd": "Get", "keys": ["_read_client_status_0_1"]}])).await.unwrap();
-        let (status, _) = bob.next_cmd("Retrieved").await.unwrap();
-        assert_eq!(status["keys"]["_read_client_status_0_1"], 30, "the goal was lost");
+        bob.send(&json!([{"cmd": "Get", "keys": ["_read_client_status_0_1", "saved"]}]))
+            .await
+            .unwrap();
+        let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(got["keys"]["_read_client_status_0_1"], 30, "the goal was lost");
+        assert_eq!(got["keys"]["saved"], 5, "the stored value was lost");
         // A check from before the crash is still deduplicated; the new one gets the next index.
         let next = locations_for(1, 2).unwrap()[3].0;
         alice.check(&[p.alice_checked[0], next]).await.unwrap();
@@ -128,8 +144,8 @@ mod restart {
         assert!(!status.success(), "SIGKILL must not look like a clean exit: {status}");
         let server = start(&db);
         let loaded = server.wait_for_log("room loaded").unwrap();
-        // Six checks, each a Checked and an Item event, and one Goal.
-        assert!(loaded.contains("events=13"), "{loaded}");
+        // Six checks, each a Checked and an Item event, two key writes and one Goal.
+        assert!(loaded.contains("events=15"), "{loaded}");
         assert_kept(&server, &played).await;
     }
 
@@ -176,11 +192,8 @@ mod restart {
         let prefix: BTreeSet<i64> = all.iter().take(n).map(|p| p.0).collect();
         assert_eq!(kept, prefix, "the surviving checks are not a prefix of those sent");
         let (mut bob, _, _) = join(&server.url(), "Bob").await.unwrap();
-        let want: Vec<(i64, i64)> =
-            all.iter().take(n).filter(|p| p.1 == 2).map(|p| (p.0, 1)).collect();
-        if want.is_empty() {
-            return;
-        }
+        let mut want = start_items(2);
+        want.extend(all.iter().take(n).filter(|p| p.1 == 2).map(|p| (p.0, 1)));
         let (inv, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!((inv["index"].clone(), items(&inv)), (json!(0), want));
     }

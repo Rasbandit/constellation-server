@@ -37,9 +37,72 @@ async fn log_len(store: &MemLogStore) -> usize {
 
 fn events(p: &Published) -> Vec<Event> {
     match p {
-        Published::Events(e) => e.to_vec(),
+        Published::Events { events, .. } => events.to_vec(),
         Published::Ext { .. } => panic!("expected events, got {p:?}"),
     }
+}
+
+fn kv_add(slot: u32, key: &str, n: i64) -> Command {
+    Command::KvSet(Box::new(proto::KvWrite {
+        slot: SlotNo(slot),
+        key: key.to_owned(),
+        default: None,
+        ops: vec![(proto::KvOp::Add, serde_json::json!(n))],
+    }))
+}
+
+/// Docs/protocol-plan.md section 0.5: what the edge attached to a command rides with that
+/// command's events, in the same queue entry, with the command's reply; commands without a
+/// note add none.
+#[tokio::test]
+async fn a_noted_command_publishes_its_note_with_its_events() {
+    let (h, _store) = start();
+    let mut sub = h.subscribe(Seq(0)).await.unwrap();
+    let note = Arc::new(serde_json::json!({"tag": 1}));
+    let got = h
+        .noted_commands(vec![(check(1, 10), None), (kv_add(2, "k", 5), Some(Arc::clone(&note)))])
+        .await
+        .unwrap();
+    let want = Reply::KvSet(Box::new(room_core::KvDone {
+        seq: Seq(3),
+        original: serde_json::json!(0),
+        value: serde_json::json!(5),
+        bytes: 2, // "k" and `5`
+    }));
+    assert_eq!(got, [Ok(Reply::Checked { seq: Seq(1) }), Ok(want.clone())]);
+    let p = sub.live.try_recv().unwrap();
+    let Published::Events { events, notes } = &*p else { panic!("{p:?}") };
+    assert_eq!(seqs(events), [1, 2, 3]);
+    assert_eq!(**notes, [Note { seq: Seq(3), reply: want, extra: note }]);
+    h.command(kv_add(2, "k", 1)).await.unwrap().unwrap();
+    let p = sub.live.try_recv().unwrap();
+    assert!(matches!(&*p, Published::Events { notes, .. } if notes.is_empty()), "{p:?}");
+}
+
+/// A refused noted command publishes nothing and its note is dropped.
+#[tokio::test]
+async fn a_refused_noted_command_publishes_no_note() {
+    let (h, _store) = start();
+    let mut sub = h.subscribe(Seq(0)).await.unwrap();
+    let mut bad = kv_add(1, "k", 1);
+    if let Command::KvSet(w) = &mut bad {
+        w.key = "_read_x".to_owned();
+    }
+    let got = h.noted_commands(vec![(bad, Some(Arc::new(serde_json::json!(1))))]).await.unwrap();
+    assert_eq!(got, [Err(CoreError::Kv(room_core::KvRefusal::ReservedKey))]);
+    assert_eq!(sub.live.try_recv().unwrap_err(), TryRecvError::Empty);
+}
+
+/// Docs/protocol-plan.md section 0.4: a read is answered from the room state after every
+/// command sent before it, and writes nothing.
+#[tokio::test]
+async fn a_read_sees_every_earlier_command_and_writes_nothing() {
+    let (h, store) = start();
+    h.command(kv_add(1, "k", 2)).await.unwrap().unwrap();
+    h.command(kv_add(2, "k", 3)).await.unwrap().unwrap();
+    let got = h.read(|s| (s.kv_get("k").cloned(), s.kv_get("other").cloned())).await.unwrap();
+    assert_eq!(got, (Some(serde_json::json!(5)), None));
+    assert_eq!(log_len(&store).await, 2);
 }
 
 fn seqs(evs: &[Event]) -> Vec<u64> {
@@ -312,4 +375,11 @@ async fn stopped_stays_pending_while_the_room_runs() {
         () = h.stopped() => panic!("stopped resolved for a running room"),
         () = std::future::ready(()) => {}
     }
+}
+
+/// A read query has no useful debug form; it prints its kind and never runs.
+#[test]
+fn a_read_query_debugs_as_its_kind() {
+    let run = ReadFn(Box::new(|_| panic!("a debug print must not run the query")));
+    assert_eq!(format!("{run:?}"), "ReadFn");
 }

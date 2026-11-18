@@ -109,7 +109,7 @@ impl LogStore for MemLogStore {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Event>, StoreError>> + Send {
         let skip = usize::try_from(after.0).unwrap_or(usize::MAX);
-        ready(Ok(self.with(room, |r| r.events.iter().skip(skip).take(limit).copied().collect())))
+        ready(Ok(self.with(room, |r| r.events.iter().skip(skip).take(limit).cloned().collect())))
     }
 
     fn read_range(
@@ -120,7 +120,7 @@ impl LogStore for MemLogStore {
     ) -> impl Future<Output = Result<Vec<Event>, StoreError>> + Send {
         let skip = usize::try_from(from.0.saturating_sub(1)).unwrap_or(usize::MAX);
         ready(Ok(self.with(room, |r| {
-            r.events.iter().skip(skip).take_while(|e| e.seq <= to).copied().collect()
+            r.events.iter().skip(skip).take_while(|e| e.seq <= to).cloned().collect()
         })))
     }
 

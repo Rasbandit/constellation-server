@@ -49,7 +49,10 @@ mod scenarios {
         assert_eq!(info["cmd"], "RoomInfo");
         assert_eq!(info["seed_name"], b.seed_name);
         assert_eq!(info["password"], false);
-        assert_eq!(info["games"], json!([GAME]));
+        // The generic game names location -2 and player 0 of start items (protocol doc, "Data
+        // Package Contents"); it is listed next to the seed's game.
+        assert_eq!(info["games"], json!([GAME, "Archipelago"]));
+        assert_eq!(info["datapackage_checksums"]["Archipelago"], b.games["Archipelago"].checksum);
         assert_eq!(info["datapackage_checksums"][GAME], b.games[GAME].checksum);
         assert_eq!(info["hint_cost"], 10);
     }
@@ -90,12 +93,16 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let (loc, item, flags) = alice_locations_for(2)[0];
+        // Bob's starting inventory comes first, at index 0, as he asked for it (bit 2).
+        let start = e2e::start_items(2).unwrap();
+        let (got, _) = bob.next_cmd("ReceivedItems").await.unwrap();
+        assert_eq!(got, json!({"cmd": "ReceivedItems", "index": 0, "items": start}));
         check(&mut alice, &[loc]).await;
         let (got, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!(
             got,
-            json!({"cmd": "ReceivedItems", "index": 0,
-            "items": [{"item": item, "location": loc, "player": 1, "flags": flags}]})
+            json!({"cmd": "ReceivedItems", "index": start.len(),
+            "items": [{"class": "NetworkItem", "item": item, "location": loc, "player": 1, "flags": flags}]})
         );
         let (update, _) = alice.next_cmd("RoomUpdate").await.unwrap();
         assert_eq!(update["checked_locations"], json!([loc]));
@@ -111,7 +118,7 @@ mod scenarios {
         assert_eq!(got["index"], 0);
         assert_eq!(
             got["items"],
-            json!([{"item": item, "location": loc, "player": 1, "flags": flags}])
+            json!([{"class": "NetworkItem", "item": item, "location": loc, "player": 1, "flags": flags}])
         );
     }
 
@@ -121,16 +128,19 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let to_bob = alice_locations_for(2);
+        let start = e2e::start_items(2).unwrap().len();
+        bob.next_cmd("ReceivedItems").await.unwrap(); // the starting inventory
         check(&mut alice, &[to_bob[0].0, to_bob[0].0]).await;
         check(&mut alice, &[to_bob[0].0]).await;
-        // The signal: a fresh check after the repeats. Bob's next item must be that one, at 1.
+        // The signal: a fresh check after the repeats. Bob's next item must be that one, right
+        // after the first.
         check(&mut alice, &[to_bob[1].0]).await;
         let (first, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         let (second, _) = bob.next_cmd("ReceivedItems").await.unwrap();
-        assert_eq!(first["index"], 0);
+        assert_eq!(first["index"], start);
         assert_eq!(
             (second["index"].clone(), second["items"][0]["location"].clone()),
-            (json!(1), json!(to_bob[1].0))
+            (json!(start + 1), json!(to_bob[1].0))
         );
     }
 
@@ -140,10 +150,14 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let to_bob: Vec<i64> = alice_locations_for(2).iter().take(3).map(|p| p.0).collect();
         check(&mut alice, &to_bob).await;
+        // The signal that the checks are durable, so Bob's first list holds them: his start
+        // items always make a first list now, so it must not race the checks.
+        alice.next_cmd("RoomUpdate").await.unwrap();
         let (mut bob, _, _) = joined(&server, "Bob").await;
+        let start = e2e::start_items(2).unwrap();
         let (first, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!(first["index"], 0);
-        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert_eq!(first["items"].as_array().unwrap().len(), start.len() + 3);
         bob.close().await.unwrap();
         let extra = alice_locations_for(2)[3].0;
         check(&mut alice, &[extra]).await;
@@ -154,7 +168,8 @@ mod scenarios {
         assert_eq!(again["index"], 0, "index 0 means: this is the whole inventory");
         let locations: Vec<Value> =
             again["items"].as_array().unwrap().iter().map(|i| i["location"].clone()).collect();
-        let mut want: Vec<Value> = to_bob.iter().map(|l| json!(l)).collect();
+        let mut want: Vec<Value> = start.iter().map(|_| json!(-2)).collect();
+        want.extend(to_bob.iter().map(|l| json!(l)));
         want.push(json!(extra));
         assert_eq!(locations, want);
         bob.send(&json!([{"cmd": "Sync"}])).await.unwrap();
@@ -181,9 +196,10 @@ mod scenarios {
             .await
             .unwrap();
         let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        // Bob is connected (5) and has not reached his goal.
         assert_eq!(
             got["keys"],
-            json!({"_read_client_status_0_1": 30, "_read_client_status_0_2": 0})
+            json!({"_read_client_status_0_1": 30, "_read_client_status_0_2": 5})
         );
     }
 
@@ -389,5 +405,54 @@ mod scenarios {
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{}; log:\n{log}", out.status);
         assert!(log.contains("SIGTERM"), "{log}");
+    }
+
+    /// Data storage over real sockets (protocol doc, "Get", "Set", "`SetNotify`", "`SetReply`"):
+    /// a watcher hears a write with the writer's extra fields, the writer gets its one reply,
+    /// and `Get` reads the stored value and the fixture's name groups.
+    #[tokio::test]
+    async fn data_storage_round_trips_between_two_real_clients() {
+        let server = start(&[]).unwrap();
+        let (mut alice, _, _) = joined(&server, "Alice").await;
+        let (mut bob, _, _) = joined(&server, "Bob").await;
+        bob.send(&json!([{"cmd": "SetNotify", "keys": ["shared"]}])).await.unwrap();
+        // SetNotify answers nothing; this Get is the signal that it was handled.
+        bob.send(&json!([{"cmd": "Get", "keys": ["shared"]}])).await.unwrap();
+        let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(got["keys"], json!({"shared": null}));
+        let set = json!([{"cmd": "Set", "key": "shared", "default": [], "want_reply": true,
+            "operations": [{"operation": "update", "value": ["a", "b"]},
+                           {"operation": "remove", "value": "a"}], "tag": "e2e"}]);
+        alice.send(&set).await.unwrap();
+        let want = json!({"cmd": "SetReply", "key": "shared", "value": ["b"], "original_value": [],
+            "slot": 1, "default": [], "want_reply": true, "tag": "e2e",
+            "operations": [{"operation": "update", "value": ["a", "b"]},
+                           {"operation": "remove", "value": "a"}]});
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, want);
+        assert_eq!(bob.next_cmd("SetReply").await.unwrap().0, want);
+        let b = fixture().unwrap();
+        let groups = format!("_read_item_name_groups_{GAME}");
+        bob.send(&json!([{"cmd": "Get", "keys": ["shared", groups]}])).await.unwrap();
+        let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(got["keys"]["shared"], json!(["b"]));
+        assert_eq!(got["keys"][&groups], json!(b.games[GAME].item_name_groups));
+        assert!(!b.games[GAME].item_name_groups.is_empty(), "the fixture has item groups");
+    }
+
+    /// A watcher of a slot's client status hears it connect (5) and its last connection leave
+    /// (0) (reference `MultiServer.py:1043-1046, 1071-1074`).
+    #[tokio::test]
+    async fn a_slots_client_status_follows_its_connections() {
+        let server = start(&[]).unwrap();
+        let (mut alice, _, _) = joined(&server, "Alice").await;
+        let key = "_read_client_status_0_2";
+        alice.send(&json!([{"cmd": "SetNotify", "keys": [key]}])).await.unwrap();
+        alice.send(&json!([{"cmd": "Get", "keys": [key]}])).await.unwrap();
+        assert_eq!(alice.next_cmd("Retrieved").await.unwrap().0["keys"][key], 0);
+        let (bob, _, _) = joined(&server, "Bob").await;
+        let reply = |v: i64| json!({"cmd": "SetReply", "key": key, "value": v});
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, reply(5));
+        bob.close().await.unwrap();
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, reply(0));
     }
 }

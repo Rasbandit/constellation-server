@@ -42,7 +42,12 @@ impl NetVersion {
 
 /// `NetworkItem`. `player` is the finding slot, except in `LocationInfo` where it is the
 /// receiving slot.
+///
+/// Sent with `"class": "NetworkItem"`, like `NetworkPlayer` and `NetworkSlot`: the reference
+/// server tags these types (`NetUtils.py:98-107`) and its client library only turns tagged
+/// objects into them (`NetUtils.py:147-170`). The protocol document does not mention the tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class")]
 pub struct NetworkItem {
     /// Item id.
     pub item: i64,
@@ -54,8 +59,9 @@ pub struct NetworkItem {
     pub flags: u8,
 }
 
-/// `NetworkPlayer`.
+/// `NetworkPlayer`, tagged with its class (see [`NetworkItem`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "class")]
 pub struct NetworkPlayer {
     /// Team, from 0.
     pub team: u32,
@@ -67,8 +73,9 @@ pub struct NetworkPlayer {
     pub name: String,
 }
 
-/// `NetworkSlot`.
+/// `NetworkSlot`, tagged with its class (see [`NetworkItem`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "class")]
 pub struct NetworkSlot {
     /// Player name.
     pub name: String,
@@ -259,6 +266,8 @@ pub enum ServerPacket {
         /// What was wrong.
         text: String,
     },
+    /// `SetReply`: the body is built by the storage module (it passes request fields through).
+    SetReply(Map<String, Value>),
     /// `Retrieved`, with the `Get` packet's extra fields passed through.
     Retrieved {
         /// Requested key to value (`null` when absent).
@@ -366,7 +375,11 @@ pub struct Get {
     pub keys: Vec<String>,
 }
 
-/// `ClientStatus` goal value.
+/// `ClientStatus` unknown: no connection on the slot (protocol doc, "`ClientStatus`").
+pub const CLIENT_UNKNOWN: i64 = 0;
+/// `ClientStatus` connected.
+pub const CLIENT_CONNECTED: i64 = 5;
+/// `ClientStatus` goal.
 pub const CLIENT_GOAL: i64 = 30;
 
 /// Encode packets as one frame (a JSON list).

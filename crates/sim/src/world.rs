@@ -40,7 +40,7 @@ pub struct Stats {
 }
 
 /// A reply the room has produced but not yet released to the caller.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HeldReply {
     cmd: Command,
     reply: Reply,
@@ -263,7 +263,7 @@ impl World {
         let i = self.rng.below(self.inflight.len());
         // 30%: the network duplicates it, so it stays queued for a second delivery.
         let (cmd, hostile) = if self.rng.chance(30) {
-            self.inflight.get(i).copied().ok_or("queue index")?
+            self.inflight.get(i).cloned().ok_or("queue index")?
         } else {
             self.inflight.swap_remove(i)
         };
@@ -279,11 +279,12 @@ impl World {
                 .get(&(slot, cid))
                 .filter(|(_, at)| self.now < at.saturating_add(self.limits.dedupe_window_secs))
                 .map(|(seq, _)| *seq),
-            Command::Ack { .. } | Command::Goal { .. } => None,
+            // The simulator sends no key writes; data storage has its own tests.
+            Command::Ack { .. } | Command::Goal { .. } | Command::KvSet(_) => None,
         };
         let before = self.owner.state.clone();
-        let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits };
-        let out = apply(&mut self.owner.state, &ctx, cmd);
+        let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits, powf: f64::powf };
+        let out = apply(&mut self.owner.state, &ctx, cmd.clone());
         let applied = match out {
             Err(e) => {
                 ensure!(
@@ -302,8 +303,8 @@ impl World {
                 "repeat of {cmd:?} inside the window did not return the original"
             );
             self.stats.deduped = self.stats.deduped.saturating_add(1);
-        } else if let (Command::Check { slot, cid, .. }, Reply::Checked { seq }) =
-            (cmd, applied.reply)
+        } else if let (&Command::Check { slot, cid, .. }, &Reply::Checked { seq }) =
+            (&cmd, &applied.reply)
         {
             // No dedupe hit was due, so this must be a new command with a brand new seq.
             ensure!(
@@ -346,11 +347,11 @@ impl World {
                 self.committed_head
             );
         }
-        match (h.cmd, h.reply) {
-            (Command::Check { slot, cid, location }, Reply::Checked { seq }) => {
+        match (&h.cmd, &h.reply) {
+            (&Command::Check { slot, cid, location }, &Reply::Checked { seq }) => {
                 self.acked.push((seq, slot, cid, h.fresh.then_some(location)));
             }
-            (Command::Check { slot, location, .. }, Reply::AlreadyChecked) => ensure!(
+            (&Command::Check { slot, location, .. }, Reply::AlreadyChecked) => ensure!(
                 self.checked.contains(&(slot, location)),
                 "AlreadyChecked released for location {location} the log never checked"
             ),
@@ -393,7 +394,7 @@ impl World {
                     self.committed_items.insert(slot, item_seq.0);
                     self.clients.entry(slot).or_default().inbox.push((item_seq, (from, location)));
                 }
-                EventKind::Goal => {}
+                EventKind::Goal | EventKind::KvSet { .. } => {}
             }
         }
         self.owner.state.mark_durable(Seq(self.committed_head)).map_err(dbg)?;
@@ -498,8 +499,8 @@ impl World {
         let location = i64::from(self.rng.below_u32(LOCATIONS));
         let cid = self.fresh_cid(slot);
         let cmd = Command::Check { slot, cid, location };
-        let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits };
-        let events = match apply(&mut z.state, &ctx, cmd) {
+        let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits, powf: f64::powf };
+        let events = match apply(&mut z.state, &ctx, cmd.clone()) {
             Ok(a) => a.events,
             Err(e) => return Err(format!("the zombie's honest {cmd:?} was refused: {e:?}")),
         };
@@ -617,7 +618,7 @@ impl World {
                 .filter(|e| e.slot == Some(*slot))
                 .filter_map(|e| match e.kind {
                     EventKind::Item { from, location, .. } => Some((from, location)),
-                    EventKind::Checked { .. } | EventKind::Goal => None,
+                    EventKind::Checked { .. } | EventKind::Goal | EventKind::KvSet { .. } => None,
                 })
                 .collect();
             ensure!(
@@ -653,7 +654,7 @@ impl World {
                 self.receive(slot, item_seq, location)?;
             }
             let applied = ItemSeq(self.clients.get(&slot).ok_or("client")?.last_applied);
-            let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits };
+            let ctx = Ctx { now: Timestamp(self.now), limits: &self.limits, powf: f64::powf };
             let out =
                 apply(&mut self.owner.state, &ctx, Command::Ack { slot, applied }).map_err(dbg)?;
             ensure!(

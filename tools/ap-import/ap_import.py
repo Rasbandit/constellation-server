@@ -67,9 +67,8 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
     client_min = multidata.get("minimum_versions", {}).get("clients", {})
     slot_data = multidata.get("slot_data", {})
     locations = multidata["locations"]
-    with_start = sorted(slot for slot, items in multidata.get("precollected_items", {}).items() if items)
-    if with_start:
-        raise ValueError(f"slots {with_start} have a starting inventory, which is not supported yet")
+    # Item ids only, in the generator's order (Main.py, the `precollected_items` entry).
+    start = multidata.get("precollected_items", {})
 
     slots = []
     for slot_id in sorted(multidata["slot_info"]):
@@ -90,17 +89,22 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
             "group_members": [int(m) for m in info.group_members],
             "locations": placed,
             "slot_data": _plain(slot_data.get(slot_id, {})),
+            "start_inventory": [int(i) for i in start.get(slot_id, [])],
         })
 
     played = {s["game"] for s in slots}
     games = {}
     for name, package in multidata.get("datapackage", {}).items():
-        if name not in played:
+        # The generic `Archipelago` package names location -2 and player 0 of start items; the
+        # generator embeds it in every seed (Main.py, the embedded data package).
+        if name not in played and name != "Archipelago":
             continue
         games[name] = {
             "item_name_to_id": {str(k): int(v) for k, v in package["item_name_to_id"].items()},
             "location_name_to_id": {str(k): int(v) for k, v in package["location_name_to_id"].items()},
             "checksum": str(package["checksum"]),
+            "item_name_groups": _plain(package.get("item_name_groups", {})),
+            "location_name_groups": _plain(package.get("location_name_groups", {})),
         }
     missing = played - games.keys()
     if missing:

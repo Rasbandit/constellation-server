@@ -140,9 +140,12 @@ async fn connected_lists_the_slot_players_and_every_location_as_missing() {
     assert_eq!(c["hint_points"], 0);
     assert_eq!(
         c["slot_info"]["2"],
-        json!({"name": "B", "game": GAME, "type": 1, "group_members": []})
+        json!({"class": "NetworkSlot", "name": "B", "game": GAME, "type": 1, "group_members": []})
     );
-    assert_eq!(c["players"][1], json!({"team": 0, "slot": 2, "alias": "B", "name": "B"}));
+    assert_eq!(
+        c["players"][1],
+        json!({"class": "NetworkPlayer", "team": 0, "slot": 2, "alias": "B", "name": "B"})
+    );
 }
 
 #[tokio::test]
@@ -247,7 +250,7 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
     assert_eq!(
         *items[0],
         json!({"cmd": "ReceivedItems", "index": 0,
-        "items": [{"item": 7, "location": 100, "player": 1, "flags": 1}]})
+        "items": [{"class": "NetworkItem", "item": 7, "location": 100, "player": 1, "flags": 1}]})
     );
     let to_a = pump(&mut a).await;
     assert_eq!(of(&to_a, "ReceivedItems"), Vec::<&Value>::new());
@@ -257,7 +260,10 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
     );
     let send = of(&to_a, "PrintJSON").into_iter().find(|p| p["type"] == "ItemSend").unwrap();
     assert_eq!(send["receiving"], 2);
-    assert_eq!(send["item"], json!({"item": 7, "location": 100, "player": 1, "flags": 1}));
+    assert_eq!(
+        send["item"],
+        json!({"class": "NetworkItem", "item": 7, "location": 100, "player": 1, "flags": 1})
+    );
 }
 
 #[tokio::test]
@@ -271,7 +277,7 @@ async fn an_own_item_comes_back_only_to_a_client_that_wants_own_items() {
     let got = pump(&mut a).await;
     assert_eq!(
         of(&got, "ReceivedItems")[0]["items"],
-        json!([{"item": 8, "location": 101, "player": 1, "flags": 0}])
+        json!([{"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}])
     );
     assert_eq!(of(&pump(&mut remote_only).await, "ReceivedItems"), Vec::<&Value>::new());
 }
@@ -303,8 +309,8 @@ async fn a_reconnect_and_a_sync_resend_every_item_from_index_zero() {
     assert_eq!(
         ps[1],
         json!({"cmd": "ReceivedItems", "index": 0, "items": [
-        {"item": 8, "location": 101, "player": 1, "flags": 0},
-        {"item": 7, "location": 100, "player": 2, "flags": 4}]})
+        {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0},
+        {"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 4}]})
     );
     pump(&mut again).await;
     let ps = send(&mut again, &json!([{"cmd": "Sync"}])).await;
@@ -341,7 +347,7 @@ async fn a_goal_is_recorded_once_announced_and_readable() {
     assert_eq!(
         ps,
         [json!({"cmd": "Retrieved", "tag": 9, "keys": {
-        "_read_client_status_0_1": 30, "_read_client_status_0_2": 0, "free": null,
+        "_read_client_status_0_1": 30, "_read_client_status_0_2": 5, "free": null,
         "_read_slot_data_1": {"answer": 42}}})]
     );
     let mut late = Session::new(Arc::clone(&room));
@@ -396,8 +402,8 @@ async fn scouts_answer_with_the_receiver_of_each_item() {
     assert_eq!(
         ps,
         [json!({"cmd": "LocationInfo", "locations": [
-        {"item": 7, "location": 100, "player": 2, "flags": 1},
-        {"item": 8, "location": 101, "player": 1, "flags": 0}]})]
+        {"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 1},
+        {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}]})]
     );
 }
 
@@ -428,7 +434,7 @@ async fn connect_update_changes_items_handling_and_resends_items() {
 #[tokio::test]
 async fn unsupported_commands_say_so() {
     let mut a = joined(&room(), "A").await;
-    for cmd in ["Set", "SetNotify", "CreateHints", "UpdateHint"] {
+    for cmd in ["CreateHints", "UpdateHint"] {
         let ps = send(&mut a, &json!([{"cmd": cmd}])).await;
         assert_eq!(ps[0]["original_cmd"], cmd);
         assert!(ps[0]["text"].as_str().unwrap().contains("not supported"));
@@ -444,12 +450,12 @@ fn a_check_cid_is_the_location_and_distinct_per_location() {
 }
 
 /// A room where slot A has locations `1000..end` that all send item 7 to B.
-fn big_room(end: i64, limits: Limits) -> Arc<CompatRoom> {
+fn big_room(end: i64, limits: &Limits) -> Arc<CompatRoom> {
     big_room_to(end, 2, limits)
 }
 
 /// As [`big_room`], every item going to `receiver`.
-fn big_room_to(end: i64, receiver: u32, limits: Limits) -> Arc<CompatRoom> {
+fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
     let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
     let locs: Vec<Value> = (1000..end)
         .map(|l| json!({"location": l, "item": 7, "receiver": receiver, "flags": 0}))
@@ -462,8 +468,8 @@ fn big_room_to(end: i64, receiver: u32, limits: Limits) -> Arc<CompatRoom> {
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
     let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, limits);
-    Arc::new(CompatRoom::new(b, h, None, limits).unwrap())
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
+    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
 
 fn indexes(ps: &[Value]) -> Vec<u64> {
@@ -479,7 +485,7 @@ fn indexes(ps: &[Value]) -> Vec<u64> {
 
 #[tokio::test]
 async fn two_hundred_checks_in_one_packet_reach_a_bystander_that_stays_connected() {
-    let room = big_room(1200, Limits::DESIGN);
+    let room = big_room(1200, &Limits::DESIGN);
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
     pump(&mut a).await;
@@ -495,7 +501,7 @@ async fn two_hundred_checks_in_one_packet_reach_a_bystander_that_stays_connected
 #[tokio::test]
 async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_order() {
     // A one-entry queue: B falls behind after the first batch and the room drops its queue.
-    let room = big_room(1030, Limits { session_queue: 1, ..Limits::DESIGN });
+    let room = big_room(1030, &Limits { session_queue: 1, ..Limits::DESIGN });
     let mut a = joined(&room, "A").await;
     let mut b = joined(&room, "B").await;
     for chunk in (1000..1030).collect::<Vec<i64>>().chunks(7) {
@@ -514,13 +520,13 @@ async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_orde
     assert_eq!(indexes(&pump(&mut b).await), Vec::<u64>::new(), "nothing twice after the resync");
 }
 
-fn limited(limits: Limits) -> Arc<CompatRoom> {
+fn limited(limits: &Limits) -> Arc<CompatRoom> {
     let b = bundle(&Value::Null);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
     let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, limits);
-    Arc::new(CompatRoom::new(b, h, None, limits).unwrap())
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
+    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
 
 /// A burst of 2 that never refills, so the test does not depend on the clock.
@@ -536,7 +542,7 @@ const TIGHT: Limits = Limits {
 
 #[tokio::test]
 async fn chat_and_bounce_share_a_rate_limit_and_the_excess_is_refused() {
-    let room = limited(TIGHT);
+    let room = limited(&TIGHT);
     let mut a = joined(&room, "A").await;
     assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
     assert_eq!(send(&mut a, &json!([{"cmd": "Bounce", "slots": [2]}])).await, Vec::<Value>::new());
@@ -552,7 +558,7 @@ async fn chat_and_bounce_share_a_rate_limit_and_the_excess_is_refused() {
 
 #[tokio::test]
 async fn oversized_chat_and_bounce_are_refused_before_they_cost_a_token() {
-    let room = limited(TIGHT);
+    let room = limited(&TIGHT);
     let mut a = joined(&room, "A").await;
     let ps = send(&mut a, &json!([{"cmd": "Say", "text": "123456789"}])).await;
     assert!(ps[0]["text"].as_str().unwrap().contains("too long"), "{ps:?}");
@@ -568,7 +574,7 @@ async fn oversized_chat_and_bounce_are_refused_before_they_cost_a_token() {
 
 #[tokio::test]
 async fn get_data_package_is_rate_limited() {
-    let mut s = Session::new(limited(TIGHT));
+    let mut s = Session::new(limited(&TIGHT));
     assert_eq!(send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await[0]["cmd"], "DataPackage");
     let ps = send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await;
     assert_eq!(ps[0]["original_cmd"], "GetDataPackage");
@@ -587,6 +593,25 @@ fn a_bucket_refills_at_its_rate_and_never_above_its_burst() {
     assert!(b.take(later) && b.take(later) && !b.take(later), "capped at the burst");
     let mut never = limit::Bucket::new(0, 1000, t0);
     assert!(!never.take(later));
+}
+
+/// A byte bucket may go into debt by one charge, and nothing is ready until the debt is
+/// repaid by refill: the long-run rate is the refill rate, whatever each charge costs.
+#[test]
+fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut b = limit::Bucket::new(100, 10_000, t0); // 100 bytes, 10 per second
+    assert!(b.ready(t0));
+    b.charge(60, t0);
+    assert!(b.ready(t0), "40 bytes left");
+    b.charge(70, t0); // 30 in debt
+    assert!(!b.ready(t0));
+    assert!(!b.ready(t0 + Duration::from_secs(3)), "the debt is repaid, no byte to spend yet");
+    assert!(b.ready(t0 + Duration::from_millis(3100)));
+    let mut b = limit::Bucket::new(100, 10_000, t0);
+    b.charge(u64::MAX, t0);
+    assert!(!b.ready(t0 + Duration::from_hours(24)), "a huge debt stays a debt");
 }
 
 /// The test bundle with an edit applied.
@@ -619,7 +644,8 @@ async fn a_tracker_cannot_declare_a_goal() {
         (json!("InvalidPacket"), json!("StatusUpdate"))
     );
     let ps = send(&mut t, &json!([{"cmd": "Get", "keys": ["_read_client_status_0_1"]}])).await;
-    assert_eq!(ps[0]["keys"]["_read_client_status_0_1"], 0);
+    // Connected (5), the status of any slot with a connection, and not the goal.
+    assert_eq!(ps[0]["keys"]["_read_client_status_0_1"], 5);
 }
 
 #[tokio::test]
@@ -735,7 +761,7 @@ fn peer(n: u8) -> IpAddr {
 
 #[tokio::test]
 async fn reconnecting_does_not_refill_the_chat_bucket_of_a_slot() {
-    let room = limited(TIGHT);
+    let room = limited(&TIGHT);
     let mut a = joined(&room, "A").await;
     for _ in 0..2 {
         assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
@@ -758,7 +784,7 @@ async fn reconnecting_does_not_refill_the_chat_bucket_of_a_slot() {
 
 #[tokio::test]
 async fn the_data_package_limit_follows_the_client_address_across_connections() {
-    let room = limited(TIGHT);
+    let room = limited(&TIGHT);
     let dp = json!([{"cmd": "GetDataPackage"}]);
     let mut first = Session::with_peer(Arc::clone(&room), peer(1));
     assert_eq!(send(&mut first, &dp).await[0]["cmd"], "DataPackage");
@@ -771,7 +797,7 @@ async fn the_data_package_limit_follows_the_client_address_across_connections() 
 #[tokio::test]
 async fn connect_is_rate_limited_per_address() {
     let room =
-        limited(Limits { connect_burst: 2, connect_refill_milli_per_sec: 0, ..Limits::DESIGN });
+        limited(&Limits { connect_burst: 2, connect_refill_milli_per_sec: 0, ..Limits::DESIGN });
     for _ in 0..2 {
         let mut s = Session::with_peer(Arc::clone(&room), peer(3));
         assert_eq!(send(&mut s, &connect_packet("A", &json!(7))).await[0]["cmd"], "Connected");
@@ -788,7 +814,7 @@ async fn connect_is_rate_limited_per_address() {
 
 #[tokio::test]
 async fn many_reconnects_in_a_quiet_room_keep_the_subscriber_count_bounded() {
-    let room = limited(Limits { connect_burst: 1000, ..Limits::DESIGN });
+    let room = limited(&Limits { connect_burst: 1000, ..Limits::DESIGN });
     let mut s = Session::new(Arc::clone(&room));
     for _ in 0..50 {
         // The same slot again announces nothing, so nothing is published to prune on.
@@ -819,7 +845,7 @@ fn a_full_rate_table_forgets_idle_keys_and_refuses_while_all_are_limited() {
 async fn a_slow_checker_resyncs_its_own_checks_and_items_with_nothing_missed_or_doubled() {
     // A one-entry queue, and A checks without reading: A itself falls behind. The first event A
     // misses is one of its own checks, so a resync that starts one event late loses a check.
-    let room = big_room_to(1030, 1, Limits { session_queue: 1, ..Limits::DESIGN });
+    let room = big_room_to(1030, 1, &Limits { session_queue: 1, ..Limits::DESIGN });
     let mut a = joined(&room, "A").await;
     for chunk in (1000..1030).collect::<Vec<i64>>().chunks(7) {
         check(&mut a, chunk).await;
@@ -996,7 +1022,7 @@ async fn chat_and_command_prints_have_the_shape_clients_display() {
 
 #[tokio::test]
 async fn a_bounce_exactly_at_the_size_cap_is_accepted() {
-    let mut a = joined(&limited(TIGHT), "A").await;
+    let mut a = joined(&limited(&TIGHT), "A").await;
     let mut p = json!({"cmd": "Bounce", "data": ""});
     let pad = TIGHT.bounce_max_bytes - p.to_string().len();
     p["data"] = json!("y".repeat(pad));
@@ -1052,4 +1078,594 @@ async fn slot_data_is_sent_when_connect_leaves_the_flag_out() {
     let mut p = connect_packet("A", &json!(7));
     p[0].as_object_mut().unwrap().remove("slot_data");
     assert_eq!(send(&mut s, &p).await[0]["slot_data"], json!({"answer": 42}));
+}
+
+/// Slot A starts with items 8 and 7 (protocol doc, "`items_handling` flags" bit 2 and "Data
+/// Package Contents": location -2, player 0).
+fn start_room() -> Arc<CompatRoom> {
+    room_edit(|v| v["slots"][0]["start_inventory"] = json!([8, 7]))
+}
+
+fn start_item(item: i64) -> Value {
+    json!({"class": "NetworkItem", "item": item, "location": -2, "player": 0, "flags": 0})
+}
+
+#[tokio::test]
+async fn a_client_with_the_start_inventory_flag_gets_start_items_first_from_index_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(7))).await;
+    assert_eq!(
+        ps[1],
+        json!({"cmd": "ReceivedItems", "index": 0, "items": [start_item(8), start_item(7)]})
+    );
+    pump(&mut a).await;
+    let mut b = joined(&room, "B").await;
+    check(&mut b, &[100]).await;
+    // Live items continue after the start inventory in the index.
+    let got = pump(&mut a).await;
+    assert_eq!(
+        *of(&got, "ReceivedItems")[0],
+        json!({"cmd": "ReceivedItems", "index": 2,
+               "items": [{"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 4}]})
+    );
+    let sync = send(&mut a, &json!([{"cmd": "Sync"}])).await;
+    assert_eq!(sync[0]["items"].as_array().unwrap().len(), 3, "{sync:?}");
+    // No print for a start item: the only prints are the check's.
+    assert!(got.iter().all(|p| p["item"]["location"] != -2), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_client_without_the_flag_never_sees_start_items_and_indexes_from_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(3))).await;
+    assert_eq!(of(&ps, "ReceivedItems"), Vec::<&Value>::new());
+    pump(&mut a).await;
+    let mut b = joined(&room, "B").await;
+    check(&mut b, &[100]).await;
+    assert_eq!(of(&pump(&mut a).await, "ReceivedItems")[0]["index"], 0);
+    // Another slot's start inventory is never sent to B.
+    assert_eq!(of(&pump(&mut b).await, "ReceivedItems"), Vec::<&Value>::new());
+}
+
+#[tokio::test]
+async fn turning_on_the_start_inventory_flag_resends_everything_from_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    send(&mut a, &connect_packet("A", &json!(3))).await;
+    check(&mut a, &[101]).await;
+    pump(&mut a).await;
+    let ps = send(&mut a, &json!([{"cmd": "ConnectUpdate", "items_handling": 7}])).await;
+    assert_eq!(
+        ps[0],
+        json!({"cmd": "ReceivedItems", "index": 0, "items": [start_item(8), start_item(7),
+               {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}]})
+    );
+}
+
+#[tokio::test]
+async fn the_archipelago_game_is_listed_and_its_package_is_served_without_name_groups() {
+    let room = room_edit(|v| {
+        v["games"]["Archipelago"] = json!({"item_name_to_id": {"Nothing": -1},
+            "location_name_to_id": {"Server": -2}, "checksum": "ap"});
+        v["games"][GAME]["item_name_groups"] = json!({"Both": ["Seven", "Eight"]});
+    });
+    let mut s = Session::new(room);
+    let info = &packets(&[s.hello()])[0];
+    assert_eq!(info["games"], json!(["Archipelago", GAME]));
+    assert_eq!(info["datapackage_checksums"]["Archipelago"], "ap");
+    let ps = send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await;
+    let games = &ps[0]["data"]["games"];
+    assert_eq!(games["Archipelago"]["location_name_to_id"]["Server"], -2);
+    // Clients read groups through `Get`, never in the package (protocol doc, "Get").
+    let keys: Vec<&String> = games[GAME].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["checksum", "item_name_to_id", "location_name_to_id"]);
+}
+
+// Data storage (protocol doc, sections "Get", "Set", "SetNotify", "SetReply"; reference
+// `MultiServer.py:2271-2312`). Expected values are hand calculations of the operations.
+
+fn set(key: &str, ops: &Value) -> Value {
+    json!([{"cmd": "Set", "key": key, "operations": ops}])
+}
+
+fn set_reply_of(ps: &[Value]) -> Vec<&Value> {
+    of(ps, "SetReply")
+}
+
+async fn watch(s: &mut Session, keys: &[&str]) {
+    assert_eq!(send(s, &json!([{"cmd": "SetNotify", "keys": keys}])).await, Vec::<Value>::new());
+}
+
+async fn get(s: &mut Session, keys: &[&str]) -> Value {
+    let ps = send(s, &json!([{"cmd": "Get", "keys": keys}])).await;
+    assert_eq!(ps[0]["cmd"], "Retrieved", "{ps:?}");
+    ps[0]["keys"].clone()
+}
+
+#[tokio::test]
+async fn a_set_with_add_replies_and_notifies_subscribers() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    watch(&mut a, &["k"]).await;
+    let p = json!([{"cmd": "Set", "key": "k", "default": 10, "want_reply": true,
+                    "operations": [{"operation": "add", "value": 5}]}]);
+    let want = json!({"cmd": "SetReply", "key": "k", "default": 10, "want_reply": true,
+                      "operations": [{"operation": "add", "value": 5}],
+                      "value": 15, "original_value": 10, "slot": 2});
+    assert_eq!(send(&mut b, &p).await, std::slice::from_ref(&want));
+    assert_eq!(set_reply_of(&pump(&mut a).await), [&want]);
+    assert_eq!(set_reply_of(&pump(&mut b).await), Vec::<&Value>::new(), "b already has its reply");
+    assert_eq!(get(&mut a, &["k"]).await, json!({"k": 15}));
+}
+
+#[tokio::test]
+async fn a_set_without_want_reply_and_no_subscribers_sends_nothing() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    watch(&mut a, &["other"]).await;
+    for want_reply in [json!(false), json!(0), json!(""), Value::Null] {
+        let mut p = set("k", &json!([{"operation": "replace", "value": 1}]));
+        p[0]["want_reply"] = want_reply;
+        assert_eq!(send(&mut b, &p).await, Vec::<Value>::new());
+    }
+    assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
+    assert_eq!(set_reply_of(&pump(&mut b).await), Vec::<&Value>::new());
+    // Any truthy value asks for a reply, as Python reads it.
+    let mut p = set("k", &json!([{"operation": "replace", "value": 2}]));
+    p[0]["want_reply"] = json!(1);
+    assert_eq!(set_reply_of(&send(&mut b, &p).await).len(), 1);
+}
+
+#[tokio::test]
+async fn a_setter_that_also_subscribes_gets_one_set_reply() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["k"]).await;
+    for want_reply in [true, false] {
+        let mut p = set("k", &json!([{"operation": "add", "value": 1}]));
+        p[0]["want_reply"] = json!(want_reply);
+        let mut got = send(&mut a, &p).await;
+        got.extend(pump(&mut a).await);
+        assert_eq!(set_reply_of(&got).len(), 1, "want_reply {want_reply}: {got:?}");
+    }
+}
+
+#[tokio::test]
+async fn set_reply_echoes_every_extra_field_of_the_set() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    watch(&mut a, &["k"]).await;
+    // Fields named like the reply's own are overwritten by the server's values.
+    let p = json!([{"cmd": "Set", "key": "k", "want_reply": true, "tag": {"n": [1]},
+                    "slot": 99, "value": "client", "original_value": "client",
+                    "operations": [{"operation": "replace", "value": "x"}]}]);
+    let mine = send(&mut b, &p).await;
+    let theirs = pump(&mut a).await;
+    for r in [&mine[0], set_reply_of(&theirs)[0]] {
+        assert_eq!(r["tag"], json!({"n": [1]}), "{r}");
+        assert_eq!((r["slot"].clone(), r["value"].clone()), (json!(2), json!("x")));
+        assert_eq!(r["original_value"], 0);
+        assert_eq!(r["operations"], json!([{"operation": "replace", "value": "x"}]));
+    }
+}
+
+#[tokio::test]
+async fn a_set_with_no_operations_still_stores_the_default() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    send(&mut a, &json!([{"cmd": "Set", "key": "d", "default": {"x": 1}, "operations": []}])).await;
+    send(&mut a, &json!([{"cmd": "Set", "key": "z", "operations": [{"operation": "default"}]}]))
+        .await;
+    assert_eq!(get(&mut a, &["d", "z"]).await, json!({"d": {"x": 1}, "z": 0}));
+}
+
+#[tokio::test]
+async fn a_refused_operation_changes_nothing_and_the_connection_stays_open() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    send(&mut a, &set("k", &json!([{"operation": "replace", "value": [1]}]))).await;
+    let bad =
+        set("k", &json!([{"operation": "add", "value": [2]}, {"operation": "mod", "value": 0}]));
+    let ps = send(&mut a, &bad).await;
+    assert_eq!(
+        (ps[0]["cmd"].clone(), ps[0]["type"].clone()),
+        (json!("InvalidPacket"), json!("arguments"))
+    );
+    assert!(ps[0]["text"].as_str().unwrap().contains("nothing was stored"), "{ps:?}");
+    assert_eq!(get(&mut a, &["k"]).await, json!({"k": [1]}));
+    for bad in [
+        json!([{"cmd": "Set", "operations": []}]),
+        json!([{"cmd": "Set", "key": 1, "operations": []}]),
+        json!([{"cmd": "Set", "key": "k"}]),
+        json!([{"cmd": "Set", "key": "k", "operations": {}}]),
+        set("k", &json!([{"operation": "frobnicate", "value": 1}])),
+        set("k", &json!([{"value": 1}])),
+        set("k", &json!([{"operation": "add"}])),
+        json!([{"cmd": "Set", "key": "k", "operations": [], "default": [[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]}]),
+    ] {
+        let ps = send(&mut a, &bad).await;
+        assert_eq!((ps.len(), ps[0]["type"].clone()), (1, json!("arguments")), "{bad}: {ps:?}");
+    }
+    assert_eq!(get(&mut a, &["k"]).await, json!({"k": [1]}));
+}
+
+#[tokio::test]
+async fn a_reserved_key_cannot_be_set_but_a_key_like_readme_can() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let ps =
+        send(&mut a, &set("_read_race_mode", &json!([{"operation": "replace", "value": 1}]))).await;
+    assert!(ps[0]["text"].as_str().unwrap().contains("read only"), "{ps:?}");
+    assert_eq!(get(&mut a, &["_read_race_mode"]).await, json!({"_read_race_mode": 0}));
+    send(&mut a, &set("_readme", &json!([{"operation": "replace", "value": 1}]))).await;
+    assert_eq!(get(&mut a, &["_readme"]).await, json!({"_readme": 1}));
+}
+
+#[tokio::test]
+async fn a_value_over_the_cap_and_a_runaway_multiply_are_refused() {
+    let room = limited(&Limits { kv_max_value_bytes: 16, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let big = set("k", &json!([{"operation": "replace", "value": "x".repeat(15)}]));
+    assert!(send(&mut a, &big).await[0]["text"].as_str().unwrap().contains("too large"));
+    let runaway = set(
+        "k",
+        &json!([{"operation": "replace", "value": [1]},
+                                   {"operation": "mul", "value": 1_000_000_000_000_i64}]),
+    );
+    assert!(send(&mut a, &runaway).await[0]["text"].as_str().unwrap().contains("too large"));
+    assert_eq!(get(&mut a, &["k"]).await, json!({"k": null}));
+}
+
+#[tokio::test]
+async fn get_returns_null_for_unknown_keys_and_echoes_extra_fields() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let ps = send(
+        &mut a,
+        &json!([{"cmd": "Get", "keys": ["nope", "_read_nope", "_read_hints_0_01",
+        "_read_hints_1_1", "_read_hints_0_9", "_read_slot_data_01", "_read_client_status_0_9"],
+        "tag": [1], "id": "x"}]),
+    )
+    .await;
+    assert_eq!(
+        ps,
+        [json!({"cmd": "Retrieved", "tag": [1], "id": "x", "keys": {
+        "nope": null, "_read_nope": null, "_read_hints_0_01": null, "_read_hints_1_1": null,
+        "_read_hints_0_9": null, "_read_slot_data_01": null, "_read_client_status_0_9": null}})]
+    );
+    assert_eq!(
+        send(&mut a, &json!([{"cmd": "Get", "keys": []}])).await,
+        [json!({"cmd": "Retrieved", "keys": {}})]
+    );
+    for bad in [
+        json!([{"cmd": "Get"}]),
+        json!([{"cmd": "Get", "keys": "k"}]),
+        json!([{"cmd": "Get", "keys": [1]}]),
+    ] {
+        assert_eq!(send(&mut a, &bad).await[0]["type"], "arguments", "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn get_set_and_set_notify_need_a_connection_first() {
+    let mut s = Session::new(room());
+    for p in [
+        json!([{"cmd": "Get", "keys": []}]),
+        set("k", &json!([])),
+        json!([{"cmd": "SetNotify", "keys": ["k"]}]),
+    ] {
+        let ps = send(&mut s, &p).await;
+        assert_eq!(
+            (ps[0]["cmd"].clone(), ps[0]["type"].clone()),
+            (json!("InvalidPacket"), json!("cmd"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn name_groups_are_readable_for_every_game_in_the_room() {
+    let room = room_edit(|v| {
+        v["games"][GAME]["item_name_groups"] = json!({"Both": ["Seven", "Eight"]});
+        v["games"][GAME]["location_name_groups"] = json!({"All": ["L100", "L101"]});
+        v["games"]["Archipelago"] = json!({"item_name_to_id": {}, "location_name_to_id": {},
+            "checksum": "ap", "item_name_groups": {"Everything": []}});
+    });
+    let mut a = joined(&room, "A").await;
+    let keys = [
+        "_read_item_name_groups_G",
+        "_read_location_name_groups_G",
+        "_read_item_name_groups_Archipelago",
+        "_read_location_name_groups_Archipelago",
+        "_read_item_name_groups_Other",
+    ];
+    assert_eq!(
+        get(&mut a, &keys).await,
+        json!({
+        "_read_item_name_groups_G": {"Both": ["Seven", "Eight"]},
+        "_read_location_name_groups_G": {"All": ["L100", "L101"]},
+        "_read_item_name_groups_Archipelago": {"Everything": []},
+        "_read_location_name_groups_Archipelago": {},
+        "_read_item_name_groups_Other": null})
+    );
+}
+
+#[tokio::test]
+async fn subscriptions_end_with_the_connection_and_a_reconnect_must_subscribe_again() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["k"]).await;
+    a.leave().await;
+    let mut again = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    send(&mut b, &set("k", &json!([{"operation": "add", "value": 1}]))).await;
+    assert_eq!(set_reply_of(&pump(&mut again).await), Vec::<&Value>::new());
+    watch(&mut again, &["k"]).await;
+    send(&mut b, &set("k", &json!([{"operation": "add", "value": 1}]))).await;
+    assert_eq!(set_reply_of(&pump(&mut again).await)[0]["value"], 2);
+    // A re-Connect on the same socket keeps its watches: it is the same connection.
+    send(&mut again, &connect_packet("A", &json!(7))).await;
+    pump(&mut again).await;
+    send(&mut b, &set("k", &json!([{"operation": "add", "value": 1}]))).await;
+    assert_eq!(set_reply_of(&pump(&mut again).await)[0]["value"], 3);
+}
+
+#[tokio::test]
+async fn a_subscriber_that_fell_behind_still_converges_on_the_latest_value() {
+    // A one-entry queue: the watcher falls behind and resyncs from the log, without notes.
+    let room = limited(&Limits { session_queue: 1, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    watch(&mut a, &["k"]).await;
+    pump(&mut a).await; // B's join print, so the first write fits the queue
+    for _ in 0..5 {
+        let p = json!([{"cmd": "Set", "key": "k", "tag": 1, "operations": [{"operation": "add", "value": 2}]}]);
+        send(&mut b, &p).await;
+    }
+    let replies: Vec<Value> = set_reply_of(&pump(&mut a).await).into_iter().cloned().collect();
+    let values: Vec<i64> = replies.iter().map(|r| r["value"].as_i64().unwrap()).collect();
+    assert_eq!(values, [2, 4, 6, 8, 10], "every write once, in order");
+    // The first came with its note; the ones read back from the log have no pass-through
+    // fields and an unknown original value.
+    assert_eq!(
+        (replies[0]["tag"].clone(), replies[0]["original_value"].clone()),
+        (json!(1), json!(0))
+    );
+    let resynced = replies.last().unwrap();
+    assert_eq!(
+        *resynced,
+        json!({"cmd": "SetReply", "key": "k", "value": 10, "original_value": null, "slot": 2})
+    );
+}
+
+#[tokio::test]
+async fn set_notify_is_bounded_per_packet_and_per_connection() {
+    let room =
+        limited(&Limits { kv_max_keys_per_request: 2, kv_max_watched_keys: 3, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let too_many = send(&mut a, &json!([{"cmd": "SetNotify", "keys": ["a", "b", "c"]}])).await;
+    assert!(too_many[0]["text"].as_str().unwrap().contains("too many keys"), "{too_many:?}");
+    let too_many = send(&mut a, &json!([{"cmd": "Get", "keys": ["a", "b", "c"]}])).await;
+    assert!(too_many[0]["text"].as_str().unwrap().contains("too many keys"), "{too_many:?}");
+    watch(&mut a, &["a", "b"]).await;
+    watch(&mut a, &["a", "c"]).await; // "a" again costs nothing
+    let full = send(&mut a, &json!([{"cmd": "SetNotify", "keys": ["d"]}])).await;
+    assert!(full[0]["text"].as_str().unwrap().contains("watched"), "{full:?}");
+    for bad in [json!([{"cmd": "SetNotify"}]), json!([{"cmd": "SetNotify", "keys": "a"}])] {
+        assert_eq!(send(&mut a, &bad).await[0]["type"], "arguments");
+    }
+}
+
+#[tokio::test]
+async fn set_is_rate_limited_per_slot_without_muting_chat() {
+    let room =
+        limited(&Limits { kv_set_burst: 2, kv_set_refill_milli_per_sec: 0, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let p = set("k", &json!([{"operation": "add", "value": 1}]));
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert!(send(&mut a, &p).await[0]["text"].as_str().unwrap().contains("rate limited"));
+    assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
+    // A malformed Set is refused before it costs a token; the other slot has its own bucket.
+    let mut b = joined(&room, "B").await;
+    assert_eq!(send(&mut b, &p).await, Vec::<Value>::new());
+    assert_eq!(get(&mut a, &["k"]).await, json!({"k": 3}));
+}
+
+#[tokio::test]
+async fn client_status_changes_reach_subscribers_of_the_status_key() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["_read_client_status_0_2"]).await;
+    assert_eq!(
+        get(&mut a, &["_read_client_status_0_2", "_read_client_status_0_1"]).await,
+        json!({"_read_client_status_0_2": 0, "_read_client_status_0_1": 5})
+    );
+    let status = |ps: &[Value]| -> Vec<Value> {
+        set_reply_of(ps).iter().map(|r| r["value"].clone()).collect()
+    };
+    let reply = |v: i64| json!({"cmd": "SetReply", "key": "_read_client_status_0_2", "value": v});
+    let mut b = joined(&room, "B").await;
+    assert_eq!(set_reply_of(&pump(&mut a).await), [&reply(5)]);
+    // A second connection to the slot changes nothing; leaving it changes nothing either.
+    let mut b2 = joined(&room, "B").await;
+    b2.leave().await;
+    assert_eq!(status(&pump(&mut a).await), Vec::<Value>::new());
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 20}])).await;
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 20}])).await;
+    assert_eq!(status(&pump(&mut a).await), [json!(20), json!(20)], "sent even when unchanged");
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 20);
+    b.leave().await;
+    assert_eq!(status(&pump(&mut a).await), [json!(0)]);
+    let mut b = joined(&room, "B").await;
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 30}])).await;
+    assert_eq!(status(&pump(&mut a).await), [json!(5), json!(30)]);
+    // The goal is never undone: later updates and leaving say nothing.
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 10}])).await;
+    b.leave().await;
+    assert_eq!(status(&pump(&mut a).await), Vec::<Value>::new());
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}
+
+#[tokio::test]
+async fn a_spectator_slot_reads_as_done() {
+    let room = room_edit(|v| v["slots"][1]["kind"] = json!("spectator"));
+    let mut a = joined(&room, "A").await;
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}
+
+/// The reference server tags `NetworkItem`, `NetworkPlayer` and `NetworkSlot` with a `class`
+/// field (`NetUtils.py:98-107`), and its client library builds them only from tagged objects
+/// (`NetUtils.py:147-170`): without the tag, `CommonClient` reads no player names and crashes on
+/// the first print naming a player (found by `just ap-client-check`).
+#[tokio::test]
+async fn network_items_players_and_slots_carry_their_class() {
+    let room = room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(7))).await;
+    assert_eq!(ps[0]["players"][0]["class"], "NetworkPlayer", "{}", ps[0]);
+    assert_eq!(ps[0]["slot_info"]["1"]["class"], "NetworkSlot");
+    check(&mut a, &[101]).await;
+    let got = pump(&mut a).await;
+    assert_eq!(of(&got, "ReceivedItems")[0]["items"][0]["class"], "NetworkItem");
+    let send_print = of(&got, "PrintJSON").into_iter().find(|p| p["type"] == "ItemSend").unwrap();
+    assert_eq!(send_print["item"]["class"], "NetworkItem");
+    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [100]}])).await;
+    assert_eq!(ps[0]["locations"][0]["class"], "NetworkItem");
+}
+
+/// Every operation name of the protocol document ("`DataStorageOperation`") reaches its own
+/// operation; results are hand calculations.
+#[tokio::test]
+async fn every_operation_name_maps_to_its_operation() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let cases = [
+        ("replace", json!(1), json!(9), json!(9)),
+        ("default", json!(1), json!(9), json!(1)),
+        ("add", json!(1), json!(2), json!(3)),
+        ("mul", json!(3), json!(2), json!(6)),
+        ("pow", json!(2), json!(3), json!(8)),
+        ("mod", json!(7), json!(4), json!(3)),
+        ("floor", json!(2.5), json!(0), json!(2)),
+        ("ceil", json!(2.5), json!(0), json!(3)),
+        ("max", json!(1), json!(5), json!(5)),
+        ("min", json!(5), json!(1), json!(1)),
+        ("and", json!(12), json!(10), json!(8)),
+        ("or", json!(12), json!(10), json!(14)),
+        ("xor", json!(12), json!(10), json!(6)),
+        ("left_shift", json!(1), json!(2), json!(4)),
+        ("right_shift", json!(8), json!(1), json!(4)),
+        ("remove", json!([1, 2]), json!(1), json!([2])),
+        ("pop", json!([1, 2]), json!(0), json!([2])),
+        ("update", json!([1]), json!([2]), json!([1, 2])),
+    ];
+    for (name, default, value, want) in cases {
+        let p = json!([{"cmd": "Set", "key": name, "default": default, "want_reply": true,
+                        "operations": [{"operation": name, "value": value}]}]);
+        let ps = send(&mut a, &p).await;
+        assert_eq!(ps[0]["value"], want, "{name}: {ps:?}");
+    }
+}
+
+/// `want_reply` is read with Python truthiness: empty strings, lists and objects are false.
+#[tokio::test]
+async fn want_reply_is_read_with_python_truthiness() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    for (flag, replies) in [
+        (json!(""), 0),
+        (json!("x"), 1),
+        (json!([]), 0),
+        (json!([0]), 1),
+        (json!({}), 0),
+        (json!({"a": 0}), 1),
+        (json!(0.0), 0),
+        (json!(0.5), 1),
+    ] {
+        let mut p = set("k", &json!([{"operation": "replace", "value": 1}]));
+        p[0]["want_reply"] = flag.clone();
+        assert_eq!(set_reply_of(&send(&mut a, &p).await).len(), replies, "{flag}");
+    }
+}
+
+/// The goal (30) is terminal for watchers even when another connection of the same slot sends
+/// a status at the same moment: its goal check and its publish must not straddle the goal
+/// (adversarial review on PR 46). `join!` polls the status first, so under the old code it
+/// read "no goal" before the goal landed and published 20 after the 30.
+#[tokio::test]
+async fn a_status_racing_the_goal_from_another_connection_never_follows_it() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["_read_client_status_0_2"]).await;
+    let mut b1 = joined(&room, "B").await;
+    let mut b2 = joined(&room, "B").await;
+    pump(&mut a).await;
+    let late = json!([{"cmd": "StatusUpdate", "status": 20}]);
+    let goal = json!([{"cmd": "StatusUpdate", "status": 30}]);
+    tokio::join!(send(&mut b2, &late), send(&mut b1, &goal));
+    let values: Vec<Value> =
+        set_reply_of(&pump(&mut a).await).iter().map(|r| r["value"].clone()).collect();
+    assert_eq!(values.last(), Some(&json!(30)), "{values:?}");
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+    // And nothing after it, from any connection of the slot.
+    send(&mut b2, &late).await;
+    b1.leave().await;
+    b2.leave().await;
+    assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
+}
+
+/// Spectators count as done from the start and never change (reference `MultiServer.py:594-598`
+/// sets them to the goal, and `update_client_status` never changes a goal, `2316-2317`): their
+/// watchers hear nothing when they join or leave, and `Get` reads 30.
+#[tokio::test]
+async fn a_spectator_publishes_no_status_and_reads_as_done() {
+    let room = room_edit(|v| v["slots"][1]["kind"] = json!("spectator"));
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["_read_client_status_0_2"]).await;
+    let mut b = joined(&room, "B").await;
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 20}])).await;
+    b.leave().await;
+    assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}
+
+/// Data storage writes cost their stored bytes from a per-slot bucket (adversarial review on
+/// PR 46: every write logs its whole value). A slot past its budget is refused with the
+/// registry's code; other slots and chat are not affected.
+#[tokio::test]
+async fn set_bytes_are_budgeted_per_slot_with_the_registry_code() {
+    let room = limited(&Limits {
+        kv_write_bytes_burst: 100,
+        kv_write_bytes_refill_milli_per_sec: 0,
+        ..Limits::DESIGN
+    });
+    let mut a = joined(&room, "A").await;
+    // "k" plus a 50-character string with its quotes: 53 bytes per write.
+    let p = set("k", &json!([{"operation": "replace", "value": "x".repeat(50)}]));
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new(), "47 bytes left: allowed, in debt");
+    let refused = send(&mut a, &p).await;
+    let text = refused[0]["text"].as_str().unwrap();
+    assert!(text.contains("room.write_rate") && text.contains("3004"), "{text}");
+    assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
+    let mut b = joined(&room, "B").await;
+    assert_eq!(send(&mut b, &p).await, Vec::<Value>::new());
+}
+
+/// The room's total of logged data storage bytes is capped (until the log is compacted):
+/// past it a write is refused with `room.storage_full`.
+#[tokio::test]
+async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
+    let room = limited(&Limits { kv_max_room_log_bytes: 20, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let p = set("k", &json!([{"operation": "replace", "value": "12345"}])); // 8 bytes
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    let text = send(&mut a, &p).await[0]["text"].as_str().unwrap().to_owned();
+    assert!(text.contains("room.storage_full") && text.contains("3003"), "{text}");
 }

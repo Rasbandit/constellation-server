@@ -345,6 +345,20 @@ pub fn locations_for(from: u32, to: u32) -> Res<Vec<(i64, i64, u8)>> {
         .collect())
 }
 
+/// The fixture's starting inventory for `slot` as the `NetworkItem`s a client that asks for it
+/// gets first (protocol doc, "Data Package Contents": location -2, player 0).
+///
+/// # Errors
+/// When the fixture is missing or has no slot `slot`.
+pub fn start_items(slot: u32) -> Res<Vec<Value>> {
+    let b = fixture()?;
+    let s = b.slot(slot).ok_or_else(|| format!("no slot {slot}"))?;
+    Ok(s.start_inventory
+        .iter()
+        .map(|i| serde_json::json!({"class": "NetworkItem", "item": i, "location": -2, "player": 0, "flags": 0}))
+        .collect())
+}
+
 /// Connect to `url` as slot `name` (no password) and return the client, the `Connected`
 /// packet and anything that came before it.
 ///

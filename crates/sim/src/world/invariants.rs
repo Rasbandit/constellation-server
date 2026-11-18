@@ -29,7 +29,7 @@ pub(super) fn check_log(events: &[Event], placement: &Placement) -> Result<(), S
         expected_seq = expected_seq.saturating_add(1);
         let slot = e.slot.ok_or_else(|| format!("event {} has no slot", e.seq.0))?;
         match e.kind {
-            EventKind::Goal => {}
+            EventKind::Goal | EventKind::KvSet { .. } => {}
             EventKind::Checked { location, .. } => {
                 ensure!(
                     checked.insert((slot, location)),

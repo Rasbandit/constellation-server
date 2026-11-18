@@ -147,7 +147,7 @@ async fn start_room<S: LogStore>(
     epoch: Epoch,
     fresh: RoomState,
     store: Arc<S>,
-    limits: Limits,
+    limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
         Some(snap) => {
@@ -160,12 +160,12 @@ async fn start_room<S: LogStore>(
     };
     let tail = store.read_tail(room, from, usize::MAX).await.map_err(|e| format!("{e:?}"))?;
     let events = tail.len();
-    let mut state = room_core::fold(state, &limits, tail).map_err(|e| e.to_string())?;
+    let mut state = room_core::fold(state, limits, tail).map_err(|e| e.to_string())?;
     for c in store.read_cursors(room).await.map_err(|e| format!("{e:?}"))? {
         state.restore_applied(c.slot, c.applied).map_err(|e| e.to_string())?;
     }
     tracing::info!(room = room.0, epoch = epoch.0, events, head = state.durable().0, "room loaded");
-    Ok(mailbox.spawn(room, epoch, state, store, limits))
+    Ok(mailbox.spawn(room, epoch, state, store, *limits))
 }
 
 /// Start the room for `loaded` and build the router.
@@ -206,14 +206,14 @@ pub async fn app(
         }
         let epoch = store.claim(room).await.map_err(|e| format!("postgres: {e:?}"))?;
         tracing::info!("log store: postgres");
-        start_room(mailbox, room, epoch, fresh, Arc::new(store), limits).await?
+        start_room(mailbox, room, epoch, fresh, Arc::new(store), &limits).await?
     } else {
         tracing::warn!(
             "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the room"
         );
         let store = Arc::new(MemLogStore::new());
         let epoch = store.claim(room);
-        start_room(mailbox, room, epoch, fresh, store, limits).await?
+        start_room(mailbox, room, epoch, fresh, store, &limits).await?
     };
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     let state = AppState {
@@ -471,7 +471,7 @@ mod tests {
 
     /// Golden value from an independent implementation: Python's `json.dumps(json.load(f),
     /// sort_keys=True, separators=(",", ":"), ensure_ascii=False)` hashed with `hashlib.sha256`
-    /// (run 2026-11-16 on the committed fixture). The hash depends on the bundle file's content
+    /// (rerun 2026-11-17 on the regenerated fixture). The hash depends on the bundle file's content
     /// only, never on the Rust type, so adding a defaulted field to `SeedBundle` cannot lock an
     /// existing room out.
     #[test]
@@ -486,7 +486,7 @@ mod tests {
                 h
             },
         );
-        assert_eq!(hex, "a78ee159f63ad862df2636415f1ce02922dd714d6ffa9290f67ded38b76eab7a");
+        assert_eq!(hex, "97cee53e7307b8ec357b4419cc1cfd89bfc52d72b57767297d22905ededb9275");
     }
 
     #[test]
