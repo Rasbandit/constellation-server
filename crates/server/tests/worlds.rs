@@ -362,6 +362,23 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
 }
 
 #[tokio::test]
+async fn a_second_world_with_a_hosted_seed_fails_instead_of_sharing_its_room() {
+    let setup = Setup::new("same-seed");
+    let (server, first, st) = hosted_world(&setup).await;
+    // The fake sidecar always prints the fixture, so the second world has the same seed name.
+    let second = generate_one(&server, b"Bob").await;
+    server.wait_for_log(&format!("world={second}")).unwrap();
+    server.wait_for_log("generation failed").unwrap();
+    let st2 = status(&server, &second).await;
+    assert_eq!(st2["status"], "failed", "{st2}");
+    assert!(st2["error"].as_str().unwrap().contains("already hosted"), "{st2}");
+    assert!(st2.get("room_key").is_none(), "{st2}");
+    let rooms = setup.root.join("rooms");
+    assert!(!rooms.join(format!("{second}.json")).exists(), "nothing reached the rooms folder");
+    assert_eq!(status(&server, &first).await["room_key"], st["room_key"], "the first is untouched");
+}
+
+#[tokio::test]
 async fn a_world_with_no_running_room_has_no_view() {
     let setup = Setup::new("no-view");
     let server = setup.start();

@@ -27,8 +27,8 @@ use config::{Generation, Limits};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -43,6 +43,8 @@ pub(crate) struct Worlds {
     one_gen: Semaphore,
     /// Room view streams open at once (`view_streams`).
     view_streams: Arc<Semaphore>,
+    /// Seed names this process put in the rooms folder (the host may not have listed them yet).
+    published: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
     /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
@@ -118,6 +120,7 @@ pub(crate) fn open(
         limits,
         one_gen: Semaphore::new(1),
         view_streams: Arc::new(Semaphore::new(limits.view_streams)),
+        published: std::sync::Mutex::default(),
         seq: AtomicU64::new(0),
         rooms: None,
     })
@@ -130,6 +133,21 @@ impl core::fmt::Debug for Worlds {
 }
 
 impl Worlds {
+    /// Reserve `seed` for a world about to enter the rooms folder. The host lists one room per
+    /// seed name, so a second world with a seed it already hosts would silently share the first
+    /// one's room: refused instead.
+    fn claim_seed(&self, seed: &str) -> Result<(), String> {
+        let mut published = self.published.lock().unwrap_or_else(PoisonError::into_inner);
+        let listed = self.rooms.as_ref().is_some_and(|(folder, _)| folder.key_of(seed).is_some());
+        if listed || !published.insert(seed.to_owned()) {
+            return Err(format!(
+                "seed {seed:?} is already hosted as a room on this server; generate again for a \
+                 new seed"
+            ));
+        }
+        Ok(())
+    }
+
     /// The routes, rooted at `/api`. With `rooms` (the host's rooms folder and the public
     /// `host:port`), finished worlds are hosted as rooms.
     pub(crate) fn router(mut self, rooms: Option<(RoomsFolder, String)>) -> Router {
@@ -458,6 +476,7 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
         Ok(stdout) => {
             let (bundle, limits) = (world.join("bundle.json"), w.limits);
             let room_file = room_file(&w, &id);
+            let worlds = Arc::clone(&w);
             tokio::task::spawn_blocking(move || {
                 let out = GenOut::parse(&stdout)?;
                 let text = out.bundle.get().as_bytes();
@@ -465,6 +484,7 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
                 let loaded = load_bundle(&bundle, &limits)?;
                 // Only a bundle that loads reaches the rooms folder, and never half written.
                 if let Some(file) = room_file {
+                    worlds.claim_seed(&loaded.bundle.seed_name)?;
                     write_atomic(&file, text).map_err(|e| format!("rooms folder: {e}"))?;
                 }
                 Ok((bundle, loaded, out.report))
