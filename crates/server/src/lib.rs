@@ -123,6 +123,15 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
     Ok(Loaded { hash: bundle_hash(&text)?, bundle })
 }
 
+/// A new room's state for a loaded bundle: the one place a room is built from a bundle.
+///
+/// # Errors
+/// When the bundle does not make a valid room.
+pub fn fresh_state(loaded: &Loaded) -> Result<RoomState, String> {
+    let b = &loaded.bundle;
+    RoomState::new(b.slot_nos(), b.placement()).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone)]
 struct AppState {
     room: Arc<CompatRoom>,
@@ -242,9 +251,9 @@ pub async fn app(
     database_url: Option<&str>,
     limits: Limits,
 ) -> Result<(Router, JoinHandle<Stopped>), String> {
+    let fresh = fresh_state(&loaded)?;
     let Loaded { bundle, hash } = loaded;
     let room = room_id(&bundle.seed_name);
-    let fresh = RoomState::new(bundle.slot_nos(), bundle.placement()).map_err(|e| e.to_string())?;
     let (live, mailbox) = RoomHandle::mailbox(&limits);
     let (seed_name, format) = (bundle.seed_name.clone(), bundle.format);
     let compat = Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password, limits)?);
