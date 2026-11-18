@@ -498,6 +498,13 @@ mod pg_only {
         // Another room cannot take a key in use; the caller draws again.
         assert!(matches!(open(&s, RoomId(2), &[2], "aaaaaaaaaa").await, Err(OpenError::Store(_))));
         assert_eq!(open(&s, RoomId(2), &[2], "cccccccccc").await.unwrap(), "cccccccccc");
+        // Only the form the server parses is stored: lowercase base32, 10 characters.
+        for bad in ["AAAAAAAAAB", "aaaaaaaab", "aaaaaaaaa1"] {
+            assert!(
+                matches!(open(&s, RoomId(3), &[3], bad).await, Err(OpenError::Store(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use proto::RoomId;
 use runtime::RoomHandle;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 /// Characters in a room key.
@@ -199,6 +199,17 @@ impl Drop for Visit {
         self.0.touch();
         self.0.open.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Read the room list. Each change to it is one call, so a writer that panicked left it
+/// whole and the poison is ignored.
+pub(crate) fn read(rooms: &RwLock<Rooms>) -> RwLockReadGuard<'_, Rooms> {
+    rooms.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Change the room list (see [`read`]).
+pub(crate) fn write(rooms: &RwLock<Rooms>) -> RwLockWriteGuard<'_, Rooms> {
+    rooms.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Every room this process lists, by key.

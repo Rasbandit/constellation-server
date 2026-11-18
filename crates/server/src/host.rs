@@ -22,7 +22,7 @@
 //! connect loads it again from its log. Only a fence ends the process, because then another
 //! process owns the database.
 
-use crate::rooms::{Activity, Listing, Moment, RoomKey, Rooms};
+use crate::rooms::{Activity, Listing, Moment, RoomKey, Rooms, read, write};
 use crate::{
     Loaded, RunError, load_bundle, open_with_key, parse_bundle, prepare, room_ended, start,
 };
@@ -32,7 +32,7 @@ use proto::RoomId;
 use runtime::Stopped;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
@@ -232,9 +232,18 @@ impl Host {
         let Store::Pg(store) = &self.store else { return Ok(()) };
         let stored = store.list_rooms().await.map_err(|e| format!("postgres: {e:?}"))?;
         for room in stored {
-            let key = RoomKey::parse(&room.key).map_err(|e| format!("stored {e}"))?;
-            let idle = Duration::from_secs(room.idle_secs);
-            self.list(key, room.room, room.seed_name, idle)?;
+            if self.len() >= self.limits.max_rooms {
+                tracing::warn!(max = self.limits.max_rooms, "stored rooms past the cap not listed");
+                break;
+            }
+            // One bad row skips its room, never the others.
+            let listed =
+                RoomKey::parse(&room.key).map_err(|e| format!("stored {e}")).and_then(|key| {
+                    self.list(key, room.room, room.seed_name, Duration::from_secs(room.idle_secs))
+                });
+            if let Err(why) = listed {
+                tracing::warn!(room = room.room.0, "stored room not listed: {why}");
+            }
         }
         Ok(())
     }
@@ -633,15 +642,6 @@ impl Host {
     }
 }
 
-fn read(rooms: &RwLock<Rooms>) -> std::sync::RwLockReadGuard<'_, Rooms> {
-    // Each change to the map is one call, so a writer that panicked left it whole.
-    rooms.read().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn write(rooms: &RwLock<Rooms>) -> std::sync::RwLockWriteGuard<'_, Rooms> {
-    rooms.write().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Every `*.json` file in `folder`, in name order, with what a scan compares.
 fn bundle_files(folder: &Path) -> Result<Vec<(PathBuf, Seen)>, String> {
     let entries = std::fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
@@ -1031,6 +1031,17 @@ mod tests {
             assert!(store.finish(crate::room_id("beta"), ABANDONED, 0).await.unwrap());
             let finished = open("beta", d, &["eeeeeeeeee"]).await;
             assert!(matches!(finished, Err(Skip::Final(_))), "{finished:?}");
+        }
+
+        #[tokio::test]
+        async fn a_restart_lists_stored_rooms_only_up_to_the_cap() {
+            let (db, dir) = (database().await, TempDir::new("pg-cap"));
+            dir.bundle("a.json", "alpha");
+            dir.bundle("b.json", "beta");
+            drop(pg_host(&dir, &db, Limits::DESIGN).await);
+            let empty = TempDir::new("pg-cap-empty");
+            let again = pg_host(&empty, &db, Limits { max_rooms: 1, ..Limits::DESIGN }).await;
+            assert_eq!(again.len(), 1);
         }
 
         const FORTY_DAYS: &str = "UPDATE rooms SET last_active = now() - interval '40 days'";

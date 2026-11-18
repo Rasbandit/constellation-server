@@ -29,7 +29,7 @@ use host::{Host, Skip};
 use log::{LogStore, OpenError, PgLogStore};
 use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
-use rooms::{Room, RoomKey, Rooms};
+use rooms::{Room, RoomKey, Rooms, read};
 use runtime::{Mailbox, RoomHandle, Stopped};
 use seed_bundle::SeedBundle;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::{PoisonError, RwLock};
+use std::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use yawc::{DeflatePool, IncomingUpgrade, Options};
@@ -234,11 +234,6 @@ const fn health(running: bool) -> (StatusCode, &'static str) {
 
 async fn healthz(State(s): State<AppState>) -> (StatusCode, &'static str) {
     health(read(&s.rooms).all_running())
-}
-
-fn read(rooms: &RwLock<Rooms>) -> std::sync::RwLockReadGuard<'_, Rooms> {
-    // Each change to the map is one call, so a writer that panicked left it whole.
-    rooms.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Rebuild the room from `store` (snapshot, then the tail through `fold`, then the stored

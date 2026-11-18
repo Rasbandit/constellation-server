@@ -15,9 +15,15 @@
 -- only 'abandoned' so far). A finished room is never served again; its rows are kept.
 --
 -- The new columns are nullable for rooms stored before this migration; the next open fills
--- room_key and bundle.
+-- room_key and bundle. room_key is checked to the form the server parses (lowercase, so
+-- UNIQUE cannot hold one key twice in two cases).
+--
+-- Rolling back to a binary without this migration (sqlx refuses to start one that lacks an
+-- applied migration): ALTER TABLE rooms DROP COLUMN room_key, DROP COLUMN bundle,
+-- DROP COLUMN last_active, DROP COLUMN finished_at, DROP COLUMN finished_reason;
+-- DELETE FROM _sqlx_migrations WHERE version = 2;
 ALTER TABLE rooms
-    ADD COLUMN room_key        text UNIQUE,
+    ADD COLUMN room_key        text UNIQUE CHECK (room_key ~ '^[a-z2-7]{10}$'),
     ADD COLUMN bundle          bytea,
     ADD COLUMN last_active     timestamptz NOT NULL DEFAULT now(),
     ADD COLUMN finished_at     timestamptz,
