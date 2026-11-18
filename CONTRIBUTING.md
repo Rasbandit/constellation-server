@@ -23,7 +23,7 @@ By opening a pull request you agree that:
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
 - CI must be green before merge. `just check` is optional while this is a POC.
 - One reviewer who is not the author approves each PR.
-- Lints are strict (`deny`). A new `allow` needs a `reason = "..."`. No `unsafe`.
+- Lints are default (POC mode). No `unsafe`.
 - Limits and environment variables live only in `crates/config`.
 
 ## Talking about Archipelago

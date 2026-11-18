@@ -10,7 +10,8 @@ on:
     paths-ignore: ["**.md", "docs/**", "LICENSE*"]
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel main runs: a cancelled run skips the cache save.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 env:
   CARGO_TERM_COLOR: always
 permissions:
