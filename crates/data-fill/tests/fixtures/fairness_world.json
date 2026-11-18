@@ -1,0 +1,34 @@
+{
+  "manifest": {
+    "options": [],
+    "items": [
+      {"key": "key_a", "id": 1}, {"key": "key_b", "id": 2},
+      {"key": "lamp", "id": 3}, {"key": "coin", "id": 4}
+    ],
+    "locations": [
+      {"key": "l1", "id": 1}, {"key": "l2", "id": 2}, {"key": "l3", "id": 3},
+      {"key": "l4", "id": 4}, {"key": "l5", "id": 5}, {"key": "l6", "id": 6}
+    ],
+    "start": "start",
+    "x.time": {"slices": 1, "start_mask": 1},
+    "defs": {},
+    "regions": [
+      {"key": "start", "can_stay": false,
+       "checks": [{"loc": "l1", "rule": {"true": {}}}, {"loc": "l2", "rule": {"true": {}}},
+                  {"loc": "l6", "rule": {"has": "lamp"}}],
+       "exits": [{"to": "hall", "rule": {"has": "key_a"}}], "events": [], "stays": []},
+      {"key": "hall", "can_stay": false,
+       "checks": [{"loc": "l3", "rule": {"true": {}}}, {"loc": "l4", "rule": {"true": {}}}],
+       "exits": [{"to": "vault", "rule": {"has": "key_b"}}], "events": [], "stays": []},
+      {"key": "vault", "can_stay": false,
+       "checks": [{"loc": "l5", "rule": {"true": {}}}],
+       "exits": [], "events": [], "stays": []}
+    ],
+    "goal": {"all": [{"reach": "region:vault"}, {"has": "lamp"}]}
+  },
+  "instance": {
+    "locations": ["l1", "l2", "l3", "l4", "l5", "l6"],
+    "pool": ["key_a", "key_b", "lamp", "coin", "coin", "coin"],
+    "pool_class": {"key_a": "progression", "key_b": "progression", "lamp": "progression", "coin": "filler"}
+  }
+}
