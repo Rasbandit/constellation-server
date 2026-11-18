@@ -14,6 +14,11 @@ pub enum Retry {
     Backoff,
     /// Retry after the `after_ms` the server sent.
     After,
+    /// Retry at once (doc 09 section 4.7, `lobby.stale_ready`).
+    Immediate,
+    /// A hint this version does not know; treat it as `never`.
+    #[serde(other)]
+    Other,
 }
 
 macro_rules! registry {
@@ -78,10 +83,10 @@ registry! {
     RoomNotFound = 3001, "room.not_found", Never;
     /// Another session holds this seat (doc 09 section 11.2).
     SlotInUse = 3011, "slot.in_use", After;
-    /// The room was restored to an older state than the client saw.
-    RoomRolledBack = 3040, "room.rolled_back", Never;
-    /// The resume cursor is older than the retained window.
-    ResumeTooOld = 3041, "resume.too_old", Never;
+    /// The host paused the room (doc 09 section 4.7).
+    RoomPaused = 3030, "room.paused", Backoff;
+    /// The command needs a live room; it is still in staging (doc 09 section 4.7).
+    RoomNotLive = 3031, "room.not_live", Never;
     /// A repeated `cid` with a different payload (doc 01 D1.10 rule 3).
     CidConflict = 3050, "cid.conflict", Never;
     /// An `ack` with no slot, or beyond the last delivered `item_seq`.
@@ -152,7 +157,7 @@ mod tests {
                 "capability" | "type" | "data" | "op" | "ext" | "proto" | "path" => 1,
                 "auth" => 2,
                 "room" if matches!(e, ErrorCode::RoomUnavailable | ErrorCode::RoomMoving) => 5,
-                "room" | "slot" | "resume" | "cid" | "ack" => 3,
+                "room" | "slot" | "cid" | "ack" => 3,
                 "rate" | "watch" | "frame" => 4,
                 other => panic!("unmapped area {other}"),
             };

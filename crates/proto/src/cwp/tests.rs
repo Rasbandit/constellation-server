@@ -104,8 +104,9 @@ fn game_ids_checksums_and_item_uids_have_their_grammars() {
     }
     assert!(Checksum::new(format!("sha256:{}", "a".repeat(64))).is_ok(), "64 hex digits");
     assert!(Checksum::new("sha256:5f1c0a").is_err(), "too short");
-    assert!(ItemUid::new("iu_7QK2M4XH").is_ok(), "Crockford base32");
-    assert!(ItemUid::new("iu_7QK2M4XI").is_err(), "I is not Crockford");
+    assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q").is_ok(), "26 Crockford base32 digits");
+    assert!(ItemUid::new("iu_7QK2M4XH").is_err(), "too short for 128 bits");
+    assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XI").is_err(), "I is not Crockford");
 }
 
 /// Every string over a small alphabet, up to `len` pieces.
@@ -263,12 +264,66 @@ fn a_result_has_exactly_one_of_ok_and_error_whatever_the_key_order() {
 }
 
 #[test]
-fn ping_and_pong_carry_an_optional_nonce() {
+fn clients_ping_with_presence_and_servers_pong() {
     assert_eq!(one_client(r#"{"op":"ping"}"#).unwrap(), ClientFrame::Ping(Beat::default()));
-    let ClientFrame::Pong(b) = one_client(r#"{"op":"pong","n":7,"p":"menu"}"#).unwrap() else {
-        panic!("not a pong")
+    let ClientFrame::Ping(b) = one_client(r#"{"op":"ping","n":7,"p":"menu"}"#).unwrap() else {
+        panic!("not a ping")
     };
     assert_eq!((b.n, b.p.as_ref().map(StreamName::as_str)), (Some(7), Some("menu")));
+    assert!(
+        matches!(one_server(r#"{"op":"pong","n":7}"#).unwrap(), ServerFrame::Pong(_)),
+        "pong is the server's"
+    );
+    assert_eq!(
+        one_client(r#"{"op":"pong"}"#).unwrap(),
+        ClientFrame::Unknown,
+        "clients never send pong"
+    );
+    assert_eq!(
+        one_server(r#"{"op":"ping"}"#).unwrap(),
+        ServerFrame::Unknown,
+        "servers never send ping"
+    );
+}
+
+#[test]
+fn values_a_newer_peer_adds_are_tolerated() {
+    let r = one_server(
+        r#"{"op":"result","cid":"c","error":{"code":6104,"key":"lobby.stale_ready","retry":"immediate"}}"#,
+    );
+    assert!(r.is_ok(), "doc 09's immediate retry decodes");
+    let r = one_server(
+        r#"{"op":"result","cid":"c","error":{"code":6999,"key":"x.new","retry":"later"}}"#,
+    )
+    .unwrap();
+    let ServerFrame::Result(CmdResult { outcome: Outcome::Error(e), .. }) = r else {
+        panic!("an error result")
+    };
+    assert_eq!(e.retry, Retry::Other, "an unknown retry hint reads as Other");
+    let caller: Caller =
+        serde_json::from_value(json!({"kind":"device","scopes":["admin"],"roles":["streamer"]}))
+            .unwrap();
+    assert_eq!(
+        (caller.kind, caller.scopes.clone(), caller.roles.clone()),
+        (CallerKind::Other, vec![Scope::Other], vec![RoomRole::Other])
+    );
+    let none = Allow { scopes: &[Scope::Play], roles: &[RoomRole::Owner], step_up: false };
+    assert!(!none.permits(&caller), "unknown scopes and roles grant nothing");
+    let mut g = sample("item.grant");
+    g["source"] = json!("gift");
+    let ev = EventFrame {
+        seq: Some(Seq(1)),
+        eseq: None,
+        ty: TypeName::new("item.grant").unwrap(),
+        slot: Some(SlotNo(1)),
+        t: None,
+        prev_hash: None,
+        data: g,
+    };
+    let CoreEvent::ItemGrant(g) = CoreEvent::decode(&ev).unwrap() else { panic!("a grant") };
+    assert_eq!(g.source, Source::Other, "an unknown source still delivers the item");
+    let w: ResumeOutcome = serde_json::from_value(json!({"status":"moved"})).unwrap();
+    assert_eq!(w.status, ResumeStatus::Other);
 }
 
 #[test]
@@ -314,6 +369,26 @@ fn a_bad_field_still_gets_a_result_for_its_cid() {
         panic!("an error frame")
     };
     assert_eq!(e.reference.as_deref(), Some("ack"), "the error names the op it answers");
+    let Err(BadFrame::Error(e)) = one_client(r#"{"op":"ack","cid":"a-1","applied":-1}"#) else {
+        panic!("an error frame")
+    };
+    assert_eq!(e.reference.as_deref(), Some("a-1"), "or its cid, when it has one");
+    let big = r#"{"op":"cmd","cid":"c-9","type":"org.cwp.x/y","data":{"n":18446744073709551615}}"#;
+    assert_eq!(
+        answer_key(one_client(big)),
+        (Some("c-9".into()), "data.invalid".into()),
+        "free-form data is range-checked"
+    );
+    let deep = r#"{"op":"cmd","cid":"c-9","type":"org.cwp.x/y","data":{"a":[{"f":1e300}]}}"#;
+    assert_eq!(
+        answer_key(one_client(deep)),
+        (Some("c-9".into()), "data.invalid".into()),
+        "however deep"
+    );
+    assert!(
+        one_client(r#"{"op":"cmd","cid":"c-9","type":"org.cwp.x/y","data":{"f":2.5}}"#).is_ok(),
+        "fractions are fine"
+    );
     assert_eq!(answer_key(one_client("{nope")), (None, "data.invalid".into()), "not JSON");
 }
 
@@ -370,7 +445,7 @@ fn sample(name: &str) -> Value {
         "status.set" => json!({"client_state": "ready"}),
         "session.update" => json!({"exts": {}}),
         "item.grant" => {
-            json!({"source":"check","from":1,"location":104,"item":7,"item_seq":1,"item_uid":"iu_7QK2M4XH","flags":["trap"]})
+            json!({"source":"check","from":1,"location":104,"item":7,"item_seq":1,"item_uid":"iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q","flags":["trap"]})
         }
         "room.epoch_change" => json!({"from": 1, "to": 2, "recovered_head": 40}),
         "state.changed" => json!({"path": "room/info", "value": {}, "ver": 3}),
@@ -510,37 +585,57 @@ fn placeholders(text: &str) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
-#[test]
-fn templates_use_known_fields_kinds_and_conditions() {
-    for t in CORE_TYPES {
-        let data = sample(t.name);
-        let has = |f: &str| f == "slot" || data.get(f).is_some();
-        for v in t.templates {
-            if let Some(when) = v.when {
-                let (a, b) = when.split_once('=').unwrap();
-                assert!(has(a) && has(b), "{}: condition {when}", t.name);
-            }
-            for (field, kind, at) in placeholders(v.text) {
-                assert!(has(&field), "{}: {{{field}}} is not a field", t.name);
-                assert!(
-                    ["slot", "item", "location", "text"].contains(&kind.as_str()),
-                    "{}: kind {kind}",
-                    t.name
-                );
-                let needs_game = kind == "item" || kind == "location";
-                assert_eq!(
-                    at.is_some(),
-                    needs_game,
-                    "{}: {field} needs @slotfield exactly for ids",
-                    t.name
-                );
-                if let Some(at) = at {
-                    assert!(has(&at), "{}: @{at} is not a field", t.name);
-                }
-            }
+/// Whether a template condition holds for `data` on a frame about `slot`.
+fn holds(when: &str, data: &Value, slot: u32) -> bool {
+    let get = |f: &str| if f == "slot" { Some(json!(slot)) } else { data.get(f).cloned() };
+    if let Some((a, b)) = when.split_once('=') {
+        return get(a).is_some() && get(a) == get(b);
+    }
+    let (field, lit) = when.split_once(':').unwrap_or_else(|| panic!("condition {when}"));
+    get(field) == Some(json!(lit))
+}
+
+fn check_template(name: &str, data: &Value, text: &str) {
+    let has = |f: &str| f == "slot" || data.get(f).is_some();
+    for (field, kind, at) in placeholders(text) {
+        assert!(has(&field), "{name}: {{{field}}} is missing in {data}");
+        assert!(
+            ["slot", "item", "location", "text"].contains(&kind.as_str()),
+            "{name}: kind {kind}"
+        );
+        let needs_game = kind == "item" || kind == "location";
+        assert_eq!(at.is_some(), needs_game, "{name}: {field} needs @slotfield exactly for ids");
+        if let Some(at) = at {
+            assert!(has(&at), "{name}: @{at} is not a field");
         }
+    }
+}
+
+#[test]
+fn templates_render_for_every_source_and_use_known_fields() {
+    for t in CORE_TYPES {
         if let Some(last) = t.templates.last() {
             assert!(last.when.is_none(), "{}: the last variant must always apply", t.name);
+        }
+        let mut cases = vec![sample(t.name)];
+        if t.name == "item.grant" {
+            for source in ["release", "collect", "link", "start", "admin"] {
+                let mut d = sample(t.name);
+                d["source"] = json!(source);
+                if source == "start" || source == "admin" {
+                    d.as_object_mut().unwrap().remove("from");
+                    d.as_object_mut().unwrap().remove("location");
+                }
+                cases.push(d);
+            }
+            let mut own = sample(t.name);
+            own["from"] = json!(1);
+            cases.push(own);
+        }
+        for data in &cases {
+            if let Some(v) = t.templates.iter().find(|v| v.when.is_none_or(|w| holds(w, data, 1))) {
+                check_template(t.name, data, v.text);
+            }
         }
     }
 }
@@ -642,8 +737,38 @@ fn schema_document() -> Value {
         "paths": CORE_PATHS,
         "errors": errors,
         "limits": {"cmd_id_max": CMD_ID_MAX, "name_max": NAME_MAX, "state_path_max": STATE_PATH_MAX, "max_safe_integer": MAX_SAFE},
-        "$defs": g.take_definitions(true),
+        "$defs": open_enums(g.take_definitions(true)),
     })
+}
+
+/// Catch-all variants (`unknown` ops, `other` values) accept any string in the schema, as
+/// they do in Rust: such a branch loses its `const`, and its `oneOf` becomes `anyOf`, since a
+/// known value then matches two branches.
+fn open_enums(mut defs: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    fn catch_all(branch: &mut Value) -> bool {
+        let open = |v: &Value| matches!(v.as_str(), Some("unknown" | "other"));
+        if branch.get("const").is_some_and(open) {
+            branch.as_object_mut().unwrap().remove("const");
+            return true;
+        }
+        if let Some(op) = branch.pointer_mut("/properties/op")
+            && op.get("const").is_some_and(open)
+        {
+            op.as_object_mut().unwrap().remove("const");
+            return true;
+        }
+        false
+    }
+    for def in defs.values_mut() {
+        let Some(obj) = def.as_object_mut() else { continue };
+        let Some(Value::Array(mut branches)) = obj.remove("oneOf") else { continue };
+        let mut open = false;
+        for b in &mut branches {
+            open |= catch_all(b);
+        }
+        obj.insert(if open { "anyOf" } else { "oneOf" }.into(), Value::Array(branches));
+    }
+    defs
 }
 
 #[test]
@@ -671,9 +796,9 @@ fn the_committed_schema_matches_the_types() {
 /// What a frame that expects a `result` must be answered with.
 #[derive(Debug, Clone)]
 enum Expect {
-    Ok(Option<CoreCmd>),
+    Ok(CoreCmd),
     Err(&'static str),
-    Same(Outcome),
+    Same(Box<CmdResult>),
     Any,
     Get(StatePath),
     Watch(Vec<StatePath>),
@@ -687,37 +812,49 @@ struct Open {
     fingerprint: Option<Value>,
 }
 
+/// Error keys that end a session (rule 13).
+const ENDING: &[&str] = &["room.moving", "slot.in_use", "auth.token_revoked", "room.kicked"];
+/// Error frames that only answer a client frame; anything else is unsolicited.
+const ANSWERING: &[&str] = &["op.unknown", "ack.invalid"];
+
 #[derive(Default)]
 struct Session {
     hello: Option<Box<Hello>>,
-    caller: Option<Caller>,
+    welcome: Option<Box<Welcome>>,
     ended: bool,
+    pending: Vec<ClientFrame>,
     enabled: BTreeSet<String>,
     open: BTreeMap<String, Open>,
-    done: BTreeMap<String, (Value, Outcome)>,
-    watched: BTreeSet<String>,
+    done: BTreeMap<String, (Value, CmdResult)>,
+    watched: BTreeMap<String, u64>,
+    epoch: u64,
+    head: u64,
     last_seq: u64,
-    replay_to: Option<u64>,
+    replay: Option<(u64, u64)>,
     replay_done: bool,
     eseq: u64,
+    applied: u64,
     own_item_seq: u64,
-    grants_since: Vec<i64>,
+    granted: BTreeSet<String>,
     last_ack: u64,
     expect_error: Vec<&'static str>,
-    expect_pong: Vec<Option<u64>>,
+    pongs: Vec<Option<u64>>,
 }
 
 /// Every field of `raw` survives in `full` (a raw `null`, `{}` or `[]` matches an absent field,
 /// since defaults are left out when encoding).
 fn covers(full: &Value, raw: &Value, at: &str) -> Result<(), String> {
+    let empty = |v: &Value| {
+        v.is_null()
+            || v.as_object().is_some_and(serde_json::Map::is_empty)
+            || v.as_array().is_some_and(Vec::is_empty)
+    };
     match (raw, full) {
         (Value::Object(r), Value::Object(f)) => {
             for (k, v) in r {
                 match f.get(k) {
                     Some(fv) => covers(fv, v, &format!("{at}.{k}"))?,
-                    None if v.is_null()
-                        || v.as_object().is_some_and(serde_json::Map::is_empty)
-                        || v.as_array().is_some_and(Vec::is_empty) => {}
+                    None if empty(v) => {}
                     None => return Err(format!("{at}.{k} did not survive a round trip")),
                 }
             }
@@ -743,7 +880,11 @@ fn registered(e: &ErrorBody) -> Result<(), String> {
 
 impl Session {
     fn caller(&self) -> Result<&Caller, String> {
-        self.caller.as_ref().ok_or_else(|| "no welcome yet".into())
+        self.welcome.as_ref().map(|w| &w.caller).ok_or_else(|| "no welcome yet".into())
+    }
+
+    fn wants(&self) -> Want {
+        self.hello.as_ref().map(|h| h.want.clone()).unwrap_or_default()
     }
 
     fn client(&mut self, f: &ClientFrame) -> Result<(), String> {
@@ -759,15 +900,23 @@ impl Session {
             (_, false) => return Err("the first client frame must be hello".into()),
             _ => {}
         }
+        if self.welcome.is_none() {
+            self.pending.push(f.clone());
+            return Ok(());
+        }
+        self.handle_client(f)
+    }
+
+    fn handle_client(&mut self, f: &ClientFrame) -> Result<(), String> {
         match f {
             ClientFrame::Cmd(c) => {
                 let fp = json!([c.ty.as_str(), c.data]);
                 let expect = match self.done.get(c.cid.as_str()) {
-                    Some((prev, outcome)) if *prev == fp => Expect::Same(outcome.clone()),
+                    Some((prev, r)) if *prev == fp => Expect::Same(Box::new(r.clone())),
                     Some(_) => Expect::Err("cid.conflict"),
                     None => self.expect_cmd(c)?,
                 };
-                let keep = !matches!(expect, Expect::Err("cid.conflict"));
+                let keep = !matches!(expect, Expect::Err("cid.conflict") | Expect::Same(_));
                 self.open_cid(c.cid.as_str(), expect, keep.then_some(fp))
             }
             ClientFrame::Get(g) => {
@@ -796,14 +945,14 @@ impl Session {
                 Ok(())
             }
             ClientFrame::Ping(b) => {
-                self.expect_pong.push(b.n);
+                self.pongs.push(b.n);
                 Ok(())
             }
             ClientFrame::Unknown => {
                 self.expect_error.push("op.unknown");
                 Ok(())
             }
-            ClientFrame::Hello(_) | ClientFrame::Pong(_) => Ok(()),
+            ClientFrame::Hello(_) => Ok(()),
         }
     }
 
@@ -819,7 +968,7 @@ impl Session {
         Ok(())
     }
 
-    fn expect_cmd(&mut self, c: &Cmd) -> Result<Expect, String> {
+    fn expect_cmd(&self, c: &Cmd) -> Result<Expect, String> {
         if let Some(ext) = c.ty.extension() {
             return Ok(if self.enabled.contains(ext) {
                 Expect::Any
@@ -836,10 +985,7 @@ impl Session {
                 if !allow.permits(self.caller()?) {
                     return Ok(Expect::Err("auth.scope_insufficient"));
                 }
-                if matches!(core, CoreCmd::Check(_)) {
-                    self.grants_since.clear();
-                }
-                Ok(Expect::Ok(Some(core)))
+                Ok(Expect::Ok(core))
             }
         }
     }
@@ -861,7 +1007,7 @@ impl Session {
         if self.ended {
             return Err("frame after the session ended".into());
         }
-        if self.caller.is_none() {
+        if self.welcome.is_none() {
             return match f {
                 ServerFrame::Welcome(w) => self.welcome(w),
                 ServerFrame::Error(e) => {
@@ -877,27 +1023,33 @@ impl Session {
             ServerFrame::Event(ev) => self.event(ev),
             ServerFrame::Error(e) => {
                 registered(e)?;
-                if !self.expect_error.is_empty() {
-                    let want = self.expect_error.remove(0);
-                    if e.key != want {
-                        return Err(format!("expected error {want}, got {}", e.key));
+                if ANSWERING.contains(&e.key.as_str()) {
+                    if self.expect_error.first() != Some(&e.key.as_str()) {
+                        return Err(format!("an unsolicited {}", e.key));
                     }
+                    self.expect_error.remove(0);
+                }
+                if ENDING.contains(&e.key.as_str()) {
+                    self.ended = true;
                 }
                 Ok(())
             }
             ServerFrame::Pong(b) => {
-                match (!self.expect_pong.is_empty()).then(|| self.expect_pong.remove(0)) {
-                    Some(n) if n == b.n => Ok(()),
-                    Some(n) => Err(format!("pong must echo the nonce {n:?}")),
-                    None => Err("pong without a ping".into()),
+                if self.pongs.is_empty() {
+                    return Err("pong without a ping".into());
                 }
+                let n = self.pongs.remove(0);
+                if n == b.n { Ok(()) } else { Err(format!("pong must echo the nonce {n:?}")) }
             }
-            ServerFrame::Ping(_) | ServerFrame::Unknown => Ok(()),
+            ServerFrame::Unknown => Ok(()),
         }
     }
 
     fn welcome(&mut self, w: &Welcome) -> Result<(), String> {
         let h = self.hello.as_ref().ok_or("welcome before hello")?;
+        if h.credential().is_none() {
+            return Err("a welcome for a hello without exactly one credential".into());
+        }
         if !h.proto.contains(&w.proto.major) {
             return Err(format!("welcome picked proto {} that hello did not offer", w.proto.major));
         }
@@ -908,27 +1060,54 @@ impl Session {
                 return Err(format!("extension {id} major {} was not offered", choice.v));
             }
         }
-        if let (Some(s), Some(info)) = (w.caller.slot, &w.slot)
+        let c = &w.caller;
+        match c.kind {
+            CallerKind::Slot if c.slot.is_none() => {
+                return Err("a slot caller without a slot".into());
+            }
+            CallerKind::Spectator if c.slot.is_some() || c.scopes.contains(&Scope::Play) => {
+                return Err("a spectator with a slot or the play scope".into());
+            }
+            _ => {}
+        }
+        if let (Some(s), Some(info)) = (c.slot, &w.slot)
             && s != info.index
         {
             return Err("caller.slot and slot.index differ".into());
         }
-        self.enabled = w.exts.keys().map(ToString::to_string).collect();
-        self.last_seq = h.resume.map_or(0, |r| r.after.0);
-        match w.replay {
-            Some(r) if r.from > r.to => {
+        let after = h.resume.map_or(0, |r| r.after.0);
+        match (w.resume.status, &w.replay, &w.resume.epoch_change) {
+            (ResumeStatus::TooOld, Some(_), _) => return Err("too_old comes with no replay".into()),
+            (ResumeStatus::NewTimeline, _, None) => {
+                return Err("new_timeline needs resume.epoch_change".into());
+            }
+            _ => {}
+        }
+        if let Some(r) = w.replay {
+            if r.from > r.to {
                 return Err("replay range is reversed".into());
             }
-            Some(r) if r.to > w.head => {
+            if w.head < r.to {
                 return Err("replay range outside the log".into());
             }
-            Some(r) if r.from.0 <= self.last_seq => {
+            if r.from.0 <= after {
                 return Err("replay starts at or before the resume cursor".into());
             }
-            Some(r) => self.replay_to = Some(r.to.0),
-            None => self.replay_done = true,
+            self.replay = Some((r.from.0, r.to.0));
+        } else {
+            self.replay_done = true;
         }
-        self.caller = Some(w.caller.clone());
+        self.enabled = w.exts.keys().map(ToString::to_string).collect();
+        self.epoch = w.epoch.0;
+        self.head = w.head.0;
+        self.last_seq = if w.replay.is_some() { after } else { after.max(w.head.0) };
+        self.applied = w.applied.0;
+        self.own_item_seq = w.applied.0;
+        self.last_ack = w.applied.0;
+        self.welcome = Some(Box::new(w.clone()));
+        for f in core::mem::take(&mut self.pending) {
+            self.handle_client(&f)?;
+        }
         Ok(())
     }
 
@@ -939,28 +1118,21 @@ impl Session {
         if let Outcome::Error(e) = &r.outcome {
             registered(e)?;
         }
+        if r.epoch.is_some_and(|e| e.0 != self.epoch) {
+            return Err(format!("{c}: result epoch differs from the session's"));
+        }
+        if r.upto.is_some_and(|u| u.0 != self.last_seq) {
+            return Err(format!("{c}: upto must be the last seq sent to the session"));
+        }
         match (&open.expect, &r.outcome) {
             (Expect::Err(k), Outcome::Error(e)) if e.key == *k => {}
             (Expect::Err(k), _) => return Err(format!("{c}: expected error {k}")),
-            (Expect::Same(o), got) if o == got => {}
-            (Expect::Same(_), _) => {
-                return Err(format!("{c}: a repeated cid must get the same result"));
-            }
-            (Expect::Ok(core), Outcome::Ok(v)) => {
-                if let Some(CoreCmd::Check(_)) = core {
-                    let ok: CheckOk = serde_json::from_value(v.clone())
-                        .map_err(|e| format!("{c}: check result: {e}"))?;
-                    let own = self.caller()?.slot;
-                    for item in ok.items.iter().filter(|i| Some(i.to) == own) {
-                        if !self.grants_since.contains(&item.item) {
-                            return Err(format!(
-                                "{c}: result came before its events (item {})",
-                                item.item
-                            ));
-                        }
-                    }
+            (Expect::Same(prev), _) => {
+                if (prev.seq, prev.epoch, &prev.outcome) != (r.seq, r.epoch, &r.outcome) {
+                    return Err(format!("{c}: a repeated cid must get the same result"));
                 }
             }
+            (Expect::Ok(core), Outcome::Ok(v)) => self.ok_result(c, core, v, r)?,
             (Expect::Get(p), Outcome::Ok(v)) => {
                 let ok: GetOk = serde_json::from_value(v.clone())
                     .map_err(|e| format!("{c}: get result: {e}"))?;
@@ -974,7 +1146,9 @@ impl Session {
                 if ok.paths.iter().map(|s| &s.path).ne(ps.iter()) {
                     return Err(format!("{c}: watch must return each path, in order"));
                 }
-                self.watched.extend(ps.iter().map(ToString::to_string));
+                for s in ok.paths {
+                    self.watched.insert(s.path.to_string(), s.ver.0);
+                }
             }
             (Expect::Unwatch(ps), Outcome::Ok(_)) => {
                 for p in ps {
@@ -985,56 +1159,74 @@ impl Session {
             (_, Outcome::Error(e)) => return Err(format!("{c}: expected ok, got {}", e.key)),
         }
         if let Some(fp) = open.fingerprint {
-            self.done.insert(c.into(), (fp, r.outcome.clone()));
+            self.done.insert(c.into(), (fp, r.clone()));
+        }
+        Ok(())
+    }
+
+    fn ok_result(
+        &mut self,
+        c: &str,
+        core: &CoreCmd,
+        v: &Value,
+        r: &CmdResult,
+    ) -> Result<(), String> {
+        match core {
+            CoreCmd::Check(_) => {
+                let ok: CheckOk = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("{c}: check result: {e}"))?;
+                let own = self.caller()?.slot;
+                for item in ok.items.iter().filter(|i| Some(i.to) == own) {
+                    if !self.granted.contains(item.item_uid.as_str()) {
+                        return Err(format!(
+                            "{c}: result came before its events ({})",
+                            item.item_uid
+                        ));
+                    }
+                }
+                if !ok.items.is_empty() && (r.seq.is_none() || r.epoch.is_none()) {
+                    return Err(format!("{c}: a committing result carries seq and epoch"));
+                }
+            }
+            CoreCmd::Goal(_) | CoreCmd::StatusSet(_) if !v.is_object() => {
+                return Err(format!("{c}: {} result must be an object", core.type_name()));
+            }
+            CoreCmd::Goal(_) | CoreCmd::StatusSet(_) => {}
+            CoreCmd::SessionUpdate(_) => {
+                let ok: SessionUpdateOk = serde_json::from_value(v.clone())
+                    .map_err(|e| format!("{c}: session.update result: {e}"))?;
+                self.enabled = ok.exts.keys().map(ToString::to_string).collect();
+            }
         }
         Ok(())
     }
 
     fn event(&mut self, ev: &EventFrame) -> Result<(), String> {
+        let caller = self.caller()?.clone();
         if let Some(ext) = ev.ty.extension() {
             if !self.enabled.contains(ext) {
                 return Err(format!("event of {ext}, which is not enabled"));
             }
+            if ev.seq.is_none() && ev.slot.is_some() && ev.slot == caller.slot {
+                return Err("a relay was echoed to its sender".into());
+            }
         } else {
-            let decoded = CoreEvent::decode(ev).map_err(|e| format!("{}: {e}", ev.ty))?;
-            let info = lookup(decoded.type_name()).ok_or("unregistered")?;
-            let caller = self.caller()?.clone();
-            match info.audience {
-                Some(Audience::Subject) if ev.slot != caller.slot && caller.roles.is_empty() => {
-                    return Err(format!("{}: audience is the subject, slot {:?}", ev.ty, ev.slot));
-                }
-                Some(Audience::Path) => {
-                    if let CoreEvent::StateChanged(s) = &decoded
-                        && !self.watched.contains(s.path.as_str())
-                    {
-                        return Err(format!("state.changed for {}, which is not watched", s.path));
-                    }
-                }
-                _ => {}
-            }
-            if let CoreEvent::ItemGrant(g) = &decoded
-                && ev.slot == caller.slot
-            {
-                if self.own_item_seq != 0 && g.item_seq.0 != self.own_item_seq.saturating_add(1) {
-                    return Err(format!("item_seq {} after {}", g.item_seq.0, self.own_item_seq));
-                }
-                self.own_item_seq = g.item_seq.0;
-                self.grants_since.push(g.item);
-            }
+            self.core_event(ev, &caller)?;
         }
         if let Some(s) = ev.seq.map(|s| s.0) {
             if s <= self.last_seq {
                 return Err(format!("seq must increase: {s} after {}", self.last_seq));
             }
-            if let Some(to) = self.replay_to
-                && !self.replay_done
-            {
-                if s > to {
-                    return Err(format!("replay must end at {to}"));
+            match self.replay {
+                Some((from, to)) if !self.replay_done => {
+                    if s < from || s > to {
+                        return Err(format!("seq {s} outside the replay {from}..={to}"));
+                    }
+                    self.replay_done = s == to;
+                    self.last_seq = if self.replay_done { self.head.max(s) } else { s };
                 }
-                self.replay_done = s == to;
+                _ => self.last_seq = s,
             }
-            self.last_seq = s;
         } else {
             if !self.replay_done {
                 return Err("an ephemeral event during replay".into());
@@ -1048,17 +1240,70 @@ impl Session {
         Ok(())
     }
 
+    fn core_event(&mut self, ev: &EventFrame, caller: &Caller) -> Result<(), String> {
+        let decoded = CoreEvent::decode(ev).map_err(|e| format!("{}: {e}", ev.ty))?;
+        let info = lookup(decoded.type_name()).ok_or("unregistered")?;
+        let streams = self.wants().streams;
+        let in_stream = info.stream.is_some_and(|s| streams.iter().any(|w| w.as_str() == s));
+        match info.audience {
+            Some(Audience::Subject)
+                if ev.slot != caller.slot && caller.roles.is_empty() && !in_stream =>
+            {
+                return Err(format!("{}: audience is the subject, slot {:?}", ev.ty, ev.slot));
+            }
+            _ => {}
+        }
+        match &decoded {
+            CoreEvent::StateChanged(s) => {
+                let last = self
+                    .watched
+                    .get(s.path.as_str())
+                    .ok_or_else(|| format!("state.changed for {}, which is not watched", s.path))?;
+                if s.ver.0 <= *last {
+                    return Err(format!("{}: ver {} after {last}", s.path, s.ver.0));
+                }
+                self.watched.insert(s.path.to_string(), s.ver.0);
+            }
+            CoreEvent::EpochChange(e) => self.epoch = e.to.0,
+            CoreEvent::ItemGrant(g) if ev.slot == caller.slot => self.own_grant(g, caller)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn own_grant(&mut self, g: &ItemGrant, caller: &Caller) -> Result<(), String> {
+        let want = self.wants().items;
+        let own_world = g.from.is_some() && g.from == caller.slot;
+        let wanted = match g.source {
+            Source::Start => want.starting,
+            _ if own_world => want.own,
+            _ => want.from_others,
+        };
+        if !wanted {
+            return Err(format!("an item the session did not want (source {:?})", g.source));
+        }
+        let n = g.item_seq.0;
+        if n > self.applied {
+            if n != self.own_item_seq.saturating_add(1) {
+                return Err(format!("item_seq {n} after {}", self.own_item_seq));
+            }
+            self.own_item_seq = n;
+        }
+        self.granted.insert(g.item_uid.to_string());
+        Ok(())
+    }
+
     fn finish(&self) -> Result<(), String> {
-        if !self.open.is_empty() {
+        if !self.open.is_empty() || !self.pending.is_empty() {
             return Err(format!("unanswered {:?}", self.open.keys().collect::<Vec<_>>()));
         }
         if !self.expect_error.is_empty() {
             return Err(format!("expected error {:?} never came", self.expect_error));
         }
-        if !self.expect_pong.is_empty() {
+        if !self.pongs.is_empty() {
             return Err("ping never answered".into());
         }
-        if !self.replay_done && self.caller.is_some() {
+        if !self.replay_done && self.welcome.is_some() {
             return Err("replay never completed".into());
         }
         Ok(())
@@ -1117,228 +1362,373 @@ fn golden_transcripts_parse_round_trip_and_keep_the_protocol_rules() {
     }
 }
 
-const HELLO: &str = r#"{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"t","client":{"kind":"game"},"exts":{"org.cwp.deathlink":{"v":[1]}}}}"#;
-const WELCOME: &str = r#"{"dir":"s2c","frame":{"op":"welcome","proto":{"major":1,"minor":0},"session":"s","caller":{"kind":"slot","slot":1,"scopes":["play"],"roles":[]},"limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":20,"max_watches":64,"max_paths_per_watch":16},"epoch":1,"head":9,"resume":{"status":"ok"},"server_time_ms":1}}"#;
-const GRANT: &str = r#"{"op":"event","seq":2,"type":"item.grant","slot":1,"data":{"source":"check","from":1,"location":5,"item":7,"item_seq":1,"item_uid":"iu_7QK2M4XH","flags":[]}}"#;
+const U1: &str = "iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q";
+const U2: &str = "iu_C9R1T0WBC9R1T0WBC9R1T0WBC9";
 
-fn c2s(frame: &str) -> String {
-    format!(r#"{{"dir":"c2s","frame":{frame}}}"#)
+/// Sets or (with `null`) removes the top-level keys of `patch` in `base`.
+fn patched(mut base: Value, patch: &Value) -> Value {
+    if let (Some(b), Some(p)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            if v.is_null() {
+                b.remove(k);
+            } else {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    base
 }
 
-fn s2c(frame: &str) -> String {
-    format!(r#"{{"dir":"s2c","frame":{frame}}}"#)
+fn line(dir: &str, frame: &Value) -> String {
+    json!({ "dir": dir, "frame": frame }).to_string()
 }
 
-fn with_deathlink(welcome: &str) -> String {
-    welcome.replace(r#""epoch":1"#, r#""exts":{"org.cwp.deathlink":{"v":1}},"epoch":1"#)
+fn hello(patch: &Value) -> String {
+    let base = json!({"op":"hello","proto":[1],"token":"t","client":{"kind":"game"},"exts":{"org.cwp.deathlink":{"v":[1]}}});
+    line("c2s", &patched(base, patch))
+}
+
+fn welcome(patch: &Value) -> String {
+    let base = json!({"op":"welcome","proto":{"major":1,"minor":0},"session":"s",
+        "caller":{"kind":"slot","slot":1,"scopes":["play"],"roles":[]},
+        "limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":20,"max_watches":64,"max_paths_per_watch":16},
+        "epoch":1,"head":1,"applied":0,"resume":{"status":"ok"},"server_time_ms":1});
+    line("s2c", &patched(base, patch))
+}
+
+fn c2s(frame: &Value) -> String {
+    line("c2s", frame)
+}
+
+fn s2c(frame: &Value) -> String {
+    line("s2c", frame)
 }
 
 fn session(lines: &[String]) -> String {
-    let mut all = vec![HELLO.to_owned(), WELCOME.to_owned()];
+    let mut all = vec![hello(&json!({})), welcome(&json!({}))];
     all.extend(lines.iter().cloned());
     all.join("\n")
+}
+
+fn grant(seq: u64, item_seq: u64, uid: &str, slot: u32) -> String {
+    s2c(&json!({"op":"event","seq":seq,"type":"item.grant","slot":slot,
+        "data":{"source":"check","from":1,"location":5,"item":7,"item_seq":item_seq,"item_uid":uid,"flags":[]}}))
+}
+
+fn cmd(cid: &str, ty: &str, data: &Value) -> String {
+    c2s(&json!({"op":"cmd","cid":cid,"type":ty,"data":data}))
+}
+
+fn ok(cid: &str, extra: &Value, v: &Value) -> String {
+    s2c(&patched(json!({"op":"result","cid":cid,"ok":v}), extra))
+}
+
+fn err(cid: &str, code: u16, key: &str) -> String {
+    s2c(&json!({"op":"result","cid":cid,"error":{"code":code,"key":key,"retry":"never"}}))
+}
+
+fn relay(eseq: u64, slot: u32) -> String {
+    s2c(&json!({"op":"event","eseq":eseq,"type":"org.cwp.deathlink/death","slot":slot,"data":{}}))
+}
+
+fn sent(uid: &str) -> Value {
+    json!({"items":[{"to":1,"item":7,"item_uid":uid}]})
 }
 
 /// Wrong transcripts, each breaking one rule, with the message the checker must give.
 #[expect(clippy::too_many_lines, reason = "one row per protocol rule")]
 fn wrong_transcripts() -> Vec<(&'static str, String, &'static str)> {
-    let cmd = |cid: &str, ty: &str, data: &str| {
-        c2s(&format!(r#"{{"op":"cmd","cid":"{cid}","type":"{ty}","data":{data}}}"#))
-    };
-    let ok = |cid: &str, v: &str| s2c(&format!(r#"{{"op":"result","cid":"{cid}","ok":{v}}}"#));
-    let err = |cid: &str, code: u16, key: &str| {
-        s2c(&format!(
-            r#"{{"op":"result","cid":"{cid}","error":{{"code":{code},"key":"{key}","retry":"never"}}}}"#
-        ))
-    };
-    let observer = WELCOME.replace(
-        r#""kind":"slot","slot":1,"scopes":["play"]"#,
-        r#""kind":"spectator","scopes":["observe"]"#,
-    );
-    let replaying =
-        with_deathlink(WELCOME).replace(r#""resume""#, r#""replay":{"from":1,"to":2},"resume""#);
-    vec![
-        ("no hello first", c2s(r#"{"op":"ping"}"#), "first client frame must be hello"),
-        ("event before welcome", [HELLO.to_owned(), s2c(GRANT)].join("\n"), "before welcome"),
+    let none = json!({});
+    let dl = json!({"exts":{"org.cwp.deathlink":{"v":1}}});
+    let check = |cid: &str, loc: i64| cmd(cid, "check", &json!({ "location": loc }));
+    let commit = |seq: u64, upto: u64| json!({"seq":seq,"epoch":1,"upto":upto});
+    let rows = vec![
+        ("no hello first", vec![c2s(&json!({"op":"ping"}))], "first client frame must be hello"),
+        ("event before welcome", vec![hello(&none), grant(2, 1, U1, 1)], "before welcome"),
         (
             "proto not offered",
-            [HELLO.to_owned(), WELCOME.replace(r#""major":1"#, r#""major":2"#)].join("\n"),
+            vec![hello(&none), welcome(&json!({"proto":{"major":2,"minor":0}}))],
             "did not offer",
         ),
         (
             "extension not offered",
-            [HELLO.replace(r#""org.cwp.deathlink":{"v":[1]}"#, ""), with_deathlink(WELCOME)]
-                .join("\n"),
+            vec![hello(&json!({"exts":null})), welcome(&dl)],
             "was not offered",
         ),
         (
+            "two credentials",
+            vec![hello(&json!({"ticket":"u"})), welcome(&none)],
+            "exactly one credential",
+        ),
+        (
+            "spectator with play",
+            vec![
+                hello(&none),
+                welcome(&json!({"caller":{"kind":"spectator","scopes":["play"],"roles":[]}})),
+            ],
+            "spectator",
+        ),
+        (
+            "too_old with replay",
+            vec![
+                hello(&none),
+                welcome(
+                    &json!({"head":7,"replay":{"from":5,"to":7},"resume":{"status":"too_old"}}),
+                ),
+            ],
+            "too_old",
+        ),
+        (
+            "new_timeline alone",
+            vec![hello(&none), welcome(&json!({"resume":{"status":"new_timeline"}}))],
+            "epoch_change",
+        ),
+        (
             "bad data answered ok",
-            session(&[cmd("c", "check", r#"{"location":"x"}"#), ok("c", "{}")]),
+            vec![check("c", 0).replace("0}", "\"x\"}"), ok("c", &none, &none)],
             "expected error data.invalid",
         ),
         (
             "observer check answered ok",
-            [
-                HELLO.to_owned(),
-                observer,
-                cmd("c", "check", r#"{"location":1}"#),
-                ok("c", r#"{"items":[]}"#),
-            ]
-            .join("\n"),
+            vec![
+                hello(&none),
+                welcome(&json!({"caller":{"kind":"spectator","scopes":["observe"],"roles":[]}})),
+                check("c", 1),
+                ok("c", &none, &json!({"items":[]})),
+            ],
             "expected error auth.scope_insufficient",
         ),
         (
             "unknown type answered ok",
-            session(&[cmd("c", "teleport", "{}"), ok("c", "{}")]),
+            vec![cmd("c", "teleport", &none), ok("c", &none, &none)],
             "expected error type.unknown",
         ),
         (
             "extension not enabled answered ok",
-            session(&[cmd("c", "org.cwp.deathlink/death", "{}"), ok("c", "{}")]),
+            vec![cmd("c", "org.cwp.deathlink/death", &none), ok("c", &none, &none)],
             "expected error ext.not_enabled",
         ),
         (
             "conflicting cid answered ok",
-            session(&[
-                cmd("c", "check", r#"{"location":1}"#),
-                ok("c", r#"{"items":[]}"#),
-                cmd("c", "check", r#"{"location":2}"#),
-                ok("c", r#"{"items":[]}"#),
-            ]),
+            vec![
+                check("c", 1),
+                ok("c", &none, &json!({"items":[]})),
+                check("c", 2),
+                ok("c", &none, &json!({"items":[]})),
+            ],
             "expected error cid.conflict",
         ),
         (
-            "repeated cid answered differently",
-            session(&[
-                cmd("c", "goal", "{}"),
-                ok("c", "{}"),
-                cmd("c", "goal", "{}"),
-                ok("c", r#"{"again":true}"#),
-            ]),
+            "repeat answered differently",
+            vec![
+                cmd("c", "goal", &none),
+                ok("c", &none, &none),
+                cmd("c", "goal", &none),
+                ok("c", &none, &json!({"again":true})),
+            ],
             "same result",
         ),
         (
-            "seq going back",
-            session(&[
-                s2c(GRANT),
-                s2c(&GRANT
-                    .replace(r#""seq":2"#, r#""seq":1"#)
-                    .replace(r#""item_seq":1"#, r#""item_seq":2"#)),
-            ]),
+            "repeat with another seq",
+            vec![
+                cmd("c", "goal", &none),
+                s2c(&json!({"op":"event","seq":2,"type":"slot.goal","slot":1,"data":{}})),
+                ok("c", &commit(2, 2), &none),
+                cmd("c", "goal", &none),
+                ok("c", &commit(3, 2), &none),
+            ],
+            "same result",
+        ),
+        ("seq going back", vec![grant(2, 1, U1, 1), grant(1, 2, U2, 1)], "seq must increase"),
+        (
+            "seq at the resume cursor",
+            vec![hello(&json!({"resume":{"after":5}})), welcome(&none), grant(5, 1, U1, 1)],
             "seq must increase",
         ),
         (
-            "seq at the resume cursor",
-            [
-                HELLO.replace(r#""client""#, r#""resume":{"after":5},"client""#),
-                WELCOME.to_owned(),
-                s2c(&GRANT.replace(r#""seq":2"#, r#""seq":5"#)),
-            ]
-            .join("\n"),
+            "seq at or below head without replay",
+            vec![hello(&none), welcome(&json!({"head":9})), grant(2, 1, U1, 1)],
             "seq must increase",
+        ),
+        (
+            "seq outside the replay",
+            vec![
+                hello(&none),
+                welcome(&json!({"head":7,"replay":{"from":5,"to":7}})),
+                grant(3, 1, U1, 1),
+            ],
+            "outside the replay",
+        ),
+        (
+            "replay never completed",
+            vec![hello(&none), welcome(&json!({"head":2,"replay":{"from":1,"to":2}}))],
+            "replay never completed",
         ),
         (
             "ephemeral during replay",
-            [
-                HELLO.to_owned(),
-                replaying,
-                s2c(r#"{"op":"event","eseq":1,"type":"org.cwp.deathlink/death","data":{}}"#),
-                s2c(GRANT),
-            ]
-            .join("\n"),
+            vec![
+                hello(&none),
+                welcome(
+                    &json!({"head":2,"replay":{"from":1,"to":2},"exts":{"org.cwp.deathlink":{"v":1}}}),
+                ),
+                relay(1, 2),
+                grant(2, 1, U1, 1),
+            ],
             "during replay",
         ),
+        ("eseq gap", vec![hello(&none), welcome(&dl), relay(2, 2)], "eseq 2 after 0"),
         (
-            "eseq gap",
-            [
-                HELLO.to_owned(),
-                with_deathlink(WELCOME),
-                s2c(r#"{"op":"event","eseq":2,"type":"org.cwp.deathlink/death","data":{}}"#),
-            ]
-            .join("\n"),
-            "eseq 2 after 0",
+            "relay echoed to its sender",
+            vec![hello(&none), welcome(&dl), relay(1, 1)],
+            "echoed to its sender",
         ),
         (
-            "state.changed for an unwatched path",
-            session(&[s2c(
-                r#"{"op":"event","eseq":1,"type":"state.changed","data":{"path":"room/info","value":{},"ver":1}}"#,
-            )]),
+            "state.changed unwatched",
+            vec![s2c(
+                &json!({"op":"event","eseq":1,"type":"state.changed","data":{"path":"room/info","value":{},"ver":2}}),
+            )],
             "not watched",
         ),
         (
-            "grant for another slot",
-            session(&[s2c(&GRANT.replace(r#""slot":1"#, r#""slot":2"#))]),
-            "audience is the subject",
+            "state.changed going back",
+            vec![
+                c2s(&json!({"op":"watch","cid":"w","paths":["room/info"]})),
+                ok("w", &none, &json!({"paths":[{"path":"room/info","value":{},"ver":9}]})),
+                s2c(
+                    &json!({"op":"event","eseq":1,"type":"state.changed","data":{"path":"room/info","value":{},"ver":3}}),
+                ),
+            ],
+            "ver 3 after 9",
+        ),
+        ("grant for another slot", vec![grant(2, 1, U1, 2)], "audience is the subject"),
+        ("item_seq gap", vec![grant(2, 1, U1, 1), grant(3, 3, U2, 1)], "item_seq 3 after 1"),
+        (
+            "gap after welcome.applied",
+            vec![hello(&none), welcome(&json!({"applied":6})), grant(2, 8, U1, 1)],
+            "item_seq 8 after 6",
         ),
         (
-            "item_seq gap",
-            session(&[
-                s2c(GRANT),
-                s2c(&GRANT
-                    .replace(r#""seq":2"#, r#""seq":3"#)
-                    .replace(r#""item_seq":1"#, r#""item_seq":3"#)),
-            ]),
-            "item_seq 3 after 1",
+            "own-world item not wanted",
+            vec![
+                hello(&json!({"want":{"items":{"own":false}}})),
+                welcome(&none),
+                grant(2, 1, U1, 1),
+            ],
+            "did not want",
         ),
         (
             "ack beyond delivery accepted",
-            session(&[c2s(r#"{"op":"ack","applied":4}"#)]),
+            vec![c2s(&json!({"op":"ack","applied":4}))],
             "ack.invalid",
         ),
         (
-            "result before its grant",
-            session(&[
-                cmd("loc5", "check", r#"{"location":5}"#),
-                ok("loc5", r#"{"items":[{"to":1,"item":7}]}"#),
-                s2c(GRANT),
-            ]),
-            "result came before its events",
+            "unsolicited ack.invalid",
+            vec![
+                grant(2, 1, U1, 1),
+                c2s(&json!({"op":"ack","applied":1})),
+                s2c(&json!({"op":"error","code":3051,"key":"ack.invalid","retry":"never"})),
+            ],
+            "unsolicited",
         ),
-        ("unanswered command", session(&[cmd("c", "goal", "{}")]), "unanswered"),
-        ("unknown op not refused", session(&[c2s(r#"{"op":"teleport"}"#)]), "op.unknown"),
+        (
+            "result before its grant",
+            vec![check("loc5", 5), ok("loc5", &commit(2, 1), &sent(U1)), grant(2, 1, U1, 1)],
+            "before its events",
+        ),
+        (
+            "two checks in flight",
+            vec![
+                check("a", 5),
+                check("b", 6),
+                grant(2, 1, U1, 1),
+                ok("a", &commit(2, 2), &sent(U1)),
+                ok("b", &commit(3, 2), &sent(U2)),
+            ],
+            "before its events",
+        ),
+        (
+            "committing result without seq",
+            vec![check("a", 5), grant(2, 1, U1, 1), ok("a", &json!({"upto":2}), &sent(U1))],
+            "carries seq and epoch",
+        ),
+        (
+            "result in another epoch",
+            vec![
+                check("a", 5),
+                grant(2, 1, U1, 1),
+                ok("a", &json!({"seq":2,"epoch":2,"upto":2}), &sent(U1)),
+            ],
+            "epoch differs",
+        ),
+        (
+            "wrong upto",
+            vec![check("a", 5), grant(2, 1, U1, 1), ok("a", &commit(2, 1), &sent(U1))],
+            "upto must be",
+        ),
+        (
+            "session.update answered with a number",
+            vec![cmd("su", "session.update", &json!({"exts":{}})), ok("su", &none, &json!(5))],
+            "session.update result",
+        ),
+        (
+            "goal answered with a number",
+            vec![cmd("g", "goal", &none), ok("g", &none, &json!(5))],
+            "must be an object",
+        ),
+        (
+            "events after a kick",
+            vec![
+                s2c(&json!({"op":"error","code":3060,"key":"room.kicked","retry":"never"})),
+                grant(2, 1, U1, 1),
+            ],
+            "after the session ended",
+        ),
+        ("unanswered command", vec![cmd("c", "goal", &none)], "unanswered"),
+        ("unknown op not refused", vec![c2s(&json!({"op":"teleport"}))], "op.unknown"),
         (
             "get answered for another path",
-            session(&[
-                c2s(r#"{"op":"get","cid":"g","path":"room/info"}"#),
-                ok("g", r#"{"path":"room/slots","value":[],"ver":0}"#),
-            ]),
+            vec![
+                c2s(&json!({"op":"get","cid":"g","path":"room/info"})),
+                ok("g", &none, &json!({"path":"room/slots","value":[],"ver":0})),
+            ],
             "another path",
         ),
         (
             "error with the wrong code",
-            session(&[cmd("c", "teleport", "{}"), err("c", 1003, "type.unknown")]),
+            vec![cmd("c", "teleport", &none), err("c", 1003, "type.unknown")],
             "wrong code",
         ),
         (
             "pong without the nonce",
-            session(&[c2s(r#"{"op":"ping","n":3}"#), s2c(r#"{"op":"pong"}"#)]),
+            vec![c2s(&json!({"op":"ping","n":3})), s2c(&json!({"op":"pong"}))],
             "echo the nonce",
         ),
-        ("result for nothing", session(&[ok("x", "{}")]), "answers nothing open"),
+        ("result for nothing", vec![ok("x", &none, &none)], "answers nothing open"),
         (
             "durable event without seq",
-            session(&[s2c(&GRANT.replace(r#""seq":2"#, r#""eseq":1"#))]),
+            vec![grant(2, 1, U1, 1).replace("\"seq\":2", "\"eseq\":1")],
             "delivery class",
         ),
         (
             "forbidden read answered",
-            session(&[
-                c2s(r#"{"op":"get","cid":"g","path":"slot/2/inventory"}"#),
-                ok("g", r#"{"path":"slot/2/inventory","value":[],"ver":0}"#),
-            ]),
+            vec![
+                c2s(&json!({"op":"get","cid":"g","path":"slot/2/inventory"})),
+                ok("g", &none, &json!({"path":"slot/2/inventory","value":[],"ver":0})),
+            ],
             "expected error path.forbidden",
         ),
-        (
-            "replay never completed",
-            [
-                HELLO.to_owned(),
-                with_deathlink(WELCOME)
-                    .replace(r#""resume""#, r#""replay":{"from":1,"to":2},"resume""#),
-            ]
-            .join("\n"),
-            "replay never completed",
-        ),
-    ]
+    ];
+    rows.into_iter()
+        .map(|(name, lines, why)| {
+            let starts_with_hello = lines.first().is_some_and(|l| l.contains(r#""op":"hello""#));
+            let text = if starts_with_hello || name == "no hello first" {
+                lines.join("\n")
+            } else {
+                session(&lines)
+            };
+            (name, text, why)
+        })
+        .collect()
 }
 
 #[test]
@@ -1349,6 +1739,63 @@ fn every_wrong_transcript_is_caught_with_its_reason() {
             Err(e) => {
                 assert!(e.contains(why), "{name}: expected a failure about {why:?}, got {e:?}");
             }
+        }
+    }
+}
+
+#[test]
+fn correct_edge_cases_pass_the_checker() {
+    let none = json!({});
+    let cases = [
+        (
+            "re-ack of welcome.applied",
+            vec![
+                hello(&none),
+                welcome(&json!({"applied":3})),
+                c2s(&json!({"op":"ack","applied":3})),
+            ],
+        ),
+        (
+            "extension enabled mid-session",
+            vec![
+                hello(&none),
+                welcome(&none),
+                cmd("su", "session.update", &json!({"exts":{"org.cwp.deathlink":{"v":[1]}}})),
+                ok("su", &none, &json!({"exts":{"org.cwp.deathlink":{"v":1,"minor":0}}})),
+                cmd("d", "org.cwp.deathlink/death", &none),
+                ok("d", &none, &none),
+            ],
+        ),
+        (
+            "command pipelined before welcome",
+            vec![
+                hello(&none),
+                cmd("st", "status.set", &json!({"client_state":"ready"})),
+                welcome(&none),
+                ok("st", &none, &none),
+            ],
+        ),
+        (
+            "the room.items stream sees every grant",
+            vec![
+                hello(&json!({"want":{"streams":["room.items"]}})),
+                welcome(&none),
+                grant(2, 1, U1, 2),
+            ],
+        ),
+        (
+            "a replayed item at or below applied",
+            vec![
+                hello(&json!({"resume":{"after":1}})),
+                welcome(&json!({"head":3,"applied":2,"replay":{"from":2,"to":3}})),
+                grant(2, 2, U1, 1),
+                grant(3, 3, U2, 1),
+            ],
+        ),
+    ];
+    for (name, lines) in cases {
+        if let Err(e) = check_transcript(&lines.join("\n")) {
+            panic!("{name}: {e}");
         }
     }
 }

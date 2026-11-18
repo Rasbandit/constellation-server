@@ -33,4 +33,4 @@ pub use registry::{
     Kind, LocationChecked, SentItem, SessionUpdate, SessionUpdateOk, SlotGoal, Source, Stability,
     StateChanged, StatusSet, Template, TypeInfo, WatchOk, lookup,
 };
-pub use serde_util::{MAX_SAFE, MAX_SAFE_I64};
+pub use serde_util::{MAX_SAFE, MAX_SAFE_I64, in_range};

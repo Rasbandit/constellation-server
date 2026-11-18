@@ -5,7 +5,7 @@ use super::frame::{
     Caller, Cmd, EventFrame, ExtChoice, ExtOffer, Minor, RoomRole, Scope, Want, empty_object,
 };
 use super::names::{CmdId, ExtId, ItemUid, StatePath, TypeName};
-use super::serde_util::{de_i, de_u, present, ser_i, ser_u};
+use super::serde_util::{de_i, de_opt_i, de_u, in_range, present, ser_i, ser_opt_i, ser_u};
 use crate::{Epoch, ErrorCode, ItemSeq, Seq, SlotNo};
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::fmt;
@@ -44,7 +44,7 @@ pub enum Audience {
     Players,
     /// Room roles only.
     Roles,
-    /// As the read rule of the path in the event (`state.changed`).
+    /// As the read rule of the path the event names (`state.changed`).
     Path,
 }
 
@@ -84,8 +84,9 @@ impl Allow {
 /// A display template variant (rule 14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Template {
-    /// The condition, `a=b` comparing two fields (`slot` is the frame's slot); `None` always
-    /// applies. The first variant whose condition holds is used.
+    /// The condition: `a=b` compares two fields (`slot` is the frame's slot), `a:v` compares a
+    /// field with a literal value; `None` always applies. The first variant whose condition
+    /// holds is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<&'static str>,
     /// English text with typed placeholders: `{field:kind}` or `{field:kind@slotfield}`.
@@ -108,6 +109,10 @@ pub struct TypeInfo {
     pub audience: Option<Audience>,
     /// Events: hidden from `observe` sessions unless the room's spoiler mode allows it.
     pub spoiler: bool,
+    /// Events: an optional stream (`want.streams`) whose sessions also receive every event of
+    /// this type, beyond the audience; for example `room.items` for item grants (rule 6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<&'static str>,
     /// Commands: who may send it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow: Option<Allow>,
@@ -115,6 +120,11 @@ pub struct TypeInfo {
     pub errors: &'static [ErrorCode],
     /// Largest `data`, in bytes.
     pub max_bytes: u32,
+    /// Commands: per-session rate limit per second; 0 means the session's `cmds_per_sec`.
+    pub rate_per_sec: u16,
+    /// Commands: the room states in which it is accepted (`staging`, `live`); empty means any.
+    /// Outside them the answer is `room.not_live` or `room.paused`.
+    pub states: &'static [&'static str],
     /// Lifecycle.
     #[serde(rename = "status")]
     pub stability: Stability,
@@ -158,9 +168,12 @@ const fn cmd(
         delivery: None,
         audience: None,
         spoiler: false,
+        stream: None,
         allow: Some(allow),
         errors,
         max_bytes,
+        rate_per_sec: 0,
+        states: &[],
         stability: Stability::Experimental,
         since: 0,
         templates: &[],
@@ -181,9 +194,12 @@ const fn event(
         delivery: Some(delivery),
         audience: Some(audience),
         spoiler: false,
+        stream: None,
         allow: None,
         errors: &[],
         max_bytes: 4096,
+        rate_per_sec: 0,
+        states: &[],
         stability: Stability::Experimental,
         since: 0,
         templates,
@@ -216,16 +232,31 @@ pub const CORE_TYPES: &[TypeInfo] = &[
         "Change wants and enable or disable extensions mid-session.",
     ),
     event("location.checked", Delivery::Durable, Audience::Room, &[], "A slot checked a location."),
-    event(
-        "item.grant",
-        Delivery::Durable,
-        Audience::Subject,
-        &[
-            Template { when: Some("from=slot"), text: "{slot:slot} found their {item:item@slot}" },
-            Template { when: None, text: "{from:slot} sent {item:item@slot} to {slot:slot}" },
-        ],
-        "An item was delivered to the event's slot, with its per-slot item_seq.",
-    ),
+    TypeInfo {
+        stream: Some("room.items"),
+        ..event(
+            "item.grant",
+            Delivery::Durable,
+            Audience::Subject,
+            &[
+                Template {
+                    when: Some("source:start"),
+                    text: "{slot:slot} started with {item:item@slot}",
+                },
+                Template {
+                    when: Some("source:admin"),
+                    text: "{slot:slot} was given {item:item@slot}",
+                },
+                Template {
+                    when: Some("from=slot"),
+                    text: "{slot:slot} found their {item:item@slot}",
+                },
+                Template { when: None, text: "{from:slot} sent {item:item@slot} to {slot:slot}" },
+            ],
+            "An item was delivered to the event's slot, with its per-slot item_seq. Sessions of \
+             the room.items stream see every grant.",
+        )
+    },
     event(
         "slot.goal",
         Delivery::Durable,
@@ -289,6 +320,8 @@ pub struct SentItem {
     /// Item classification.
     #[serde(default)]
     pub flags: Vec<ItemFlag>,
+    /// The grant's stable identity, as the receiver will see it in `item.grant`.
+    pub item_uid: ItemUid,
 }
 
 /// `goal` payload (empty).
@@ -313,6 +346,9 @@ pub enum ClientState {
     Ready,
     /// The client says it is playing.
     Playing,
+    /// A state this version does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// `session.update` payload.
@@ -363,6 +399,9 @@ pub enum Source {
     Start,
     /// Given by a room role.
     Admin,
+    /// A source this version does not know; its `from` and `location` are not checked.
+    #[serde(other)]
+    Other,
 }
 
 impl Source {
@@ -410,24 +449,29 @@ pub struct ItemGrant {
     /// The finding slot, for location-based sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<SlotNo>,
-    /// The location in `from`'s world, for location-based sources. Its range is checked by
-    /// [`CoreEvent::decode`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The location in `from`'s world, for location-based sources.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_i",
+        serialize_with = "ser_opt_i"
+    )]
     #[cfg_attr(test, schemars(range(min = -9_007_199_254_740_991_i64, max = 9_007_199_254_740_991_i64)))]
     pub location: Option<i64>,
 }
 
 impl ItemGrant {
-    /// Whether `from` and `location` are present exactly when `source` names a location, and
-    /// `location` is within the CWP integer range.
+    /// Whether `from` and `location` are present exactly when `source` names a location (not
+    /// checked for a source this version does not know).
     #[must_use]
-    pub fn is_consistent(&self) -> bool {
-        let in_range = self.location.is_none_or(|l| {
-            (-super::serde_util::MAX_SAFE_I64..=super::serde_util::MAX_SAFE_I64).contains(&l)
-        });
+    pub const fn is_consistent(&self) -> bool {
         let named = self.from.is_some() && self.location.is_some();
         let absent = self.from.is_none() && self.location.is_none();
-        in_range && if self.source.has_location() { named } else { absent }
+        match self.source {
+            Source::Other => true,
+            s if s.has_location() => named,
+            _ => absent,
+        }
     }
 }
 
@@ -446,9 +490,12 @@ pub struct EpochChange {
     /// The epoch now.
     #[serde(deserialize_with = "de_u", serialize_with = "ser_u")]
     pub to: Epoch,
-    /// The last `seq` the new history kept.
+    /// The last `seq` the new history kept; the client replays its journal after it.
     #[serde(deserialize_with = "de_u", serialize_with = "ser_u")]
     pub recovered_head: Seq,
+    /// Estimated seconds of acknowledged activity lost (doc 06 section 6.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approx_lost_seconds: Option<u32>,
 }
 
 /// `state.changed` payload, also one entry of a `watch` result.
@@ -598,7 +645,7 @@ impl CoreCmd {
         }
     }
 
-    /// The `cmd` frame for this command.
+    /// The `cmd` frame for this command, checked by [`Self::decode`].
     ///
     /// # Errors
     /// When a payload value is outside the CWP integer range.
@@ -609,7 +656,9 @@ impl CoreCmd {
             Self::StatusSet(p) => serde_json::to_value(p),
             Self::SessionUpdate(p) => serde_json::to_value(p),
         }?;
-        Ok(Cmd { cid, ty: type_name(self.type_name())?, data })
+        let cmd = Cmd { cid, ty: type_name(self.type_name())?, data };
+        Self::decode(&cmd).map_err(serde::ser::Error::custom)?;
+        Ok(cmd)
     }
 }
 
@@ -689,10 +738,12 @@ impl CoreEvent {
         }
     }
 
-    /// The `event` frame for this event.
+    /// The `event` frame for this event, checked by [`Self::decode`], so it never produces a
+    /// frame a receiver would refuse.
     ///
     /// # Errors
-    /// When a payload value is outside the CWP integer range.
+    /// When a value is outside the CWP integer range, or the frame breaks the type's rules
+    /// (durable or ephemeral, a missing `slot`, an inconsistent `source`).
     pub fn to_frame(
         &self,
         at: Delivered,
@@ -711,7 +762,7 @@ impl CoreEvent {
             Delivered::Ephemeral(e) => (None, Some(e)),
         };
         let data = if data.is_null() { empty_object() } else { data };
-        Ok(EventFrame {
+        let frame = EventFrame {
             seq,
             eseq,
             ty: type_name(self.type_name())?,
@@ -719,6 +770,11 @@ impl CoreEvent {
             t,
             prev_hash: None,
             data,
-        })
+        };
+        if !in_range(&frame.data) {
+            return Err(serde::ser::Error::custom("integer outside the CWP range"));
+        }
+        Self::decode(&frame).map_err(serde::ser::Error::custom)?;
+        Ok(frame)
     }
 }

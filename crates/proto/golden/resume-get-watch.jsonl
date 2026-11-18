@@ -1,6 +1,6 @@
 {"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_slot_one","client":{"kind":"game"},"exts":{"org.cwp.deathlink":{"v":[1]}},"want":{"items":{"from_others":true,"own":false,"starting":true},"slot_data":true},"resume":{"after":2,"epoch":1}}}
 {"dir":"s2c","frame":{"op":"welcome","proto":{"major":1,"minor":0},"session":"s_golden_2","caller":{"kind":"slot","slot":1,"scopes":["play"],"roles":[]},"slot":{"index":1,"name":"Rowan","game":"dev.example.mosscave"},"exts":{"org.cwp.deathlink":{"v":1,"minor":0}},"limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":20,"max_watches":64,"max_paths_per_watch":16},"epoch":1,"head":5,"applied":1,"replay":{"from":3,"to":5},"resume":{"status":"ok"},"slot_data":{"goal":"boss"},"server_time_ms":1790000001000}}
-{"dir":"s2c","frame":{"op":"event","seq":3,"type":"item.grant","slot":1,"data":{"source":"check","from":2,"location":9,"item":2,"item_seq":2,"item_uid":"iu_C9R1T0WB","flags":[]}}}
+{"dir":"s2c","frame":{"op":"event","seq":3,"type":"item.grant","slot":1,"data":{"source":"check","from":2,"location":9,"item":2,"item_seq":2,"item_uid":"iu_C9R1T0WBC9R1T0WBC9R1T0WBC9","flags":[]}}}
 {"dir":"s2c","frame":{"op":"event","seq":5,"type":"slot.goal","slot":2,"data":{}}}
 {"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"slot/2/status"}}
 {"dir":"s2c","frame":{"op":"result","cid":"g-1","ok":{"path":"slot/2/status","value":{"connection":"online","goal":true},"ver":5}}}

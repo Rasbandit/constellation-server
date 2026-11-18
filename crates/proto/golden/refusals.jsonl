@@ -10,7 +10,7 @@
 {"dir":"s2c","frame":{"op":"result","cid":"c-4","error":{"code":1005,"key":"ext.not_enabled","retry":"never"}}}
 {"dir":"c2s","frame":{"op":"cmd","cid":"loc1","type":"check","data":{"location":1}}}
 {"dir":"s2c","frame":{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":1}}}
-{"dir":"s2c","frame":{"op":"result","cid":"loc1","seq":1,"epoch":1,"ok":{"items":[]}}}
+{"dir":"s2c","frame":{"op":"result","cid":"loc1","seq":1,"epoch":1,"upto":1,"ok":{"items":[]}}}
 {"dir":"c2s","frame":{"op":"cmd","cid":"loc1","type":"check","data":{"location":2}}}
 {"dir":"s2c","frame":{"op":"result","cid":"loc1","error":{"code":3050,"key":"cid.conflict","retry":"never"}}}
 {"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"slot/1/secrets"}}

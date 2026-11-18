@@ -1,6 +1,7 @@
 //! The CWP v1 frames (doc 01 D1.10): a fixed set, each with one shape. Features are types
 //! carried inside `cmd` and `event`, never new frames.
 use super::names::{Checksum, CmdId, ExtId, GameId, Secret, StatePath, StreamName, TypeName};
+use super::registry::EpochChange;
 use super::serde_util::{de_opt_u, de_u, is_false, present, ser_opt_u, ser_u};
 use crate::{Epoch, ErrorCode, ItemSeq, Retry, Seq, SlotNo};
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
@@ -34,10 +35,8 @@ pub enum ClientFrame {
     Unwatch(Watch),
     /// The game has applied every item up to `applied`.
     Ack(Ack),
-    /// Liveness check; answered by `pong`.
+    /// Heartbeat, sent every `limits.hb_ms` (doc 09 section 5.5); answered by `pong`.
     Ping(Beat),
-    /// Answer to a server `ping`.
-    Pong(Beat),
     /// An `op` this version does not know. A server answers it with `op.unknown` (rule 1).
     #[serde(other)]
     Unknown,
@@ -56,9 +55,7 @@ pub enum ServerFrame {
     Event(EventFrame),
     /// A problem not tied to a `cid` (rule 13 reasons, a bad frame, a bad `ack`).
     Error(ErrorBody),
-    /// Liveness check; answered by `pong`.
-    Ping(Beat),
-    /// Answer to a client `ping`.
+    /// Answer to a client `ping`, echoing its nonce.
     Pong(Beat),
     /// An `op` this version does not know. Clients ignore it (rule 1).
     #[serde(other)]
@@ -83,8 +80,8 @@ frame_from!(ServerFrame::Result(CmdResult));
 frame_from!(ServerFrame::Event(EventFrame));
 frame_from!(ServerFrame::Error(ErrorBody));
 
-/// `ping` and `pong` (doc 09 section 5.5): an optional nonce, echoed by `pong`, and an optional
-/// presence state.
+/// `ping` (client) and `pong` (server), doc 09 section 5.5: an optional nonce, which `pong`
+/// echoes, and on `ping` an optional presence state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -97,7 +94,7 @@ pub struct Beat {
     )]
     #[cfg_attr(test, schemars(range(max = 9_007_199_254_740_991_u64)))]
     pub n: Option<u64>,
-    /// Presence state (`menu`, `loading`, `playing`), on a client's `pong`.
+    /// Presence state (`menu`, `loading`, `playing`), on a client's `ping`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p: Option<StreamName>,
 }
@@ -427,6 +424,9 @@ pub enum CallerKind {
     Integration,
     /// An account (the host console).
     Account,
+    /// A value this version does not know; it grants nothing.
+    #[serde(other)]
+    Other,
 }
 
 /// Token scopes (doc 01 D1.2).
@@ -438,6 +438,9 @@ pub enum Scope {
     Play,
     /// Reads the player-visible log only.
     Observe,
+    /// A value this version does not know; it grants nothing.
+    #[serde(other)]
+    Other,
 }
 
 /// Room roles (doc 10 section 2.3).
@@ -451,6 +454,9 @@ pub enum RoomRole {
     CoHost,
     /// Moderates chat and players.
     Moderator,
+    /// A value this version does not know; it grants nothing.
+    #[serde(other)]
+    Other,
 }
 
 /// `welcome.slot`.
@@ -515,6 +521,10 @@ pub struct Replay {
 pub struct ResumeOutcome {
     /// What happened to the cursor.
     pub status: ResumeStatus,
+    /// For `new_timeline`: the change, so the client can replay its journal after
+    /// `recovered_head` (doc 06 section 6.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_change: Option<EpochChange>,
 }
 
 /// `welcome.resume.status`.
@@ -526,8 +536,12 @@ pub enum ResumeStatus {
     Ok,
     /// The cursor is older than the retained window: read the inventory in pages.
     TooOld,
-    /// The room was restored or failed over to another history (doc 01 D5.3 rule 2).
+    /// The room was restored or failed over to another history (doc 01 D5.3 rule 2);
+    /// `epoch_change` says where the new history starts.
     NewTimeline,
+    /// A status this version does not know; treat it as `new_timeline`.
+    #[serde(other)]
+    Other,
 }
 
 /// The answer to one `cmd`, `get`, `watch` or `unwatch`: `{"cid", "seq"?, "epoch"?, "ok"}` or
@@ -543,6 +557,10 @@ pub struct CmdResult {
     /// Epoch of that commit.
     #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_u")]
     pub epoch: Option<Epoch>,
+    /// The last durable `seq` sent to this session when the result was produced; over HTTP
+    /// the client applies the result once its stream has reached it (rule 4).
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_u")]
+    pub upto: Option<Seq>,
     /// Success or failure.
     #[serde(flatten)]
     pub outcome: Outcome,
@@ -567,6 +585,8 @@ struct RawResult {
     seq: Option<Seq>,
     #[serde(default, deserialize_with = "de_opt_u")]
     epoch: Option<Epoch>,
+    #[serde(default, deserialize_with = "de_opt_u")]
+    upto: Option<Seq>,
     #[serde(default, deserialize_with = "present")]
     ok: Option<Value>,
     #[serde(default)]
@@ -582,7 +602,7 @@ impl<'de> Deserialize<'de> for CmdResult {
             (Some(_), Some(_)) => return Err(de::Error::custom("a result has both ok and error")),
             (None, None) => return Err(de::Error::custom("a result has neither ok nor error")),
         };
-        Ok(Self { cid: raw.cid, seq: raw.seq, epoch: raw.epoch, outcome })
+        Ok(Self { cid: raw.cid, seq: raw.seq, epoch: raw.epoch, upto: raw.upto, outcome })
     }
 }
 
@@ -590,13 +610,13 @@ impl CmdResult {
     /// A success with no commit.
     #[must_use]
     pub const fn ok(cid: CmdId, value: Value) -> Self {
-        Self { cid, seq: None, epoch: None, outcome: Outcome::Ok(value) }
+        Self { cid, seq: None, epoch: None, upto: None, outcome: Outcome::Ok(value) }
     }
 
     /// A refusal.
     #[must_use]
     pub fn error(cid: CmdId, e: impl Into<ErrorBody>) -> Self {
-        Self { cid, seq: None, epoch: None, outcome: Outcome::Error(e.into()) }
+        Self { cid, seq: None, epoch: None, upto: None, outcome: Outcome::Error(e.into()) }
     }
 }
 

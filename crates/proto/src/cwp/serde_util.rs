@@ -113,3 +113,34 @@ pub(super) fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, 
 pub(super) const fn is_false(b: &bool) -> bool {
     !*b
 }
+
+#[expect(clippy::ref_option, reason = "serde's serialize_with passes a reference to the field")]
+pub(super) fn ser_opt_i<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        None => s.serialize_none(),
+        Some(v) => ser_i(v, s),
+    }
+}
+
+pub(super) fn de_opt_i<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    match Option::<i64>::deserialize(d)? {
+        Some(v) if !(-MAX_SAFE_I64..=MAX_SAFE_I64).contains(&v) => Err(de::Error::custom(RANGE)),
+        v => Ok(v),
+    }
+}
+
+/// Whether every number in `v`, however deep (free-form `data`, `opts`, `ok`, `value`), is within
+/// plus or minus 2^53 - 1 (rule 15). Fractions are allowed; magnitudes above the bound are not.
+#[must_use]
+pub fn in_range(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => {
+            n.as_u64().is_none_or(|u| u <= MAX_SAFE)
+                && n.as_i64().is_none_or(|i| i >= -MAX_SAFE_I64)
+                && n.as_f64().is_none_or(|f| f.abs() <= 9_007_199_254_740_991.0)
+        }
+        Value::Array(a) => a.iter().all(in_range),
+        Value::Object(m) => m.values().all(in_range),
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+    }
+}

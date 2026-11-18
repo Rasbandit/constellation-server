@@ -3,12 +3,14 @@
 //! readable the server answers with a `result` for it, otherwise with an `error` frame.
 use super::frame::{ClientFrame, CmdResult, ErrorBody, ServerFrame};
 use super::names::{CmdId, StatePath, TypeName};
+use super::serde_util::in_range;
 use crate::ErrorCode;
 use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-/// A frame that could not be decoded, with what the server answers it with.
+/// A frame that could not be decoded, with what the receiver answers it with. An `error`
+/// frame's `ref` names the frame it answers: its `cid` when it had a readable one, else its `op`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadFrame {
     /// The `cid` was readable: answer with this `result`.
@@ -36,15 +38,16 @@ fn classify(raw: &Value) -> ErrorCode {
     }
 }
 
-fn answer(raw: &Value, err: &serde_json::Error) -> BadFrame {
+fn answer(raw: &Value, code: ErrorCode, reason: &str) -> BadFrame {
     let op = raw.get("op").and_then(Value::as_str);
-    let body = ErrorBody::from(classify(raw)).with_detail(json!({ "reason": err.to_string() }));
+    let body = ErrorBody::from(code).with_detail(json!({ "reason": reason }));
     let cid = raw.get("cid").and_then(Value::as_str).and_then(|c| CmdId::new(c).ok());
     match (op, cid) {
         (Some(op), Some(cid)) if ANSWERED.contains(&op) => {
             BadFrame::Answer(Box::new(CmdResult::error(cid, body)))
         }
-        (Some(op), _) => BadFrame::Error(Box::new(body.with_ref(op))),
+        (_, Some(cid)) => BadFrame::Error(Box::new(body.with_ref(cid.as_str()))),
+        (Some(op), None) => BadFrame::Error(Box::new(body.with_ref(op))),
         (None, _) => BadFrame::Error(Box::new(body)),
     }
 }
@@ -62,7 +65,15 @@ fn frames<T: DeserializeOwned>(text: &str) -> Vec<Result<T, BadFrame>> {
         Value::Array(items) => items,
         one => vec![one],
     };
-    items.into_iter().map(|raw| T::deserialize(&raw).map_err(|e| answer(&raw, &e))).collect()
+    items
+        .into_iter()
+        .map(|raw| {
+            if !in_range(&raw) {
+                return Err(answer(&raw, ErrorCode::DataInvalid, "integer outside the CWP range"));
+            }
+            T::deserialize(&raw).map_err(|e| answer(&raw, classify(&raw), &e.to_string()))
+        })
+        .collect()
 }
 
 /// Reads one client message into its frames, in order.

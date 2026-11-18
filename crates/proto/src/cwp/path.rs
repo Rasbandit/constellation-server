@@ -57,7 +57,7 @@ pub const CORE_PATHS: &[PathInfo] = &[
     },
     PathInfo {
         pattern: "slot/{n}/locations",
-        read: Read::SubjectOrSpoiler,
+        read: Read::Room,
         paged: false,
         summary: "Checked and missing location ids.",
     },

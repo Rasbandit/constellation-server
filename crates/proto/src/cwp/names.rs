@@ -246,8 +246,7 @@ const fn is_crockford(c: u8) -> bool {
 }
 
 fn is_item_uid(s: &str) -> bool {
-    s.strip_prefix("iu_")
-        .is_some_and(|b| (8..=64).contains(&b.len()) && b.bytes().all(is_crockford))
+    s.strip_prefix("iu_").is_some_and(|b| b.len() == 26 && b.bytes().all(is_crockford))
 }
 
 validated!(
@@ -316,10 +315,11 @@ validated!(
 printable!(Checksum);
 
 validated!(
-    /// Stable item identity (doc 01 D1.10 rule 11): `iu_` and Crockford base32.
+    /// Stable item identity (doc 01 D1.10 rule 11): `iu_` and 26 Crockford base32 digits (a
+    /// 128-bit hash).
     ItemUid,
     is_item_uid,
-    "^iu_[0-9A-HJKMNP-TV-Z]{8,64}$",
+    "^iu_[0-9A-HJKMNP-TV-Z]{26}$",
     NAME_MAX
 );
 printable!(ItemUid);

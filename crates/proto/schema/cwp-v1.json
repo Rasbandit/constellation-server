@@ -14,7 +14,7 @@
       "type": "object"
     },
     "Beat": {
-      "description": "`ping` and `pong` (doc 09 section 5.5): an optional nonce, echoed by `pong`, and an optional\npresence state.",
+      "description": "`ping` (client) and `pong` (server), doc 09 section 5.5: an optional nonce, which `pong`\nechoes, and on `ping` an optional presence state.",
       "properties": {
         "n": {
           "description": "Nonce; a `pong` echoes the `ping`'s.",
@@ -35,7 +35,7 @@
               "type": "null"
             }
           ],
-          "description": "Presence state (`menu`, `loading`, `playing`), on a client's `pong`."
+          "description": "Presence state (`menu`, `loading`, `playing`), on a client's `ping`."
         }
       },
       "type": "object"
@@ -81,8 +81,7 @@
       "type": "object"
     },
     "CallerKind": {
-      "description": "`welcome.caller.kind`.",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "slot",
           "description": "A slot token.",
@@ -102,8 +101,13 @@
           "const": "account",
           "description": "An account (the host console).",
           "type": "string"
+        },
+        {
+          "description": "A value this version does not know; it grants nothing.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "`welcome.caller.kind`."
     },
     "Check": {
       "description": "`check` payload.",
@@ -143,8 +147,7 @@
       "type": "string"
     },
     "ClientFrame": {
-      "description": "Everything a client may send.",
-      "oneOf": [
+      "anyOf": [
         {
           "$ref": "#/$defs/Hello",
           "description": "First frame of a session.",
@@ -231,7 +234,7 @@
         },
         {
           "$ref": "#/$defs/Beat",
-          "description": "Liveness check; answered by `pong`.",
+          "description": "Heartbeat, sent every `limits.hb_ms` (doc 09 section 5.5); answered by `pong`.",
           "properties": {
             "op": {
               "const": "ping",
@@ -244,24 +247,9 @@
           "type": "object"
         },
         {
-          "$ref": "#/$defs/Beat",
-          "description": "Answer to a server `ping`.",
-          "properties": {
-            "op": {
-              "const": "pong",
-              "type": "string"
-            }
-          },
-          "required": [
-            "op"
-          ],
-          "type": "object"
-        },
-        {
           "description": "An `op` this version does not know. A server answers it with `op.unknown` (rule 1).",
           "properties": {
             "op": {
-              "const": "unknown",
               "type": "string"
             }
           },
@@ -270,7 +258,8 @@
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "Everything a client may send."
     },
     "ClientInfo": {
       "description": "`hello.client` (doc 09 section 4.6).",
@@ -307,8 +296,7 @@
       "type": "object"
     },
     "ClientKind": {
-      "description": "`hello.client.kind` (doc 09 section 4.6).",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "game",
           "description": "A game or mod.",
@@ -350,15 +338,14 @@
           "type": "string"
         },
         {
-          "const": "other",
           "description": "A kind this version does not know.",
           "type": "string"
         }
-      ]
+      ],
+      "description": "`hello.client.kind` (doc 09 section 4.6)."
     },
     "ClientState": {
-      "description": "`slot/{n}/status.client_state`.",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "ready",
           "description": "The client says it is ready.",
@@ -368,8 +355,13 @@
           "const": "playing",
           "description": "The client says it is playing.",
           "type": "string"
+        },
+        {
+          "description": "A state this version does not know.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "`slot/{n}/status.client_state`."
     },
     "Cmd": {
       "description": "A command (doc 01 D1.10 rule 3).",
@@ -452,6 +444,17 @@
             }
           ],
           "description": "Last durable `seq` the command committed (rule 4)."
+        },
+        "upto": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Seq"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last durable `seq` sent to this session when the result was produced; over HTTP\nthe client applies the result once its stream has reached it (rule 4)."
         }
       },
       "required": [
@@ -472,13 +475,22 @@
     "EpochChange": {
       "description": "`room.epoch_change` payload (rule 12).",
       "properties": {
+        "approx_lost_seconds": {
+          "description": "Estimated seconds of acknowledged activity lost (doc 06 section 6.4).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "from": {
           "$ref": "#/$defs/Epoch",
           "description": "The epoch before."
         },
         "recovered_head": {
           "$ref": "#/$defs/Seq",
-          "description": "The last `seq` the new history kept."
+          "description": "The last `seq` the new history kept; the client replays its journal after it."
         },
         "to": {
           "$ref": "#/$defs/Epoch",
@@ -883,8 +895,7 @@
       "type": "object"
     },
     "ItemFlag": {
-      "description": "Item classification. Unknown flags from newer servers read as `Other`.",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "progression",
           "description": "Can unlock logical progress.",
@@ -901,11 +912,11 @@
           "type": "string"
         },
         {
-          "const": "other",
           "description": "A flag this version does not know.",
           "type": "string"
         }
-      ]
+      ],
+      "description": "Item classification. Unknown flags from newer servers read as `Other`."
     },
     "ItemGrant": {
       "description": "`item.grant` payload; the frame's `slot` is the receiver.",
@@ -945,7 +956,7 @@
           "description": "Stable identity across epochs; clients dedupe by it."
         },
         "location": {
-          "description": "The location in `from`'s world, for location-based sources. Its range is checked by\n[`CoreEvent::decode`].",
+          "description": "The location in `from`'s world, for location-based sources.",
           "format": "int64",
           "maximum": 9007199254740991,
           "minimum": -9007199254740991,
@@ -975,10 +986,10 @@
       "type": "integer"
     },
     "ItemUid": {
-      "description": "Stable item identity (doc 01 D1.10 rule 11): `iu_` and Crockford base32.",
+      "description": "Stable item identity (doc 01 D1.10 rule 11): `iu_` and 26 Crockford base32 digits (a\n128-bit hash).",
       "maxLength": 128,
       "minLength": 1,
-      "pattern": "^iu_[0-9A-HJKMNP-TV-Z]{8,64}$",
+      "pattern": "^iu_[0-9A-HJKMNP-TV-Z]{26}$",
       "type": "string"
     },
     "Limits": {
@@ -1115,6 +1126,17 @@
     "ResumeOutcome": {
       "description": "`welcome.resume` (rule 12).",
       "properties": {
+        "epoch_change": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochChange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For `new_timeline`: the change, so the client can replay its journal after\n`recovered_head` (doc 06 section 6.4)."
+        },
         "status": {
           "$ref": "#/$defs/ResumeStatus",
           "description": "What happened to the cursor."
@@ -1126,8 +1148,7 @@
       "type": "object"
     },
     "ResumeStatus": {
-      "description": "`welcome.resume.status`.",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "ok",
           "description": "Replay follows (also for a first connect).",
@@ -1140,14 +1161,18 @@
         },
         {
           "const": "new_timeline",
-          "description": "The room was restored or failed over to another history (doc 01 D5.3 rule 2).",
+          "description": "The room was restored or failed over to another history (doc 01 D5.3 rule 2);\n`epoch_change` says where the new history starts.",
+          "type": "string"
+        },
+        {
+          "description": "A status this version does not know; treat it as `new_timeline`.",
           "type": "string"
         }
-      ]
+      ],
+      "description": "`welcome.resume.status`."
     },
     "Retry": {
-      "description": "Retry hint carried by every error frame (doc 01 D1.7).",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "never",
           "description": "Retrying will not help.",
@@ -1162,12 +1187,21 @@
           "const": "after",
           "description": "Retry after the `after_ms` the server sent.",
           "type": "string"
+        },
+        {
+          "const": "immediate",
+          "description": "Retry at once (doc 09 section 4.7, `lobby.stale_ready`).",
+          "type": "string"
+        },
+        {
+          "description": "A hint this version does not know; treat it as `never`.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "Retry hint carried by every error frame (doc 01 D1.7)."
     },
     "RoomRole": {
-      "description": "Room roles (doc 10 section 2.3).",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "owner",
           "description": "Owns the room.",
@@ -1182,12 +1216,16 @@
           "const": "moderator",
           "description": "Moderates chat and players.",
           "type": "string"
+        },
+        {
+          "description": "A value this version does not know; it grants nothing.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "Room roles (doc 10 section 2.3)."
     },
     "Scope": {
-      "description": "Token scopes (doc 01 D1.2).",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "play",
           "description": "Sends checks, receives items.",
@@ -1197,8 +1235,13 @@
           "const": "observe",
           "description": "Reads the player-visible log only.",
           "type": "string"
+        },
+        {
+          "description": "A value this version does not know; it grants nothing.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "Token scopes (doc 01 D1.2)."
     },
     "Secret": {
       "description": "A credential or session id: slot token, integration credential, connect ticket, session.\nIts `Debug` and `Display` never print the value, so it cannot leak into logs.",
@@ -1225,6 +1268,10 @@
           "minimum": -9007199254740991,
           "type": "integer"
         },
+        "item_uid": {
+          "$ref": "#/$defs/ItemUid",
+          "description": "The grant's stable identity, as the receiver will see it in `item.grant`."
+        },
         "to": {
           "$ref": "#/$defs/SlotNo",
           "description": "The receiving slot."
@@ -1232,7 +1279,8 @@
       },
       "required": [
         "to",
-        "item"
+        "item",
+        "item_uid"
       ],
       "type": "object"
     },
@@ -1244,8 +1292,7 @@
       "type": "integer"
     },
     "ServerFrame": {
-      "description": "Everything a server may send.",
-      "oneOf": [
+      "anyOf": [
         {
           "$ref": "#/$defs/Welcome",
           "description": "Answer to `hello`.",
@@ -1304,21 +1351,7 @@
         },
         {
           "$ref": "#/$defs/Beat",
-          "description": "Liveness check; answered by `pong`.",
-          "properties": {
-            "op": {
-              "const": "ping",
-              "type": "string"
-            }
-          },
-          "required": [
-            "op"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/Beat",
-          "description": "Answer to a client `ping`.",
+          "description": "Answer to a client `ping`, echoing its nonce.",
           "properties": {
             "op": {
               "const": "pong",
@@ -1334,7 +1367,6 @@
           "description": "An `op` this version does not know. Clients ignore it (rule 1).",
           "properties": {
             "op": {
-              "const": "unknown",
               "type": "string"
             }
           },
@@ -1343,7 +1375,8 @@
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "Everything a server may send."
     },
     "SessionUpdate": {
       "description": "`session.update` payload.",
@@ -1426,8 +1459,7 @@
       "type": "integer"
     },
     "Source": {
-      "description": "Where an item grant came from (rule 11).",
-      "oneOf": [
+      "anyOf": [
         {
           "const": "check",
           "description": "A check of a location.",
@@ -1457,8 +1489,13 @@
           "const": "admin",
           "description": "Given by a room role.",
           "type": "string"
+        },
+        {
+          "description": "A source this version does not know; its `from` and `location` are not checked.",
+          "type": "string"
         }
-      ]
+      ],
+      "description": "Where an item grant came from (rule 11)."
     },
     "StateChanged": {
       "description": "`state.changed` payload, also one entry of a `watch` result.",
@@ -1799,13 +1836,13 @@
       "retry": "after"
     },
     {
-      "code": 3040,
-      "key": "room.rolled_back",
-      "retry": "never"
+      "code": 3030,
+      "key": "room.paused",
+      "retry": "backoff"
     },
     {
-      "code": 3041,
-      "key": "resume.too_old",
+      "code": 3031,
+      "key": "room.not_live",
       "retry": "never"
     },
     {
@@ -1877,7 +1914,7 @@
     {
       "paged": false,
       "pattern": "slot/{n}/locations",
-      "read": "subject_or_spoiler",
+      "read": "room",
       "summary": "Checked and missing location ids."
     },
     {
@@ -1950,11 +1987,13 @@
       "errors": [],
       "kind": "cmd",
       "max_bytes": 256,
+      "rate_per_sec": 0,
       "result": {
         "$ref": "#/$defs/CheckOk"
       },
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "Report a checked location in the slot's own world; the result lists the items it held.",
       "type": "check"
@@ -1973,11 +2012,13 @@
       "errors": [],
       "kind": "cmd",
       "max_bytes": 64,
+      "rate_per_sec": 0,
       "result": {
         "$ref": "#/$defs/Empty"
       },
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "The slot reached its goal. Repeats are answered from the first.",
       "type": "goal"
@@ -1991,11 +2032,22 @@
       "errors": [],
       "kind": "event",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
-      "summary": "An item was delivered to the event's slot, with its per-slot item_seq.",
+      "stream": "room.items",
+      "summary": "An item was delivered to the event's slot, with its per-slot item_seq. Sessions of the room.items stream see every grant.",
       "templates": [
+        {
+          "text": "{slot:slot} started with {item:item@slot}",
+          "when": "source:start"
+        },
+        {
+          "text": "{slot:slot} was given {item:item@slot}",
+          "when": "source:admin"
+        },
         {
           "text": "{slot:slot} found their {item:item@slot}",
           "when": "from=slot"
@@ -2015,8 +2067,10 @@
       "errors": [],
       "kind": "event",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "A slot checked a location.",
       "type": "location.checked"
@@ -2030,8 +2084,10 @@
       "errors": [],
       "kind": "event",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "The room moved to another history (failover or restore), rule 12.",
       "type": "room.epoch_change"
@@ -2057,11 +2113,13 @@
       ],
       "kind": "cmd",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "result": {
         "$ref": "#/$defs/SessionUpdateOk"
       },
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "Change wants and enable or disable extensions mid-session.",
       "type": "session.update"
@@ -2075,8 +2133,10 @@
       "errors": [],
       "kind": "event",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "The event's slot reached its goal.",
       "templates": [
@@ -2095,8 +2155,10 @@
       "errors": [],
       "kind": "event",
       "max_bytes": 4096,
+      "rate_per_sec": 0,
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "A watched state path changed; after a gap in eseq, get it again.",
       "type": "state.changed"
@@ -2115,11 +2177,13 @@
       "errors": [],
       "kind": "cmd",
       "max_bytes": 128,
+      "rate_per_sec": 0,
       "result": {
         "$ref": "#/$defs/Empty"
       },
       "since": 0,
       "spoiler": false,
+      "states": [],
       "status": "experimental",
       "summary": "The client's own state claim (ready, playing); lobby readiness is separate.",
       "type": "status.set"
