@@ -400,6 +400,13 @@ fn a_snapshot_whose_hints_disagree_with_its_counters_is_refused() {
         }),
         "out of order"
     );
+    assert!(
+        bad(&|v| {
+            let same = v["hints"][0].clone();
+            v["hints"].as_array_mut().unwrap().push(same);
+        }),
+        "the same hint twice"
+    );
     assert!(bad(&|v| v["hints_used"]["9"] = 1.into()));
     assert!(bad(&|v| v["hints_used"]["2"] = 2.into()));
 }

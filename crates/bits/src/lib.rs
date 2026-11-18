@@ -345,6 +345,7 @@ mod tests {
         assert_eq!(BitSet::from_words(s.words().to_vec(), 129), None, "bit 129 is past 129");
         assert_eq!(BitSet::from_words(alloc::vec![0], 130), None, "too few words");
         assert_eq!(BitSet::new(0).words().len(), 0);
+        assert!(BitSet::new(0).is_empty());
     }
 
     #[test]
@@ -383,12 +384,13 @@ mod tests {
     #[test]
     fn a_packed_list_keeps_values_in_their_width() {
         let mut p = Packed::new(11);
+        assert!(p.is_empty());
         for v in [0, 2047, 5, 1024] {
             assert!(p.push(v));
         }
         assert!(!p.push(2048), "needs 12 bits");
         assert_eq!(p.iter().collect::<Vec<_>>(), [0, 2047, 5, 1024]);
-        assert_eq!((p.get(4), p.len()), (None, 4));
+        assert_eq!((p.get(4), p.len(), p.is_empty()), (None, 4, false));
         let mut wide = Packed::new(40);
         assert!(wide.push(u32::MAX));
         assert_eq!(wide.get(0), Some(u32::MAX));

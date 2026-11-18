@@ -1098,3 +1098,10 @@ mod float_round_trip {
         }
     }
 }
+
+/// A room's `Debug` names its world by size, not by every location (a log line stays short).
+#[test]
+fn the_world_debugs_as_its_slot_count() {
+    assert_eq!(std::format!("{:?}", room().world), "World(2 slots)");
+    assert_eq!(std::format!("{:?}", super::no_world()), "World(0 slots)");
+}

@@ -609,6 +609,8 @@ mod tests {
         let f = file_bytes(&all).unwrap();
         assert_eq!(sections(&f, 1 << 20).unwrap(), all, "an unknown section is kept, not refused");
         assert!(sections(&f, 10).is_err(), "over the cap");
+        assert_eq!(sections(&f, 304).unwrap(), all, "4 + 300 bytes: exactly at the cap");
+        assert!(sections(&f, 303).is_err(), "one byte over the cap");
         for cut in [0, 4, 7, 20, f.len() - 1] {
             assert!(sections(&f[..cut], 1 << 20).is_err(), "cut at {cut}");
         }
