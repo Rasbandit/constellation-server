@@ -1,9 +1,11 @@
-//! The composition root (D-99: one process). Loads a seed bundle, starts its room on
-//! `room-core` and the log (Postgres when `CONSTELLATION_DATABASE_URL` is set, D-98, else in
-//! memory), and serves the Archipelago-compatible edge over HTTP: a WebSocket at `/` (yawc,
-//! D-97) and `GET /healthz` (axum).
+//! The composition root (D-99: one process). Loads one seed bundle (`--bundle`) or every
+//! bundle in a folder (`--rooms`, watched for new ones while the server runs: [`host`]),
+//! starts a room for each on `room-core` and the log (Postgres when
+//! `CONSTELLATION_DATABASE_URL` is set, D-98, else in memory), and serves the
+//! Archipelago-compatible edge over HTTP: a WebSocket at `/` (yawc, D-97) and `GET /healthz`
+//! (axum). Each room has a room key ([`rooms::RoomKey`]).
 //!
-//! With Postgres the room survives a restart: the server claims the room (fencing any older
+//! With Postgres every room survives a restart: the server claims each room (fencing any older
 //! process), then rebuilds it from the stored snapshot and log tail through `room_core::fold`
 //! and restores the stored applied cursors, before it accepts a connection.
 //!
@@ -13,6 +15,9 @@
 mod sandbox;
 mod worlds;
 
+pub mod host;
+pub mod rooms;
+
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{StatusCode, header};
@@ -20,9 +25,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use config::{Generation, Limits, Secrets};
 use edge_compat::CompatRoom;
-use log::{LogStore, MemLogStore, OpenError, PgLogStore};
+use host::Host;
+use log::{LogStore, OpenError, PgLogStore};
 use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
+use rooms::{Room, RoomKey, Rooms};
 use runtime::{Mailbox, RoomHandle, Stopped};
 use seed_bundle::SeedBundle;
 use sha2::{Digest, Sha256};
@@ -30,15 +37,26 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::{PoisonError, RwLock};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use yawc::{DeflatePool, IncomingUpgrade, Options};
+
+/// Where the rooms come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// One seed bundle file: one room.
+    Bundle(PathBuf),
+    /// A folder: one room per `*.json` seed bundle in it, including bundles added while the
+    /// server runs.
+    Rooms(PathBuf),
+}
 
 /// Command line settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
-    /// Seed bundle file.
-    pub bundle: PathBuf,
+    /// The seed bundle file or the rooms folder.
+    pub source: Source,
     /// Port; 0 picks a free one (the bound address is logged).
     pub port: u16,
     /// Address to bind.
@@ -53,12 +71,12 @@ pub struct Args {
 }
 
 /// How to run the binary.
-pub const USAGE: &str = "usage: constellation-server --bundle <path> --port <port> [--host <ip>] \
-     [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] (room password: CONSTELLATION_ROOM_PASSWORD or \
-     CONSTELLATION_ROOM_PASSWORD_FILE; durable log: CONSTELLATION_DATABASE_URL or \
-     CONSTELLATION_DATABASE_URL_FILE; --data-dir needs CONSTELLATION_ADMIN_TOKEN or \
-     CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
-     CONSTELLATION_AP_GEN_SCRIPT)";
+pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
+     --port <port> [--host <ip>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
+     (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
+     durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
+     needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
+     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT)";
 
 impl Args {
     /// Parse the arguments after the program name.
@@ -66,13 +84,21 @@ impl Args {
     /// # Errors
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let (mut bundle, mut port, mut host, mut data_dir) = (None, None, None, None);
+        let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
         let (mut admin_host, mut admin_port) = (None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
-                "--bundle" => bundle = Some(PathBuf::from(value()?)),
+                // As with every flag, the last one given wins (a test appends `--bundle`).
+                "--bundle" | "--rooms" => {
+                    let path = PathBuf::from(value()?);
+                    source = Some(if flag == "--bundle" {
+                        Source::Bundle(path)
+                    } else {
+                        Source::Rooms(path)
+                    });
+                }
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
@@ -86,7 +112,7 @@ impl Args {
             }
         }
         Ok(Self {
-            bundle: bundle.ok_or("--bundle is required")?,
+            source: source.ok_or("--bundle or --rooms is required")?,
             port: port.ok_or("--port is required")?,
             host: host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             data_dir,
@@ -119,15 +145,15 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > cap {
         return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    let bundle = SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
-    Ok(Loaded { hash: bundle_hash(&text)?, bundle })
+    let named = |e: String| format!("{}: {e}", path.display());
+    let bundle = SeedBundle::from_json(&text).map_err(|e| named(e.to_string()))?;
+    Ok(Loaded { hash: bundle_hash(&text).map_err(named)?, bundle })
 }
 
 #[derive(Debug, Clone)]
 struct AppState {
-    room: Arc<CompatRoom>,
-    /// For `/healthz`: the room task's liveness.
-    live: RoomHandle,
+    /// Changed only by the [`Host`]; a request holds the lock for one lookup.
+    rooms: Arc<RwLock<Rooms>>,
     options: Options,
     /// One permit per open WebSocket (`Limits::max_connections`).
     slots: Arc<Semaphore>,
@@ -188,13 +214,18 @@ pub fn bundle_hash(text: &str) -> Result<Vec<u8>, String> {
     Ok(Sha256::digest(&canonical).to_vec())
 }
 
-/// `/healthz`: 200 while the room task runs, 503 once it stopped.
+/// `/healthz`: 200 while every room task runs, 503 once one stopped.
 const fn health(running: bool) -> (StatusCode, &'static str) {
     if running { (StatusCode::OK, "ok") } else { (StatusCode::SERVICE_UNAVAILABLE, "room stopped") }
 }
 
 async fn healthz(State(s): State<AppState>) -> (StatusCode, &'static str) {
-    health(s.live.is_running())
+    health(read(&s.rooms).all_running())
+}
+
+fn read(rooms: &RwLock<Rooms>) -> std::sync::RwLockReadGuard<'_, Rooms> {
+    // Each change to the map is one call, so a writer that panicked left it whole.
+    rooms.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Rebuild the room from `store` (snapshot, then the tail through `fold`, then the stored
@@ -226,83 +257,176 @@ async fn start_room<S: LogStore>(
     Ok(mailbox.spawn(room, epoch, state, store, *limits))
 }
 
-/// Start the room for `loaded` and build the router.
+/// A room built from its bundle, not yet claimed or started, and without its key.
+struct Prepared {
+    id: RoomId,
+    hash: Vec<u8>,
+    format: u32,
+    fresh: RoomState,
+    room: Room,
+    mailbox: Mailbox,
+}
+
+fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<Prepared, String> {
+    let Loaded { bundle, hash } = loaded;
+    let id = room_id(&bundle.seed_name);
+    let fresh = RoomState::new(bundle.slot_nos(), bundle.placement())
+        .map_err(|e| format!("seed {:?}: {e}", bundle.seed_name))?;
+    let (live, mailbox) = RoomHandle::mailbox(&limits);
+    let (seed, format) = (bundle.seed_name.clone(), bundle.format);
+    let compat =
+        Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password.cloned(), limits)?);
+    Ok(Prepared { id, hash, format, fresh, room: Room { seed, compat, live }, mailbox })
+}
+
+/// Draws of a new room key before giving up; each draw collides with an existing key only
+/// with odds of about one in 2^50 per stored room.
+const KEY_DRAWS: usize = 3;
+
+/// Start the rooms of `source` and build the router.
 ///
-/// Also returns the room task, whose value says why it stopped (see [`run`]). With
-/// `database_url` the log is in Postgres and the room is rebuilt from it; without, it is in
-/// memory and a restart loses it. Everything that can fail on the bundle alone runs before the
-/// room is claimed, so a bad bundle never fences a live room.
+/// Also returns the [`Host`], which watches the rooms folder and says when the process must
+/// end ([`Host::supervise`]). With `database_url` the log is in Postgres and each room is
+/// rebuilt from it and keeps its stored room key; without, the log is in memory, keys are
+/// drawn fresh, and a restart loses the rooms. `password` overrides every room's. A bundle is
+/// validated before its room is claimed, so a bad bundle never fences a live room.
+///
+/// With `--bundle` every failure is an error. With `--rooms` the folder must exist, but it may
+/// be empty, and a bundle that does not make a room (invalid, a seed name that already runs, a
+/// stored room made from a different bundle, past `max_rooms`) is skipped with a warning.
 ///
 /// # Errors
-/// A message when the bundle does not make a valid room, the database fails, or the stored
-/// room was made from a different bundle.
+/// A message when the bundle does not make a valid room, the rooms folder cannot be read, the
+/// database fails, or a stored room was made from a different bundle.
 pub async fn app(
-    loaded: Loaded,
+    source: &Source,
     password: Option<String>,
     database_url: Option<&str>,
     limits: Limits,
-) -> Result<(Router, JoinHandle<Stopped>), String> {
-    let Loaded { bundle, hash } = loaded;
-    let room = room_id(&bundle.seed_name);
-    let fresh = RoomState::new(bundle.slot_nos(), bundle.placement()).map_err(|e| e.to_string())?;
-    let (live, mailbox) = RoomHandle::mailbox(&limits);
-    let (seed_name, format) = (bundle.seed_name.clone(), bundle.format);
-    let compat = Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password, limits)?);
-    let task = if let Some(url) = database_url {
-        let store = PgLogStore::connect(url, &limits)
-            .await
-            .map_err(|e| format!("postgres: {e:?} (see the log above)"))?;
-        match store.open_room(room, &seed_name, format, &hash).await {
-            Ok(()) => {}
-            Err(OpenError::OtherBundle) => {
-                return Err(format!(
-                    "the database holds room {seed_name:?} made from a different bundle with \
-                     this seed name; refusing to start"
-                ));
-            }
-            Err(OpenError::Store(e)) => return Err(format!("postgres: {e:?}")),
+) -> Result<(Router, Host), String> {
+    let mut host = match source {
+        Source::Bundle(path) => {
+            let loaded = load_bundle(path, &limits)?;
+            let mut host = Host::new(database_url, password, limits, None).await?;
+            host.add(loaded, None).await?;
+            host
         }
-        let epoch = store.claim(room).await.map_err(|e| format!("postgres: {e:?}"))?;
-        tracing::info!("log store: postgres");
-        start_room(mailbox, room, epoch, fresh, Arc::new(store), &limits).await?
-    } else {
-        tracing::warn!(
-            "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the room"
-        );
-        let store = Arc::new(MemLogStore::new());
-        let epoch = store.claim(room);
-        start_room(mailbox, room, epoch, fresh, store, &limits).await?
+        Source::Rooms(dir) => {
+            host::check_folder(dir)?;
+            Host::new(database_url, password, limits, Some(dir.clone())).await?
+        }
     };
+    host.scan().await;
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     let state = AppState {
-        room: compat,
-        live,
+        rooms: host.rooms(),
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
     let router =
         Router::new().route("/", get(upgrade)).route("/healthz", get(healthz)).with_state(state);
-    Ok((router, task))
+    Ok((router, host))
+}
+
+/// Record the room in Postgres and return its key: the stored one, or a new random one for a
+/// new room (drawn again when it collides with another room's).
+async fn open_with_key(store: &PgLogStore, p: &Prepared) -> Result<RoomKey, String> {
+    let mut last = String::new();
+    for _ in 0..KEY_DRAWS {
+        let new_key = RoomKey::random()?;
+        match store.open_room(p.id, &p.room.seed, p.format, &p.hash, new_key.as_str()).await {
+            Ok(stored) => return RoomKey::parse(&stored).map_err(|e| format!("stored {e}")),
+            Err(OpenError::OtherBundle) => {
+                return Err(format!(
+                    "the database holds room {:?} made from a different bundle with this seed \
+                     name; refusing to start",
+                    p.room.seed
+                ));
+            }
+            Err(OpenError::Store(e)) => last = format!("postgres: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
+/// Rebuild and start one prepared room, and log its key.
+async fn start<S: LogStore>(
+    p: Prepared,
+    key: RoomKey,
+    epoch: Epoch,
+    store: Arc<S>,
+    limits: &Limits,
+) -> Result<JoinHandle<Stopped>, String> {
+    let handle = start_room(p.mailbox, p.id, epoch, p.fresh, store, limits).await?;
+    tracing::info!(%key, seed = p.room.seed, "room ready");
+    Ok(handle)
+}
+
+/// The room key a `Host` header names: its first DNS label, when that is a room key
+/// (`{room_key}.{host}`, doc 01 section 3.8.1). The port, if any, is ignored; an IP address
+/// names no key.
+#[must_use]
+pub fn key_from_host(host: &str) -> Option<RoomKey> {
+    if host.starts_with('[') {
+        return None;
+    }
+    let name = host.split(':').next()?;
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return None;
+    }
+    RoomKey::parse(name.split('.').next()?).ok()
+}
+
+/// The room a connection with this `Host` header joins.
+///
+/// One room takes every connection, whatever the host, so `--bundle` and old addresses keep
+/// working (a host whose first label only looks like a key, such as `playground.example`, is
+/// not refused). With several rooms the first label must be the key of one of them, so once a
+/// second room joins a rooms folder, new connections must name their room (open ones stay).
+fn route(rooms: &Rooms, host: Option<&str>) -> Result<(RoomKey, Arc<CompatRoom>), String> {
+    if let Some((key, room)) = rooms.only_with_key() {
+        return Ok((key.clone(), Arc::clone(&room.compat)));
+    }
+    match host.and_then(key_from_host) {
+        Some(key) => match rooms.get(&key) {
+            Some(room) => Ok((key, Arc::clone(&room.compat))),
+            None => Err(format!("no room with key {key} on this server")),
+        },
+        None => Err(format!(
+            "this server runs {} rooms; connect through {{room_key}}.<this host>",
+            rooms.len()
+        )),
+    }
 }
 
 async fn upgrade(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     ws: IncomingUpgrade,
 ) -> Response {
     let Ok(permit) = Arc::clone(&s.slots).try_acquire_owned() else {
         tracing::warn!("connection cap reached");
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let found = route(&read(&s.rooms), host);
+    let (key, room) = match found {
+        Ok(found) => found,
+        Err(why) => {
+            tracing::info!(host, "{why}");
+            return (StatusCode::NOT_FOUND, why).into_response();
+        }
+    };
     let (response, fut) = match ws.upgrade(s.options) {
         Ok(pair) => pair,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let deflate = response.headers().contains_key(header::SEC_WEBSOCKET_EXTENSIONS);
-    tracing::info!(deflate, "websocket accepted");
+    tracing::info!(%key, deflate, "websocket accepted");
     tokio::spawn(async move {
         match fut.await {
-            Ok(socket) => edge_compat::serve(socket, s.room, peer.ip()).await,
+            Ok(socket) => edge_compat::serve(socket, room, peer.ip()).await,
             Err(e) => tracing::debug!(error = %e, "upgrade did not complete"),
         }
         drop(permit);
@@ -372,7 +496,7 @@ impl core::fmt::Display for RunError {
 }
 
 /// What the room task's end means for the process.
-fn room_ended(r: Result<Stopped, tokio::task::JoinError>) -> RunError {
+fn room_ended(r: Result<Stopped, JoinError>) -> RunError {
     match r {
         Ok(Stopped::Fenced { current }) => RunError::Fenced { current },
         Ok(Stopped::Failed) => RunError::Failed(
@@ -383,17 +507,17 @@ fn room_ended(r: Result<Stopped, tokio::task::JoinError>) -> RunError {
     }
 }
 
-/// Bind, start the room, log the address, and serve until SIGTERM or Ctrl-C, or until the
-/// room stops.
+/// Bind, start the rooms, log the address, and serve until SIGTERM or Ctrl-C, or until a
+/// room's end must end the process ([`Host::supervise`]).
 ///
 /// The signal handlers are installed first, so a stop at any point is clean: before the
 /// server listens it abandons startup and returns `Ok`. Nothing is left half-written: each
 /// startup write (a migration, the room record, the claim) is its own transaction, and a claim
 /// already sent may still commit, which only bumps the epoch as a crash after it would. The port is bound before the room is claimed, so a mistaken
-/// second instance fails before it can fence the live one. A room that stops ends the process:
-/// fenced by a newer owner with [`EXIT_FENCED`] (do not restart), otherwise with 1, so the
-/// supervisor restarts it and the room reloads from the log instead of answering every client
-/// with "unavailable".
+/// second instance fails before it can fence the live one. A fenced room ends the process with
+/// [`EXIT_FENCED`] (do not restart). With `--bundle` any other end of the room exits with 1, so
+/// the supervisor restarts it and the room reloads from the log instead of answering every
+/// client with "unavailable"; with `--rooms` the host restarts that room alone ([`host`]).
 ///
 /// # Errors
 /// [`RunError::Fenced`], or [`RunError::Failed`] when the bundle, the socket or the database
@@ -406,7 +530,6 @@ pub async fn run(
 ) -> Result<(), RunError> {
     let mut stop = shutdown();
     let startup = async {
-        let loaded = load_bundle(&args.bundle, &limits)?;
         if args.data_dir.is_some() {
             sandbox::check_host(&limits)?;
         }
@@ -416,12 +539,12 @@ pub async fn run(
             generation,
             limits,
         )?;
-        let seed = loaded.bundle.seed_name.clone();
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;
-        let (router, room) =
-            app(loaded, secrets.room_password, secrets.database_url.as_deref(), limits).await?;
+        let (router, host) =
+            app(&args.source, secrets.room_password, secrets.database_url.as_deref(), limits)
+                .await?;
         let admin = match api {
             Some(api) => {
                 let at = SocketAddr::new(args.admin_host, args.admin_port);
@@ -435,10 +558,10 @@ pub async fn run(
             None => None,
         };
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        tracing::info!(%addr, seed, "listening");
-        Ok::<_, RunError>((listener, router, room, admin))
+        tracing::info!(%addr, rooms = host.len(), "listening");
+        Ok::<_, RunError>((listener, router, host, admin))
     };
-    let (listener, router, room, admin) = tokio::select! {
+    let (listener, router, mut host, admin) = tokio::select! {
         r = startup => r?,
         () = &mut stop => {
             tracing::info!("stopped before listening");
@@ -457,7 +580,7 @@ pub async fn run(
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
         r = admin => return Err(RunError::Failed(format!("the admin API stopped: {r:?}"))),
-        r = room => return Err(room_ended(r)),
+        fatal = host.supervise() => return Err(fatal),
     }
     tracing::info!("stopped");
     Ok(())
@@ -510,7 +633,7 @@ mod tests {
     #[test]
     fn the_documented_flags_parse_and_host_defaults_to_loopback() {
         let a = parse("--bundle b.json --port 0").unwrap();
-        assert_eq!(a.bundle, PathBuf::from("b.json"));
+        assert_eq!(a.source, Source::Bundle(PathBuf::from("b.json")));
         assert_eq!((a.port, a.host), (0, IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert_eq!(
             (a.data_dir, a.admin_host, a.admin_port),
@@ -521,12 +644,17 @@ mod tests {
         assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
         let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
         assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
+        let a = parse("--rooms seeds --port 1").unwrap();
+        assert_eq!(a.source, Source::Rooms(PathBuf::from("seeds")));
+        let a = parse("--bundle b --port 1 --rooms r --bundle c").unwrap();
+        assert_eq!(a.source, Source::Bundle(PathBuf::from("c")), "the last source wins");
     }
 
     #[test]
     fn missing_bad_and_unknown_arguments_are_errors() {
         for (args, want) in [
-            ("", "--bundle is required"),
+            ("", "--bundle or --rooms is required"),
+            ("--port 1", "--bundle or --rooms is required"),
             ("--bundle b", "--port is required"),
             ("--bundle b --port", "--port needs a value"),
             ("--bundle b --port 70000", "--port needs a number"),
@@ -601,6 +729,20 @@ mod tests {
         assert_ne!(bundle_hash(&text).unwrap(), bundle_hash(&v.to_string()).unwrap());
         assert_eq!(bundle_hash(&text).unwrap().len(), 32);
         assert!(bundle_hash("{not json").is_err());
+    }
+
+    #[test]
+    fn the_key_is_the_hosts_first_label_without_the_port() {
+        let key = |h: &str| key_from_host(h).map(|k| k.as_str().to_owned());
+        assert_eq!(key("abcdefgh23.example.gg"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("abcdefgh23.example.gg:38281"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("ABCDEFGH23.127.0.0.1.sslip.io:38281"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("abcdefgh23"), Some("abcdefgh23".to_owned()));
+        for none in
+            ["example.gg", "localhost:38281", "127.0.0.1:38281", "[::1]:38281", "", "abcdefgh1.x"]
+        {
+            assert_eq!(key(none), None, "{none:?}");
+        }
     }
 
     #[test]

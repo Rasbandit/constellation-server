@@ -173,46 +173,60 @@ impl PgLogStore {
         task.await.unwrap_or_else(|_| Err(E::unavailable()))
     }
 
-    /// Record which bundle made `room` (its format version and content hash), or check the
-    /// hash against the record.
+    /// Record the room the first time it opens, and return its room key.
+    ///
+    /// A new room is stored with `new_key` (a random key the caller drew); a room stored
+    /// before keys existed gets `new_key` now; a room that has a key keeps it, so a restart
+    /// serves it under the same key. A reopen must come from the same bundle (by hash).
     ///
     /// # Errors
-    /// `OtherBundle` when the room was created from a different bundle, `Store` on failure.
+    /// [`OpenError::OtherBundle`] when the room id is taken by another bundle, and
+    /// [`OpenError::Store`] when the database fails, including when another room already has
+    /// `new_key` (draw a new one and retry).
     pub async fn open_room(
         &self,
         room: RoomId,
         seed_name: &str,
         bundle_format: u32,
         bundle_hash: &[u8],
-    ) -> Result<(), OpenError> {
-        let (seed, hash) = (seed_name.to_owned(), bundle_hash.to_vec());
-        let stored = self
+        new_key: &str,
+    ) -> Result<String, OpenError> {
+        let (seed, hash, key) = (seed_name.to_owned(), bundle_hash.to_vec(), new_key.to_owned());
+        let (stored_hash, stored_key) = self
             .isolated(move |c| {
                 Box::pin(async move {
                     sqlx::query(
-                        "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash) \
-                         VALUES ($1, $2, $3, $4) ON CONFLICT (room_id) DO NOTHING",
+                        "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash, \
+                         room_key) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (room_id) DO NOTHING",
                     )
                     .bind(room_key(room))
                     .bind(seed)
                     .bind(i64::from(bundle_format))
                     .bind(&hash)
+                    .bind(&key)
                     .execute(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))?;
-                    sqlx::query_scalar::<_, Vec<u8>>(
-                        "SELECT bundle_hash FROM rooms WHERE room_id = $1",
+                    sqlx::query(
+                        "UPDATE rooms SET room_key = $2 WHERE room_id = $1 AND room_key IS NULL",
+                    )
+                    .bind(room_key(room))
+                    .bind(&key)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))?;
+                    sqlx::query_as::<_, (Vec<u8>, String)>(
+                        "SELECT bundle_hash, room_key FROM rooms WHERE room_id = $1",
                     )
                     .bind(room_key(room))
                     .fetch_one(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))
-                    .map(|stored| stored == hash)
                 })
             })
             .await
             .map_err(OpenError::Store)?;
-        if stored { Ok(()) } else { Err(OpenError::OtherBundle) }
+        if stored_hash == bundle_hash { Ok(stored_key) } else { Err(OpenError::OtherBundle) }
     }
 
     /// Take the room: bump its owner epoch and return the new one (the directory's claim, like

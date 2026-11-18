@@ -474,10 +474,30 @@ mod pg_only {
     #[tokio::test]
     async fn a_room_reopens_with_its_bundle_and_refuses_another() {
         let s = pg_store().await;
-        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
-        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
-        assert_eq!(s.open_room(R, "seed", 1, &[1, 3]).await, Err(OpenError::OtherBundle));
-        s.open_room(RoomId(2), "seed", 1, &[1, 3]).await.unwrap();
+        s.open_room(R, "seed", 1, &[1, 2], "aaaaaaaaaa").await.unwrap();
+        s.open_room(R, "seed", 1, &[1, 2], "bbbbbbbbbb").await.unwrap();
+        assert_eq!(
+            s.open_room(R, "seed", 1, &[1, 3], "cccccccccc").await,
+            Err(OpenError::OtherBundle)
+        );
+        s.open_room(RoomId(2), "seed", 1, &[1, 3], "dddddddddd").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_room_keeps_the_key_it_first_opened_with_and_keys_are_unique() {
+        let s = pg_store().await;
+        assert_eq!(s.open_room(R, "seed", 1, &[1], "aaaaaaaaaa").await.unwrap(), "aaaaaaaaaa");
+        // A reopen draws a new key, but the stored one wins: the address never changes.
+        assert_eq!(s.open_room(R, "seed", 1, &[1], "bbbbbbbbbb").await.unwrap(), "aaaaaaaaaa");
+        // Another room cannot take a key in use; the caller draws again.
+        assert!(matches!(
+            s.open_room(RoomId(2), "other", 1, &[2], "aaaaaaaaaa").await,
+            Err(OpenError::Store(_))
+        ));
+        assert_eq!(
+            s.open_room(RoomId(2), "other", 1, &[2], "cccccccccc").await.unwrap(),
+            "cccccccccc"
+        );
     }
 
     /// Two writers with the same epoch (a bug upstream, but the store must say so): both pass

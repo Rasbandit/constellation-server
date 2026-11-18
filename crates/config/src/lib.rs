@@ -35,6 +35,15 @@ pub struct Limits {
     pub session_queue: usize,
     /// Largest seed bundle file the server will read.
     pub bundle_max_bytes: u64,
+    /// Most rooms one process runs from a rooms folder (`--rooms`); further bundles are skipped
+    /// with a warning.
+    pub max_rooms: usize,
+    /// How often the server looks in the rooms folder for new seed bundles and for rooms past
+    /// their lifetime (`CONSTELLATION_ROOMS_SCAN_MS`).
+    pub rooms_scan_ms: u64,
+    /// A room from a rooms folder is removed this long after this process started it
+    /// (`CONSTELLATION_ROOM_LIFETIME_SECS`). A stopgap until rooms have a real lifecycle, see #56.
+    pub room_lifetime_secs: u64,
     /// Chat and bounce messages a session may send in a burst (one shared token bucket).
     pub fanout_burst: u32,
     /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
@@ -165,6 +174,9 @@ impl Limits {
         room_mailbox: 1024,
         session_queue: 256,
         bundle_max_bytes: 64 * 1024 * 1024,
+        max_rooms: 1000,
+        rooms_scan_ms: 2_000,
+        room_lifetime_secs: 24 * 60 * 60,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
         chat_max_bytes: 2048,
@@ -243,6 +255,8 @@ pub fn load() -> Limits {
         ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
         ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
         ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
+        ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
+        ("CONSTELLATION_ROOM_LIFETIME_SECS", &mut l.room_lifetime_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -469,6 +483,8 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
+        assert_eq!(l.max_rooms, 1000);
+        assert_eq!((l.rooms_scan_ms, l.room_lifetime_secs), (2_000, 86_400));
     }
 
     #[test]
