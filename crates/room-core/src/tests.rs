@@ -920,8 +920,9 @@ mod key_value {
         assert_eq!(apply(&mut s, &ctx, write()), Err(CoreError::Kv(KvRefusal::LogFull)));
         let mut folded = fold(room(), &lim, events).unwrap();
         assert_eq!(apply(&mut folded, &ctx, write()), Err(CoreError::Kv(KvRefusal::LogFull)));
-        let small = set(1, "k", None, vec![(KvOp::Replace, json!(1))]); // 2 bytes: 18 + 2 = 20
-        assert!(apply(&mut folded, &ctx, small).is_ok(), "exactly at the cap is allowed");
+        // "k" and `123` are 4 bytes: 16 + 4 is exactly the cap, which is allowed.
+        let at_cap = set(1, "k", None, vec![(KvOp::Replace, json!(123))]);
+        assert!(apply(&mut folded, &ctx, at_cap).is_ok(), "exactly at the cap is allowed");
     }
 
     #[test]

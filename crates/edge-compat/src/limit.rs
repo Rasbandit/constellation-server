@@ -108,10 +108,11 @@ impl<K: Hash + Eq> RateTable<K> {
     fn with(&self, key: K, now: Instant, f: impl FnOnce(&mut Bucket) -> bool) -> bool {
         let mut map = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         if !map.contains_key(&key) && map.len() >= self.max_keys {
-            // A full bucket is the same as a new one, so forgetting it changes nothing.
+            // A full bucket is the same as a new one, so forgetting it changes nothing. A bucket
+            // in debt has no tokens, so it is never full and is kept.
             map.retain(|_, b| {
                 b.refill(now);
-                b.tokens < b.cap || b.debt > 0
+                b.tokens < b.cap
             });
             if map.len() >= self.max_keys {
                 return false;
