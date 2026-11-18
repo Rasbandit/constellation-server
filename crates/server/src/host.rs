@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{AbortHandle, JoinError, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 
 /// Where the directory and the rooms' logs live.
 enum Store {
@@ -63,6 +63,18 @@ const ABANDONED: &str = "abandoned";
 
 /// Seconds in a day, for the log line of an abandoned room.
 const DAY_SECS: u64 = 24 * 60 * 60;
+
+/// A room just loaded: what its sessions share, and its task.
+type Ready = (crate::rooms::Room, JoinHandle<Stopped>);
+
+/// The end of a load run apart from the host ([`Host::load`]).
+type LoadEnd = (RoomKey, Result<Ready, String>);
+
+/// Where a load reads the room from: the store, and for the in-memory one its bundle file.
+enum LoadFrom {
+    Pg(Arc<PgLogStore>),
+    Mem(Arc<MemLogStore>, Option<String>),
+}
 
 /// A file's length and modification time: a scan rereads a file only when they change.
 type Seen = (u64, Option<SystemTime>);
@@ -125,6 +137,11 @@ pub struct Host {
     seen: BTreeMap<PathBuf, (Seen, bool)>,
     // Unbounded, but every request holds a connection permit (`max_connections`).
     wakes: mpsc::UnboundedReceiver<Wake>,
+    waker: Waker,
+    /// Loads running apart from the supervisor loop, at most one per room.
+    loads: JoinSet<LoadEnd>,
+    /// The wakes waiting on each running load.
+    waiting: BTreeMap<RoomKey, Vec<oneshot::Sender<Result<(), String>>>>,
 }
 
 impl core::fmt::Debug for Host {
@@ -137,14 +154,13 @@ impl core::fmt::Debug for Host {
 }
 
 impl Host {
-    /// A host with no rooms yet, on Postgres when `database_url` is set, and the waker the
-    /// router uses.
+    /// A host with no rooms yet, on Postgres when `database_url` is set.
     pub(crate) async fn new(
         database_url: Option<&str>,
         password: Option<String>,
         limits: Limits,
         folder: Option<PathBuf>,
-    ) -> Result<(Self, Waker), String> {
+    ) -> Result<Self, String> {
         let store = if let Some(url) = database_url {
             let pg = PgLogStore::connect(url, &limits)
                 .await
@@ -175,8 +191,17 @@ impl Host {
             recorded: BTreeMap::new(),
             seen: BTreeMap::new(),
             wakes,
+            waker: Waker(tx),
+            loads: JoinSet::new(),
+            waiting: BTreeMap::new(),
         };
-        Ok((host, Waker(tx)))
+        Ok(host)
+    }
+
+    /// What the router asks to load a cold room with; answered while [`Host::supervise`]
+    /// runs.
+    pub(crate) fn waker(&self) -> Waker {
+        self.waker.clone()
     }
 
     /// The room list the router reads.
@@ -259,42 +284,80 @@ impl Host {
         Ok(key)
     }
 
-    /// Load the cold room `key` into memory: claim it, rebuild it from the log and start its
-    /// task. A room already in memory is left as it is.
+    /// Load the cold room `key` into memory now: claim it, rebuild it from the log and start
+    /// its task. A room already in memory is left as it is. The supervisor runs the same load
+    /// in its own task instead ([`Host::supervise`]).
     pub(crate) async fn wake(&mut self, key: &RoomKey) -> Result<(), String> {
+        match self.load(key)? {
+            Some(load) => {
+                let loaded = load.await;
+                self.install(key, loaded)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The load of the cold room `key`, which needs nothing from the host so it can run in
+    /// its own task; `None` when the room is in memory already.
+    fn load(
+        &self,
+        key: &RoomKey,
+    ) -> Result<Option<impl Future<Output = Result<Ready, String>> + Send + 'static>, String> {
         let (id, seed) = {
             let rooms = read(&self.rooms);
             let listing = rooms.get(key).ok_or_else(|| format!("no room with key {key}"))?;
             if listing.room.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             (listing.id, listing.seed.clone())
         };
-        let text = match &self.store {
-            Store::Pg(store) => {
-                let file = store.room_bundle(id).await.map_err(|e| format!("postgres: {e:?}"))?;
-                let file =
-                    file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?;
-                String::from_utf8(file).map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?
-            }
-            Store::Mem { bundles, .. } => {
-                bundles.get(&id).cloned().ok_or_else(|| format!("room {seed:?} has no bundle"))?
+        let from = match &self.store {
+            Store::Pg(store) => LoadFrom::Pg(Arc::clone(store)),
+            Store::Mem { log, bundles, .. } => {
+                LoadFrom::Mem(Arc::clone(log), bundles.get(&id).cloned())
             }
         };
-        let loaded =
-            parse_bundle(text).map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?;
-        let p = prepare(loaded, self.password.as_ref(), self.limits)?;
-        let room = p.room.clone();
-        let handle = match &self.store {
-            Store::Pg(store) => {
-                let epoch = store.claim(id).await.map_err(|e| format!("postgres: {e:?}"))?;
-                start(p, key.clone(), epoch, Arc::clone(store), &self.limits).await?
-            }
-            Store::Mem { log, .. } => {
-                let epoch = log.claim(id);
-                start(p, key.clone(), epoch, Arc::clone(log), &self.limits).await?
-            }
-        };
+        let (password, limits, key) = (self.password.clone(), self.limits, key.clone());
+        Ok(Some(async move {
+            let text = match &from {
+                LoadFrom::Pg(store) => {
+                    let file =
+                        store.room_bundle(id).await.map_err(|e| format!("postgres: {e:?}"))?;
+                    let file =
+                        file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?;
+                    String::from_utf8(file)
+                        .map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?
+                }
+                LoadFrom::Mem(_, text) => {
+                    text.clone().ok_or_else(|| format!("room {seed:?} has no bundle"))?
+                }
+            };
+            // Parsing a bundle of up to `bundle_max_bytes` is CPU work: off the runtime.
+            let p = tokio::task::spawn_blocking(move || {
+                let loaded =
+                    parse_bundle(text).map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?;
+                prepare(loaded, password.as_ref(), limits)
+            })
+            .await
+            .map_err(|e| format!("room {key}: the bundle check failed: {e}"))??;
+            let room = p.room.clone();
+            let handle = match from {
+                LoadFrom::Pg(store) => {
+                    let epoch = store.claim(id).await.map_err(|e| format!("postgres: {e:?}"))?;
+                    start(p, key, epoch, store, &limits).await?
+                }
+                LoadFrom::Mem(log, _) => {
+                    let epoch = log.claim(id);
+                    start(p, key, epoch, log, &limits).await?
+                }
+            };
+            Ok((room, handle))
+        }))
+    }
+
+    /// Put a finished load in place: the room is in memory and its task watched.
+    fn install(&mut self, key: &RoomKey, loaded: Result<Ready, String>) -> Result<(), String> {
+        let (room, handle) = loaded?;
         let task = handle.abort_handle();
         match write(&self.rooms).get_mut(key) {
             Some(listing) => {
@@ -316,7 +379,44 @@ impl Host {
         Ok(())
     }
 
-    /// Run until a room's end must end the process: load rooms on request, and on every tick
+    /// A wake request from the router: start the room's load, or join the one running.
+    fn request(&mut self, key: RoomKey, done: oneshot::Sender<Result<(), String>>) {
+        if let Some(waiting) = self.waiting.get_mut(&key) {
+            waiting.push(done);
+            return;
+        }
+        match self.load(&key) {
+            Ok(Some(load)) => {
+                self.waiting.insert(key.clone(), vec![done]);
+                self.loads.spawn(async move {
+                    // Its own task, so a panic in the load still answers the waiting wakes.
+                    let loaded = tokio::spawn(load)
+                        .await
+                        .unwrap_or_else(|e| Err(format!("the load ended without a value: {e}")));
+                    (key, loaded)
+                });
+            }
+            Ok(None) => drop(done.send(Ok(()))),
+            Err(why) => {
+                tracing::warn!(%key, "room not loaded: {why}");
+                drop(done.send(Err(why)));
+            }
+        }
+    }
+
+    /// A load started by [`Host::request`] ended: put it in place and answer its wakes.
+    fn loaded(&mut self, (key, loaded): LoadEnd) {
+        let woke = self.install(&key, loaded);
+        if let Err(why) = &woke {
+            tracing::warn!(%key, "room not loaded: {why}");
+        }
+        for done in self.waiting.remove(&key).unwrap_or_default() {
+            drop(done.send(woke.clone()));
+        }
+    }
+
+    /// Run until a room's end must end the process: load rooms on request (each load in its
+    /// own task, so a slow room never holds up the others), and on every tick
     /// unload idle rooms, end abandoned ones and rescan the rooms folder.
     pub(crate) async fn supervise(&mut self) -> RunError {
         let every = Duration::from_millis(self.limits.rooms_scan_ms.max(1));
@@ -334,13 +434,12 @@ impl Host {
                     // room task inside it is), so this cannot happen.
                     Err(e) => tracing::error!(error = %e, "a room watcher ended without a value"),
                 },
-                Some(Wake { key, done }) = self.wakes.recv() => {
-                    let woke = self.wake(&key).await;
-                    if let Err(why) = &woke {
-                        tracing::warn!(%key, "room not loaded: {why}");
-                    }
-                    drop(done.send(woke));
-                }
+                Some(Wake { key, done }) = self.wakes.recv() => self.request(key, done),
+                Some(end) = self.loads.join_next() => match end {
+                    Ok(end) => self.loaded(end),
+                    // The load runs in a task of its own inside this one, so this cannot happen.
+                    Err(e) => tracing::error!(error = %e, "a room load ended without a value"),
+                },
                 _ = tick.tick() => self.tick().await,
             }
         }
@@ -494,7 +593,8 @@ impl Host {
     /// (while the server is at its room cap, only once it is not).
     pub(crate) async fn scan(&mut self) {
         let Some(folder) = self.folder.clone() else { return };
-        let files = match bundle_files(&folder) {
+        let files = tokio::task::spawn_blocking(move || bundle_files(&folder)).await;
+        let files = match files.map_err(|e| e.to_string()).and_then(|f| f) {
             Ok(files) => files,
             Err(e) => {
                 tracing::warn!("rooms folder: {e}");
@@ -512,7 +612,9 @@ impl Host {
                 }
                 _ => false,
             };
-            let listed = match load_bundle(&path, &self.limits) {
+            let (file, limits) = (path.clone(), self.limits);
+            let read = tokio::task::spawn_blocking(move || load_bundle(&file, &limits)).await;
+            let listed = match read.map_err(|e| e.to_string()).and_then(|r| r) {
                 Ok(loaded) => self.import(loaded).await.map(drop),
                 Err(e) => Err(Skip::Final(e)),
             };
@@ -739,6 +841,36 @@ mod tests {
         assert!(in_memory(&host, &key));
     }
 
+    /// Ask the host to wake `key`, in order: the request is queued before this returns.
+    fn ask(host: &Host, key: &RoomKey) -> oneshot::Receiver<Result<(), String>> {
+        let (done, answer) = oneshot::channel();
+        host.waker.0.send(Wake { key: key.clone(), done }).unwrap();
+        answer
+    }
+
+    #[tokio::test]
+    async fn two_wakes_of_one_cold_room_share_one_load() {
+        let dir = TempDir::new("shared");
+        dir.bundle("a.json", "alpha");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let key = key_of(&host, "alpha");
+        let (first, second) = (ask(&host, &key), ask(&host, &key));
+        let both = async { (first.await.unwrap(), second.await.unwrap()) };
+        let woke = tokio::select! {
+            fatal = host.supervise() => panic!("the host ended: {}", fatal.exit_code()),
+            woke = both => woke,
+        };
+        assert_eq!(woke, (Ok(()), Ok(())));
+        assert_eq!((host.runs, host.resident()), (1, 1), "one load");
+        let unknown = RoomKey::parse("zzzzzzzzzz").unwrap();
+        let refused = ask(&host, &unknown);
+        let refused = tokio::select! {
+            fatal = host.supervise() => panic!("the host ended: {}", fatal.exit_code()),
+            r = refused => r.unwrap(),
+        };
+        assert!(refused.unwrap_err().contains("no room"));
+    }
+
     #[tokio::test]
     async fn a_room_with_a_connection_open_stays_in_memory() {
         let dir = TempDir::new("busy");
@@ -880,6 +1012,51 @@ mod tests {
             let mut again = pg_host(&dir, &db, Limits::DESIGN).await;
             again.tick().await;
             assert_eq!(seeds(&again), ["alpha"], "still served after the restart");
+        }
+
+        /// Review of #55, M2: a load stuck on the database (alpha's owner row is locked, so
+        /// its claim waits) must not hold up the wake of another room. Before, every wake ran
+        /// inline in the supervisor loop and beta waited for alpha's lock timeout.
+        #[tokio::test]
+        async fn a_load_stuck_on_the_database_does_not_hold_up_another_rooms_wake() {
+            let (db, dir) = (database().await, TempDir::new("pg-slow"));
+            dir.bundle("a.json", "alpha");
+            dir.bundle("b.json", "beta");
+            // Long database timeouts, so before the fix beta would wait far past the guard.
+            let limits = Limits {
+                db_lock_timeout_ms: 60_000,
+                db_statement_timeout_ms: 60_000,
+                ..Limits::DESIGN
+            };
+            let mut host = pg_host(&dir, &db, limits).await;
+            let (alpha, beta) = (key_of(&host, "alpha"), key_of(&host, "beta"));
+            host.wake(&alpha).await.unwrap();
+            host.wake(&beta).await.unwrap();
+            host.limits.room_idle_secs = 0;
+            host.unload_idle();
+            host.limits.room_idle_secs = Limits::DESIGN.room_idle_secs;
+            assert_eq!(host.resident(), 0);
+            let mut lock = sqlx::PgConnection::connect(&db).await.unwrap();
+            sqlx::raw_sql("BEGIN").execute(&mut lock).await.unwrap();
+            sqlx::query("SELECT 1 FROM room_owner WHERE room_id = $1 FOR UPDATE")
+                .bind(i64::from_be_bytes(crate::room_id("alpha").0.to_be_bytes()))
+                .execute(&mut lock)
+                .await
+                .unwrap();
+            let (slow, also) = (ask(&host, &alpha), ask(&host, &alpha));
+            let waker = host.waker();
+            let body = async {
+                let fast = tokio::time::timeout(Duration::from_secs(10), waker.wake(beta)).await;
+                assert_eq!(fast, Ok(Ok(())), "beta waited for alpha's load");
+                sqlx::raw_sql("ROLLBACK").execute(&mut lock).await.unwrap();
+                (slow.await.unwrap(), also.await.unwrap())
+            };
+            let woke = tokio::select! {
+                fatal = host.supervise() => panic!("the host ended: {}", fatal.exit_code()),
+                woke = body => woke,
+            };
+            assert_eq!(woke, (Ok(()), Ok(())), "alpha loads once its row is free");
+            assert_eq!(host.resident(), 2);
         }
 
         #[tokio::test]

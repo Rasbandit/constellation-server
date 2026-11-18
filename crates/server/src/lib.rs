@@ -314,27 +314,26 @@ pub async fn app(
     database_url: Option<&str>,
     limits: Limits,
 ) -> Result<(Router, Host), String> {
-    let (mut host, wake) = match source {
+    let mut host = match source {
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
-            let (mut host, wake) = Host::new(database_url, password, limits, None).await?;
+            let mut host = Host::new(database_url, password, limits, None).await?;
             let key = host.import(loaded).await?;
             host.wake(&key).await?;
-            (host, wake)
+            host
         }
         Source::Rooms(dir) => {
             host::check_folder(dir)?;
-            let (mut host, wake) =
-                Host::new(database_url, password, limits, Some(dir.clone())).await?;
+            let mut host = Host::new(database_url, password, limits, Some(dir.clone())).await?;
             host.list_stored().await?;
-            (host, wake)
+            host
         }
     };
     host.scan().await;
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     let state = AppState {
         rooms: host.rooms(),
-        wake,
+        wake: host.waker(),
         any_host: matches!(source, Source::Bundle(_)),
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
