@@ -207,53 +207,57 @@ impl Sandbox {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Vec<u8>, Failure> {
-        let argv = self.argv(with_ap, mounts, args);
-        let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
-        let mut child = tokio::process::Command::new(program)
-            .args(rest)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // Dropping the child on timeout kills bwrap; `--die-with-parent` takes the rest.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| Failure::Broken(format!("cannot start the sandbox (is bwrap installed?): {e}")))?;
-        let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-            return Err(Failure::Broken("no pipes to the sandbox".into()));
-        };
-        let l = &self.limits;
-        let all = async {
-            tokio::join!(
-                drain(out, l.gen_stdout_max_bytes, Keep::Head),
-                drain(err, l.gen_error_max_bytes, Keep::Tail),
-                child.wait()
-            )
-        };
-        let Ok((out, err, status)) = tokio::time::timeout(timeout, all).await else {
-            // Kill bwrap and reap it before reporting; its sandbox goes with it.
-            if let Err(e) = child.kill().await {
-                tracing::warn!(error = %e, "could not kill a timed-out sandbox");
-            }
-            return Err(Failure::Broken(format!(
-                "timed out after {} s and was killed",
-                timeout.as_secs()
-            )));
-        };
-        let broken = |e: std::io::Error| Failure::Broken(format!("sandbox: {e}"));
-        let (status, (out, out_total), (err, _)) =
-            (status.map_err(broken)?, out.map_err(broken)?, err.map_err(broken)?);
-        if !status.success() {
-            let err = String::from_utf8_lossy(&err);
-            return Err(Failure::Refused(format!("{} ({status})", err.trim())));
-        }
-        if out_total > l.gen_stdout_max_bytes as u64 {
-            return Err(Failure::Broken(format!(
-                "the sidecar printed more than {} bytes",
-                l.gen_stdout_max_bytes
-            )));
-        }
-        Ok(out)
+        exec(&self.argv(with_ap, mounts, args), &self.limits, timeout).await
     }
+}
+
+/// Run `argv` (program first) with no input, and return its stdout (at most
+/// `Limits::gen_stdout_max_bytes`); see [`Sandbox::run`].
+async fn exec(argv: &[OsString], l: &Limits, timeout: Duration) -> Result<Vec<u8>, Failure> {
+    let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
+    let mut child = tokio::process::Command::new(program)
+        .args(rest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Dropping the child on timeout kills bwrap; `--die-with-parent` takes the rest.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Failure::Broken(format!("cannot start the sandbox (is bwrap installed?): {e}")))?;
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(Failure::Broken("no pipes to the sandbox".into()));
+    };
+    let all = async {
+        tokio::join!(
+            drain(out, l.gen_stdout_max_bytes, Keep::Head),
+            drain(err, l.gen_error_max_bytes, Keep::Tail),
+            child.wait()
+        )
+    };
+    let Ok((out, err, status)) = tokio::time::timeout(timeout, all).await else {
+        // Kill bwrap and reap it before reporting; its sandbox goes with it.
+        if let Err(e) = child.kill().await {
+            tracing::warn!(error = %e, "could not kill a timed-out sandbox");
+        }
+        return Err(Failure::Broken(format!(
+            "timed out after {} s and was killed",
+            timeout.as_secs()
+        )));
+    };
+    let broken = |e: std::io::Error| Failure::Broken(format!("sandbox: {e}"));
+    let (status, (out, out_total), (err, _)) =
+        (status.map_err(broken)?, out.map_err(broken)?, err.map_err(broken)?);
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err);
+        return Err(Failure::Refused(format!("{} ({status})", err.trim())));
+    }
+    if out_total > l.gen_stdout_max_bytes as u64 {
+        return Err(Failure::Broken(format!(
+            "the sidecar printed more than {} bytes",
+            l.gen_stdout_max_bytes
+        )));
+    }
+    Ok(out)
 }
 
 /// Check once at startup that each job can get its own cgroup (`systemd-run --user`
@@ -306,18 +310,21 @@ async fn drain<R: AsyncRead + Unpin>(
                 let room = max.saturating_sub(kept.len());
                 kept.extend_from_slice(chunk.get(..room.min(n)).unwrap_or_default());
             }
-            Keep::Tail => {
-                kept.extend_from_slice(chunk);
-                if kept.len() > 2 * max {
-                    kept.drain(..kept.len() - max);
-                }
-            }
+            Keep::Tail => push_tail(&mut kept, chunk, max),
         }
     }
-    if keep == Keep::Tail && kept.len() > max {
+    // A tail can be up to twice `max` here; a head never passes `max`.
+    kept.drain(..kept.len().saturating_sub(max));
+    Ok((kept, total))
+}
+
+/// Add `chunk` to the end of `kept` and cut it back to its last `max` bytes once it holds
+/// more than twice that: one cut per `max` bytes read, not one per read.
+fn push_tail(kept: &mut Vec<u8>, chunk: &[u8], max: usize) {
+    kept.extend_from_slice(chunk);
+    if kept.len() > 2 * max {
         kept.drain(..kept.len() - max);
     }
-    Ok((kept, total))
 }
 
 /// How to show the Python at `python` inside: the venv (the folder with `pyvenv.cfg`) and the
@@ -369,7 +376,7 @@ fn python_plan(python: &Path) -> Result<PythonPlan, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
@@ -380,7 +387,7 @@ mod tests {
     }
 
     /// A fake checkout and tools folder under `root`.
-    fn layout(root: &Path) -> Generation {
+    pub(crate) fn layout(root: &Path) -> Generation {
         for d in [
             "ap/custom_worlds",
             "ap/worlds/generic",
@@ -501,6 +508,67 @@ mod tests {
         assert_eq!((all.as_slice(), total), (&b"ab"[..], 2));
         let (none, total) = drain(&b""[..], 3, Keep::Tail).await.unwrap();
         assert_eq!((none.len(), total), (0, 0));
+    }
+
+    #[test]
+    fn a_tail_is_cut_back_to_its_cap_each_time_it_passes_twice_that() {
+        let (mut kept, mut lens) = (Vec::new(), Vec::new());
+        for i in 0..8_u8 {
+            push_tail(&mut kept, &[i; 5], 10);
+            lens.push(kept.len());
+        }
+        assert_eq!(lens, [5, 10, 15, 20, 10, 15, 20, 10]);
+        assert_eq!(kept, [[6_u8; 5], [7; 5]].concat());
+    }
+
+    fn sh(script: &str) -> Vec<OsString> {
+        ["/bin/sh", "-c", script].map(OsString::from).to_vec()
+    }
+
+    /// The bound on these calls is a guard only: each command ends at once.
+    const NEVER: Duration = Duration::from_secs(60);
+
+    #[tokio::test]
+    async fn a_result_of_exactly_the_stdout_cap_is_kept_and_one_byte_more_is_refused() {
+        let l = Limits { gen_stdout_max_bytes: 5, ..Limits::DESIGN };
+        assert_eq!(exec(&sh("printf 12345"), &l, NEVER).await.unwrap(), b"12345");
+        let e = exec(&sh("printf 123456"), &l, NEVER).await.unwrap_err();
+        assert_eq!(e, Failure::Broken("the sidecar printed more than 5 bytes".into()));
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_that_fails_is_refused_with_the_end_of_its_error_output() {
+        let l = Limits { gen_error_max_bytes: 4, ..Limits::DESIGN };
+        let fails = sh("printf out; printf 'long reason' >&2; exit 3");
+        let e = exec(&fails, &l, NEVER).await.unwrap_err();
+        assert_eq!(e, Failure::Refused("ason (exit status: 3)".into()));
+    }
+
+    #[test]
+    fn a_failure_shows_its_reason_alone() {
+        assert_eq!(Failure::Refused("bad yaml".into()).to_string(), "bad yaml");
+        assert_eq!(Failure::Broken("timed out".into()).to_string(), "timed out");
+    }
+
+    /// A cgroup too small to start any process: the check fails, as it does on a host with no
+    /// user systemd session (there at connecting), so such a host is refused at startup.
+    #[test]
+    fn a_host_where_no_job_could_start_is_refused() {
+        let tiny = Limits { gen_cgroup_memory_bytes: 1, ..Limits::DESIGN };
+        let e = check_host(&tiny).unwrap_err();
+        assert!(e.contains("systemd-run"), "{e}");
+    }
+
+    /// Only a symlinked file is recreated as a link; a python reached through a symlinked
+    /// folder that is not its install is refused.
+    #[test]
+    fn a_python_behind_a_symlinked_bin_folder_is_refused() {
+        let root = temp("py-dir-link");
+        std::fs::create_dir_all(root.join("base/bin")).unwrap();
+        std::fs::write(root.join("base/bin/python3"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("base/bin"), root.join("bin")).unwrap();
+        let e = python_plan(&root.join("bin/python3")).unwrap_err();
+        assert!(e.contains("cannot place"), "{e}");
     }
 
     #[test]
