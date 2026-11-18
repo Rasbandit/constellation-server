@@ -687,6 +687,23 @@ mod tests {
         assert!(!text.is_empty() && !text.contains("secret"), "{text}");
     }
 
+    #[test]
+    fn an_unavailable_room_is_a_503_that_asks_to_try_again() {
+        let (status, text) = unavailable("room task stopped");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text, "the room is not available right now; try again");
+    }
+
+    /// Shows the data folder only: never the token's hash, the sandbox or the limits.
+    #[test]
+    fn the_state_shows_its_folder_and_not_the_token() {
+        let root = temp("debug");
+        let w = worlds(&root, Limits::DESIGN);
+        let shown = format!("{w:?}");
+        assert_eq!(shown, format!("Worlds {{ dir: {:?}, .. }}", root.join("data")));
+        assert!(!shown.contains("token") && !shown.contains(&hex(&w.token)), "{shown}");
+    }
+
     /// The API's state on a fake checkout under `root`, data in `root/data`.
     fn worlds(root: &Path, limits: Limits) -> Worlds {
         let paths = crate::sandbox::tests::layout(root);
