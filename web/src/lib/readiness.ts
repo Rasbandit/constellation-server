@@ -1,4 +1,5 @@
 import type { ApWorld, PlayerFile, ReadinessCheck } from '../api/types';
+import { gamesOf } from '../api/uploads';
 
 /** Longest connection name a slot may have (estimate taken from what existing clients accept). */
 export const NAME_MAX = 16;
@@ -87,7 +88,8 @@ export function checkReadiness(input: ReadinessInput): Readiness {
     }
   }
 
-  const needed = [...new Set(players.map((p) => p.game).filter((g): g is string => !!g))];
+  // A weighted pick needs every game it can roll.
+  const needed = [...new Set(players.flatMap((p) => gamesOf(p.game)))];
   const missingGames = needed.filter((g) => !byGame.has(g) && !builtinGames.includes(g)).sort();
   if (missingGames.length > 0) {
     checks.push({

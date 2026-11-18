@@ -1,13 +1,12 @@
+import { toApWorld, toPlayers, type ApWorldRecord, type YamlRecord } from './uploads';
 import type {
   ApiError,
-  ApWorld,
   AuditEntry,
   CreateRoomRequest,
   FeedItem,
   GameCatalog,
   Hint,
   HintStatus,
-  PlayerFile,
   Room,
   RoomRules,
   RoomState,
@@ -35,8 +34,17 @@ async function call<T>(method: string, path: string, opts: { body?: unknown; raw
   }
   const res = await fetch(path, { method, headers, body });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : undefined;
-  if (!res.ok) throw new HttpError(res.status, data ?? { error: res.statusText });
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : undefined;
+  } catch {
+    data = undefined;
+  }
+  if (!res.ok) {
+    // The upload API answers errors in plain text; the stub answers `{ error }`.
+    const body = (data as ApiError | undefined)?.error ? (data as ApiError) : { error: text || res.statusText };
+    throw new HttpError(res.status, body);
+  }
   return data as T;
 }
 
@@ -45,8 +53,10 @@ const enc = encodeURIComponent;
 export const api = {
   games: () => call<{ builtin: string[]; known: string[] }>('GET', '/api/games'),
   catalog: (game: string) => call<GameCatalog>('GET', `/api/games/${enc(game)}`),
-  uploadApWorld: (f: File) => call<ApWorld>('POST', '/api/apworlds', { raw: f, headers: { 'X-File-Name': enc(f.name) } }),
-  uploadPlayerFile: (f: File) => call<PlayerFile>('POST', '/api/player-files', { raw: f, headers: { 'X-File-Name': enc(f.name) } }),
+  /** Inspected and stored by the server; the same file again returns the stored one. */
+  uploadApWorld: (f: File) => call<ApWorldRecord>('PUT', `/api/apworlds?name=${enc(f.name)}`, { raw: f }).then(toApWorld),
+  /** One player per document in the file. */
+  uploadPlayerFile: (f: File) => call<YamlRecord>('PUT', `/api/yamls?name=${enc(f.name)}`, { raw: f }).then(toPlayers),
 
   rooms: () => call<RoomSummary[]>('GET', '/api/rooms'),
   resolveCode: (code: string) => call<{ roomId: string }>('GET', `/api/codes/${enc(code)}`),

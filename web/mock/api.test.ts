@@ -32,15 +32,27 @@ describe('stub API', () => {
     expect(rooms.map((r) => r.id)).toContain('friday-7k2q');
   });
 
-  it('reads the game from an uploaded YAML and an APWorld file name', async () => {
-    const p = await (
-      await fetch(`${base}/api/player-files`, { method: 'POST', headers: { 'X-File-Name': 'a.yaml' }, body: 'name: Alice\ngame: Starfall Keep\n' })
-    ).json();
-    expect(p).toMatchObject({ name: 'Alice', game: 'Starfall Keep' });
-    const w = await (
-      await fetch(`${base}/api/apworlds`, { method: 'POST', headers: { 'X-File-Name': 'starfall_keep-1.2.0.apworld' }, body: 'x' })
-    ).json();
-    expect(w).toMatchObject({ game: 'Starfall Keep', version: '1.2.0' });
+  it('answers uploads with the same paths and records as the server', async () => {
+    const put = (path: string, body: string) => fetch(`${base}${path}`, { method: 'PUT', body });
+    const yaml = 'name: Alice\ngame: Starfall Keep\n---\nname: Bob\ngame:\n  Tidewater Farm: 1\n  Lantern Run: 2\n';
+    const y = await put('/api/yamls?name=two%20players.yaml', yaml);
+    expect(y.status).toBe(201);
+    const rec = await y.json();
+    expect(rec).toMatchObject({
+      name: 'two players.yaml',
+      players: [
+        { name: 'Alice', game: 'Starfall Keep' },
+        { name: 'Bob', game: 'Lantern Run, Tidewater Farm' },
+      ],
+    });
+    expect(rec.id).toMatch(/^[0-9a-f]{64}$/);
+
+    const w = await put('/api/apworlds?name=starfall_keep-1.2.0.apworld', 'zip bytes');
+    expect(w.status).toBe(201);
+    expect(await w.json()).toMatchObject({ module: 'starfall_keep', game: 'Starfall Keep', world_version: '1.2.0', bytes: 9 });
+
+    expect((await put('/api/yamls?name=bad.yaml', 'game: X\n')).status).toBe(422);
+    expect((await put('/api/yamls', 'name: A\ngame: B\n')).status).toBe(400);
   });
 
   it('refuses a room that is not ready and creates one that is', async () => {

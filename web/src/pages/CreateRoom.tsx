@@ -5,6 +5,7 @@ import type { ApWorld, CollectMode, PlayerFile, ReadinessCheck, ReleaseMode, Roo
 import { Phases } from '../components/phases';
 import { Card, Dropzone, Empty, Modal, useToast } from '../components/ui';
 import { bytes } from '../lib/format';
+import { gamesOf } from '../api/uploads';
 import { NAME_MAX, checkReadiness } from '../lib/readiness';
 
 const defaultRules: RoomRules = { hintCostPct: 10, releaseMode: 'goal', collectMode: 'goal', password: '', spoilerLog: true };
@@ -40,7 +41,7 @@ export function CreateRoom() {
     () => checkReadiness({ roomName: name, apworlds: worlds, players, builtinGames: builtin }),
     [name, worlds, players, builtin],
   );
-  const neededGames = useMemo(() => [...new Set(players.map((p) => p.game).filter((g): g is string => !!g))].sort(), [players]);
+  const neededGames = useMemo(() => [...new Set(players.flatMap((p) => gamesOf(p.game)))].sort(), [players]);
   const gameChoices = useMemo(() => [...new Set([...builtin, ...known, ...worlds.map((w) => w.game)])].sort(), [builtin, known, worlds]);
 
   async function track<T>(p: Promise<T>): Promise<T> {
@@ -55,7 +56,7 @@ export function CreateRoom() {
   const addPlayerFiles = (files: File[]) =>
     files.forEach((f) =>
       track(api.uploadPlayerFile(f)).then(
-        (p) => setPlayers((ps) => [...ps, p]),
+        (added) => setPlayers((ps) => [...ps, ...added]),
         (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
       ),
     );
@@ -136,7 +137,7 @@ export function CreateRoom() {
               accept=".yaml,.yml"
               onFiles={addPlayerFiles}
               title="Drop player YAML files"
-              hint="Several at once: one file per player. Or use Add game/player for one player with their files."
+              hint="Several at once; a file can hold several players. Or use Add game/player for one player with their files."
             />
             {players.length > 0 && (
               <div className="table-wrap">
@@ -171,7 +172,10 @@ export function CreateRoom() {
                               p.game
                             )}
                             {p.error && <div className="small error-text">{p.error}</div>}
-                            {p.game && <WorldStatus game={p.game} worlds={worlds} builtin={builtin} />}
+                            {gamesOf(p.game).length > 1 && <div className="small muted">Weighted: the generator picks one</div>}
+                            {gamesOf(p.game).map((g) => (
+                              <WorldStatus key={g} game={g} label={gamesOf(p.game).length > 1 ? g : undefined} worlds={worlds} builtin={builtin} />
+                            ))}
                           </td>
                           <td>
                             <input
@@ -182,7 +186,10 @@ export function CreateRoom() {
                               onChange={(e) => updatePlayer(p.id, { name: e.target.value })}
                             />
                             <div className={`small ${problem ? 'error-text' : 'muted'}`}>
-                              {problem ?? `${p.name.length}/${NAME_MAX}, what the player types to connect`}
+                              {problem ??
+                                (p.yamlName && p.name !== p.yamlName
+                                  ? `The YAML says "${p.yamlName}". Generation still uses the YAML's name.`
+                                  : `${p.name.length}/${NAME_MAX}, what the player types to connect`)}
                             </div>
                           </td>
                           <td className="muted small">{p.fileName ?? 'Game defaults'}</td>
@@ -222,7 +229,7 @@ export function CreateRoom() {
               <ul className="needs">
                 {neededGames.map((g) => {
                   const w = worlds.filter((x) => x.game === g);
-                  const users = players.filter((p) => p.game === g).map((p) => p.name);
+                  const users = players.filter((p) => gamesOf(p.game).includes(g)).map((p) => p.name);
                   const state = w.length > 1 ? 'dup' : w.length === 1 ? 'ok' : builtin.includes(g) ? 'builtin' : 'missing';
                   return (
                     <li key={g} className={`need need-${state}`}>
@@ -311,7 +318,7 @@ export function CreateRoom() {
         worlds={worlds}
         builtin={builtin}
         onAdd={(p, w) => {
-          setPlayers((ps) => [...ps, p]);
+          setPlayers((ps) => [...ps, ...p]);
           if (w) setWorlds((ws) => [...ws, w]);
         }}
       />
@@ -319,12 +326,13 @@ export function CreateRoom() {
   );
 }
 
-function WorldStatus({ game, worlds, builtin }: { game: string; worlds: ApWorld[]; builtin: string[] }) {
+function WorldStatus({ game, label, worlds, builtin }: { game: string; label?: string; worlds: ApWorld[]; builtin: string[] }) {
   const n = worlds.filter((w) => w.game === game).length;
-  if (n === 1) return <div className="small muted">✓ APWorld uploaded</div>;
-  if (n > 1) return <div className="small error-text">{n} APWorlds, keep one</div>;
-  if (builtin.includes(game)) return <div className="small muted">✓ Built in</div>;
-  return <div className="small error-text">APWorld missing</div>;
+  const pre = label ? `${label}: ` : '';
+  if (n === 1) return <div className="small muted">{pre}✓ APWorld uploaded</div>;
+  if (n > 1) return <div className="small error-text">{pre}{n} APWorlds, keep one</div>;
+  if (builtin.includes(game)) return <div className="small muted">{pre}✓ Built in</div>;
+  return <div className="small error-text">{pre}APWorld missing</div>;
 }
 
 /** One player at a time: name, their YAML (or a game with defaults), and the game's APWorld if needed. */
@@ -341,7 +349,7 @@ function AddPlayerDialog({
   gameChoices: string[];
   worlds: ApWorld[];
   builtin: string[];
-  onAdd: (p: PlayerFile, w: ApWorld | null) => void;
+  onAdd: (p: PlayerFile[], w: ApWorld | null) => void;
 }) {
   const [name, setName] = useState('');
   const [yaml, setYaml] = useState<File | null>(null);
@@ -367,14 +375,15 @@ function AddPlayerDialog({
     setSaving(true);
     try {
       const w = world ? await api.uploadApWorld(world) : null;
-      let p: PlayerFile;
+      let p: PlayerFile[];
       if (yaml) {
         p = await api.uploadPlayerFile(yaml);
-        if (name.trim()) p = { ...p, name: name.trim() };
+        // A typed name renames a one-player file; a file with several players keeps theirs.
+        if (name.trim() && p.length === 1) p = [{ ...p[0], name: name.trim() }];
       } else {
         const g = game || w?.game;
         if (!g) throw new Error('Choose a game, or add the player\'s YAML.');
-        p = { id: `manual-${Date.now()}`, fileName: null, name: name.trim() || 'Player', game: g, defaults: true };
+        p = [{ id: `manual-${Date.now()}`, fileName: null, name: name.trim() || 'Player', game: g, defaults: true }];
       }
       onAdd(p, w);
       onClose();

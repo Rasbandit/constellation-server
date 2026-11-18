@@ -22,6 +22,8 @@ export interface ApWorld {
   game: string;
   version: string;
   sizeBytes: number;
+  /** The Python module the generator loads it as. */
+  module?: string;
 }
 
 export interface PlayerFile {
@@ -29,11 +31,16 @@ export interface PlayerFile {
   fileName: string | null;
   /** The connection (slot) name from the YAML; the host can change it before creating the room. */
   name: string;
+  /** One game, or for a weighted pick "A, B": the generator rolls one of them. */
   game: string | null;
   /** Why the YAML could not be read, if it could not. */
   error?: string;
   /** No YAML: the game's default options. */
   defaults?: boolean;
+  /** The stored YAML this player came from (several players can share one). */
+  yamlId?: string;
+  /** The name written in the YAML, when it came from one. */
+  yamlName?: string;
 }
 
 export interface RoomRules {

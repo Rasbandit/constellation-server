@@ -3,7 +3,7 @@ import type { Plugin } from 'vite';
 import type { CreateRoomRequest, HintStatus, RoomState } from '../src/api/types';
 import { checkReadiness } from '../src/lib/readiness';
 import { catalogFor, knownGames } from './catalog';
-import { NotFound, Refused, store, subscribe } from './store';
+import { NotFound, Refused, store, subscribe, Unprocessable } from './store';
 
 // Stub of the web API. Every handler takes the happy path over seeded data in `store.ts`.
 // The routes and shapes are the contract the real server implements (see README.md).
@@ -44,16 +44,21 @@ const slotParam = (ctx: Ctx) => Number(ctx.params.slot);
 route('GET', '/api/games', () => ({ builtin: store.builtinGames(), known: knownGames() }));
 route('GET', '/api/games/:game', (ctx) => catalogFor(decodeURIComponent(ctx.params.game)));
 
-route('POST', '/api/apworlds', async (ctx) => {
-  const name = decodeURIComponent(String(ctx.req.headers['x-file-name'] ?? ''));
-  const body = await ctx.body();
-  return store.addApWorld(name, body.length);
+// Same paths, bodies and records as the server's upload API (see src/api/uploads.ts).
+const uploadName = (ctx: Ctx) => {
+  const name = ctx.query.get('name');
+  if (!name) throw Object.assign(new Error('the name query parameter is required'), { status: 400 });
+  return name;
+};
+route('PUT', '/api/apworlds', async (ctx) => {
+  const name = uploadName(ctx);
+  ctx.res.statusCode = 201;
+  return store.addApWorld(name, await ctx.body());
 });
-
-route('POST', '/api/player-files', async (ctx) => {
-  const name = decodeURIComponent(String(ctx.req.headers['x-file-name'] ?? 'player.yaml'));
-  const body = await ctx.body();
-  return store.readPlayerFile(name, utf8(body));
+route('PUT', '/api/yamls', async (ctx) => {
+  const name = uploadName(ctx);
+  ctx.res.statusCode = 201;
+  return store.addYaml(name, await ctx.body());
 });
 
 // ---- Rooms ---------------------------------------------------------------------------------
@@ -157,7 +162,6 @@ route('POST', '/api/rooms/:id/admin/state', async (ctx) => {
 // ---- Plumbing ------------------------------------------------------------------------------
 
 const STREAMING = Symbol('streaming');
-
 const utf8 = (b: Uint8Array) => new TextDecoder().decode(b);
 
 // Plain Uint8Array (not Buffer) so the same handler also runs in a browser (see browser.ts).
@@ -179,9 +183,11 @@ function readBody(req: IncomingMessage): Promise<Uint8Array> {
 }
 
 /** Handles one request if it is for the API; returns false otherwise. Exported for tests. */
-export async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+export async function handle(req: IncomingMessage, res: ServerResponse, passthrough?: RegExp): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (!url.pathname.startsWith('/api/')) return false;
+  // Paths a real server answers (see proxy.ts) go on to Vite's proxy.
+  if (passthrough?.test(url.pathname)) return false;
   const send = (status: number, value: unknown) => {
     res.statusCode = status;
     res.setHeader('Content-Type', 'application/json');
@@ -213,7 +219,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse): Promise
       const out = await r.handler(ctx);
       if (out !== STREAMING) send(res.statusCode && res.statusCode !== 200 ? res.statusCode : 200, out);
     } catch (e) {
-      const status = e instanceof NotFound ? 404 : e instanceof Refused ? 400 : ((e as { status?: number }).status ?? 500);
+      const status = e instanceof NotFound ? 404 : e instanceof Refused ? 400 : e instanceof Unprocessable ? 422 : ((e as { status?: number }).status ?? 500);
       send(status, { error: (e as Error).message });
     }
     return true;
@@ -222,18 +228,17 @@ export async function handle(req: IncomingMessage, res: ServerResponse): Promise
   return true;
 }
 
-export function mockApi(): Plugin {
+/** The stub API as a Vite plugin. Paths matching `passthrough` are left to the proxy. */
+export function mockApi(passthrough?: RegExp): Plugin {
+  // Returns nothing on purpose: a function returned from configureServer runs as a post hook.
+  const use = (server: { middlewares: { use: (fn: (req: IncomingMessage, res: ServerResponse, next: () => void) => void) => unknown } }): void => {
+    server.middlewares.use((req, res, next) => {
+      handle(req, res, passthrough).then((done) => done || next(), next);
+    });
+  };
   return {
     name: 'constellation-mock-api',
-    configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        handle(req, res).then((done) => done || next(), next);
-      });
-    },
-    configurePreviewServer(server) {
-      server.middlewares.use((req, res, next) => {
-        handle(req, res).then((done) => done || next(), next);
-      });
-    },
+    configureServer: use,
+    configurePreviewServer: use,
   };
 }

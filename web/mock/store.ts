@@ -1,11 +1,9 @@
 import type {
-  ApWorld,
   AuditEntry,
   CreateRoomRequest,
   FeedItem,
   Hint,
   HintStatus,
-  PlayerFile,
   Room,
   RoomRules,
   RoomState,
@@ -14,6 +12,7 @@ import type {
   SlotNo,
   SlotStatus,
 } from '../src/api/types';
+import type { ApWorldRecord, YamlRecord } from '../src/api/uploads';
 import { BUILTIN_GAMES, catalogFor } from './catalog';
 
 // In-memory state for the stub API. It resets when the dev server restarts.
@@ -39,7 +38,7 @@ const rooms = new Map<string, RoomRecord>();
 type Listener = (item: FeedItem) => void;
 const listeners = new Map<string, Set<Listener>>();
 
-const apworlds = new Map<string, ApWorld>();
+const apworlds = new Map<string, ApWorldRecord>();
 /** Live join codes to room ids. A closed room's code goes back to the pool. */
 const codes = new Map<string, string>();
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
@@ -297,6 +296,25 @@ setInterval(() => {
 
 export class NotFound extends Error {}
 export class Refused extends Error {}
+/** The upload API's 422: the file was read and refused. */
+export class Unprocessable extends Error {}
+
+/** Stand-in for the server's SHA-256 content address: 64 hex characters, same bytes same id. */
+function fakeContentId(bytes: Uint8Array, salt: string): string {
+  let h = 2166136261;
+  const feed = (b: number) => {
+    h ^= b;
+    h = Math.imul(h, 16777619) >>> 0;
+  };
+  for (const b of bytes) feed(b);
+  if (bytes.length === 0) for (const c of salt) feed(c.charCodeAt(0));
+  let out = '';
+  for (let i = 0; i < 8; i++) {
+    feed(i);
+    out += h.toString(16).padStart(8, '0');
+  }
+  return out;
+}
 
 function get(roomId: string): RoomRecord {
   const rec = rooms.get(roomId);
@@ -333,9 +351,15 @@ export const store = {
     return { roomId };
   },
 
-  /** Reads game and version from the file name (`starfall_keep-1.2.0.apworld`). A real server opens the zip. */
-  addApWorld(fileName: string, sizeBytes: number): ApWorld {
-    if (!fileName.toLowerCase().endsWith('.apworld')) throw new Refused('Not an .apworld file');
+  /**
+   * Stub of `PUT /api/apworlds`. The real server unzips the file in a sandbox and reads its
+   * manifest; the stub reads game and version from the name (`starfall_keep-1.2.0.apworld`).
+   */
+  addApWorld(fileName: string, bytes: Uint8Array): ApWorldRecord {
+    if (!fileName.toLowerCase().endsWith('.apworld')) throw new Unprocessable('not an .apworld file');
+    const id = fakeContentId(bytes, fileName);
+    const stored = apworlds.get(id);
+    if (stored) return stored;
     const stem = fileName.replace(/\.apworld$/i, '');
     const m = /^(.*?)[-_ ]v?(\d+(?:\.\d+){1,2})$/.exec(stem);
     const raw = m ? m[1] : stem;
@@ -343,22 +367,39 @@ export const store = {
       .replace(/[_-]+/g, ' ')
       .trim()
       .replace(/\b\w/g, (c) => c.toUpperCase());
-    const w: ApWorld = { id: id('w'), fileName, game, version: m ? m[2] : '0.0.0', sizeBytes };
-    apworlds.set(w.id, w);
-    return w;
+    const module = raw.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^(\d)/, '_$1');
+    const rec: ApWorldRecord = { module, game, world_version: m ? m[2] : null, id, name: fileName, bytes: bytes.length };
+    apworlds.set(id, rec);
+    return rec;
   },
 
-  /** Reads `name:` and `game:` from a player YAML. A real server runs a YAML parser and checks options. */
-  readPlayerFile(fileName: string, text: string): PlayerFile {
-    const field = (k: string) => {
-      const m = new RegExp(`^${k}:[ \\t]*(.*)$`, 'm').exec(text);
-      return m ? m[1].trim().replace(/^['"]|['"]$/g, '') : null;
-    };
-    const n = field('name') ?? fileName.replace(/\.ya?ml$/i, '');
-    const game = field('game');
-    const p: PlayerFile = { id: id('p'), fileName, name: n, game: game || null };
-    if (!game) p.error = 'No "game:" line found';
-    return p;
+  /**
+   * Stub of `PUT /api/yamls`: `name:` and `game:` of each `---` document. The real server reads
+   * it with a YAML parser in a sandbox. A weighted `game:` mapping becomes "A, B", as there.
+   */
+  addYaml(fileName: string, bytes: Uint8Array): YamlRecord {
+    const text = new TextDecoder().decode(bytes);
+    const players = text
+      .split(/^---[ \t]*$/m)
+      .filter((doc) => doc.trim() !== '')
+      .map((doc, i) => {
+        const field = (k: string) => {
+          const m = new RegExp(`^${k}:[ \\t]*(.*)$`, 'm').exec(doc);
+          return m ? m[1].trim().replace(/^['"]|['"]$/g, '') : null;
+        };
+        const name = field('name');
+        let game = field('game');
+        if (game === '') {
+          // `game:` followed by an indented mapping of weights
+          const block = /^game:[ \t]*\n((?:[ \t]+.*\n?)+)/m.exec(doc)?.[1] ?? '';
+          game = [...block.matchAll(/^[ \t]+['"]?([^'":\n]+?)['"]?:/gm)].map((x) => x[1]).sort().join(', ') || null;
+        }
+        if (!name) throw new Unprocessable(`document ${i + 1} has no name`);
+        if (!game) throw new Unprocessable(`document ${i + 1} has no game`);
+        return { name, game };
+      });
+    if (players.length === 0) throw new Unprocessable('no player documents');
+    return { players, id: fakeContentId(bytes, fileName), name: fileName, bytes: bytes.length };
   },
 
   createRoom(req: CreateRoomRequest): Room {

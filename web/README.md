@@ -35,8 +35,8 @@ Types are in `src/api/types.ts`. Names follow CWP v1 (`crates/proto/schema/cwp-v
 |---|---|---|---|
 | GET | `/api/games` | | `{ builtin, known }` game names |
 | GET | `/api/games/:game` | | `GameCatalog` (items with flags, locations) |
-| POST | `/api/apworlds` | raw file, header `X-File-Name` | `ApWorld` |
-| POST | `/api/player-files` | raw YAML, header `X-File-Name` | `PlayerFile` |
+| PUT | `/api/apworlds?name=<file>` | raw `.apworld` | 201 (200 if already stored) `{id, name, bytes, module, game, world_version, ...}` |
+| PUT | `/api/yamls?name=<file>` | raw `.yaml` | 201 (200 if already stored) `{id, name, bytes, players: [{name, game}]}` |
 | GET | `/api/rooms` | | `RoomSummary[]` |
 | POST | `/api/rooms/check` | `CreateRoomRequest` | readiness checks |
 | POST | `/api/rooms` | `CreateRoomRequest` | 201 `Room` with `adminKey`, or 422 with the failing checks |
@@ -62,6 +62,18 @@ Admin endpoints need `X-Admin-Key` (403 without it), under `/api/rooms/:id/admin
 
 The feed is resumable: entries carry the room log `seq`, and after a reconnect the page asks for `feed?after=<last seq>` before relying on the stream again.
 
-## Moving to the real server
+The two upload routes are the server's own (branch `feat/web-upload-rooms`, `crates/server/src/worlds.rs`): same paths, raw bodies, records and status codes, with errors as plain text. `src/api/uploads.ts` turns the records into what the pages use: one player per YAML document, and a weighted `game` ("A, B") needs an APWorld for each game it can roll.
 
-Remove `mockApi()` from `vite.config.ts` and proxy `/api` to the server (`server.proxy`). The stub's shortcuts the server must replace: APWorld game and version come from the file name (the server should read the archive), YAML fields come from two regexes (the server should parse and validate options), and the admin key is a shared demo value.
+## Uploads through the server
+
+Point the dev server at the server's admin API and the upload routes (`/api/apworlds`, `/api/yamls`, `/api/worlds`) go there; everything else stays on the stub:
+
+```sh
+CONSTELLATION_ADMIN_URL=http://127.0.0.1:<admin port> \
+CONSTELLATION_ADMIN_TOKEN_FILE=<file with the token> \
+bun --bun run dev
+```
+
+The admin port is the server's `admin api addr=` log line (it listens on loopback; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards, so the token never reaches the browser. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
+
+Still stubbed: the room pages, and the name a player connects with. Renaming a player on the create page does not change their YAML, and generation uses the YAML's name; the page says so when they differ. The shared demo admin key stands in for host sign-in.

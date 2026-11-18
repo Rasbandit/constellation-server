@@ -86,4 +86,13 @@ describe('checkReadiness', () => {
     });
     expect(r.ready).toBe(false);
   });
+
+  it('needs an APWorld for every game a weighted pick can roll', () => {
+    const r = checkReadiness({
+      ...base,
+      apworlds: [world('Starfall Keep')],
+      players: [player('a', 'Alice', 'Starfall Keep, Tidewater Farm')],
+    });
+    expect(r.missingGames).toEqual(['Tidewater Farm']);
+  });
 });
