@@ -2,6 +2,7 @@
 //! its events as server-sent events. The data is the room's own ([`CompatRoom::summary`],
 //! [`CompatRoom::watch`]); this module only frames it.
 
+use crate::rooms::Visit;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use edge_compat::CompatRoom;
@@ -20,6 +21,8 @@ struct Watch {
     /// The last durable event sent (the SSE `id`), to resubscribe from after falling behind.
     cursor: Seq,
     queue: VecDeque<(Option<u64>, Value)>,
+    /// Keeps the room in memory while the stream is open.
+    _visit: Visit,
 }
 
 impl Watch {
@@ -52,9 +55,14 @@ impl Watch {
 ///
 /// # Errors
 /// When the room task has stopped.
-pub(crate) async fn events(room: Arc<CompatRoom>, after: Seq) -> Result<Response, String> {
+pub(crate) async fn events(
+    room: Arc<CompatRoom>,
+    visit: Visit,
+    after: Seq,
+) -> Result<Response, String> {
     let sub = room.watch(after).await.map_err(|e| format!("room unavailable: {e:?}"))?;
-    let mut w = Watch { room, live: sub.live, cursor: after, queue: VecDeque::new() };
+    let mut w =
+        Watch { room, live: sub.live, cursor: after, queue: VecDeque::new(), _visit: visit };
     w.history(sub.history);
     let stream = futures_util::stream::unfold(w, |mut w| async move {
         loop {

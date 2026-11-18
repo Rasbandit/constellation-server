@@ -5,12 +5,17 @@
 //! `{room_key}.{host}` (doc 01 section 3.8.1). It is not a secret. A new room draws its key at
 //! random (50 bits from the OS); with Postgres the key is stored with the room, so a restart
 //! serves the room under the same key.
+//!
+//! A listed room is either in memory (resident) or not (cold); doc 02 section 4.3. Each
+//! listing counts its open connections, so the host can tell how long a room has been idle.
 
 use edge_compat::CompatRoom;
+use proto::RoomId;
 use runtime::RoomHandle;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 /// Characters in a room key.
 pub const ROOM_KEY_LEN: usize = 10;
@@ -75,7 +80,7 @@ impl core::fmt::Display for RoomKey {
     }
 }
 
-/// One running room: what its sessions share and its task's liveness.
+/// A room in memory: what its sessions share and its task's liveness.
 #[derive(Debug, Clone)]
 pub struct Room {
     /// The seed name it was made from.
@@ -84,47 +89,176 @@ pub struct Room {
     pub compat: Arc<CompatRoom>,
     /// The room task's liveness.
     pub live: RoomHandle,
-    /// The bundle file in the rooms folder it was started from (`None` for `--bundle`).
-    pub file: Option<PathBuf>,
 }
 
-/// Every room this process runs, by key.
+/// A room the server lists, in memory or not.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    /// The room's id.
+    pub id: RoomId,
+    /// The seed name it was made from.
+    pub seed: String,
+    /// The room while it is in memory; `None` while it is cold.
+    pub room: Option<Room>,
+    /// Its connections, open and past.
+    pub activity: Arc<Activity>,
+}
+
+/// A moment on this process's monotonic clock, in milliseconds since its first use. Earlier
+/// moments are negative, so a room idle for longer than the machine has been up keeps its
+/// idle time (an [`Instant`] cannot go back past boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Moment(i64);
+
+impl Moment {
+    /// Now.
+    #[must_use]
+    pub fn now() -> Self {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        Self(millis(ORIGIN.get_or_init(Instant::now).elapsed()))
+    }
+
+    /// The moment `by` before this one.
+    #[must_use]
+    pub fn minus(self, by: Duration) -> Self {
+        Self(self.0.saturating_sub(millis(by)))
+    }
+
+    /// How long after `earlier` this is; zero when it is not after it.
+    #[must_use]
+    pub fn since(self, earlier: Self) -> Duration {
+        Duration::from_millis(u64::try_from(self.0.saturating_sub(earlier.0)).unwrap_or(0))
+    }
+}
+
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// How many connections a room has open, and since when it has had none.
+#[derive(Debug)]
+pub struct Activity {
+    open: AtomicUsize,
+    last: Mutex<Moment>,
+}
+
+impl Activity {
+    /// A room whose last connection was `idle` ago.
+    #[must_use]
+    pub fn new(idle: Duration) -> Arc<Self> {
+        Arc::new(Self { open: AtomicUsize::new(0), last: Mutex::new(Moment::now().minus(idle)) })
+    }
+
+    /// A connection begins; it counts until the returned [`Visit`] is dropped.
+    #[must_use]
+    pub fn enter(self: &Arc<Self>) -> Visit {
+        self.open.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        Visit(Arc::clone(self))
+    }
+
+    /// Restart the idle clock: a connection is about to enter (it woke the room).
+    pub fn touch(&self) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Moment::now();
+    }
+
+    /// How long the room has had no connection; `None` while one is open.
+    #[must_use]
+    pub fn idle_for(&self) -> Option<Duration> {
+        if self.open.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        Some(Moment::now().since(*self.last.lock().unwrap_or_else(PoisonError::into_inner)))
+    }
+
+    /// When the room was last used: `now` while a connection is open.
+    #[must_use]
+    pub fn last_used(&self, now: Moment) -> Moment {
+        if self.open.load(Ordering::SeqCst) > 0 {
+            return now;
+        }
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Move the idle clock back by `by`, as if that much time had passed (tests only, so no
+    /// test sleeps; docs/TESTING.md rule 5).
+    #[cfg(test)]
+    pub fn age(&self, by: Duration) {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        *last = last.minus(by);
+    }
+}
+
+/// One open connection to a room ([`Activity::enter`]).
+#[derive(Debug)]
+pub struct Visit(Arc<Activity>);
+
+impl Drop for Visit {
+    fn drop(&mut self) {
+        // The time first, so a reader that sees no open connection never sees an old time.
+        self.0.touch();
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Read the room list. Each change to it is one call, so a writer that panicked left it
+/// whole and the poison is ignored.
+pub(crate) fn read(rooms: &RwLock<Rooms>) -> RwLockReadGuard<'_, Rooms> {
+    rooms.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Change the room list (see [`read`]).
+pub(crate) fn write(rooms: &RwLock<Rooms>) -> RwLockWriteGuard<'_, Rooms> {
+    rooms.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every room this process lists, by key.
 #[derive(Debug, Clone, Default)]
 pub struct Rooms {
-    by_key: BTreeMap<RoomKey, Room>,
+    by_key: BTreeMap<RoomKey, Listing>,
 }
 
 impl Rooms {
-    /// Add a room under its key.
+    /// List a room under its key.
     ///
     /// # Errors
-    /// When another room already has the key (two bundles with the same seed name, or a
-    /// collision of 50-bit prefixes).
-    pub fn insert(&mut self, key: RoomKey, room: Room) -> Result<(), String> {
+    /// When another room already has the key (a collision of 50-bit prefixes).
+    pub fn insert(&mut self, key: RoomKey, listing: Listing) -> Result<(), String> {
         if let Some(old) = self.by_key.get(&key) {
             return Err(format!(
                 "room key {key} is taken by seed {:?}; seed {:?} cannot use it",
-                old.seed, room.seed
+                old.seed, listing.seed
             ));
         }
-        self.by_key.insert(key, room);
+        self.by_key.insert(key, listing);
         Ok(())
     }
 
-    /// Take the room with this key out, so no new connection reaches it.
-    pub fn remove(&mut self, key: &RoomKey) -> Option<Room> {
+    /// Stop listing the room with this key.
+    pub fn remove(&mut self, key: &RoomKey) -> Option<Listing> {
         self.by_key.remove(key)
     }
 
     /// The room with this key.
     #[must_use]
-    pub fn get(&self, key: &RoomKey) -> Option<&Room> {
+    pub fn get(&self, key: &RoomKey) -> Option<&Listing> {
         self.by_key.get(key)
+    }
+
+    /// The room with this key, to change.
+    pub fn get_mut(&mut self, key: &RoomKey) -> Option<&mut Listing> {
+        self.by_key.get_mut(key)
+    }
+
+    /// The key of the room with this id.
+    #[must_use]
+    pub fn key_of(&self, id: RoomId) -> Option<&RoomKey> {
+        self.by_key.iter().find(|(_, l)| l.id == id).map(|(k, _)| k)
     }
 
     /// The only room and its key, when there is exactly one.
     #[must_use]
-    pub fn only_with_key(&self) -> Option<(&RoomKey, &Room)> {
+    pub fn only_with_key(&self) -> Option<(&RoomKey, &Listing)> {
         let mut all = self.by_key.iter();
         match (all.next(), all.next()) {
             (Some(room), None) => Some(room),
@@ -145,14 +279,14 @@ impl Rooms {
     }
 
     /// Every room with its key, in key order.
-    pub fn iter(&self) -> impl Iterator<Item = (&RoomKey, &Room)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&RoomKey, &Listing)> {
         self.by_key.iter()
     }
 
-    /// True while every room's task runs.
+    /// True while every room in memory has its task running.
     #[must_use]
     pub fn all_running(&self) -> bool {
-        self.by_key.values().all(|r| r.live.is_running())
+        self.by_key.values().filter_map(|l| l.room.as_ref()).all(|r| r.live.is_running())
     }
 }
 
@@ -184,6 +318,31 @@ mod tests {
         let keys: std::collections::BTreeSet<_> =
             (0..100).map(|_| RoomKey::random().unwrap()).collect();
         assert_eq!(keys.len(), 100, "50 random bits: 100 draws never repeat in practice");
+    }
+
+    #[test]
+    fn a_room_is_idle_only_with_no_connection_open() {
+        let a = Activity::new(Duration::from_secs(60));
+        assert!(a.idle_for().unwrap() >= Duration::from_secs(60));
+        let one = a.enter();
+        let two = a.enter();
+        assert_eq!(a.idle_for(), None);
+        drop(one);
+        assert_eq!(a.idle_for(), None, "one is still open");
+        drop(two);
+        assert!(a.idle_for().unwrap() < Duration::from_secs(60), "the clock restarts on close");
+    }
+
+    /// A room idle for longer than the machine has been up (a restart after a reboot) keeps
+    /// its idle time; an `Instant` would have clamped it to zero.
+    #[test]
+    fn an_idle_time_longer_than_the_uptime_is_kept() {
+        let years = Duration::from_secs(100 * 365 * 86_400);
+        let idle = Activity::new(years).idle_for().unwrap();
+        assert!(idle >= years && idle < years + Duration::from_secs(60), "{idle:?}");
+        let now = Moment::now();
+        assert_eq!(now.since(now.minus(years)), Duration::from_secs(100 * 365 * 86_400));
+        assert_eq!(now.minus(years).since(now), Duration::ZERO, "never negative");
     }
 
     #[test]

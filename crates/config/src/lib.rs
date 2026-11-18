@@ -35,15 +35,27 @@ pub struct Limits {
     pub session_queue: usize,
     /// Largest seed bundle file the server will read.
     pub bundle_max_bytes: u64,
-    /// Most rooms one process runs from a rooms folder (`--rooms`); further bundles are skipped
-    /// with a warning.
+    /// Most rooms one process lists (in memory or not); further bundles are skipped with a
+    /// warning.
     pub max_rooms: usize,
-    /// How often the server looks in the rooms folder for new seed bundles and for rooms past
-    /// their lifetime (`CONSTELLATION_ROOMS_SCAN_MS`).
+    /// How often the server looks in the rooms folder for new seed bundles and checks for idle
+    /// and abandoned rooms (`CONSTELLATION_ROOMS_SCAN_MS`).
     pub rooms_scan_ms: u64,
-    /// A room from a rooms folder is removed this long after this process started it
-    /// (`CONSTELLATION_ROOM_LIFETIME_SECS`). A stopgap until rooms have a real lifecycle, see #56.
-    pub room_lifetime_secs: u64,
+    /// A room with no connection for this long leaves memory, and its next connect loads it
+    /// again (doc 02 section 4.3: Resident to Draining after idle 15 min, a design value;
+    /// `CONSTELLATION_ROOM_IDLE_SECS`).
+    pub room_idle_secs: u64,
+    /// A room with no connection for this long ends as abandoned and is never served again
+    /// (D-30: 30 days, a design value; `CONSTELLATION_ROOM_ABANDON_SECS`).
+    pub room_abandon_secs: u64,
+    /// A room in use has the time it was last used written to the database at most this
+    /// often, so a crash loses at most this much of it (a cost trade, not a design value;
+    /// `CONSTELLATION_ROOM_TOUCH_SECS`). A room leaving memory, and a clean stop, write it
+    /// at once.
+    pub room_touch_secs: u64,
+    /// Draws of a new room key before a new room gives up until the next scan; each draw
+    /// collides with an existing key only with odds of about one in 2^50 per stored room.
+    pub room_key_draws: usize,
     /// Chat and bounce messages a session may send in a burst (one shared token bucket).
     pub fanout_burst: u32,
     /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
@@ -176,7 +188,10 @@ impl Limits {
         bundle_max_bytes: 64 * 1024 * 1024,
         max_rooms: 1000,
         rooms_scan_ms: 2_000,
-        room_lifetime_secs: 24 * 60 * 60,
+        room_idle_secs: 15 * 60,
+        room_abandon_secs: 30 * 24 * 60 * 60,
+        room_touch_secs: 60,
+        room_key_draws: 3,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
         chat_max_bytes: 2048,
@@ -256,7 +271,9 @@ pub fn load() -> Limits {
         ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
         ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
         ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
-        ("CONSTELLATION_ROOM_LIFETIME_SECS", &mut l.room_lifetime_secs),
+        ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
+        ("CONSTELLATION_ROOM_ABANDON_SECS", &mut l.room_abandon_secs),
+        ("CONSTELLATION_ROOM_TOUCH_SECS", &mut l.room_touch_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -484,7 +501,9 @@ mod tests {
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
         assert_eq!(l.max_rooms, 1000);
-        assert_eq!((l.rooms_scan_ms, l.room_lifetime_secs), (2_000, 86_400));
+        assert_eq!(l.rooms_scan_ms, 2_000);
+        assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
+        assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
     }
 
     #[test]
@@ -589,6 +608,9 @@ mod tests {
             .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
             .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
+            .env("CONSTELLATION_AP_DIR", "/probe/ap")
+            .env("CONSTELLATION_AP_PYTHON", "/probe/python")
+            .env("CONSTELLATION_AP_GEN_SCRIPT", "/probe/ap_gen.py")
             .env("CONSTELLATION_DATABASE_URL_FILE", &url_file)
             .env_remove("CONSTELLATION_ROOM_PASSWORD_FILE")
             .env_remove("CONSTELLATION_DATABASE_URL")
@@ -605,6 +627,10 @@ mod tests {
         assert!(text.contains(&want), "want {want:?} in {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
+            "{text}"
+        );
+        assert!(
+            text.contains("probe generation /probe/ap /probe/python /probe/ap_gen.py"),
             "{text}"
         );
     }
@@ -630,6 +656,13 @@ mod tests {
         );
         let s = load_secrets().unwrap();
         println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
+        let g = load_generation().unwrap().expect("the paths are set");
+        println!(
+            "probe generation {} {} {}",
+            g.ap_dir.display(),
+            g.python.display(),
+            g.sidecar.display()
+        );
     }
 
     #[test]

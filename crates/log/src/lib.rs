@@ -17,7 +17,7 @@ pub use mem::MemLogStore;
 #[cfg(feature = "pg-tests")]
 pub use pg::testing;
 #[cfg(feature = "postgres")]
-pub use pg::{OpenError, PgLogStore};
+pub use pg::{Listed, OpenError, Opened, PgLogStore};
 
 /// Opaque snapshot of room state as of room `seq` `seq` (the caller owns the encoding).
 #[derive(Debug, Clone, PartialEq, Eq)]

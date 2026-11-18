@@ -13,7 +13,7 @@
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
 use crate::host::RoomsFolder;
-use crate::rooms::{Room, RoomKey};
+use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
 use crate::{hex, load_bundle};
 use axum::Router;
@@ -502,25 +502,30 @@ fn room_file(w: &Worlds, id: &str) -> Option<PathBuf> {
     w.rooms.as_ref().map(|(folder, _)| folder.dir().join(format!("{id}.json")))
 }
 
-/// The running room of world `id` (`--rooms` only): its key, the room, and its join address
-/// (`{key}.{host}:{port}`). `id` must be a checked world id.
-fn hosted(w: &Worlds, id: &str) -> Option<(RoomKey, Room, String)> {
+/// The listed room of a finished world (`--rooms` only): its rooms folder, key and join address
+/// (`{key}.{host}:{port}`). Found by the seed name in the world's status; the host lists each
+/// seed once.
+fn hosted<'a>(w: &'a Worlds, status: &Value) -> Option<(&'a RoomsFolder, RoomKey, String)> {
     let (folder, public) = w.rooms.as_ref()?;
-    let (key, room) = folder.room_of(&room_file(w, id)?)?;
+    let key = folder.key_of(status["seed_name"].as_str()?)?;
     let address = format!("{key}.{public}");
-    Some((key, room, address))
+    Some((folder, key, address))
 }
 
 fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
     if valid_id(id) { Ok(()) } else { Err((StatusCode::BAD_REQUEST, "bad id".to_owned())) }
 }
 
-/// The status on disk, plus `room_key` and `address` once the host runs the world's room.
+fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCode, String)> {
+    checked_id(id)?;
+    read_json(&w.dir.join("worlds").join(id).join("status.json"))
+        .ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))
+}
+
+/// The status on disk, plus `room_key` and `address` once the host lists the world's room.
 async fn world_status(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    checked_id(&id)?;
-    let mut status = read_json(&w.dir.join("worlds").join(&id).join("status.json"))
-        .ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))?;
-    if let Some((key, _, address)) = hosted(&w, &id) {
+    let mut status = read_status(&w, &id)?;
+    if let Some((_, key, address)) = hosted(&w, &status) {
         status["room_key"] = json!(key.as_str());
         status["address"] = json!(address);
     }
@@ -531,29 +536,33 @@ fn no_room() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "this world does not run as a room on this server".to_owned())
 }
 
-/// The world's running room now ([`edge_compat::CompatRoom::summary`]), with its key and address.
+/// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
+/// cold room is loaded to answer, as a connection would load it.
 async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    checked_id(&id)?;
-    let (key, room, address) = hosted(&w, &id).ok_or_else(no_room)?;
-    let mut summary = room.compat.summary().await.map_err(|_| no_room())?;
+    let status = read_status(&w, &id)?;
+    let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;
+    let (room, _visit) = folder.enter(key.clone()).await.map_err(|_| no_room())?;
+    let mut summary = room.summary().await.map_err(|_| no_room())?;
     summary["room_key"] = json!(key.as_str());
     summary["address"] = json!(address);
     Ok(json_reply(StatusCode::OK, &summary))
 }
 
-/// The world's room events as server-sent events, resuming after `Last-Event-ID`.
+/// The world's room events as server-sent events, resuming after `Last-Event-ID`. The stream
+/// counts as a visit, so the room stays in memory while someone watches it.
 async fn room_events(
     State(w): State<Arc<Worlds>>,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Reply {
-    checked_id(&id)?;
-    let (_, room, _) = hosted(&w, &id).ok_or_else(no_room)?;
+    let status = read_status(&w, &id)?;
+    let (folder, key, _) = hosted(&w, &status).ok_or_else(no_room)?;
+    let (room, visit) = folder.enter(key).await.map_err(|_| no_room())?;
     let after = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .map_or(proto::Seq(0), proto::Seq);
-    crate::room_view::events(room.compat, after).await.map_err(|_| no_room())
+    crate::room_view::events(room, visit, after).await.map_err(|_| no_room())
 }
 
 /// A job a previous process left queued or running will never finish: mark it failed.
