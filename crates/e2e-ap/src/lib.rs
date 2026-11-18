@@ -10,7 +10,8 @@ mod tests {
     use flate2 as _; // only pins the version (see Cargo.toml)
 
     use archipelago_rs::{
-        Cache, Client, ClientStatus, ConnectionOptions, Event, ItemHandling, Print,
+        Cache, Client, ClientStatus, ConnectionOptions, DataStorageOperation, Event, ItemHandling,
+        Print,
     };
     use e2e::{GUARD, Server, fixture};
     use std::path::Path;
@@ -90,6 +91,10 @@ mod tests {
         let b = fixture().unwrap();
         let alice_world = &b.slot(1).unwrap().locations;
         let to_bob: Vec<_> = alice_world.iter().filter(|p| p.receiver == 2).collect();
+        // Bob asks for his starting inventory, so it leads his item list (protocol doc,
+        // "items_handling flags" bit 2).
+        let start_items = &b.slot(2).unwrap().start_inventory;
+        let n = start_items.len();
         let own = alice_world.iter().find(|p| p.receiver == 1).unwrap();
         let server = start();
         let test = "core";
@@ -102,13 +107,23 @@ mod tests {
         assert_eq!(alice.slot_data(), &b.slot(1).unwrap().slot_data);
         let mut log = pump(&mut alice, |_, _| true);
 
+        log.extend(pump(&mut bob, |c, _| c.received_items().len() == n));
+        let got: Vec<_> = bob
+            .received_items()
+            .iter()
+            .map(|i| (i.index(), i.item().id(), i.location().id(), i.sender().slot()))
+            .collect();
+        let want: Vec<_> =
+            start_items.iter().enumerate().map(|(i, &item)| (i, item, -2, 0)).collect();
+        assert_eq!(got, want, "start items: location -2 from player 0, the server");
+
         // Cross-slot: Alice's check lands in Bob's inventory with Alice as the sender.
         alice.mark_checked([to_bob[0].location]).unwrap();
-        log.extend(pump(&mut bob, |c, _| c.received_items().len() == 1));
-        let got = &bob.received_items()[0];
+        log.extend(pump(&mut bob, |c, _| c.received_items().len() == n + 1));
+        let got = &bob.received_items()[n];
         assert_eq!(
             (got.index(), got.item().id(), got.location().id()),
-            (0, to_bob[0].item, to_bob[0].location)
+            (n, to_bob[0].item, to_bob[0].location)
         );
         assert_eq!(got.sender().slot(), 1);
         assert_eq!(got.is_trap(), to_bob[0].flags & 4 != 0);
@@ -124,13 +139,13 @@ mod tests {
         alice.mark_checked([to_bob[1].location]).unwrap();
         log.extend(pump(&mut alice, |c, _| c.checked_locations().count() == 3));
         let mut bob = connect(&server, "Bob", test);
-        log.extend(pump(&mut bob, |c, _| c.received_items().len() == 2));
+        log.extend(pump(&mut bob, |c, _| c.received_items().len() == n + 2));
         let ids: Vec<_> =
-            bob.received_items().iter().map(|i| (i.index(), i.location().id())).collect();
-        assert_eq!(ids, [(0, to_bob[0].location), (1, to_bob[1].location)]);
+            bob.received_items().iter().skip(n).map(|i| (i.index(), i.location().id())).collect();
+        assert_eq!(ids, [(n, to_bob[0].location), (n + 1, to_bob[1].location)]);
         alice.mark_checked([to_bob[2].location]).unwrap();
-        log.extend(pump(&mut bob, |c, _| c.received_items().len() == 3));
-        assert_eq!(bob.received_items()[2].index(), 2);
+        log.extend(pump(&mut bob, |c, _| c.received_items().len() == n + 3));
+        assert_eq!(bob.received_items()[n + 2].index(), n + 2);
 
         // A repeated check after reconnecting (as the protocol asks clients to do) adds nothing.
         alice.mark_checked([to_bob[0].location, to_bob[2].location]).unwrap();
@@ -138,7 +153,7 @@ mod tests {
         log.extend(pump(&mut bob, |_, evs| {
             evs.iter().any(|e| matches!(e, Event::ReceivedItems(0)))
         }));
-        assert_eq!(bob.received_items().len(), 3);
+        assert_eq!(bob.received_items().len(), n + 3);
 
         // Goal: Bob hears about it through a Goal print naming Alice.
         alice.set_status(ClientStatus::Goal).unwrap();
@@ -150,6 +165,67 @@ mod tests {
         log.extend(heard);
         log.extend(pump(&mut alice, |_, _| true));
         assert_compressed(&server, &log);
+    }
+
+    /// Data storage through the library's own calls: `watch` (`SetNotify`), `change` (`Set`
+    /// with operations and a reply) and `get`; client status changes reach a watcher.
+    #[test]
+    fn archipelago_rs_stores_watches_and_reads_data_storage() {
+        let server = start();
+        let test = "storage";
+        let mut alice = connect(&server, "Alice", test);
+        let mut bob = connect(&server, "Bob", test);
+        let key = "e2e-ap-shared";
+        alice.watch([key, "_read_client_status_0_2"]).unwrap();
+        let changed = |key: &'static str| {
+            move |_: &Ap, evs: &[Event]| {
+                evs.iter().any(|e| matches!(e, Event::KeyChanged { key: k, .. } if k == key))
+            }
+        };
+        let ops = [
+            DataStorageOperation::Union(vec![serde_json::json!("a"), serde_json::json!("b")]),
+            DataStorageOperation::Remove(serde_json::json!("a")),
+        ];
+        bob.change(key, serde_json::json!([]), ops, true).unwrap();
+        for c in [&mut bob, &mut alice] {
+            let seen = pump(c, changed(key));
+            let (old, new, by) = seen
+                .iter()
+                .find_map(|e| match e {
+                    Event::KeyChanged { key: k, old_value, new_value, player } if k == key => Some(
+                        (old_value.clone(), new_value.clone(), player.as_ref().map(|p| p.slot())),
+                    ),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                (old, new, by),
+                (Some(serde_json::json!([])), serde_json::json!(["b"]), Some(2))
+            );
+        }
+        // Arithmetic as the library sends it (floats), then floor without a value.
+        let ops = [DataStorageOperation::Add(2.5), DataStorageOperation::Floor];
+        bob.change("e2e-ap-n", serde_json::json!(1), ops, false).unwrap();
+        let groups = format!("_read_item_name_groups_{GAME}");
+        let rx = alice.get([key.to_owned(), "e2e-ap-n".to_owned(), groups.clone()]);
+        let mut got = None;
+        pump(&mut alice, |_, _| {
+            got = rx.try_recv().ok();
+            got.is_some()
+        });
+        let got = got.unwrap().unwrap();
+        assert_eq!(got[key], serde_json::json!(["b"]));
+        assert_eq!(got["e2e-ap-n"], serde_json::json!(3));
+        let want = serde_json::to_value(&fixture().unwrap().games[GAME].item_name_groups).unwrap();
+        assert_eq!(got[&groups], want);
+        // Bob leaves: his status goes to 0 for the watcher.
+        drop(bob);
+        let seen = pump(&mut alice, changed("_read_client_status_0_2"));
+        assert!(
+            seen.iter().any(|e| matches!(e, Event::KeyChanged { new_value, player: None, .. }
+                if *new_value == serde_json::json!(0))),
+            "no status 0 after Bob left"
+        );
     }
 
     #[test]

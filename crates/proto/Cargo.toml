@@ -13,12 +13,9 @@ categories.workspace = true
 
 [dependencies]
 serde.workspace = true
-# `Value` for frame payloads; `alloc` only, so the crate stays `no_std`.
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
+serde_json.workspace = true
 
 [dev-dependencies]
-# `std` for the tests (pretty printing, reading the committed schema).
-serde_json.workspace = true
 # The CWP schema is generated in tests and committed (`schema/cwp-v1.json`); pinned so the
 # generated file only changes when we change the types.
 schemars = "=1.2.3"

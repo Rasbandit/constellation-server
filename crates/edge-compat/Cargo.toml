@@ -15,17 +15,17 @@ categories.workspace = true
 config = { path = "../config" }
 futures-util = { workspace = true }
 proto = { path = "../proto" }
+room-core = { path = "../room-core" }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "macros", "io-util", "time"] }
 tracing.workspace = true
 yawc.workspace = true
 
 [dev-dependencies]
 log = { path = "../log" }
-room-core = { path = "../room-core" }
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 
 [lints]

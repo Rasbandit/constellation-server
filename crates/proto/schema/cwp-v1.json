@@ -1931,6 +1931,16 @@
       "retry": "never"
     },
     {
+      "code": 3003,
+      "key": "room.storage_full",
+      "retry": "never"
+    },
+    {
+      "code": 3004,
+      "key": "room.write_rate",
+      "retry": "backoff"
+    },
+    {
       "code": 3050,
       "key": "cid.conflict",
       "retry": "never"

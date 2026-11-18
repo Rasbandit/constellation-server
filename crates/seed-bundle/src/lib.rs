@@ -121,6 +121,11 @@ pub struct Slot {
     pub locations: Vec<Placed>,
     /// Game-defined data handed to the client on connect (a JSON object).
     pub slot_data: serde_json::Value,
+    /// Starting inventory: item ids of this slot's game, in the generator's order, repeats
+    /// allowed. Sent only to clients that ask for it (`items_handling` bit 2), before every
+    /// received item, as from location -2 and player 0 (protocol doc, "Data Package Contents").
+    #[serde(default)]
+    pub start_inventory: Vec<i64>,
 }
 
 /// An item placed at a location.
@@ -147,6 +152,13 @@ pub struct GameData {
     pub location_name_to_id: BTreeMap<String, i64>,
     /// The generator's checksum of this data package.
     pub checksum: String,
+    /// Item group name to item names, read by clients as `_read_item_name_groups_<game>`. Not
+    /// part of the data package sent to clients.
+    #[serde(default)]
+    pub item_name_groups: BTreeMap<String, Vec<String>>,
+    /// Location group name to location names (`_read_location_name_groups_<game>`).
+    #[serde(default)]
+    pub location_name_groups: BTreeMap<String, Vec<String>>,
 }
 
 /// Why a bundle was refused. Names the first rule that failed.
@@ -265,6 +277,14 @@ impl SeedBundle {
                 ensure!(ids.contains(m), "group {} names missing slot {m}", s.id);
             }
             self.validate_locations(s, &items, &locations)?;
+            let own = items.get(s.game.as_str());
+            if let Some(i) = s.start_inventory.iter().find(|i| !own.is_some_and(|g| g.contains(i)))
+            {
+                return Err(BundleError::Invalid(format!(
+                    "slot {} starts with item {i}, which game {:?} lacks",
+                    s.id, s.game
+                )));
+            }
         }
         for (name, (team, slot)) in &self.connect_names {
             ensure!(

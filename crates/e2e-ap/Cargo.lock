@@ -1214,6 +1214,7 @@ name = "proto"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1314,6 +1315,7 @@ dependencies = [
  "config",
  "proto",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

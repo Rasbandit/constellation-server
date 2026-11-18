@@ -1,0 +1,197 @@
+"""Drive our server with Archipelago's own client library (CommonClient) from a local checkout.
+
+Usage (from the repo root; `just ap-client-check` builds the server and runs this):
+
+    <archipelago venv python> tools/ap-client-check/check_common_client.py \
+        --ap <Archipelago checkout> --server <constellation-server binary> --bundle <fixture>
+
+It starts our server on a free loopback port with the fixture bundle (in-memory log), connects
+two `CommonContext` clients (Alice and Bob), and checks what a standard client does on connect
+and with data storage: the `Get` and `SetNotify` every CommonClient sends after `Connected`
+(hints, item and location name groups), `Set` with a reply to the writer and to a watcher,
+a `Get` round trip, the starting inventory, and client status changes. Expected values come
+from the fixture bundle and the protocol document. Exits 0 when every check passes.
+
+Local only (CI has no Archipelago checkout). It runs their client library as a test client; it
+never runs their server. Side effects are kept out of the user's files: the data package cache
+goes to a temporary directory and the client's persistent store is not written.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from typing import Any, Callable
+
+GUARD = 20.0  # seconds any single wait may take before the check fails instead of hanging
+GAME = "Archipela-Go 2: Electric Boogaloo"
+
+
+class Failure(Exception):
+    pass
+
+
+def start_server(binary: str, bundle: str) -> tuple[subprocess.Popen, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CONSTELLATION_DATABASE_URL")}
+    proc = subprocess.Popen([binary, "--bundle", bundle, "--port", "0"], env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    found: list[str] = []
+    ready = threading.Event()
+
+    def drain() -> None:  # keep reading so the pipe never fills
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            if not found and "listening addr=" in line:
+                found.append(line.split("listening addr=", 1)[1].split()[0])
+                ready.set()
+        ready.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    if not ready.wait(GUARD) or not found:
+        proc.kill()
+        raise Failure("the server never logged its address")
+    return proc, f"ws://{found[0]}"
+
+
+def make_probe(base: type) -> type:
+    class Probe(base):  # type: ignore[misc, valid-type]
+        game = GAME
+        items_handling = 0b111  # every item, own world too, and the starting inventory
+
+        def __init__(self, address: str, name: str) -> None:
+            super().__init__(address, None)
+            self.username = name
+            self.packets: list[tuple[str, dict]] = []
+            self.changed = asyncio.Event()
+
+        async def server_auth(self, password_requested: bool = False) -> None:
+            await super().server_auth(password_requested)
+            await self.get_username()
+            await self.send_connect()
+
+        def on_package(self, cmd: str, args: dict) -> None:
+            self.packets.append((cmd, args))
+            self.changed.set()
+
+        async def until(self, what: str, done: Callable[[], bool]) -> None:
+            async def wait() -> None:
+                while not done():
+                    self.changed.clear()
+                    await self.changed.wait()
+
+            try:
+                await asyncio.wait_for(wait(), GUARD)
+            except asyncio.TimeoutError:
+                raise Failure(f"{self.username}: timed out waiting for {what}") from None
+
+        def invalid(self) -> list[dict]:
+            return [a for c, a in self.packets if c == "InvalidPacket"]
+
+    return Probe
+
+
+def check(cond: bool, what: str) -> None:
+    if not cond:
+        raise Failure(what)
+    print(f"ok: {what}")
+
+
+async def run(url: str, bundle: dict[str, Any]) -> None:
+    from CommonClient import CommonContext
+
+    Probe = make_probe(CommonContext)
+    game = bundle["games"][GAME]
+    alice = Probe(url, "Alice")
+    await alice.connect()
+    items_key, locations_key = f"_read_item_name_groups_{GAME}", f"_read_location_name_groups_{GAME}"
+    # What every CommonClient asks for right after `Connected` (Get, then SetNotify).
+    on_connect = ["_read_hints_0_1", items_key, locations_key, "_read_race_mode"]
+    await alice.until("the keys CommonClient reads on connect",
+                      lambda: all(k in alice.stored_data for k in on_connect))
+    check(alice.stored_data[items_key] == game["item_name_groups"], "item name groups match the seed")
+    check(alice.stored_data[locations_key] == game["location_name_groups"],
+          "location name groups match the seed")
+    check(alice.stored_data["_read_hints_0_1"] == [], "hints read as an empty list")
+    check(alice.stored_data["_read_race_mode"] == bundle["race_mode"], "race mode is the seed's")
+
+    alice.set_notify("shared", "_read_client_status_0_2")
+    await alice.until("Get of the watched keys", lambda: "shared" in alice.stored_data)
+    check(alice.stored_data["_read_client_status_0_2"] == 0, "Bob's status is 0 before he connects")
+
+    bob = Probe(url, "Bob")
+    await bob.connect()
+    await alice.until("Bob's status 5", lambda: alice.stored_data.get("_read_client_status_0_2") == 5)
+    check(True, "a watcher hears Bob connect (5)")
+    start = bundle["slots"][1]["start_inventory"]
+    await bob.until("Bob's starting inventory", lambda: len(bob.items_received) >= len(start))
+    got = [(i.item, i.location, i.player) for i in bob.items_received[:len(start)]]
+    check(got == [(i, -2, 0) for i in start], "the starting inventory arrives first, from location -2")
+
+    await bob.send_msgs([{"cmd": "Set", "key": "shared", "default": 1, "want_reply": True,
+                          "operations": [{"operation": "add", "value": 4},
+                                         {"operation": "mul", "value": 3}]}])
+    await bob.until("Bob's own SetReply", lambda: bob.stored_data.get("shared") == 15)
+    await alice.until("the watcher's SetReply", lambda: alice.stored_data.get("shared") == 15)
+    replies = [a for c, a in alice.packets if c == "SetReply" and a["key"] == "shared"]
+    check(replies[-1]["original_value"] == 1 and replies[-1]["slot"] == 2,
+          "SetReply carries the original value and the writing slot")
+    check(sum(1 for c, a in bob.packets if c == "SetReply" and a["key"] == "shared") == 1,
+          "the writer gets exactly one SetReply")
+
+    await alice.send_msgs([{"cmd": "Get", "keys": ["shared", "never-set"], "probe": 7}])
+    await alice.until("Retrieved", lambda: any(c == "Retrieved" and a.get("probe") == 7
+                                               for c, a in alice.packets))
+    got = next(a for c, a in alice.packets if c == "Retrieved" and a.get("probe") == 7)
+    check(got["keys"] == {"shared": 15, "never-set": None}, "Get reads stored and missing keys")
+
+    await bob.send_msgs([{"cmd": "StatusUpdate", "status": 20}])
+    await alice.until("Bob's status 20", lambda: alice.stored_data.get("_read_client_status_0_2") == 20)
+    check(True, "a watcher hears Bob's StatusUpdate (20)")
+    await bob.disconnect()
+    await alice.until("Bob's status 0", lambda: alice.stored_data.get("_read_client_status_0_2") == 0)
+    check(True, "a watcher hears Bob's last connection leave (0)")
+
+    for p in (alice, bob):
+        check(p.invalid() == [], f"{p.username} got no InvalidPacket ({p.invalid()})")
+    await alice.disconnect()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--ap", required=True, help="Archipelago checkout (its CommonClient)")
+    parser.add_argument("--server", required=True, help="constellation-server binary")
+    parser.add_argument("--bundle", required=True, help="seed bundle (the e2e fixture)")
+    args = parser.parse_args()
+    with open(args.bundle) as f:
+        bundle = json.load(f)
+    # Keep the client's cache out of the user's home; set before Archipelago is imported.
+    os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="ap-client-check-")
+    sys.path.insert(0, os.path.abspath(args.ap))
+    import ModuleUpdate  # Archipelago's dependency check; skip it, the venv is already set up
+
+    ModuleUpdate.update_ran = True
+    import Utils
+
+    Utils.persistent_store = lambda *a, **k: None  # never write into the checkout or home
+    proc, url = start_server(args.server, args.bundle)
+    try:
+        asyncio.run(run(url, bundle))
+    except Failure as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+    finally:
+        proc.terminate()
+        proc.wait(GUARD)
+    print("CommonClient check passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

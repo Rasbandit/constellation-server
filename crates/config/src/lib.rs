@@ -76,6 +76,34 @@ pub struct Limits {
     /// Postgres `idle_in_transaction_session_timeout`: the server ends a session that sits in
     /// an open transaction this long, releasing its locks (design value).
     pub db_idle_in_transaction_timeout_ms: u64,
+    /// Longest data storage key, bytes (estimate, docs/protocol-plan.md 1.5).
+    pub kv_max_key_bytes: usize,
+    /// Largest stored value, serialized as JSON, bytes (estimate).
+    pub kv_max_value_bytes: usize,
+    /// Largest key-value store per room: keys plus serialized values, bytes (estimate).
+    pub kv_max_room_bytes: u64,
+    /// Most operations in one `Set` (estimate).
+    pub kv_max_ops: usize,
+    /// Deepest JSON nesting of a stored value or operand, counting each list and object. The
+    /// same number as the frame depth cap of the reference server (`NetUtils.py:179-205`).
+    pub kv_max_depth: usize,
+    /// Most keys in one `Get` or `SetNotify` (estimate).
+    pub kv_max_keys_per_request: usize,
+    /// Most keys one connection may watch with `SetNotify` (estimate).
+    pub kv_max_watched_keys: usize,
+    /// `Set` packets a slot may send in a burst; its own bucket, so frequent shared-value writes
+    /// never use up chat (estimate).
+    pub kv_set_burst: u32,
+    /// Refill of that bucket, thousandths per second (20000 = 20 per second).
+    pub kv_set_refill_milli_per_sec: u32,
+    /// Stored bytes (key plus value as JSON) a slot's data storage writes may log in a burst.
+    /// Every write is logged in full, so this, not the write count, bounds log growth (estimate).
+    pub kv_write_bytes_burst: u32,
+    /// Refill of that byte bucket, thousandths of a byte per second (4096000 = 4 KiB/s).
+    pub kv_write_bytes_refill_milli_per_sec: u32,
+    /// Most data storage bytes a room may ever log (the log is not compacted yet), bytes
+    /// (estimate; a room past it refuses writes with `room.storage_full`).
+    pub kv_max_room_log_bytes: u64,
 }
 
 impl Limits {
@@ -110,6 +138,18 @@ impl Limits {
         db_statement_timeout_ms: 10_000,
         db_lock_timeout_ms: 5_000,
         db_idle_in_transaction_timeout_ms: 10_000,
+        kv_max_key_bytes: 1024,
+        kv_max_value_bytes: 64 * 1024,
+        kv_max_room_bytes: 16 * 1024 * 1024,
+        kv_max_ops: 64,
+        kv_max_depth: 16,
+        kv_max_keys_per_request: 1024,
+        kv_max_watched_keys: 4096,
+        kv_set_burst: 50,
+        kv_set_refill_milli_per_sec: 20_000,
+        kv_write_bytes_burst: 256 * 1024,
+        kv_write_bytes_refill_milli_per_sec: 4096 * 1000,
+        kv_max_room_log_bytes: 512 * 1024 * 1024,
     };
 }
 
@@ -443,6 +483,21 @@ mod tests {
             (30_000, 60_000, 20_000)
         );
         assert!(l.ping_interval_ms < l.idle_timeout_ms);
+    }
+
+    #[test]
+    fn data_storage_limits_are_the_planned_estimates() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.kv_max_key_bytes, l.kv_max_value_bytes), (1024, 65_536));
+        assert_eq!(l.kv_max_room_bytes, 16_777_216);
+        assert_eq!((l.kv_max_ops, l.kv_max_depth), (64, 16));
+        assert_eq!((l.kv_max_keys_per_request, l.kv_max_watched_keys), (1024, 4096));
+        assert_eq!((l.kv_set_burst, l.kv_set_refill_milli_per_sec), (50, 20_000));
+        assert_eq!(
+            (l.kv_write_bytes_burst, l.kv_write_bytes_refill_milli_per_sec),
+            (262_144, 4_096_000)
+        );
+        assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
     }
 
     #[test]

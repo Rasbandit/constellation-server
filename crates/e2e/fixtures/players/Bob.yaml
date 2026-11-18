@@ -9,3 +9,6 @@ game: "Archipela-Go 2: Electric Boogaloo"
   easy_share: 50
   medium_share: 35
   hard_share: 15
+  start_inventory:
+    "Hydrate!": 2
+    "Running Shoes": 1

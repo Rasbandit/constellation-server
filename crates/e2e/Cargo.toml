@@ -14,7 +14,7 @@ categories.workspace = true
 [dependencies]
 futures-util.workspace = true
 seed-bundle = { path = "../seed-bundle" }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "time", "net", "io-util", "macros"] }
 yawc.workspace = true
 

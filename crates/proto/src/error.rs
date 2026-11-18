@@ -87,6 +87,10 @@ registry! {
     RoomPaused = 3030, "room.paused", Backoff;
     /// The command needs a live room; it is still in staging (doc 09 section 4.7).
     RoomNotLive = 3031, "room.not_live", Never;
+    /// The room's data storage may log no more bytes.
+    RoomStorageFull = 3003, "room.storage_full", Never;
+    /// The slot used up its data storage byte budget for now.
+    RoomWriteRate = 3004, "room.write_rate", Backoff;
     /// A repeated `cid` with a different payload (doc 01 D1.10 rule 3).
     CidConflict = 3050, "cid.conflict", Never;
     /// An `ack` with no slot, or beyond the last delivered `item_seq`.
@@ -178,6 +182,20 @@ mod tests {
         ] {
             assert_eq!(ErrorCode::from_key(key).map(ErrorCode::code), Some(code), "{key}");
         }
+    }
+
+    #[test]
+    fn data_storage_refusals_are_registered_room_errors() {
+        assert_eq!(
+            (ErrorCode::RoomStorageFull.code(), ErrorCode::RoomStorageFull.key()),
+            (3003, "room.storage_full")
+        );
+        assert_eq!(
+            (ErrorCode::RoomWriteRate.code(), ErrorCode::RoomWriteRate.key()),
+            (3004, "room.write_rate")
+        );
+        assert_eq!(ErrorCode::RoomStorageFull.retry(), Retry::Never);
+        assert_eq!(ErrorCode::RoomWriteRate.retry(), Retry::Backoff);
     }
 
     #[test]

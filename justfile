@@ -56,3 +56,9 @@ deny:
 
 typos:
     typos
+
+# Archipelago's own CommonClient (from the sibling Archipela-Go checkout and its venv) against
+# the real server: connect, SetNotify, Set, Get, start items, client status. Local only.
+ap-client-check:
+    cargo build -p server --bin constellation-server --locked
+    {{justfile_directory()}}/../Archipela-Go/apworld/.venv/bin/python tools/ap-client-check/check_common_client.py --ap {{justfile_directory()}}/../Archipela-Go/.ap --server {{justfile_directory()}}/target/debug/constellation-server --bundle {{justfile_directory()}}/crates/e2e/fixtures/two-slot.json
