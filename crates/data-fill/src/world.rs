@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use bits::{BitSet, PackedRef, bytes_for, read};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, stored};
 use serde_json::Value;
 
 use crate::section::{
-    self, CMP_OPS, GROUPS, HEADER, MAX_SLICES, Node, SECTION_GAME, SECTION_RULES, STAYS,
-    SUBSECTIONS, VERSION, Widths, node, sub,
+    self, CMP_OPS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths, node, sub,
 };
-use crate::section_io::{BitSet, PackedRef, read, stored};
 
 type R<T> = Result<T, String>;
 
@@ -153,7 +153,7 @@ fn list(b: &[u8], at: usize, end: usize) -> R<(List, usize)> {
     let len = u32_at(b, at)? as usize;
     let width = *b.get(at + 4).ok_or_else(|| bad("truncated"))?;
     let l = List { at: at + 5, width, len };
-    let stop = l.at + crate::section_io::bytes_for(len, usize::from(width));
+    let stop = l.at + bytes_for(len, usize::from(width));
     if width == 0 || width > 32 || stop > end {
         return Err(bad("packed list out of bounds"));
     }
@@ -200,8 +200,9 @@ impl World {
     /// # Errors
     /// A missing section or any offset, index or def that breaks the layout rules.
     pub fn from_package(file: &[u8]) -> R<Self> {
-        let rules = stored(file, SECTION_RULES)?.ok_or("package: no rules section")?;
-        let game = stored(file, SECTION_GAME)?.ok_or("package: no game section")?;
+        let section = |id| stored(file, id).map_err(|e| e.to_string());
+        let rules = section(SECTION_RULES)?.ok_or("package: no rules section")?;
+        let game = section(SECTION_GAME)?.ok_or("package: no game section")?;
         Self::from_sections(rules.to_vec(), game.to_vec())
     }
 
@@ -266,7 +267,7 @@ impl World {
         let s = dir[sub::SITES].clone();
         let site_widths = (*b.get(s.start).unwrap_or(&0), *b.get(s.start + 1).unwrap_or(&0));
         let rec = usize::from(site_widths.0) + usize::from(site_widths.1);
-        if s.len() < 2 + crate::section_io::bytes_for(counts[SITES], rec) || rec > 57 {
+        if s.len() < 2 + bytes_for(counts[SITES], rec) || rec > 57 {
             return Err(bad("site records out of bounds"));
         }
         let d = dir[sub::DEFS].clone();

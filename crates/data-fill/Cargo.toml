@@ -26,6 +26,7 @@ memory-harness = ["dep:allocation-counter"]
 [dependencies]
 # Counts allocations per thread for the memory harness only (feature `memory-harness`).
 allocation-counter = { version = "0.8", optional = true }
+bits = { path = "../bits" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }

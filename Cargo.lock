@@ -294,6 +294,7 @@ name = "data-fill"
 version = "0.0.0"
 dependencies = [
  "allocation-counter",
+ "bits",
  "seed-bundle",
  "serde",
  "serde_json",

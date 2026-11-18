@@ -5,14 +5,10 @@
 
 use std::collections::HashMap;
 
+use bits::{Packer, width};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, Section, file_bytes};
 use serde_json::{Map, Value, json};
 
-use crate::section_io::{Packer, file_bytes, width};
-
-/// Section ids in a package (as in seed-bundle v2).
-pub const SECTION_GAME: u16 = 1;
-/// The rules section.
-pub const SECTION_RULES: u16 = 2;
 /// Layout version in the rules header.
 pub const VERSION: u16 = 1;
 /// Number of time slices a region mask can carry (`x.time_slices@0`).
@@ -369,7 +365,8 @@ fn counter_keys<'m>(v: &'m Value, out: &mut Vec<&'m str>) {
 /// A message naming the manifest path of the first malformed or unknown construct.
 pub fn compile(m: &Value) -> R<Vec<u8>> {
     let (rules, game) = sections(m)?;
-    Ok(file_bytes(&[(SECTION_GAME, &game), (SECTION_RULES, &rules)]))
+    let raw = |id, bytes| Section { id, bytes, deflate: false };
+    file_bytes(&[raw(SECTION_GAME, game), raw(SECTION_RULES, rules)]).map_err(|e| e.to_string())
 }
 
 /// The rules section and the game section stand-in.

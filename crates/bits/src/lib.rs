@@ -134,6 +134,13 @@ impl BitSet {
         true
     }
 
+    /// Remove `i` (nothing past the range).
+    pub fn remove(&mut self, i: usize) {
+        if let Some(w) = self.words.get_mut(i / 64) {
+            *w &= !(1 << (i % 64));
+        }
+    }
+
     /// How many indexes are in the set.
     #[must_use]
     pub fn count(&self) -> usize {
@@ -341,6 +348,10 @@ mod tests {
         assert!(s.contains(129) && !s.contains(1) && !s.contains(1000));
         assert_eq!(s.ones().collect::<Vec<_>>(), [0, 63, 64, 129]);
         assert_eq!(s.count(), 4);
+        s.remove(63);
+        s.remove(1000);
+        assert!(!s.contains(63) && s.contains(64) && s.count() == 3);
+        s.insert(63);
         let back = BitSet::from_words(s.words().to_vec(), 130).unwrap();
         assert_eq!(back, s);
         assert_eq!(BitSet::from_words(s.words().to_vec(), 129), None, "bit 129 is past 129");

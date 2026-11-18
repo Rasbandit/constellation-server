@@ -9,7 +9,6 @@ mod fold;
 pub mod parity_rng;
 pub mod reach;
 pub mod section;
-mod section_io;
 pub mod spheres;
 pub mod world;
 

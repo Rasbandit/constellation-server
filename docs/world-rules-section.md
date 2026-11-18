@@ -1,6 +1,6 @@
 # The rules section of a game package
 
-Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions in `data-only-world-experiment.md`, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). Until the shared types land here (see #68), `crates/data-fill/src/section_io.rs` stands in for `crates/bits` and the package reader under the same method names (table at the end).
+Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions in `data-only-world-experiment.md`, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). The package around it is the v2 package file (`seed_bundle::package::file_bytes` and `stored`, uncompressed so the sections are read in place); the game section inside it is still this crate's stand-in (below).
 
 ## Two layers: authors and the machine
 
@@ -188,21 +188,6 @@ The max of 601 is the most-read item (one entry per site that reads it); it is w
 | **engine peak heap** | **17.9 / 17.8 MB** | **688 / 691 KB** | **715 / 718 KB** |
 
 The section is 68 KB against the 66 KB estimate; the peak is above the 160 KB estimate because the typed instance (0.27 MB, the first open question below) and the instance parser's buffers are live while the plan is built, and the game stand-in keeps every key. Fills are byte-identical to the tree-walking engine for seeds 1 to 20 on both instances (the `golden` example), and `port-check` (5 legacy seeds, 50 inventories, 200 sanity fills) passes every check.
-
-## Standing in for the shared types
-
-`crates/data-fill/src/section_io.rs` holds the only bit and package reading this crate does, under the shared names:
-
-| `section_io` | `crates/bits` / seed-bundle `package` |
-|---|---|
-| `width`, `read`, `bytes_for` | `bits::width`, `bits::read`, `bits::bytes_for` |
-| `Packer::{push, finish}` | `bits::Packer::{push, finish}` |
-| `PackedRef::{from_bytes, get}` | `bits::PackedRef::{from_bytes, get}` |
-| `BitSet::{new, contains, insert, clear}` | `bits::BitSet::{new, contains, insert, clear}` |
-| `stored(file, id)` | `package::stored(file, id)` (returns `BundleError` instead of `String`) |
-| `file_bytes(&[(id, bytes)])` | `package::file_bytes(&[Section])` (adds a magic, a version and a hash per section) |
-
-`read` here takes one unaligned eight-byte load when eight bytes remain, instead of copying; `bits::read` should do the same before the swap, or the solve loses about a third of its speed (measured).
 
 ## What is not decided here
 

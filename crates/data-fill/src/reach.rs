@@ -16,9 +16,10 @@ use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use bits::BitSet;
+
 use crate::fill::Plan;
 use crate::section::{CHECKS, EVENTS, EXITS, Node, STAYS, compare, node, operand};
-use crate::section_io::BitSet;
 use crate::world::World;
 
 /// What a rule reads besides its region's mask.
