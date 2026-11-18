@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# POC mode: formatting only (under a second). Tests run in CI.
+# POC mode: formatting only (under a second). CI runs the unit tests.
 set -euo pipefail
 cargo fmt --all --check

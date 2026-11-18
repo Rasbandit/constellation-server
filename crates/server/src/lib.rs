@@ -8,6 +8,12 @@
 //! With Postgres every room survives a restart: the server claims each room (fencing any older
 //! process), then rebuilds it from the stored snapshot and log tail through `room_core::fold`
 //! and restores the stored applied cursors, before it accepts a connection.
+//!
+//! With `--data-dir` it also serves the admin API for uploads and seed generation
+//! ([`worlds`], run in [`sandbox`]).
+
+mod sandbox;
+mod worlds;
 
 pub mod host;
 pub mod rooms;
@@ -17,7 +23,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use config::{Limits, Secrets};
+use config::{Generation, Limits, Secrets};
 use edge_compat::CompatRoom;
 use host::Host;
 use log::{LogStore, OpenError, PgLogStore};
@@ -55,13 +61,22 @@ pub struct Args {
     pub port: u16,
     /// Address to bind.
     pub host: IpAddr,
+    /// Folder for uploads and generated seeds; turns on the admin API (needs the admin token).
+    pub data_dir: Option<PathBuf>,
+    /// Address of the admin API's own listener (default loopback: it runs uploaded code, so it
+    /// is never on the room's port; reach it through SSH or a TLS proxy).
+    pub admin_host: IpAddr,
+    /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
+    pub admin_port: u16,
 }
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
-     --port <port> [--host <ip>] \
+     --port <port> [--host <ip>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
-     durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE)";
+     durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
+     needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
+     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT)";
 
 impl Args {
     /// Parse the arguments after the program name.
@@ -69,7 +84,8 @@ impl Args {
     /// # Errors
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let (mut source, mut port, mut host) = (None, None, None);
+        let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
+        let (mut admin_host, mut admin_port) = (None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -85,6 +101,13 @@ impl Args {
                 }
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
+                "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--admin-host" => {
+                    admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
+                }
+                "--admin-port" => {
+                    admin_port = Some(value()?.parse().map_err(|_| "--admin-port needs a number")?);
+                }
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -92,6 +115,9 @@ impl Args {
             source: source.ok_or("--bundle or --rooms is required")?,
             port: port.ok_or("--port is required")?,
             host: host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            data_dir,
+            admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            admin_port: admin_port.unwrap_or(0),
         })
     }
 }
@@ -152,6 +178,37 @@ pub fn room_id(seed_name: &str) -> RoomId {
     let mut first = [0_u8; 8];
     first.copy_from_slice(h.get(..8).unwrap_or(&[0; 8]));
     RoomId(u64::from_be_bytes(first))
+}
+
+/// Lowercase hex of `bytes`.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut h, x| {
+        // Writing to a String cannot fail.
+        let _ = write!(h, "{x:02x}");
+        h
+    })
+}
+
+/// The admin API for `--data-dir`, or why it cannot start: it needs the admin token and the
+/// generation paths. Checked before the port is bound or the room claimed.
+fn worlds_api(
+    data_dir: Option<&std::path::Path>,
+    token: Option<&str>,
+    generation: Option<Generation>,
+    limits: Limits,
+) -> Result<Option<Router>, String> {
+    let Some(dir) = data_dir else { return Ok(None) };
+    let token = token.ok_or(
+        "--data-dir serves an admin API that runs uploaded code; set \
+         CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE",
+    )?;
+    let generation = generation.ok_or(
+        "--data-dir needs CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
+         CONSTELLATION_AP_GEN_SCRIPT",
+    )?;
+    worlds::router(dir, token, generation, limits).map(Some)
 }
 
 /// SHA-256 of the bundle file's canonical JSON.
@@ -527,21 +584,47 @@ fn room_ended(r: Result<Stopped, JoinError>) -> RunError {
 ///
 /// # Errors
 /// [`RunError::Fenced`], or [`RunError::Failed`] when the bundle, the socket or the database
-/// fails or the room stopped.
-pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), RunError> {
+/// fails, the room stopped, or `--data-dir` lacks its settings.
+pub async fn run(
+    args: Args,
+    limits: Limits,
+    secrets: Secrets,
+    generation: Option<Generation>,
+) -> Result<(), RunError> {
     let mut stop = shutdown();
     let startup = async {
+        if args.data_dir.is_some() {
+            sandbox::check_host(&limits)?;
+        }
+        let api = worlds_api(
+            args.data_dir.as_deref(),
+            secrets.admin_token.as_deref(),
+            generation,
+            limits,
+        )?;
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;
         let (router, host) =
             app(&args.source, secrets.room_password, secrets.database_url.as_deref(), limits)
                 .await?;
+        let admin = match api {
+            Some(api) => {
+                let at = SocketAddr::new(args.admin_host, args.admin_port);
+                let l = tokio::net::TcpListener::bind(at)
+                    .await
+                    .map_err(|e| format!("bind the admin API: {e}"))?;
+                let addr = l.local_addr().map_err(|e| e.to_string())?;
+                tracing::info!(%addr, "admin api");
+                Some((l, api))
+            }
+            None => None,
+        };
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%addr, rooms = host.len(), "listening");
-        Ok::<_, RunError>((listener, router, host))
+        Ok::<_, RunError>((listener, router, host, admin))
     };
-    let (listener, router, mut host) = tokio::select! {
+    let (listener, router, mut host, admin) = tokio::select! {
         r = startup => r?,
         () = &mut stop => {
             tracing::info!("stopped before listening");
@@ -550,8 +633,16 @@ pub async fn run(args: Args, limits: Limits, secrets: Secrets) -> Result<(), Run
     };
     let serve = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(stop);
+    // The admin API ends with the room's listener (dropped by the select below).
+    let admin = async {
+        match admin {
+            Some((l, api)) => axum::serve(l, api).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
+        r = admin => return Err(RunError::Failed(format!("the admin API stopped: {r:?}"))),
         fatal = host.supervise() => return Err(fatal),
     }
     tracing::info!("stopped");
@@ -607,8 +698,15 @@ mod tests {
         let a = parse("--bundle b.json --port 0").unwrap();
         assert_eq!(a.source, Source::Bundle(PathBuf::from("b.json")));
         assert_eq!((a.port, a.host), (0, IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        let a = parse("--port 38281 --host 0.0.0.0 --bundle x").unwrap();
+        assert_eq!(
+            (a.data_dir, a.admin_host, a.admin_port),
+            (None, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        );
+        let a = parse("--port 38281 --host 0.0.0.0 --bundle x --data-dir /d").unwrap();
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
+        let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
+        assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
         let a = parse("--rooms seeds --port 1").unwrap();
         assert_eq!(a.source, Source::Rooms(PathBuf::from("seeds")));
         let a = parse("--bundle b --port 1 --rooms r --bundle c").unwrap();
@@ -626,6 +724,9 @@ mod tests {
             ("--bundle b --port 1 --host nope", "--host needs an IP"),
             ("--bundle b --port 1 --verbose", "unknown argument"),
             ("--bundle b --port 1 --password pw", "unknown argument"),
+            ("--bundle b --port 1 --data-dir", "--data-dir needs a value"),
+            ("--bundle b --port 1 --admin-port x", "--admin-port needs a number"),
+            ("--bundle b --port 1 --admin-host x", "--admin-host needs an IP"),
         ] {
             assert!(parse(args).unwrap_err().contains(want), "{args:?}");
         }
@@ -670,14 +771,7 @@ mod tests {
     fn the_bundle_hash_is_sha256_of_the_canonical_input_json() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
-        let hex = load_bundle(&fixture, &Limits::DESIGN).unwrap().hash.iter().fold(
-            String::new(),
-            |mut h, x| {
-                use std::fmt::Write;
-                write!(h, "{x:02x}").unwrap();
-                h
-            },
-        );
+        let hex = hex(&load_bundle(&fixture, &Limits::DESIGN).unwrap().hash);
         assert_eq!(hex, "97cee53e7307b8ec357b4419cc1cfd89bfc52d72b57767297d22905ededb9275");
     }
 
@@ -722,6 +816,41 @@ mod tests {
         assert_eq!(room_ended(Ok(Stopped::Failed)).exit_code(), 1);
         assert_eq!(room_ended(Ok(Stopped::Closed)).exit_code(), 1);
         assert_eq!(RunError::from("bind: in use".to_owned()).exit_code(), 1);
+    }
+
+    #[test]
+    fn the_admin_api_is_off_without_a_data_dir_and_refused_without_its_token() {
+        let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
+        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
+        let g = || {
+            Some(Generation {
+                ap_dir: root.join("ap"),
+                python: "/usr/bin/python3".into(),
+                sidecar: root.join("tools/ap-gen/ap_gen.py"),
+                private: vec![],
+            })
+        };
+        assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
+        assert!(worlds_api(None, Some("t"), g(), Limits::DESIGN).unwrap().is_none());
+        let dir = root.join("data");
+        // A temporary upload a previous process left behind is cleared at start.
+        std::fs::create_dir_all(dir.join("tmp/left-behind")).unwrap();
+        let e = worlds_api(Some(&dir), None, g(), Limits::DESIGN).unwrap_err();
+        assert!(e.contains("CONSTELLATION_ADMIN_TOKEN"), "{e}");
+        let e = worlds_api(Some(&dir), Some("t"), None, Limits::DESIGN).unwrap_err();
+        assert!(e.contains("CONSTELLATION_AP_DIR"), "{e}");
+        assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
+        assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
+        assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
+    }
+
+    #[test]
+    fn hex_is_lowercase_two_digits_per_byte() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0, 0x0f, 0xab, 0xff]), "000fabff");
     }
 
     #[test]
