@@ -354,7 +354,10 @@ mod tests {
         let (key, id) = (RoomKey::from_bits(1 << 14), crate::room_id("alpha"));
         let activity = Activity::new(Duration::ZERO);
         rooms
-            .insert(key.clone(), Listing { id, seed: "alpha".into(), room: None, activity })
+            .insert(
+                key.clone(),
+                Listing { id, seed: "alpha".into(), hash: vec![], room: None, activity },
+            )
             .unwrap();
         assert!(!rooms.is_empty());
         assert_eq!(rooms.key_of(id), Some(&key));
