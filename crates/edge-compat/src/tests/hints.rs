@@ -141,6 +141,7 @@ async fn update_hint_by_the_receiver_changes_status_and_notifies_both_sides() {
         assert_eq!(replies[0]["key"], hints_key(slot));
         assert_eq!(replies[0]["value"][0]["status"], 20);
         assert_eq!(hint_prints(&got), [], "a status change prints nothing");
+        assert_eq!(points(&got), None, "and changes no points");
     }
 }
 
@@ -156,9 +157,14 @@ async fn update_hint_by_anyone_else_is_refused_and_found_cannot_be_set() {
         (ps[0]["cmd"].clone(), ps[0]["type"].clone()),
         (json!("InvalidPacket"), json!("arguments"))
     );
+    assert!(ps[0]["text"].as_str().unwrap().contains("receiver"), "{ps:?}");
     for bad in [json!(40), json!(7), json!("x")] {
         let ps = send(&mut b, &up(bad.clone())).await;
         assert_eq!(ps[0]["cmd"], "InvalidPacket", "status {bad}");
+    }
+    for bad in [40, 7] {
+        let ps = send(&mut b, &up(json!(bad))).await;
+        assert!(ps[0]["text"].as_str().unwrap().contains("not a status"), "{ps:?}");
     }
     // An unknown hint and a null status are ignored silently, as in the reference.
     let unknown = json!([{"cmd": "UpdateHint", "player": 1, "location": 101, "status": 30}]);
@@ -351,7 +357,9 @@ async fn hint_prints_reach_only_the_finder_and_the_receiver() {
     send(&mut a, &scout(&[100], &json!(1))).await;
     assert_eq!(hint_prints(&pump(&mut a).await).len(), 1);
     assert_eq!(hint_prints(&pump(&mut b).await).len(), 1);
-    assert_eq!(hint_prints(&pump(&mut c).await).len(), 0);
+    let to_c = pump(&mut c).await;
+    assert_eq!(hint_prints(&to_c).len(), 0);
+    assert_eq!(points(&to_c), None, "no RoomUpdate for a slot the hint does not concern");
 }
 
 #[tokio::test]
