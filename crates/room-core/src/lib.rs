@@ -14,7 +14,7 @@
 //! reads them from the store and calls [`RoomState::restore_applied`].
 //!
 //! The room also holds a key-value store written by `KvSet` (data storage, docs/protocol-plan.md
-//! section 1). `apply` evaluates the operations ([`kv`]); the event carries the resulting value,
+//! section 1). `apply` evaluates the operations (the `kv` module); the event carries the resulting value,
 //! so `fold` never evaluates them again.
 #![no_std]
 
