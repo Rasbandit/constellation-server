@@ -1,17 +1,18 @@
 //! One connection's state machine. Input: text frames from the client and events the room
 //! publishes. Output: text frames to send. The socket loop (`socket.rs`) owns the IO.
 
+use crate::hints;
 use crate::limit::RateTable;
 use crate::presence::{Changed, Who};
 use crate::storage;
 use crate::wire::{
     self, Bounce, CLIENT_GOAL, Connect, ConnectUpdate, Get, GetDataPackage, Locations, NetVersion,
     NetworkItem, NetworkPlayer, NetworkSlot, Permissions, PrintJson, Say, ServerPacket,
-    StatusUpdate, TextPart,
+    StatusUpdate, TextPart, UpdateHint,
 };
 use crate::{CompatRoom, NO_GAME_MIN_VERSION, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
-use proto::{Command, ErrorCode, Event, EventKind, Seq, SlotNo};
-use room_core::{CoreError, RESERVED_KEY_PREFIX, Reply};
+use proto::{Command, ErrorCode, Event, EventKind, HintAsk, HintRequest, Seq, SlotNo};
+use room_core::{CoreError, Hint, HintRefusal, Hinted, RESERVED_KEY_PREFIX, Reply, hint_status};
 use runtime::{Note, Published, Subscription};
 use seed_bundle::{Slot, SlotKind};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ enum Fanout {
     Bounce { team: u32, targets: Bounce, packet: Map<String, Value> },
     /// A read-only key changed: a `SetReply` for the clients watching it.
     KeyChanged { key: String, value: Value },
+    /// `Hint` prints for the finders and receivers among `hints`, only on `to` when set.
+    Hints { hints: Vec<Hint>, to: Option<u32> },
 }
 
 /// Which items a client wants (section `items_handling flags`).
@@ -98,6 +101,13 @@ struct Joined {
     /// This connection's own key writes not yet seen in the stream: already answered from the
     /// room's reply, so the published copy is skipped (exactly one `SetReply` per write).
     own_writes: BTreeSet<Seq>,
+    /// Hints the slot paid for, so far.
+    used: u64,
+    /// The last hint list sent for each watched `_read_hints_` key, by slot: a change is
+    /// told, the same list is not.
+    hint_lists: BTreeMap<u32, Vec<Hint>>,
+    /// Watched hint lists the last events may have changed; reread from the room.
+    stale_hints: BTreeSet<u32>,
 }
 
 impl Joined {
@@ -245,15 +255,16 @@ impl Session {
             }
             "Sync" => Ok(self.full_items().into_iter().collect()),
             "LocationChecks" => self.location_checks(parse(cmd, p)?).await,
-            "LocationScouts" => Ok(vec![self.scout(&parse(cmd, p)?)?]),
+            "LocationScouts" => self.scout(&parse(cmd, p)?).await,
             "StatusUpdate" => self.status(&parse(cmd, p)?).await,
             "Say" => self.say(parse(cmd, p)?).await,
             "Bounce" => self.bounce(p).await,
             "Get" => self.get(p).await,
             "Set" => self.set(p).await,
-            "SetNotify" => self.set_notify(&p),
+            "SetNotify" => self.set_notify(&p).await,
             "ConnectUpdate" => self.connect_update(parse(cmd, p)?),
-            "CreateHints" | "UpdateHint" => Err(Step::from(invalid(
+            "UpdateHint" => self.update_hint(&parse(cmd, p)?).await,
+            "CreateHints" => Err(Step::from(invalid(
                 "cmd",
                 Some(cmd),
                 format!("{cmd} is not supported by this server yet"),
@@ -270,9 +281,9 @@ impl Session {
             return Ok(vec![wire::frame(&[ServerPacket::ConnectionRefused { errors }])]);
         };
         // Leave the old subscription first, so the room can prune its queue.
-        let (previous, watch) = match self.joined.take() {
-            Some(j) => (Some((j.team, j.slot)), j.watch),
-            None => (None, BTreeSet::new()),
+        let (previous, watch, hint_lists) = match self.joined.take() {
+            Some(j) => (Some((j.team, j.slot)), j.watch, j.hint_lists),
+            None => (None, BTreeSet::new(), BTreeMap::new()),
         };
         let Subscription { history, live } =
             self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
@@ -293,10 +304,15 @@ impl Session {
             cursor: Seq(0),
             watch,
             own_writes: BTreeSet::new(),
+            used: 0,
+            hint_lists,
+            stale_hints: BTreeSet::new(),
         };
         for e in &history {
             fold(&self.room, &mut j, e);
         }
+        // Lists watched before this re-Connect may have changed meanwhile.
+        j.stale_hints = j.hint_lists.keys().copied().collect();
         let connected = self.connected(&j, slot, c.slot_data);
         let wanted = j.wanted();
         j.sent = wanted.len();
@@ -305,6 +321,7 @@ impl Session {
         if !wanted.is_empty() {
             packets.push(ServerPacket::ReceivedItems { index: 0, items: wanted });
         }
+        packets.extend(self.refresh_hints().await?);
         // A re-Connect to the same slot announces nothing; to another slot it leaves the old one.
         if previous.is_none_or(|(_, old)| old != slot.id) {
             if let Some((old_team, old)) = previous {
@@ -372,14 +389,40 @@ impl Session {
         }
     }
 
+    /// Reread the watched hint lists the last events may have changed, and tell the ones that
+    /// did change (reference `MultiServer.py:962-966`: only `key` and `value`).
+    async fn refresh_hints(&mut self) -> Result<Vec<ServerPacket>, Step> {
+        let room = Arc::clone(&self.room);
+        let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
+        let slots = std::mem::take(&mut j.stale_hints);
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lists = read_hint_lists(&room, slots).await?;
+        let mut out = Vec::new();
+        for (slot, list) in lists {
+            if j.hint_lists.get(&slot) == Some(&list) {
+                continue;
+            }
+            let team = room.bundle.slot(slot).map_or(0, |s| s.team);
+            let key = storage::hints_key(team, slot);
+            if j.watch.contains(&key) {
+                let value = hints::list(&room, &list);
+                out.push(ServerPacket::SetReply(storage::read_only_reply(&key, value)));
+            }
+            j.hint_lists.insert(slot, list);
+        }
+        Ok(out)
+    }
+
     /// Handle one published room message.
     ///
     /// # Errors
-    /// Never today; kept so the socket loop treats every input alike.
-    pub fn on_published(&mut self, p: &Published) -> Result<Vec<String>, Closed> {
+    /// [`Closed`] when the room is gone while a changed hint list is reread.
+    pub async fn on_published(&mut self, p: &Published) -> Result<Vec<String>, Closed> {
         let room = Arc::clone(&self.room);
         let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
-        let packets = match p {
+        let mut packets = match p {
             Published::Events { events, notes } => events_packets(&room, j, events, notes),
             Published::Ext { body, .. } => {
                 match serde_json::from_value::<Fanout>((**body).clone()) {
@@ -395,7 +438,17 @@ impl Session {
                     Ok(Fanout::KeyChanged { key, value }) if j.watch.contains(&key) => {
                         vec![ServerPacket::SetReply(storage::read_only_reply(&key, value))]
                     }
-                    Ok(Fanout::Print { .. } | Fanout::KeyChanged { .. }) => Vec::new(),
+                    Ok(Fanout::Hints { hints, to })
+                        if !j.no_text() && to.is_none_or(|t| t == j.slot) =>
+                    {
+                        hints::for_slot(j.slot, &hints)
+                            .iter()
+                            .map(|h| ServerPacket::PrintJson(hints::print(&room, h)))
+                            .collect()
+                    }
+                    Ok(Fanout::Print { .. } | Fanout::KeyChanged { .. } | Fanout::Hints { .. }) => {
+                        Vec::new()
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "unreadable fan-out body");
                         Vec::new()
@@ -403,6 +456,7 @@ impl Session {
                 }
             }
         };
+        packets.extend(self.refresh_hints().await.map_err(|_| Closed)?);
         Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })
     }
 
@@ -419,7 +473,8 @@ impl Session {
         j.live = live;
         // The log has no notes: watchers get `null` for `original_value` and no pass-through
         // fields for the writes they missed (docs/protocol-plan.md 1.4).
-        let packets = events_packets(&room, j, &history, &[]);
+        let mut packets = events_packets(&room, j, &history, &[]);
+        packets.extend(self.refresh_hints().await.map_err(|_| Closed)?);
         Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })
     }
 
@@ -459,6 +514,15 @@ impl Session {
     async fn fan(&self, from: u32, f: &Fanout) -> Result<(), Step> {
         let body = serde_json::to_value(f).map_err(|_| Step::Closed)?;
         self.room.room.ext(SlotNo(from), Arc::new(body)).await.map_err(|_| Step::Closed)
+    }
+
+    /// Hint prints for their finders and receivers (only on `to` when set); nothing to send
+    /// for no hints.
+    async fn fan_hints(&self, from: u32, hints: Vec<Hint>, to: Option<u32>) -> Result<(), Step> {
+        if hints.is_empty() {
+            return Ok(());
+        }
+        self.fan(from, &Fanout::Hints { hints, to }).await
     }
 
     fn data_package(&self, req: &GetDataPackage) -> String {
@@ -503,18 +567,23 @@ impl Session {
     }
 
     /// One answer per requested id, in request order; an id outside the slot's world refuses
-    /// the whole packet.
-    fn scout(&self, req: &Locations) -> Result<String, Step> {
-        let slot = self.joined.as_ref().and_then(|j| self.room.bundle.slot(j.slot));
-        let slot = slot.ok_or(Step::Closed)?;
+    /// the whole packet. With `create_as_hint`, each location also becomes a free hint, kept
+    /// even when found, announced to its finder and receiver (only the new ones with 2;
+    /// reference `MultiServer.py:2086-2105`).
+    async fn scout(&self, req: &Locations) -> Result<Vec<String>, Step> {
+        let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        let slot = self.room.bundle.slot(j.slot).ok_or(Step::Closed)?;
+        let refuse = |text: String| Step::from(invalid("arguments", Some("LocationScouts"), text));
+        let create = req.create_as_hint().ok_or_else(|| {
+            refuse("LocationScouts: create_as_hint must be an integer".to_owned())
+        })?;
         let world: BTreeMap<i64, _> = slot.locations.iter().map(|p| (p.location, p)).collect();
         let locations = req
             .locations
             .iter()
             .map(|l| {
                 let p = world.get(l).ok_or_else(|| {
-                    let text = format!("LocationScouts: location {l} is not in this world");
-                    Step::from(invalid("arguments", Some("LocationScouts"), text))
+                    refuse(format!("LocationScouts: location {l} is not in this world"))
                 })?;
                 Ok(NetworkItem {
                     item: p.item,
@@ -524,7 +593,90 @@ impl Session {
                 })
             })
             .collect::<Result<_, Step>>()?;
-        Ok(wire::frame(&[ServerPacket::LocationInfo { locations }]))
+        if create != 0 {
+            Self::rate(&self.room.hint_writes, j.slot, "LocationScouts")?;
+            let asks = req
+                .locations
+                .iter()
+                .map(|&location| HintAsk {
+                    finding: SlotNo(j.slot),
+                    location,
+                    status: hint_status::UNSPECIFIED,
+                })
+                .collect();
+            let h = self.hint(j.slot, asks, false).await?;
+            let hints = h.shown.iter().filter(|s| create != 2 || s.new).map(|s| s.hint).collect();
+            self.fan_hints(j.slot, hints, None).await?;
+        }
+        Ok(vec![wire::frame(&[ServerPacket::LocationInfo { locations }])])
+    }
+
+    /// Ask the room for hints; `pay` for the chat commands.
+    async fn hint(&self, slot: u32, asks: Vec<HintAsk>, pay: bool) -> Result<Box<Hinted>, Step> {
+        let req = HintRequest { slot: SlotNo(slot), asks, pay, keep_found: !pay };
+        match self.room.room.command(Command::Hint(Box::new(req))).await {
+            Ok(Ok(Reply::Hinted(h))) => Ok(h),
+            _ => Err(Step::Closed),
+        }
+    }
+
+    /// `UpdateHint`: only the hint's receiver may change it, never to found; an unknown hint
+    /// or a `null` status changes nothing (reference `MultiServer.py:2159-2201`).
+    async fn update_hint(&self, req: &UpdateHint) -> Result<Vec<String>, Step> {
+        let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        let Some(status) = req.status else { return Ok(Vec::new()) };
+        Self::rate(&self.room.hint_writes, j.slot, "UpdateHint")?;
+        let cmd = Command::HintStatus {
+            slot: SlotNo(j.slot),
+            finding: SlotNo(req.player),
+            location: req.location,
+            status,
+        };
+        let text = match self.room.room.command(cmd).await.map_err(|_| Step::Closed)? {
+            Ok(_) => return Ok(Vec::new()),
+            Err(CoreError::Hint(HintRefusal::NoPermission)) => {
+                "UpdateHint: only the hint's receiver may change it"
+            }
+            Err(CoreError::Hint(HintRefusal::BadStatus(_))) => {
+                "UpdateHint: not a status a hint can be set to"
+            }
+            Err(_) => "UpdateHint: no such slot",
+        };
+        Err(Step::from(invalid("arguments", Some("UpdateHint"), text)))
+    }
+
+    /// `!hint` and `!hint_location` (reference `MultiServer.py:1775-1918`): with no argument,
+    /// the slot's hints to itself and what a hint costs; else the named item's locations (or
+    /// the named location), paid as the room decides.
+    async fn bang_hint(&self, arg: &str, kind: hints::Kind) -> Result<Vec<String>, Step> {
+        let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        let me = j.slot;
+        let slot = self.room.bundle.slot(me).ok_or(Step::Closed)?;
+        let result = |text: String| {
+            let print = PrintJson {
+                kind: "CommandResult".to_owned(),
+                data: json!([TextPart::text(text)]),
+                ..PrintJson::default()
+            };
+            Ok(vec![wire::frame(&[ServerPacket::PrintJson(print)])])
+        };
+        if arg.is_empty() {
+            let read = self.room.room.read(move |s| {
+                let n = SlotNo(me);
+                (s.hints_of(n), s.hint_cost(n), s.hint_points(n))
+            });
+            let (hints, cost, points) = read.await.map_err(|_| Step::Closed)?;
+            self.fan_hints(me, hints, Some(me)).await?;
+            return result(hints::summary(cost, points));
+        }
+        let asks = match hints::resolve(&self.room, slot, arg, kind) {
+            Ok(asks) => asks,
+            Err(text) => return result(text),
+        };
+        let h = self.hint(me, asks, true).await?;
+        let hints = h.shown.iter().map(|s| s.hint).collect();
+        self.fan_hints(me, hints, None).await?;
+        hints::outcome(&h, arg).map_or_else(|| Ok(Vec::new()), result)
     }
 
     async fn status(&self, req: &StatusUpdate) -> Result<Vec<String>, Step> {
@@ -561,25 +713,36 @@ impl Session {
         }
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
         Self::rate(&self.room.fanout, j.slot, "Say")?;
-        if req.text.starts_with('!') {
+        // Every `!` text but `!admin` is chat too (reference `MultiServer.py:1510-1514`).
+        if !req.text.starts_with("!admin") {
+            let name = self.room.bundle.slot(j.slot).map_or("", |s| s.name.as_str());
             let print = PrintJson {
-                kind: "CommandResult".to_owned(),
-                data: json!([TextPart::text("Commands are not supported by this server yet.")]),
+                kind: "Chat".to_owned(),
+                data: json!([TextPart::text(format!("{name}: {}", req.text))]),
+                team: Some(j.team),
+                slot: Some(j.slot),
+                message: Some(req.text.clone()),
                 ..PrintJson::default()
             };
-            return Ok(vec![wire::frame(&[ServerPacket::PrintJson(print)])]);
+            self.fan(j.slot, &Fanout::Print { print }).await?;
         }
-        let name = self.room.bundle.slot(j.slot).map_or("", |s| s.name.as_str());
-        let print = PrintJson {
-            kind: "Chat".to_owned(),
-            data: json!([TextPart::text(format!("{name}: {}", req.text))]),
-            team: Some(j.team),
-            slot: Some(j.slot),
-            message: Some(req.text),
-            ..PrintJson::default()
-        };
-        self.fan(j.slot, &Fanout::Print { print }).await?;
-        Ok(Vec::new())
+        let Some(command) = req.text.strip_prefix('!') else { return Ok(Vec::new()) };
+        // The command name ignores case; the argument is the rest of the line as typed.
+        let (name, arg) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
+        match name.to_lowercase().as_str() {
+            "hint" => self.bang_hint(arg.trim_start(), hints::Kind::Item).await,
+            "hint_location" => self.bang_hint(arg.trim_start(), hints::Kind::Location).await,
+            _ => {
+                let print = PrintJson {
+                    kind: "CommandResult".to_owned(),
+                    data: json!([TextPart::text(format!(
+                        "!{name} is not supported by this server yet."
+                    ))]),
+                    ..PrintJson::default()
+                };
+                Ok(vec![wire::frame(&[ServerPacket::PrintJson(print)])])
+            }
+        }
     }
 
     async fn bounce(&self, p: Value) -> Result<Vec<String>, Step> {
@@ -622,7 +785,9 @@ impl Session {
             req.keys.iter().filter(|k| !k.starts_with(RESERVED_KEY_PREFIX)).cloned().collect();
         let status: Vec<u32> =
             req.keys.iter().filter_map(|k| storage::status_slot(room, k)).map(|s| s.id).collect();
-        let (values, goals) = room
+        let hinted: Vec<u32> =
+            req.keys.iter().filter_map(|k| storage::hints_slot(room, k)).map(|s| s.id).collect();
+        let (values, goals, hint_lists) = room
             .room
             .read(move |s| {
                 let values: BTreeMap<String, Value> = stored
@@ -634,7 +799,9 @@ impl Session {
                     .collect();
                 let goals: BTreeSet<u32> =
                     status.into_iter().filter(|&n| s.has_goal(SlotNo(n))).collect();
-                (values, goals)
+                let hints: BTreeMap<u32, Vec<Hint>> =
+                    hinted.into_iter().map(|n| (n, s.hints_of(SlotNo(n)))).collect();
+                (values, goals, hints)
             })
             .await
             .map_err(|_| Step::Closed)?;
@@ -644,6 +811,10 @@ impl Session {
                 v.clone()
             } else if let Some(v) = storage::read_only(room, &k) {
                 v
+            } else if let Some(list) =
+                storage::hints_slot(room, &k).and_then(|s| hint_lists.get(&s.id))
+            {
+                hints::list(room, list)
             } else if let Some(slot) = storage::status_slot(room, &k) {
                 let presence = room.presence.status(slot.id).await;
                 Value::from(storage::status_value(slot, goals.contains(&slot.id), presence))
@@ -711,7 +882,7 @@ impl Session {
     }
 
     /// Watch keys for this connection; nothing is sent back (reference `MultiServer.py:2306-2312`).
-    fn set_notify(&mut self, p: &Value) -> Result<Vec<String>, Step> {
+    async fn set_notify(&mut self, p: &Value) -> Result<Vec<String>, Step> {
         let req: Get = parse("SetNotify", p.clone())?;
         self.key_count("SetNotify", req.keys.len())?;
         let max = self.room.limits.kv_max_watched_keys;
@@ -721,7 +892,20 @@ impl Session {
             let text = "SetNotify: too many watched keys on this connection";
             return Err(Step::from(invalid("arguments", Some("SetNotify"), text)));
         }
+        // A watched hint list is read now, so a later change can be told from no change.
+        let fresh: BTreeSet<u32> = req
+            .keys
+            .iter()
+            .filter_map(|k| storage::hints_slot(&self.room, k))
+            .map(|s| s.id)
+            .filter(|n| !j.hint_lists.contains_key(n))
+            .collect();
         j.watch.extend(req.keys);
+        if !fresh.is_empty() {
+            let lists = read_hint_lists(&self.room, fresh).await?;
+            let j = self.joined.as_mut().ok_or(Step::Closed)?;
+            j.hint_lists.extend(lists);
+        }
         Ok(Vec::new())
     }
 
@@ -803,10 +987,22 @@ fn refusals<'a>(
     (errors, handling.map(|h| (team, slot, h)))
 }
 
-/// Points per check times checks; no hints are spent yet.
+/// The slot's hint points, by the room's rule (`room_core::HintRules::points`) over this
+/// view's checks and paid hints.
 fn hint_points(room: &CompatRoom, j: &Joined) -> i64 {
-    let per = i64::from(room.bundle.server_options.location_check_points);
-    per.saturating_mul(i64::try_from(j.checked.len()).unwrap_or(i64::MAX))
+    let size = room.bundle.slot(j.slot).map_or(0, |s| s.locations.len());
+    room.hint_rules.points(size, j.checked.len(), j.used)
+}
+
+/// The current hint list of each slot, from the room.
+async fn read_hint_lists(
+    room: &CompatRoom,
+    slots: BTreeSet<u32>,
+) -> Result<BTreeMap<u32, Vec<Hint>>, Step> {
+    let read = room.room.read(move |s| {
+        slots.into_iter().map(|n| (n, s.hints_of(SlotNo(n)))).collect::<BTreeMap<_, _>>()
+    });
+    read.await.map_err(|_| Step::Closed)
 }
 
 /// Apply a durable event to a session's view of the room. Returns the item an `Item` event
@@ -822,10 +1018,13 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
             None
         }
         // The goal and stored values are read from the room when asked for.
-        EventKind::Goal
-        | EventKind::KvSet { .. }
-        | EventKind::HintAdded { .. }
-        | EventKind::HintStatus { .. } => None,
+        EventKind::HintAdded { paid, .. } => {
+            if paid && slot == j.slot {
+                j.used = j.used.saturating_add(1);
+            }
+            None
+        }
+        EventKind::Goal | EventKind::KvSet { .. } | EventKind::HintStatus { .. } => None,
         EventKind::Item { from, location, item, .. } => {
             let it =
                 NetworkItem { item, location, player: from.0, flags: room.flags(from.0, location) };
@@ -848,6 +1047,7 @@ fn events_packets(
 ) -> Vec<ServerPacket> {
     let (mut checked, mut items, mut prints) = (Vec::new(), Vec::new(), Vec::new());
     let mut replies = Vec::new();
+    let mut points_changed = false;
     for e in evs {
         let slot = e.slot.map_or(0, |s| s.0);
         let was = j.checked.len();
@@ -865,8 +1065,30 @@ fn events_packets(
                     replies.push(ServerPacket::SetReply(reply));
                 }
             }
-            (&EventKind::Checked { location, .. }, _) if j.checked.len() != was => {
-                checked.push(location);
+            (&EventKind::Checked { location, .. }, _) => {
+                if j.checked.len() != was {
+                    checked.push(location);
+                }
+                // A watched list holding this location unfound now reads it as found.
+                let touched = j.hint_lists.iter().filter(|(_, l)| {
+                    l.iter().any(|h| h.finding.0 == slot && h.location == location && !h.found)
+                });
+                let touched: Vec<u32> = touched.map(|(&n, _)| n).collect();
+                j.stale_hints.extend(touched);
+            }
+            (
+                &(EventKind::HintAdded { finding, location, .. }
+                | EventKind::HintStatus { finding, location, .. }),
+                _,
+            ) => {
+                let receiver = room.placed.get(&(finding.0, location)).map_or(0, |p| p.receiver);
+                let concerned = [finding.0, receiver];
+                if matches!(e.kind, EventKind::HintAdded { .. }) && concerned.contains(&j.slot) {
+                    points_changed = true;
+                }
+                let watched = concerned.into_iter().filter(|n| j.hint_lists.contains_key(n));
+                let watched: Vec<u32> = watched.collect();
+                j.stale_hints.extend(watched);
             }
             (&EventKind::Item { .. }, Some(it)) => {
                 if slot == j.slot && j.handling.wants(j.slot, &it) {
@@ -891,9 +1113,10 @@ fn events_packets(
         }
     }
     let mut packets = Vec::new();
-    if !checked.is_empty() {
+    if !checked.is_empty() || points_changed {
         let hint_points = hint_points(room, j);
-        packets.push(ServerPacket::RoomUpdate { checked_locations: checked, hint_points });
+        let checked_locations = (!checked.is_empty()).then_some(checked);
+        packets.push(ServerPacket::RoomUpdate { checked_locations, hint_points });
     }
     if !items.is_empty() {
         let index = j.sent;

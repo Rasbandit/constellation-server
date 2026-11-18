@@ -6,6 +6,7 @@
 //! [`CompatRoom`] holds one room's fixed data, prepared once; [`Session`] is one connection's
 //! state machine; [`serve`] runs a session over a `yawc` WebSocket.
 
+mod hints;
 mod limit;
 mod presence;
 mod session;
@@ -16,8 +17,9 @@ pub mod wire;
 use config::Limits;
 use limit::RateTable;
 use proto::Cid;
+use room_core::HintRules;
 use runtime::RoomHandle;
-use seed_bundle::SeedBundle;
+use seed_bundle::{Placed, SeedBundle};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -42,8 +44,12 @@ pub struct CompatRoom {
     bundle: Arc<SeedBundle>,
     room: RoomHandle,
     password: Option<String>,
-    /// `(slot, location)` to item flags.
-    flags: BTreeMap<(u32, i64), u8>,
+    /// `(slot, location)` to what is placed there.
+    placed: BTreeMap<(u32, i64), Placed>,
+    /// `(receiving slot, item)` to every `(slot, location)` holding it, for `!hint`.
+    by_item: BTreeMap<(u32, i64), Vec<(u32, i64)>>,
+    /// The hint economy, from the seed (the room holds the same rules).
+    hint_rules: HintRules,
     /// Game name to its data package as JSON, serialized once (R4: no heavy work per request).
     packages: BTreeMap<String, String>,
     limits: Limits,
@@ -57,6 +63,8 @@ pub struct CompatRoom {
     kv_sets: RateTable<u32>,
     /// Bytes `Set` packets logged, per slot (every write is logged in full).
     kv_bytes: RateTable<u32>,
+    /// Packets that write hints (scouts creating hints, `UpdateHint`), per slot.
+    hint_writes: RateTable<u32>,
     /// Who is connected to each slot, and the client statuses they set.
     presence: presence::Presence,
 }
@@ -82,11 +90,17 @@ impl CompatRoom {
         password: Option<String>,
         limits: Limits,
     ) -> Result<Self, String> {
-        let flags = bundle
+        let placed: BTreeMap<(u32, i64), Placed> = bundle
             .slots
             .iter()
-            .flat_map(|s| s.locations.iter().map(move |p| ((s.id, p.location), p.flags)))
+            .flat_map(|s| s.locations.iter().map(move |p| ((s.id, p.location), *p)))
             .collect();
+        let mut by_item: BTreeMap<(u32, i64), Vec<(u32, i64)>> = BTreeMap::new();
+        for (&at, p) in &placed {
+            by_item.entry((p.receiver, p.item)).or_default().push(at);
+        }
+        let o = &bundle.server_options;
+        let hint_rules = HintRules { cost_pct: o.hint_cost, check_points: o.location_check_points };
         // Name groups are not part of the package clients get; they read them through `Get`
         // (reference server: the reduced package, `MultiServer.py:624-641`).
         let packages = bundle
@@ -109,7 +123,9 @@ impl CompatRoom {
             bundle,
             room,
             password,
-            flags,
+            placed,
+            by_item,
+            hint_rules,
             packages,
             limits,
             fanout: RateTable::new(l.fanout_burst, l.fanout_refill_milli_per_sec, keys),
@@ -125,12 +141,13 @@ impl CompatRoom {
                 l.kv_write_bytes_refill_milli_per_sec,
                 keys,
             ),
+            hint_writes: RateTable::new(l.hint_burst, l.hint_refill_milli_per_sec, keys),
             presence: presence::Presence::default(),
         })
     }
 
     fn flags(&self, slot: u32, location: i64) -> u8 {
-        self.flags.get(&(slot, location)).copied().unwrap_or(0)
+        self.placed.get(&(slot, location)).map_or(0, |p| p.flags)
     }
 }
 

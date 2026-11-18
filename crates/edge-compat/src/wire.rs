@@ -113,19 +113,28 @@ pub struct TextPart {
     /// Item flags, for `item_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flags: Option<u8>,
+    /// The status, for `hint_status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint_status: Option<u8>,
 }
 
 impl TextPart {
     /// Plain text.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
-        Self { kind: None, text: text.into(), player: None, flags: None }
+        Self { kind: None, text: text.into(), player: None, flags: None, hint_status: None }
     }
 
     /// A slot reference, rendered by the client with the player's name.
     #[must_use]
     pub fn player(slot: u32) -> Self {
-        Self { kind: Some("player_id"), text: slot.to_string(), player: None, flags: None }
+        Self {
+            kind: Some("player_id"),
+            text: slot.to_string(),
+            player: None,
+            flags: None,
+            hint_status: None,
+        }
     }
 
     /// An item of `receiver`'s world.
@@ -136,6 +145,7 @@ impl TextPart {
             text: item.to_string(),
             player: Some(receiver),
             flags: Some(flags),
+            hint_status: None,
         }
     }
 
@@ -147,8 +157,52 @@ impl TextPart {
             text: location.to_string(),
             player: Some(owner),
             flags: None,
+            hint_status: None,
         }
     }
+
+    /// An entrance name (worlds with shuffled entrances).
+    #[must_use]
+    pub fn entrance(name: impl Into<String>) -> Self {
+        Self { kind: Some("entrance_name"), ..Self::text(name) }
+    }
+
+    /// A hint status, with its name as the text (protocol doc, "`HintStatus`").
+    #[must_use]
+    pub fn hint_status(status: u8) -> Self {
+        let name = match status {
+            0 => "(unspecified)",
+            10 => "(no priority)",
+            20 => "(avoid)",
+            30 => "(priority)",
+            40 => "(found)",
+            _ => "(unknown)",
+        };
+        Self { kind: Some("hint_status"), hint_status: Some(status), ..Self::text(name) }
+    }
+}
+
+/// `Hint` (protocol doc, "Hint"), tagged with its class like the reference sends it
+/// (`NetUtils.py:98-104` tags every such record).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "class")]
+pub struct Hint {
+    /// The slot the item goes to.
+    pub receiving_player: u32,
+    /// The slot whose world holds the location.
+    pub finding_player: u32,
+    /// The location.
+    pub location: i64,
+    /// The item.
+    pub item: i64,
+    /// The location is checked.
+    pub found: bool,
+    /// The entrance the location is behind, or empty.
+    pub entrance: String,
+    /// 1 progression, 2 useful, 4 trap.
+    pub item_flags: u8,
+    /// `HintStatus`.
+    pub status: u8,
 }
 
 /// `PrintJSON`. Only `data` is needed to show it; the rest depends on `type`.
@@ -159,10 +213,13 @@ pub struct PrintJson {
     pub kind: String,
     /// The message.
     pub data: Value,
-    /// `ItemSend`: the receiving slot.
+    /// `ItemSend`, `Hint`: the receiving slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiving: Option<u32>,
-    /// `ItemSend`: the item, `player` being the finder.
+    /// `Hint`: the location is checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<bool>,
+    /// `ItemSend`, `Hint`: the item, `player` being the finder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item: Option<NetworkItem>,
     /// `Join`, `Part`, `Chat`, `Goal`: the player's team.
@@ -248,8 +305,9 @@ pub enum ServerPacket {
     },
     /// `RoomUpdate`, only the fields we change.
     RoomUpdate {
-        /// Newly checked locations.
-        checked_locations: Vec<i64>,
+        /// Newly checked locations, when there are any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checked_locations: Option<Vec<i64>>,
         /// Hint points after the change.
         hint_points: i64,
     },
@@ -321,9 +379,34 @@ pub struct ConnectUpdate {
 pub struct Locations {
     /// Location ids in the sender's world.
     pub locations: Vec<i64>,
-    /// `LocationScouts` only: create hints (not supported yet, see `docs/compat-status.md`).
+    /// `LocationScouts` only: 0 no hints, 2 announce only new hints, anything else announce
+    /// all. An integer or a boolean (the reference reads it with Python's `int()`).
     #[serde(default)]
-    pub create_as_hint: i64,
+    pub create_as_hint: Value,
+}
+
+impl Locations {
+    /// `create_as_hint` as a number; `None` when it is neither an integer nor a boolean.
+    #[must_use]
+    pub fn create_as_hint(&self) -> Option<i64> {
+        match &self.create_as_hint {
+            Value::Null => Some(0),
+            Value::Bool(b) => Some(i64::from(*b)),
+            v => v.as_i64(),
+        }
+    }
+}
+
+/// Section `UpdateHint`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateHint {
+    /// The slot whose world holds the hinted location.
+    pub player: u32,
+    /// The location.
+    pub location: i64,
+    /// The new status; missing or `null` changes nothing.
+    #[serde(default)]
+    pub status: Option<u8>,
 }
 
 /// Section `StatusUpdate`.

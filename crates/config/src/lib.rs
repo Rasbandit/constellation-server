@@ -104,6 +104,12 @@ pub struct Limits {
     /// Most data storage bytes a room may ever log (the log is not compacted yet), bytes
     /// (estimate; a room past it refuses writes with `room.storage_full`).
     pub kv_max_room_log_bytes: u64,
+    /// Packets that write hints (scouts that create hints, `UpdateHint`) a slot may send in a
+    /// burst. Each can log events, so it has its own bucket; `!hint` shares chat's (estimate,
+    /// docs/protocol-plan.md 2.5).
+    pub hint_burst: u32,
+    /// Refill of that bucket, thousandths per second (1000 = 1 per second).
+    pub hint_refill_milli_per_sec: u32,
 }
 
 impl Limits {
@@ -150,6 +156,8 @@ impl Limits {
         kv_write_bytes_burst: 256 * 1024,
         kv_write_bytes_refill_milli_per_sec: 4096 * 1000,
         kv_max_room_log_bytes: 512 * 1024 * 1024,
+        hint_burst: 10,
+        hint_refill_milli_per_sec: 1000,
     };
 }
 
@@ -503,6 +511,7 @@ mod tests {
     #[test]
     fn session_rate_limits_are_design_values() {
         let l = Limits::DESIGN;
+        assert_eq!((l.hint_burst, l.hint_refill_milli_per_sec), (10, 1000));
         assert_eq!((l.fanout_burst, l.fanout_refill_milli_per_sec), (10, 2000));
         assert_eq!((l.chat_max_bytes, l.bounce_max_bytes), (2048, 16384));
         assert_eq!((l.datapackage_burst, l.datapackage_refill_milli_per_sec), (4, 100));

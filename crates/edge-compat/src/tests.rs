@@ -85,7 +85,7 @@ async fn pump(s: &mut Session) -> Vec<Value> {
             None => return Vec::new(),
         };
         match next {
-            Ok(p) => frames.extend(s.on_published(&p).unwrap()),
+            Ok(p) => frames.extend(s.on_published(&p).await.unwrap()),
             Err(TryRecvError::Empty) => return packets(&frames),
             Err(TryRecvError::Disconnected) => {
                 // A resync that does not resubscribe leaves the queue closed: fail, do not spin.
@@ -394,7 +394,7 @@ async fn chat_reaches_everyone_and_no_text_clients_skip_prints() {
     assert_eq!(chat[0]["type"], "Chat");
     assert_eq!(chat[0]["message"], "hello");
     assert_eq!(pump(&mut quiet).await, Vec::<Value>::new());
-    let ps = send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await;
+    let ps = send(&mut a, &json!([{"cmd": "Say", "text": "!release"}])).await;
     assert_eq!(ps[0]["type"], "CommandResult");
 }
 
@@ -438,7 +438,7 @@ async fn connect_update_changes_items_handling_and_resends_items() {
 #[tokio::test]
 async fn unsupported_commands_say_so() {
     let mut a = joined(&room(), "A").await;
-    for cmd in ["CreateHints", "UpdateHint"] {
+    for cmd in ["CreateHints"] {
         let ps = send(&mut a, &json!([{"cmd": cmd}])).await;
         assert_eq!(ps[0]["original_cmd"], cmd);
         assert!(ps[0]["text"].as_str().unwrap().contains("not supported"));
@@ -1006,9 +1006,9 @@ async fn chat_and_command_prints_have_the_shape_clients_display() {
             "team": 0, "slot": 1, "message": "hello"})]
     );
     assert_eq!(
-        send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await,
+        send(&mut a, &json!([{"cmd": "Say", "text": "!release"}])).await,
         [json!({"cmd": "PrintJSON", "type": "CommandResult",
-            "data": [{"text": "Commands are not supported by this server yet."}]})]
+            "data": [{"text": "!release is not supported by this server yet."}]})]
     );
 }
 
@@ -1661,3 +1661,5 @@ async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
     let text = send(&mut a, &p).await[0]["text"].as_str().unwrap().to_owned();
     assert!(text.contains("room.storage_full") && text.contains("3003"), "{text}");
 }
+
+mod hints;
