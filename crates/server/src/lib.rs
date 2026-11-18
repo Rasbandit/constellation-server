@@ -186,7 +186,7 @@ pub async fn app(
 ) -> Result<(Router, JoinHandle<Stopped>), String> {
     let Loaded { bundle, hash } = loaded;
     let room = room_id(&bundle.seed_name);
-    let fresh = RoomState::new(bundle.slot_nos(), bundle.placement()).map_err(|e| e.to_string())?;
+    let fresh = bundle.room_state().map_err(|e| e.to_string())?;
     let (live, mailbox) = RoomHandle::mailbox(&limits);
     let (seed_name, format) = (bundle.seed_name.clone(), bundle.format);
     let compat = Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password, limits)?);

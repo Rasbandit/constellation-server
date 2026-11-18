@@ -6,7 +6,7 @@
 //! compatible with Archipelago asks for them; only `edge-compat` interprets them.
 
 use proto::SlotNo;
-use room_core::Placement;
+use room_core::{CoreError, HintRules, Placement, RoomState};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -38,6 +38,22 @@ pub struct SeedBundle {
     /// The generator's race mode flag (0 or 1); clients read it as `_read_race_mode`.
     #[serde(default)]
     pub race_mode: u8,
+    /// Hints every room of this seed starts with (the generator's start hints and start
+    /// location hints), once each.
+    #[serde(default)]
+    pub start_hints: Vec<StartHint>,
+}
+
+/// A hint the seed starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartHint {
+    /// The slot whose world holds the location.
+    pub finding: u32,
+    /// The location.
+    pub location: i64,
+    /// Its status (protocol doc, "`HintStatus`").
+    pub status: u8,
 }
 
 /// A three-part version.
@@ -126,6 +142,9 @@ pub struct Slot {
     /// received item, as from location -2 and player 0 (protocol doc, "Data Package Contents").
     #[serde(default)]
     pub start_inventory: Vec<i64>,
+    /// Location id to the entrance a hint names for it (worlds with shuffled entrances).
+    #[serde(default)]
+    pub entrances: BTreeMap<i64, String>,
 }
 
 /// An item placed at a location.
@@ -140,6 +159,10 @@ pub struct Placed {
     pub receiver: u32,
     /// Item classification bits: 1 progression, 2 useful, 4 trap.
     pub flags: u8,
+    /// The generator's sphere of this location, from 0 (`!hint` prefers early ones); `None`
+    /// when the seed records none.
+    #[serde(default)]
+    pub sphere: Option<u32>,
 }
 
 /// One game's names and ids.
@@ -159,6 +182,9 @@ pub struct GameData {
     /// Location group name to location names (`_read_location_name_groups_<game>`).
     #[serde(default)]
     pub location_name_groups: BTreeMap<String, Vec<String>>,
+    /// Item and location names the world forbids hinting.
+    #[serde(default)]
+    pub hint_blacklist: BTreeSet<String>,
 }
 
 /// Why a bundle was refused. Names the first rule that failed.
@@ -226,6 +252,17 @@ impl SeedBundle {
             .collect()
     }
 
+    /// The room's state before any event: the placement, the hint economy and the start hints.
+    ///
+    /// # Errors
+    /// What room-core refuses (the bundle's own validation rules most of it out).
+    pub fn room_state(&self) -> Result<RoomState, CoreError> {
+        let o = &self.server_options;
+        let rules = HintRules { cost_pct: o.hint_cost, check_points: o.location_check_points };
+        let start = self.start_hints.iter().map(|h| (SlotNo(h.finding), h.location, h.status));
+        RoomState::new(self.slot_nos(), self.placement())?.with_hints(rules, start)
+    }
+
     /// Every slot number.
     pub fn slot_nos(&self) -> impl Iterator<Item = SlotNo> + '_ {
         self.slots.iter().map(|s| SlotNo(s.id))
@@ -286,6 +323,16 @@ impl SeedBundle {
                 )));
             }
         }
+        for h in &self.start_hints {
+            let world = self.slot(h.finding).map(|s| &s.locations);
+            ensure!(
+                world.is_some_and(|w| w.iter().any(|p| p.location == h.location)),
+                "start hint for slot {} location {} is outside that world",
+                h.finding,
+                h.location
+            );
+            ensure!(room_core::valid_hint_status(h.status), "start hint has status {}", h.status);
+        }
         for (name, (team, slot)) in &self.connect_names {
             ensure!(
                 self.slot(*slot).is_some_and(|s| s.team == *team),
@@ -304,6 +351,13 @@ impl SeedBundle {
         let none = BTreeSet::new();
         let own = locations.get(s.game.as_str()).unwrap_or(&none);
         let mut seen = BTreeSet::new();
+        for l in s.entrances.keys() {
+            ensure!(
+                s.locations.iter().any(|p| p.location == *l),
+                "slot {} entrance for location {l}, which its world lacks",
+                s.id
+            );
+        }
         for p in &s.locations {
             ensure!(seen.insert(p.location), "slot {} location {} repeats", s.id, p.location);
             ensure!(

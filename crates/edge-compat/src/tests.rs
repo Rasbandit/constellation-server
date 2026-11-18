@@ -4,7 +4,6 @@
 use super::*;
 use log::MemLogStore;
 use proto::RoomId;
-use room_core::RoomState;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -38,11 +37,16 @@ fn bundle(password: &Value) -> Arc<SeedBundle> {
 
 fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
     let b = bundle(password);
+    spawn_with(b, override_pw, &Limits::DESIGN)
+}
+
+/// A room task for `b` on an in-memory log, and its compatible edge.
+fn spawn_with(b: Arc<SeedBundle>, password: Option<&str>, limits: &Limits) -> Arc<CompatRoom> {
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
-    Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned), Limits::DESIGN).unwrap())
+    let state = b.room_state().unwrap();
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
+    Arc::new(CompatRoom::new(b, h, password.map(str::to_owned), *limits).unwrap())
 }
 
 fn room() -> Arc<CompatRoom> {
@@ -465,11 +469,7 @@ fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
     }
     let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
-    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
+    spawn_with(b, None, limits)
 }
 
 fn indexes(ps: &[Value]) -> Vec<u64> {
@@ -522,11 +522,7 @@ async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_orde
 
 fn limited(limits: &Limits) -> Arc<CompatRoom> {
     let b = bundle(&Value::Null);
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
-    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
+    spawn_with(b, None, limits)
 }
 
 /// A burst of 2 that never refills, so the test does not depend on the clock.
@@ -619,11 +615,7 @@ fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
     let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
     edit(&mut v);
     let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
-    Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap())
+    spawn_with(b, None, &Limits::DESIGN)
 }
 
 fn tracker_packet(name: &str, version: (u32, u32, u32)) -> Value {

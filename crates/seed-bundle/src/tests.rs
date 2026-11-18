@@ -176,3 +176,46 @@ fn bundle_errors_display_which_check_failed() {
     assert_eq!(BundleError::Parse("eof".into()).to_string(), "seed bundle does not parse: eof");
     assert_eq!(BundleError::Invalid("x".into()).to_string(), "seed bundle is invalid: x");
 }
+
+#[test]
+fn start_hints_and_the_hint_economy_reach_the_fresh_room() {
+    let mut v = good();
+    // B's location 101 holds A's item 7; A asked for it at generation (a start hint).
+    v["start_hints"] = json!([{"finding": 2, "location": 101, "status": 30}]);
+    let b = parse(&v).unwrap();
+    let s = b.room_state().unwrap();
+    let hints = s.hints_of(SlotNo(1));
+    assert_eq!(hints.len(), 1);
+    assert_eq!((hints[0].finding, hints[0].location, hints[0].status), (SlotNo(2), 101, 30));
+    assert_eq!(s.hint_rules(), HintRules { cost_pct: 10, check_points: 1 });
+    assert_eq!(s.head(), proto::Seq(0), "start hints are not log events");
+    assert_eq!(parse(&good()).unwrap().start_hints, [], "absent means none");
+}
+
+#[test]
+fn entrances_spheres_and_hint_blacklists_are_kept_and_default_to_empty() {
+    let mut v = good();
+    v["slots"][1]["entrances"] = json!({"101": "Cave"});
+    v["slots"][1]["locations"][1]["sphere"] = json!(2);
+    v["games"]["G"]["hint_blacklist"] = json!(["Eight"]);
+    let b = parse(&v).unwrap();
+    let bslot = b.slot(2).unwrap();
+    assert_eq!(bslot.entrances.get(&101).map(String::as_str), Some("Cave"));
+    assert_eq!((bslot.locations[0].sphere, bslot.locations[1].sphere), (None, Some(2)));
+    assert!(b.games["G"].hint_blacklist.contains("Eight"));
+    let plain = parse(&good()).unwrap();
+    assert_eq!(plain.slot(2).unwrap().entrances.len(), 0);
+    assert_eq!(plain.games["G"].hint_blacklist.len(), 0);
+}
+
+#[test]
+fn hint_data_outside_a_world_or_with_a_bad_status_is_refused() {
+    let m = refused(|v| v["start_hints"] = json!([{"finding": 1, "location": 101, "status": 0}]));
+    assert!(m.contains("start hint"), "{m}");
+    let m = refused(|v| v["start_hints"] = json!([{"finding": 9, "location": 100, "status": 0}]));
+    assert!(m.contains("start hint"), "{m}");
+    let m = refused(|v| v["start_hints"] = json!([{"finding": 2, "location": 101, "status": 5}]));
+    assert!(m.contains("status 5"), "{m}");
+    let m = refused(|v| v["slots"][0]["entrances"] = json!({"101": "Cave"}));
+    assert!(m.contains("entrance"), "{m}");
+}
