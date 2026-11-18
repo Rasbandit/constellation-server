@@ -103,11 +103,14 @@ struct Joined {
     own_writes: BTreeSet<Seq>,
     /// Hints the slot paid for, so far.
     used: u64,
-    /// The last hint list sent for each watched `_read_hints_` key, by slot: a change is
-    /// told, the same list is not.
-    hint_lists: BTreeMap<u32, Vec<Hint>>,
-    /// Watched hint lists the last events may have changed; reread from the room.
+    /// A digest of the last hint list sent for each watched `_read_hints_` key, by slot: a
+    /// change is told, the same list is not (a digest, not a copy of the list).
+    hint_lists: BTreeMap<u32, u64>,
+    /// Watched hint lists the last events changed; reread from the room.
     stale_hints: BTreeSet<u32>,
+    /// Checked (finder, location) since the last reread, with a watched list it can change
+    /// (the finder's or the receiver's): changed only if the room holds a hint there.
+    checked_hints: Vec<(u32, SlotNo, i64)>,
 }
 
 impl Joined {
@@ -314,6 +317,7 @@ impl Session {
             used: 0,
             hint_lists,
             stale_hints: BTreeSet::new(),
+            checked_hints: Vec::new(),
         };
         for e in &history {
             fold(&self.room, &mut j, e);
@@ -398,22 +402,20 @@ impl Session {
         let room = Arc::clone(&self.room);
         let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
         let slots = std::mem::take(&mut j.stale_hints);
-        if slots.is_empty() {
+        let checked = std::mem::take(&mut j.checked_hints);
+        if slots.is_empty() && checked.is_empty() {
             return Ok(Vec::new());
         }
-        let lists = read_hint_lists(&room, slots).await?;
+        let lists = changed_hint_lists(&room, slots, checked, j.hint_lists.clone()).await?;
         let mut out = Vec::new();
-        for (slot, list) in lists {
-            if j.hint_lists.get(&slot) == Some(&list) {
-                continue;
-            }
+        for (slot, digest, list) in lists {
             let team = room.bundle.slot(slot).map_or(0, |s| s.team());
             let key = storage::hints_key(team, slot);
             if j.watch.contains(&key) {
                 let value = hints::list(&room, &list);
                 out.push(ServerPacket::SetReply(storage::read_only_reply(&key, value)));
             }
-            j.hint_lists.insert(slot, list);
+            j.hint_lists.insert(slot, digest);
         }
         Ok(out)
     }
@@ -908,9 +910,9 @@ impl Session {
             .collect();
         j.watch.extend(req.keys);
         if !fresh.is_empty() {
-            let lists = read_hint_lists(&self.room, fresh).await?;
+            let lists = changed_hint_lists(&self.room, fresh, Vec::new(), BTreeMap::new()).await?;
             let j = self.joined.as_mut().ok_or(Step::Closed)?;
-            j.hint_lists.extend(lists);
+            j.hint_lists.extend(lists.into_iter().map(|(n, d, _)| (n, d)));
         }
         Ok(Vec::new())
     }
@@ -1009,29 +1011,47 @@ fn hint_points(room: &CompatRoom, j: &Joined) -> i64 {
     room.hint_rules.points(size, j.checked.count(), j.used)
 }
 
-/// The slots whose list holds `finder`'s `location` as not yet found: a check of it changes
-/// them.
+/// The lists a hint at `finder`'s location can be in: the finder's and the receiver's, of
+/// those this session keeps.
 #[allow(
     clippy::redundant_pub_crate,
     reason = "rustc's unreachable_pub (denied) needs crate visibility in this private module"
 )]
-pub(crate) fn lists_finding(
-    lists: &BTreeMap<u32, Vec<Hint>>,
+pub(crate) fn lists_of_hint(
+    lists: &BTreeMap<u32, u64>,
     finder: u32,
-    location: i64,
-) -> Vec<u32> {
-    let holds =
-        |l: &[Hint]| l.iter().any(|h| h.finding.0 == finder && h.location == location && !h.found);
-    lists.iter().filter(|(_, l)| holds(l)).map(|(&n, _)| n).collect()
+    receiver: Option<u32>,
+) -> impl Iterator<Item = u32> + '_ {
+    let other = receiver.filter(|&r| r != finder);
+    [Some(finder), other].into_iter().flatten().filter(|n| lists.contains_key(n))
 }
 
-/// The current hint list of each slot, from the room.
-async fn read_hint_lists(
+/// A digest of a hint list (equal lists, equal digests).
+fn digest(list: &[Hint]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    list.hash(&mut h);
+    h.finish()
+}
+
+/// From the room, in one read: the lists of `slots`, and of each `checked` list whose
+/// location is hinted, that differ from their `known` digest, as (slot, digest, list).
+async fn changed_hint_lists(
     room: &CompatRoom,
-    slots: BTreeSet<u32>,
-) -> Result<BTreeMap<u32, Vec<Hint>>, Step> {
+    mut slots: BTreeSet<u32>,
+    checked: Vec<(u32, SlotNo, i64)>,
+    known: BTreeMap<u32, u64>,
+) -> Result<Vec<(u32, u64, Vec<Hint>)>, Step> {
     let read = room.room.read(move |s| {
-        slots.into_iter().map(|n| (n, s.hints_of(SlotNo(n)))).collect::<BTreeMap<_, _>>()
+        slots.extend(checked.into_iter().filter(|c| s.is_hinted(c.1, c.2)).map(|c| c.0));
+        slots
+            .into_iter()
+            .filter_map(|n| {
+                let list = s.hints_of(SlotNo(n));
+                let d = digest(&list);
+                (known.get(&n) != Some(&d)).then_some((n, d, list))
+            })
+            .collect::<Vec<_>>()
     });
     read.await.map_err(|_| Step::Closed)
 }
@@ -1107,8 +1127,10 @@ fn events_packets(
                 if j.checked.count() != was {
                     checked.push(location);
                 }
-                let touched = lists_finding(&j.hint_lists, slot, location);
-                j.stale_hints.extend(touched);
+                let receiver = room.bundle.slot(slot).and_then(|s| s.placement(s.find(location)?));
+                let lists = lists_of_hint(&j.hint_lists, slot, receiver.map(|p| p.receiver));
+                let lists: Vec<u32> = lists.collect();
+                j.checked_hints.extend(lists.into_iter().map(|n| (n, SlotNo(slot), location)));
             }
             (
                 &(EventKind::HintAdded { finding, location, .. }
@@ -1121,8 +1143,8 @@ fn events_packets(
                 if matches!(e.kind, EventKind::HintAdded { .. }) && concerned.contains(&j.slot) {
                     points_changed = true;
                 }
-                let watched = concerned.into_iter().filter(|n| j.hint_lists.contains_key(n));
-                let watched: Vec<u32> = watched.collect();
+                let watched: Vec<u32> =
+                    lists_of_hint(&j.hint_lists, finding.0, Some(receiver)).collect();
                 j.stale_hints.extend(watched);
             }
             (&EventKind::Item { .. }, Some(it)) => {

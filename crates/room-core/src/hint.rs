@@ -100,7 +100,7 @@ pub(crate) struct HintRec {
 }
 
 /// A hint as clients see it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hint {
     /// The slot whose world holds the location.
     pub finding: SlotNo,
@@ -240,6 +240,12 @@ impl RoomState {
         let status = if found { status::FOUND } else { stored };
         let (finding, receiver) = (*w.slots().get(pos)?, *w.slots().get(to)?);
         Some(Hint { finding, location: w.location(pos, i)?, receiver, item, status, found })
+    }
+
+    /// Whether `finding`'s `location` has a hint (found or not).
+    #[must_use]
+    pub fn is_hinted(&self, finding: SlotNo, location: i64) -> bool {
+        self.place(finding, location).is_some_and(|(pos, i, ..)| self.hints.get(pos, i).is_some())
     }
 
     /// Every hint `slot` finds or receives, in (finding slot, location) order: the value of

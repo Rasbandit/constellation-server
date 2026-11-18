@@ -504,24 +504,13 @@ async fn bang_hint_says_when_nothing_matches_and_when_more_cost_too_much() {
 }
 
 #[test]
-fn a_check_changes_only_the_lists_holding_that_location_unfound() {
-    let h = |finding: u32, location: i64, found: bool| room_core::Hint {
-        finding: proto::SlotNo(finding),
-        location,
-        receiver: proto::SlotNo(2),
-        item: 7,
-        status: if found { 40 } else { 0 },
-        found,
-    };
-    let lists = BTreeMap::from([
-        (1, vec![h(1, 100, false)]),
-        (2, vec![h(1, 101, true), h(2, 100, false)]),
-        (3, vec![h(1, 100, false), h(1, 101, false)]),
-    ]);
-    assert_eq!(session::lists_finding(&lists, 1, 100), [1, 3]);
-    assert_eq!(session::lists_finding(&lists, 1, 101), [3], "found already: no change for 2");
-    assert_eq!(session::lists_finding(&lists, 2, 101), Vec::<u32>::new());
-    assert_eq!(session::lists_finding(&lists, 2, 100), [2]);
+fn a_hint_can_only_be_in_the_finders_and_the_receivers_list() {
+    let lists = BTreeMap::from([(1, 0), (2, 0), (3, 0)]);
+    let of = |f, r| session::lists_of_hint(&lists, f, r).collect::<Vec<_>>();
+    assert_eq!(of(1, Some(2)), [1, 2]);
+    assert_eq!(of(1, Some(1)), [1], "a slot's own item: one list");
+    assert_eq!(of(4, Some(2)), [2], "a list the session does not keep is skipped");
+    assert_eq!(of(4, None), Vec::<u32>::new());
 }
 
 #[test]
@@ -560,4 +549,42 @@ async fn a_group_of_every_location_resolves_within_a_small_budget() {
     assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
     // A hint costs 10 percent of 40,000 locations; nothing is checked yet.
     assert_eq!(command_results(&ps), ["You have 0 points and need 4000 for a hint."]);
+}
+
+/// Review finding: every check scanned every watched hint list of the session, and each list
+/// was a full copy, so a watcher of big lists paid lists x hints per checked location. Now a
+/// check can only change the finder's and the receiver's lists, the room is asked whether the
+/// location is hinted at all, and a session keeps one digest per list.
+/// The time `A` checks all `n` locations of a big room and `B` takes the result, with `B`
+/// watching both hint lists of a hint on every location, or with no hints.
+async fn time_checks(n: i64, hinted: bool) -> std::time::Duration {
+    let room = big_room(1000 + n, &Limits::DESIGN);
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    let all: Vec<i64> = (1000..1000 + n).collect();
+    if hinted {
+        send(&mut b, &json!([{"cmd": "SetNotify", "keys": [hints_key(1), hints_key(2)]}])).await;
+        send(&mut a, &scout(&all, &json!(1))).await;
+    }
+    pump(&mut b).await;
+    let started = std::time::Instant::now();
+    check(&mut a, &all).await;
+    let got = pump(&mut b).await;
+    let took = started.elapsed();
+    if hinted {
+        let replies = of(&got, "SetReply");
+        let last = &replies.last().unwrap()["value"];
+        assert!(last.as_array().unwrap().iter().all(|h| h["found"] == true), "converged");
+    }
+    took
+}
+
+#[tokio::test]
+async fn checks_under_big_watched_hint_lists_stay_cheap() {
+    // Measured here in a debug build: 5.9 s without hints; with them 10.4 s before the fix
+    // (the per-check scan grows with checks x hints) and 7.4 s after.
+    let plain = time_checks(20_000, false).await;
+    let hinted = time_checks(20_000, true).await;
+    let budget = plain * 3 / 2 + std::time::Duration::from_millis(500);
+    assert!(hinted < budget, "{hinted:?} with hints, {plain:?} without");
 }
