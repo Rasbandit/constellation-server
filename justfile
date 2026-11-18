@@ -28,6 +28,16 @@ test-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --workspace --locked --features log/pg-tests,server/pg-tests
 
+# The upload and generation API through the real bubblewrap sandbox, with a fake sidecar (no
+# Archipelago). Needs bwrap and python3; fails, never skips, without them. Local only for now.
+test-sandbox:
+    cargo test -p server --features sandbox-tests --test worlds --locked
+
+# The sidecar's Python tests (zip and yaml checks, the bundle converter). Light; CI runs them.
+test-py:
+    python3 -m unittest discover -s tools/ap-gen
+    python3 -m unittest discover -s tools/ap-import
+
 # Gate G-DB throughput benchmark (manual nightly workflow). Heavy: never on a shared developer box.
 bench-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
@@ -62,3 +72,9 @@ typos:
 ap-client-check:
     cargo build -p server --bin constellation-server --locked
     {{justfile_directory()}}/../Archipela-Go/apworld/.venv/bin/python tools/ap-client-check/check_common_client.py --ap {{justfile_directory()}}/../Archipela-Go/.ap --server {{justfile_directory()}}/target/debug/constellation-server --bundle {{justfile_directory()}}/crates/e2e/fixtures/two-slot.json
+
+# A real seed generation through the admin API and the sandbox: one apworld and one player yaml
+# (yours; they are never committed), the sibling Archipela-Go checkout and its venv. Local only.
+ap-gen-check apworld=(home_directory() / "Downloads/mm_2ship.apworld") yaml=(home_directory() / "Downloads/Majoras Mask.yaml"):
+    cargo build -p server --bin constellation-server --locked
+    tools/ap-gen/check.sh "{{apworld}}" "{{yaml}}" {{justfile_directory()}}/../Archipela-Go/.ap {{justfile_directory()}}/../Archipela-Go/apworld/.venv/bin/python

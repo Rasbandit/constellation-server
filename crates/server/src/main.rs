@@ -24,7 +24,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match server::run(args, config::load(), secrets).await {
+    let generation = match config::load_generation() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    match server::run(args, config::load(), secrets, generation).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
