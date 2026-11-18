@@ -48,6 +48,33 @@ pub enum OpenError {
     Store(StoreError),
     /// The room id is taken by a room made from another bundle.
     OtherBundle,
+    /// The room has finished (doc 02 section 4.3); it is never served again.
+    Finished {
+        /// Why it finished (`abandoned`).
+        reason: String,
+    },
+}
+
+/// A stored room as [`PgLogStore::open_room`] leaves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opened {
+    /// Its room key.
+    pub key: String,
+    /// Seconds since it last had a connection.
+    pub idle_secs: u64,
+}
+
+/// A room the directory lists: stored, not finished, and loadable (it has its bundle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// The room.
+    pub room: RoomId,
+    /// The seed name it was made from.
+    pub seed_name: String,
+    /// Its room key.
+    pub key: String,
+    /// Seconds since it last had a connection.
+    pub idle_secs: u64,
 }
 
 type Fut<'c, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>;
@@ -175,14 +202,16 @@ impl PgLogStore {
 
     /// Record the room the first time it opens, and return its room key.
     ///
-    /// A new room is stored with `new_key` (a random key the caller drew); a room stored
-    /// before keys existed gets `new_key` now; a room that has a key keeps it, so a restart
-    /// serves it under the same key. A reopen must come from the same bundle (by hash).
+    /// A new room is stored with `new_key` (a random key the caller drew) and its `bundle`
+    /// file; a room stored before keys or bundles were kept gets them now; a room that has a
+    /// key keeps it, so a restart serves it under the same key. A reopen must come from the
+    /// same bundle (by hash).
     ///
     /// # Errors
-    /// [`OpenError::OtherBundle`] when the room id is taken by another bundle, and
-    /// [`OpenError::Store`] when the database fails, including when another room already has
-    /// `new_key` (draw a new one and retry).
+    /// [`OpenError::OtherBundle`] when the room id is taken by another bundle,
+    /// [`OpenError::Finished`] when the room has ended, and [`OpenError::Store`] when the
+    /// database fails, including when another room already has `new_key` (draw a new one and
+    /// retry).
     pub async fn open_room(
         &self,
         room: RoomId,
@@ -190,33 +219,46 @@ impl PgLogStore {
         bundle_format: u32,
         bundle_hash: &[u8],
         new_key: &str,
-    ) -> Result<String, OpenError> {
+        bundle: &[u8],
+    ) -> Result<Opened, OpenError> {
         let (seed, hash, key) = (seed_name.to_owned(), bundle_hash.to_vec(), new_key.to_owned());
-        let (stored_hash, stored_key) = self
+        let file = bundle.to_vec();
+        let (stored_hash, stored_key, idle, finished) = self
             .isolated(move |c| {
                 Box::pin(async move {
                     sqlx::query(
                         "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash, \
-                         room_key) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (room_id) DO NOTHING",
+                         room_key, bundle) VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (room_id) DO NOTHING",
                     )
                     .bind(room_key(room))
                     .bind(seed)
                     .bind(i64::from(bundle_format))
                     .bind(&hash)
                     .bind(&key)
+                    .bind(&file)
                     .execute(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))?;
+                    // Only a room made from this very bundle may take the file.
                     sqlx::query(
-                        "UPDATE rooms SET room_key = $2 WHERE room_id = $1 AND room_key IS NULL",
+                        "UPDATE rooms SET room_key = COALESCE(room_key, $2), \
+                         bundle = COALESCE(bundle, $3) WHERE room_id = $1 AND bundle_hash = $4",
                     )
                     .bind(room_key(room))
                     .bind(&key)
+                    .bind(&file)
+                    .bind(&hash)
                     .execute(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))?;
-                    sqlx::query_as::<_, (Vec<u8>, String)>(
-                        "SELECT bundle_hash, room_key FROM rooms WHERE room_id = $1",
+                    // The idle seconds since last_active, never negative.
+                    sqlx::query_as::<_, (Vec<u8>, Option<String>, i64, Option<String>)>(
+                        "SELECT bundle_hash, room_key, \
+                         GREATEST(0, EXTRACT(EPOCH FROM now() - last_active))::bigint, \
+                         CASE WHEN finished_at IS NULL THEN NULL \
+                         ELSE COALESCE(finished_reason, 'finished') END \
+                         FROM rooms WHERE room_id = $1",
                     )
                     .bind(room_key(room))
                     .fetch_one(&mut *c)
@@ -226,7 +268,116 @@ impl PgLogStore {
             })
             .await
             .map_err(OpenError::Store)?;
-        if stored_hash == bundle_hash { Ok(stored_key) } else { Err(OpenError::OtherBundle) }
+        if stored_hash != bundle_hash {
+            return Err(OpenError::OtherBundle);
+        }
+        if let Some(reason) = finished {
+            return Err(OpenError::Finished { reason });
+        }
+        let key = stored_key
+            .ok_or_else(|| OpenError::Store(StoreError::Corrupt("room without a key".into())))?;
+        Ok(Opened { key, idle_secs: stored(idle, "idle seconds").map_err(OpenError::Store)? })
+    }
+
+    /// Every room the directory lists: not finished and stored with its key and bundle, in
+    /// room id order.
+    ///
+    /// # Errors
+    /// When the database fails.
+    pub async fn list_rooms(&self) -> Result<Vec<Listed>, StoreError> {
+        let rows = self
+            .isolated(|c| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, (i64, String, String, i64)>(
+                        "SELECT room_id, seed_name, room_key, \
+                         GREATEST(0, EXTRACT(EPOCH FROM now() - last_active))::bigint \
+                         FROM rooms WHERE finished_at IS NULL AND room_key IS NOT NULL \
+                         AND bundle IS NOT NULL ORDER BY room_id",
+                    )
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(room, seed_name, key, idle)| {
+                Ok(Listed {
+                    room: RoomId(u64::from_be_bytes(room.to_be_bytes())),
+                    seed_name,
+                    key,
+                    idle_secs: stored(idle, "idle seconds")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The bundle file a room was made from, to load it (`None` for an unknown room or one
+    /// stored before bundles were kept).
+    ///
+    /// # Errors
+    /// When the database fails.
+    pub async fn room_bundle(&self, room: RoomId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, Option<Vec<u8>>>(
+                    "SELECT bundle FROM rooms WHERE room_id = $1",
+                )
+                .bind(room_key(room))
+                .fetch_optional(&mut *c)
+                .await
+                .map(Option::flatten)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    /// Record that the room had a connection `idle_secs` ago (D-30 counts from here).
+    ///
+    /// # Errors
+    /// When the database fails.
+    pub async fn touch(&self, room: RoomId, idle_secs: u64) -> Result<(), StoreError> {
+        let idle = bound(idle_secs);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE rooms SET last_active = now() - make_interval(secs => $2::bigint::double precision) \
+                     WHERE room_id = $1",
+                )
+                .bind(room_key(room))
+                .bind(idle)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    /// End the room for `reason` (doc 02 section 4.3, Finished). Its rows are kept; it is never
+    /// listed or opened again. Ending a finished room changes nothing.
+    ///
+    /// # Errors
+    /// When the database fails.
+    pub async fn finish(&self, room: RoomId, reason: &str) -> Result<(), StoreError> {
+        let reason = reason.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE rooms SET finished_at = now(), finished_reason = $2 \
+                     WHERE room_id = $1 AND finished_at IS NULL",
+                )
+                .bind(room_key(room))
+                .bind(reason)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
     }
 
     /// Take the room: bump its owner epoch and return the new one (the directory's claim, like

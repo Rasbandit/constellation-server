@@ -459,19 +459,36 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn a_room_past_its_lifetime_closes_its_clients_and_refuses_new_ones() {
-        let env =
-            [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_LIFETIME_SECS", "1")];
-        let (server, dir) = rooms_server_env("expire", &["alpha"], &env);
+    async fn an_idle_room_leaves_memory_and_its_next_connect_loads_it_with_its_checks() {
+        let env = [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_IDLE_SECS", "1")];
+        let (server, dir) = rooms_server_env("idle", &["alpha", "beta"], &env);
         let alpha = key_of(&server, "alpha");
+        let (loc, _, _) = alice_locations_for(2)[0];
         let (mut alice, _, _) =
             e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
-        server.wait_for_log("room expired").unwrap();
-        let end = alice.next_cmd("Retrieved").await.unwrap_err();
-        assert!(end.contains("closed") || end.contains("socket"), "{end}");
+        check(&mut alice, &[loc]).await;
+        alice.next_cmd("RoomUpdate").await.unwrap();
+        alice.close().await.unwrap();
+        server.wait_for_log("room idle; left memory").unwrap();
+        let (_, connected, _) = e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice")
+            .await
+            .unwrap_or_else(|e| panic!("{e}; log:\n{}", server.log().join("\n")));
+        assert_eq!(connected["checked_locations"], json!([loc]));
+        let loads = server.log().iter().filter(|l| l.contains("room in memory")).count();
+        assert_eq!(loads, 2, "loaded on the first connect and again after it idled");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_room_ends_and_is_refused() {
+        let env =
+            [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_ABANDON_SECS", "1")];
+        let (server, dir) = rooms_server_env("abandon", &["alpha"], &env);
+        let alpha = key_of(&server, "alpha");
+        server.wait_for_log("room abandoned").unwrap();
         let again = e2e::Client::connect_via(server.addr, &room_url(&server, &alpha)).await;
         assert!(again.unwrap_err().contains("404"));
-        assert!(dir.join("alpha.json.expired").exists() && !dir.join("alpha.json").exists());
+        assert!(dir.join("alpha.json").exists(), "the file is left alone");
         drop(std::fs::remove_dir_all(&dir));
     }
 

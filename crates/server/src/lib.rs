@@ -103,6 +103,8 @@ pub struct Loaded {
     pub bundle: SeedBundle,
     /// SHA-256 of the file's canonical JSON.
     pub hash: Vec<u8>,
+    /// The file as read, which the directory stores so the room can be loaded again.
+    pub text: String,
 }
 
 /// Read and validate a bundle, refusing files over `limits.bundle_max_bytes`.
@@ -119,15 +121,24 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > cap {
         return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    let named = |e: String| format!("{}: {e}", path.display());
-    let bundle = SeedBundle::from_json(&text).map_err(|e| named(e.to_string()))?;
-    Ok(Loaded { hash: bundle_hash(&text).map_err(named)?, bundle })
+    parse_bundle(text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Validate a bundle file's text.
+///
+/// # Errors
+/// When it is not a valid bundle.
+pub fn parse_bundle(text: String) -> Result<Loaded, String> {
+    let bundle = SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
+    Ok(Loaded { hash: bundle_hash(&text)?, bundle, text })
 }
 
 #[derive(Debug, Clone)]
 struct AppState {
     /// Changed only by the [`Host`]; a request holds the lock for one lookup.
     rooms: Arc<RwLock<Rooms>>,
+    /// Asks the host to load a cold room.
+    wake: host::Waker,
     options: Options,
     /// One permit per open WebSocket (`Limits::max_connections`).
     slots: Arc<Semaphore>,
@@ -203,66 +214,72 @@ async fn start_room<S: LogStore>(
 /// A room built from its bundle, not yet claimed or started, and without its key.
 struct Prepared {
     id: RoomId,
-    hash: Vec<u8>,
-    format: u32,
     fresh: RoomState,
     room: Room,
     mailbox: Mailbox,
 }
 
 fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<Prepared, String> {
-    let Loaded { bundle, hash } = loaded;
+    let Loaded { bundle, .. } = loaded;
     let id = room_id(&bundle.seed_name);
     let fresh = RoomState::new(bundle.slot_nos(), bundle.placement())
         .map_err(|e| format!("seed {:?}: {e}", bundle.seed_name))?;
     let (live, mailbox) = RoomHandle::mailbox(&limits);
-    let (seed, format) = (bundle.seed_name.clone(), bundle.format);
+    let seed = bundle.seed_name.clone();
     let compat =
         Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password.cloned(), limits)?);
-    Ok(Prepared { id, hash, format, fresh, room: Room { seed, compat, live }, mailbox })
+    Ok(Prepared { id, fresh, room: Room { seed, compat, live }, mailbox })
 }
 
 /// Draws of a new room key before giving up; each draw collides with an existing key only
 /// with odds of about one in 2^50 per stored room.
 const KEY_DRAWS: usize = 3;
 
-/// Start the rooms of `source` and build the router.
+/// List the rooms of `source` and build the router.
 ///
-/// Also returns the [`Host`], which watches the rooms folder and says when the process must
-/// end ([`Host::supervise`]). With `database_url` the log is in Postgres and each room is
-/// rebuilt from it and keeps its stored room key; without, the log is in memory, keys are
-/// drawn fresh, and a restart loses the rooms. `password` overrides every room's. A bundle is
-/// validated before its room is claimed, so a bad bundle never fences a live room.
+/// Also returns the [`Host`], which loads rooms on their first connect, unloads idle ones,
+/// ends abandoned ones, watches the rooms folder, and says when the process must end
+/// ([`Host::supervise`]). With `database_url` the rooms and their logs are in Postgres: every
+/// room stored there and not finished is listed, and keeps its stored room key. Without, they
+/// are in memory, keys are drawn fresh, and a restart loses the rooms. `password` overrides
+/// every room's. A bundle is validated before its room is claimed, so a bad bundle never
+/// fences a live room.
 ///
-/// With `--bundle` every failure is an error. With `--rooms` the folder must exist, but it may
-/// be empty, and a bundle that does not make a room (invalid, a seed name that already runs, a
-/// stored room made from a different bundle, past `max_rooms`) is skipped with a warning.
+/// With `--bundle` the room is loaded now and every failure is an error. With `--rooms` the
+/// folder must exist, but it may be empty, and a bundle that does not make a room (invalid, a
+/// stored room made from another bundle or finished, past `max_rooms`) is skipped with a
+/// warning; rooms stay cold until their first connect.
 ///
 /// # Errors
 /// A message when the bundle does not make a valid room, the rooms folder cannot be read, the
-/// database fails, or a stored room was made from a different bundle.
+/// database fails, or a stored room was made from a different bundle or has finished.
 pub async fn app(
     source: &Source,
     password: Option<String>,
     database_url: Option<&str>,
     limits: Limits,
 ) -> Result<(Router, Host), String> {
-    let mut host = match source {
+    let (mut host, wake) = match source {
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
-            let mut host = Host::new(database_url, password, limits, None).await?;
-            host.add(loaded, None).await?;
-            host
+            let (mut host, wake) = Host::new(database_url, password, limits, None).await?;
+            let key = host.import(loaded).await?;
+            host.wake(&key).await?;
+            (host, wake)
         }
         Source::Rooms(dir) => {
             host::check_folder(dir)?;
-            Host::new(database_url, password, limits, Some(dir.clone())).await?
+            let (mut host, wake) =
+                Host::new(database_url, password, limits, Some(dir.clone())).await?;
+            host.list_stored().await?;
+            (host, wake)
         }
     };
     host.scan().await;
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
     let state = AppState {
         rooms: host.rooms(),
+        wake,
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
@@ -273,17 +290,30 @@ pub async fn app(
 
 /// Record the room in Postgres and return its key: the stored one, or a new random one for a
 /// new room (drawn again when it collides with another room's).
-async fn open_with_key(store: &PgLogStore, p: &Prepared) -> Result<RoomKey, String> {
+async fn open_with_key(
+    store: &PgLogStore,
+    id: RoomId,
+    loaded: &Loaded,
+) -> Result<(RoomKey, u64), String> {
     let mut last = String::new();
+    let (seed, format) = (&loaded.bundle.seed_name, loaded.bundle.format);
     for _ in 0..KEY_DRAWS {
         let new_key = RoomKey::random()?;
-        match store.open_room(p.id, &p.room.seed, p.format, &p.hash, new_key.as_str()).await {
-            Ok(stored) => return RoomKey::parse(&stored).map_err(|e| format!("stored {e}")),
+        let text = loaded.text.as_bytes();
+        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), text).await {
+            Ok(o) => {
+                let key = RoomKey::parse(&o.key).map_err(|e| format!("stored {e}"))?;
+                return Ok((key, o.idle_secs));
+            }
+            Err(OpenError::Finished { reason }) => {
+                return Err(format!(
+                    "room {seed:?} has finished ({reason}); it is not served again"
+                ));
+            }
             Err(OpenError::OtherBundle) => {
                 return Err(format!(
-                    "the database holds room {:?} made from a different bundle with this seed \
-                     name; refusing to start",
-                    p.room.seed
+                    "the database holds room {seed:?} made from a different bundle with this seed \
+                     name; refusing to start"
                 ));
             }
             Err(OpenError::Store(e)) => last = format!("postgres: {e:?}"),
@@ -301,7 +331,7 @@ async fn start<S: LogStore>(
     limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let handle = start_room(p.mailbox, p.id, epoch, p.fresh, store, limits).await?;
-    tracing::info!(%key, seed = p.room.seed, "room ready");
+    tracing::info!(%key, seed = p.room.seed, "room in memory");
     Ok(handle)
 }
 
@@ -326,20 +356,53 @@ pub fn key_from_host(host: &str) -> Option<RoomKey> {
 /// working (a host whose first label only looks like a key, such as `playground.example`, is
 /// not refused). With several rooms the first label must be the key of one of them, so once a
 /// second room joins a rooms folder, new connections must name their room (open ones stay).
-fn route(rooms: &Rooms, host: Option<&str>) -> Result<(RoomKey, Arc<CompatRoom>), String> {
-    if let Some((key, room)) = rooms.only_with_key() {
-        return Ok((key.clone(), Arc::clone(&room.compat)));
-    }
-    match host.and_then(key_from_host) {
-        Some(key) => match rooms.get(&key) {
-            Some(room) => Ok((key, Arc::clone(&room.compat))),
-            None => Err(format!("no room with key {key} on this server")),
+fn route(rooms: &Rooms, host: Option<&str>) -> Result<Route, String> {
+    let key = match rooms.only_with_key() {
+        Some((key, _)) => key.clone(),
+        None => match host.and_then(key_from_host) {
+            Some(key) => key,
+            None => {
+                return Err(format!(
+                    "this server runs {} rooms; connect through {{room_key}}.<this host>",
+                    rooms.len()
+                ));
+            }
         },
-        None => Err(format!(
-            "this server runs {} rooms; connect through {{room_key}}.<this host>",
-            rooms.len()
-        )),
+    };
+    let Some(listing) = rooms.get(&key) else {
+        return Err(format!("no room with key {key} on this server"));
+    };
+    Ok(match &listing.room {
+        // Counted while the lookup holds the lock, so the host never unloads a room a
+        // connection is entering.
+        Some(room) => Route::Ready(key, Arc::clone(&room.compat), listing.activity.enter()),
+        None => Route::Cold(key),
+    })
+}
+
+/// Where a connection goes.
+enum Route {
+    /// A room in memory; the visit counts the connection.
+    Ready(RoomKey, Arc<CompatRoom>, rooms::Visit),
+    /// A listed room that is not in memory: wake it, then route again.
+    Cold(RoomKey),
+}
+
+/// The room a connection with this `Host` header joins, woken first when it is cold.
+async fn find(
+    s: &AppState,
+    host: Option<&str>,
+) -> Result<(RoomKey, Arc<CompatRoom>, rooms::Visit), String> {
+    // Twice at most: a room can go cold again between its wake and the second lookup only if
+    // it idled for the whole idle time in between.
+    for _ in 0..2 {
+        let found = route(&read(&s.rooms), host)?;
+        match found {
+            Route::Ready(key, room, visit) => return Ok((key, room, visit)),
+            Route::Cold(key) => s.wake.wake(key).await?,
+        }
     }
+    Err("the room could not be loaded; try again".to_owned())
 }
 
 async fn upgrade(
@@ -353,8 +416,7 @@ async fn upgrade(
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     };
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
-    let found = route(&read(&s.rooms), host);
-    let (key, room) = match found {
+    let (key, room, visit) = match find(&s, host).await {
         Ok(found) => found,
         Err(why) => {
             tracing::info!(host, "{why}");
@@ -373,6 +435,7 @@ async fn upgrade(
             Err(e) => tracing::debug!(error = %e, "upgrade did not complete"),
         }
         drop(permit);
+        drop(visit);
         tracing::info!("connection closed");
     });
     response.into_response()

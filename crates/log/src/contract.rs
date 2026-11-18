@@ -471,33 +471,67 @@ mod pg_only {
             .unwrap()
     }
 
+    async fn open(
+        s: &PgLogStore,
+        room: RoomId,
+        hash: &[u8],
+        key: &str,
+    ) -> Result<String, OpenError> {
+        s.open_room(room, "seed", 1, hash, key, b"{}").await.map(|o| o.key)
+    }
+
     #[tokio::test]
     async fn a_room_reopens_with_its_bundle_and_refuses_another() {
         let s = pg_store().await;
-        s.open_room(R, "seed", 1, &[1, 2], "aaaaaaaaaa").await.unwrap();
-        s.open_room(R, "seed", 1, &[1, 2], "bbbbbbbbbb").await.unwrap();
-        assert_eq!(
-            s.open_room(R, "seed", 1, &[1, 3], "cccccccccc").await,
-            Err(OpenError::OtherBundle)
-        );
-        s.open_room(RoomId(2), "seed", 1, &[1, 3], "dddddddddd").await.unwrap();
+        open(&s, R, &[1, 2], "aaaaaaaaaa").await.unwrap();
+        open(&s, R, &[1, 2], "bbbbbbbbbb").await.unwrap();
+        assert_eq!(open(&s, R, &[1, 3], "cccccccccc").await, Err(OpenError::OtherBundle));
+        open(&s, RoomId(2), &[1, 3], "dddddddddd").await.unwrap();
     }
 
     #[tokio::test]
     async fn a_room_keeps_the_key_it_first_opened_with_and_keys_are_unique() {
         let s = pg_store().await;
-        assert_eq!(s.open_room(R, "seed", 1, &[1], "aaaaaaaaaa").await.unwrap(), "aaaaaaaaaa");
+        assert_eq!(open(&s, R, &[1], "aaaaaaaaaa").await.unwrap(), "aaaaaaaaaa");
         // A reopen draws a new key, but the stored one wins: the address never changes.
-        assert_eq!(s.open_room(R, "seed", 1, &[1], "bbbbbbbbbb").await.unwrap(), "aaaaaaaaaa");
+        assert_eq!(open(&s, R, &[1], "bbbbbbbbbb").await.unwrap(), "aaaaaaaaaa");
         // Another room cannot take a key in use; the caller draws again.
-        assert!(matches!(
-            s.open_room(RoomId(2), "other", 1, &[2], "aaaaaaaaaa").await,
-            Err(OpenError::Store(_))
-        ));
+        assert!(matches!(open(&s, RoomId(2), &[2], "aaaaaaaaaa").await, Err(OpenError::Store(_))));
+        assert_eq!(open(&s, RoomId(2), &[2], "cccccccccc").await.unwrap(), "cccccccccc");
+    }
+
+    #[tokio::test]
+    async fn the_directory_lists_open_rooms_with_their_bundles_and_drops_finished_ones() {
+        let s = pg_store().await;
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"bundle a").await.unwrap();
+        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", b"bundle b").await.unwrap();
+        let listed = s.list_rooms().await.unwrap();
+        let names: Vec<_> = listed.iter().map(|l| (l.seed_name.as_str(), l.key.as_str())).collect();
+        assert_eq!(names, [("alpha", "aaaaaaaaaa"), ("beta", "bbbbbbbbbb")]);
+        assert!(listed.iter().all(|l| l.idle_secs < 60), "a new room was just active");
+        assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
+        assert_eq!(s.room_bundle(RoomId(99)).await.unwrap(), None);
+        // A reopen never replaces the stored file.
+        s.open_room(R, "alpha", 1, &[1], "cccccccccc", b"other").await.unwrap();
+        assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
+        s.finish(R, "abandoned").await.unwrap();
+        let left: Vec<_> = s.list_rooms().await.unwrap().into_iter().map(|l| l.seed_name).collect();
+        assert_eq!(left, ["beta"]);
         assert_eq!(
-            s.open_room(RoomId(2), "other", 1, &[2], "cccccccccc").await.unwrap(),
-            "cccccccccc"
+            s.open_room(R, "alpha", 1, &[1], "dddddddddd", b"bundle a").await,
+            Err(OpenError::Finished { reason: "abandoned".to_owned() })
         );
+    }
+
+    #[tokio::test]
+    async fn touch_sets_how_long_a_room_has_been_idle() {
+        let s = pg_store().await;
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"{}").await.unwrap();
+        s.touch(R, 3 * 86_400).await.unwrap();
+        let idle = s.list_rooms().await.unwrap()[0].idle_secs;
+        assert!((3 * 86_400..3 * 86_400 + 60).contains(&idle), "{idle}");
+        let reopened = s.open_room(R, "alpha", 1, &[1], "bbbbbbbbbb", b"{}").await.unwrap();
+        assert!(reopened.idle_secs >= 3 * 86_400, "opening is not a connection");
     }
 
     /// Two writers with the same epoch (a bug upstream, but the store must say so): both pass
