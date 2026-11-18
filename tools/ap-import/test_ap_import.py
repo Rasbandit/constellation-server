@@ -81,8 +81,7 @@ class ConvertTests(unittest.TestCase):
         games = convert(md)["games"]
         self.assertEqual(list(games), ["G"])
         self.assertEqual(set(games["G"]), {"item_name_to_id", "location_name_to_id", "checksum",
-                                           "item_name_groups", "location_name_groups", "hint_blacklist",
-                                           "entrance_names"})
+                                           "item_name_groups", "location_name_groups", "hint_blacklist"})
 
     def test_name_groups_are_kept_and_missing_ones_are_empty(self):
         md = multidata()
@@ -139,8 +138,6 @@ class ConvertTests(unittest.TestCase):
         b = convert(md)
         self.assertEqual(b["slots"][0]["entrances"], {"11": "Cave"})
         self.assertEqual(b["slots"][1]["entrances"], {})
-        self.assertEqual(b["games"]["G"]["entrance_names"], ["Cave"])
-        self.assertEqual(convert(multidata())["games"]["G"]["entrance_names"], [])
         self.assertEqual([p["sphere"] for p in b["slots"][0]["locations"]], [0, 1])
         self.assertEqual(b["slots"][1]["locations"][0]["sphere"], 1)
         self.assertNotIn("sphere", convert(multidata())["slots"][0]["locations"][0])

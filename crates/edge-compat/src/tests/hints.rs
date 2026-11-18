@@ -368,7 +368,6 @@ async fn start_hints_from_the_seed_are_readable_on_first_connect() {
     let room = hint_room(|v| {
         v["start_hints"] = json!([{"finding": 2, "location": 100, "status": 30}]);
         v["slots"][1]["entrances"] = json!({"100": "Cave"});
-        v["games"][GAME]["entrance_names"] = json!(["Cave"]);
     });
     let mut a = joined(&room, "A").await;
     let got = read_hints(&mut a, 1).await;

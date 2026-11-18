@@ -60,7 +60,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 
 The hints a room starts with, the generator's spheres and the entrances hints name. It takes header field 28, reserved and 0 before, so the version stays 2: a seed without hint data has no block (field 28 is 0) and is byte for byte what it was, and a reader older than the block refuses a seed that has one ("reserved header fields are not 0") instead of misreading it.
 
-Every location in the block is a **location index**: the position of its id in the game's sorted location ids (section 1 order), the same index as the presence bitset. The block never holds names or ids.
+Every location in the block is a **location index**: the position of its id in the game's sorted location ids (section 1 order), the same index as the presence bitset. The block holds no ids; its only names are the seed's entrance names, as references into the seed's string table.
 
 | At | Size | Field |
 |---|---|---|
@@ -70,13 +70,15 @@ Every location in the block is a **location index**: the position of its id in t
 | 3 | 1 | `wp`: bits per slot position |
 | 4 | 4 | start hints `h` |
 | 8 | 4 | start hints offset: `h` records of `wp + wl + 3` bits |
-| 12 | `n` × 12 | per slot, in slot order: spheres offset (0: none), entrances offset, entrances count `e` |
+| 12 | 4 | entrance names `m` |
+| 16 | 4 | entrance names offset: `m` string references (8 bytes each), sorted by name |
+| 20 | `n` × 12 | per slot, in slot order: spheres offset (0: none), entrances offset, entrances count `e` |
 
 - **Start hint** record: finding slot position (`wp` bits), location index in that slot's game (`wl`), status code (3 bits: 0 unspecified, 1 no priority, 2 avoid, 3 priority, 4 found; the status values 0, 10, 20, 30, 40). In the bundle's order; each location is placed in that slot. The finder and the receiver both see it; a room builds them into its fresh state (`seed_bundle::room_state`), never into the log.
 - **Spheres**: one value of `ws` bits per location of the slot's game (`L` values, for placed and unplaced locations alike), by location index. The all-ones value at `ws` bits means "unreachable or not needed" (no sphere); the encoder sets `ws` to the fewest bits that hold the largest sphere plus that value, `ceil(log2(max + 2))`, so it never collides. A slot with no sphere stores none (offset 0). This is the only sphere encoding: the importer writes it from the v1 data, and data-fill writes the same field directly.
-- **Entrances**: `e` records of `wl + we` bits (at least 1 bit), ascending by location index: location index (`wl` bits), then entrance index (the rest) into the game package's entrance names (section 1, `entrance_names`, sorted). Each location is placed in that slot. The names live in the package because the seed never holds names; exit indexes will be rekeyed to section 2's exit table once that section exists, and the game section's `entrance_names` dropped then.
+- **Entrances**: `e` records of `wl + we` bits (at least 1 bit), ascending by location index: location index (`wl` bits), then entrance index (the rest) into the block's entrance names. Each location is placed in that slot. The names are per seed (a world may compose them per generation), so they live in the seed's string table, never in the package: a package key never depends on a seed. Exit indexes will be rekeyed to section 2's exit table once that section exists.
 
-Widths are capped: `ws` 16, `wl` 32, `we` 24, `wp` 16. A reader checks every area against the data range, every index against its table, every hinted location against the presence set, and the entrance order, before the seed opens.
+Widths are capped: `ws` 16, `wl` 32, `we` 24, `wp` 16. The encoder sizes the block from its counts before it writes anything (spheres stay sparse until then), so the seed cap refuses an oversized block before it costs memory. A reader checks every area against the data range, every index against its table, every entrance name against the string table, every hinted location against the presence set, and the entrance order, before the seed opens.
 
 ## Package file
 
@@ -89,7 +91,7 @@ Package files are blobs keyed by the SHA-256 of the whole file, kept in the serv
 | 6 | 2 | section count `s` |
 | 8 | `s` × 48 | table of contents: id `u16`, flags `u16` (bit 0: deflated), offset `u32`, stored length `u32`, inflated length `u32`, SHA-256 of the inflated bytes |
 
-Each id appears once and no two sections share bytes (a reader refuses the file otherwise), and a reader inflates only the section it asks for, each under the caller's cap. Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. `GameData` carries the game's `hint_blacklist` (names `!hint` refuses, the same for every seed of the game) and `entrance_names` (the hint block's entrance table); each is left out when empty, so a game without them keeps the key it had. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
+Each id appears once and no two sections share bytes (a reader refuses the file otherwise), and a reader inflates only the section it asks for, each under the caller's cap. Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. `GameData` carries the game's `hint_blacklist` (names `!hint` refuses, the same for every seed of the game), left out when empty, so a game without one keeps the key it had. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
 
 **Index stability.** A game's location and item indexes are the positions of its ids, sorted ascending, in section 1. The key hashes the file, section 1 included, so for a given package key the indexes never change, whatever order the names were listed in. Other sections, and seeds, may refer to them by index (test: `indexes_are_fixed_by_the_package_key`).
 

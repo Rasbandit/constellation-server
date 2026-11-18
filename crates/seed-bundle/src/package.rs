@@ -205,8 +205,6 @@ pub struct GamePackage {
     location_groups: Box<str>,
     /// Names `!hint` refuses, sorted.
     hint_blacklist: Box<[Box<str>]>,
-    /// Entrance names, sorted: a seed's entrance index is a position here.
-    entrances: Box<[Box<str>]>,
 }
 
 #[derive(Deserialize)]
@@ -284,7 +282,6 @@ impl GamePackage {
             item_groups: serde_json::json!(g.item_name_groups).to_string().into(),
             location_groups: serde_json::json!(g.location_name_groups).to_string().into(),
             hint_blacklist: g.hint_blacklist.iter().map(|n| n.as_str().into()).collect(),
-            entrances: g.entrance_names.iter().map(|n| n.as_str().into()).collect(),
         }
     }
 
@@ -375,12 +372,6 @@ impl GamePackage {
     #[must_use]
     pub fn hint_blacklisted(&self, name: &str) -> bool {
         self.hint_blacklist.binary_search_by(|n| (**n).cmp(name)).is_ok()
-    }
-
-    /// Entrance names; a seed's entrance index is a position here.
-    #[must_use]
-    pub fn entrances(&self) -> &[Box<str>] {
-        &self.entrances
     }
 
     /// The JSON object clients get for this game in `DataPackage`.

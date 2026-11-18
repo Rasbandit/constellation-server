@@ -118,8 +118,6 @@ def convert(multidata: dict[str, Any], hint_blacklist: dict[str, Any] | None = N
             "item_name_groups": _plain(package.get("item_name_groups", {})),
             "location_name_groups": _plain(package.get("location_name_groups", {})),
             "hint_blacklist": sorted(str(n) for n in (hint_blacklist or {}).get(name, ())),
-            # The seed refers to entrances by index into this list (docs/seed-bundle-v2.md).
-            "entrance_names": sorted({e for s in slots if s["game"] == name for e in s["entrances"].values()}),
         }
     missing = played - games.keys()
     if missing:

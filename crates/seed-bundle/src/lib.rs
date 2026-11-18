@@ -155,8 +155,8 @@ pub struct Slot {
     /// received item, as from location -2 and player 0 (protocol doc, "Data Package Contents").
     #[serde(default)]
     pub start_inventory: Vec<i64>,
-    /// Location id to the entrance a hint names for it (worlds with shuffled entrances); each
-    /// name is one of its game's [`GameData::entrance_names`].
+    /// Location id to the entrance a hint names for it (worlds with shuffled entrances). The
+    /// names are per seed, so the v2 seed keeps them in its own string table.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entrances: BTreeMap<i64, String>,
 }
@@ -200,11 +200,6 @@ pub struct GameData {
     /// game, so it lives in the package).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hint_blacklist: BTreeSet<String>,
-    /// Every entrance name a slot of this game names ([`Slot::entrances`]); a seed refers to
-    /// them by index. Empty, and left out of the package, for a game without shuffled
-    /// entrances.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub entrance_names: BTreeSet<String>,
 }
 
 /// Why a bundle was refused. Names the first rule that failed.
@@ -399,16 +394,10 @@ impl SeedBundle {
         let none = BTreeSet::new();
         let own = locations.get(s.game.as_str()).unwrap_or(&none);
         let mut seen = BTreeSet::new();
-        let names = self.games.get(&s.game).map(|g| &g.entrance_names);
-        for (l, name) in &s.entrances {
+        for l in s.entrances.keys() {
             ensure!(
                 s.locations.iter().any(|p| p.location == *l),
                 "slot {} entrance for location {l}, which its world lacks",
-                s.id
-            );
-            ensure!(
-                names.is_some_and(|n| n.contains(name)),
-                "slot {} entrance {name:?} is not in its game's entrance_names",
                 s.id
             );
         }
