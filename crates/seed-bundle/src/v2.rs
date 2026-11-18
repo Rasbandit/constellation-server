@@ -891,7 +891,7 @@ impl<'a> SlotView<'a> {
         (0..n).map(|k| self.r().u32(at + 4 * k)).collect()
     }
 
-    fn start_indexes(&self) -> impl Iterator<Item = usize> + 'a {
+    fn start_indexes(&self) -> impl Iterator<Item = usize> + use<'a> {
         let (at, n) = (self.field(64) as usize, self.field(68) as usize);
         let w = self.seed.widths().0;
         let bytes = self.seed.bytes.get(at..).unwrap_or_default();
@@ -899,7 +899,7 @@ impl<'a> SlotView<'a> {
     }
 
     /// Starting inventory: item ids of this slot's game, in order.
-    pub fn start_inventory(&self) -> impl Iterator<Item = i64> + 'a {
+    pub fn start_inventory(&self) -> impl Iterator<Item = i64> + use<'a> {
         let items = self.package().items();
         self.start_indexes().map(move |i| items.get(i).copied().unwrap_or(0))
     }
@@ -958,7 +958,7 @@ impl<'a> SlotView<'a> {
     }
 
     /// Location ids of every placed location, ascending.
-    pub fn locations(&self) -> impl Iterator<Item = i64> + 'a {
+    pub fn locations(&self) -> impl Iterator<Item = i64> + use<'a> {
         let p = self.presence();
         let ids = self.package().locations();
         let words = p.len() / 8;
@@ -1009,7 +1009,7 @@ impl<'a> SlotView<'a> {
     }
 
     /// Every placement, by location id.
-    pub fn placements(&self) -> impl Iterator<Item = Placement> + 'a {
+    pub fn placements(&self) -> impl Iterator<Item = Placement> + use<'a> {
         let me = *self;
         self.locations().enumerate().map(move |(i, l)| me.resolve(i, l))
     }

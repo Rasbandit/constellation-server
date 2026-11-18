@@ -21,7 +21,7 @@ const ROOM_BUDGET: i64 = 400 * 1024;
 fn run(name: &str, shape: &Shape) -> harness::Numbers {
     let text = bundle(shape);
     let b = SeedBundle::from_json(&text).unwrap();
-    let path = harness::temp_file(&format!("{name}.json"), &text);
+    let path = temp_file(&format!("{name}.json"), &text);
     let n = harness::measure_bundle(&path, &b);
     println!("{} seed={}", n.row(name), shape.seed);
     println!("{name}: per active room = {} bytes", n.per_room(i64::from(shape.slots)));
@@ -38,4 +38,14 @@ fn a_one_slot_room_with_its_connection_fits_the_budget() {
 fn an_eight_slot_room_with_its_connections_fits_eight_budgets() {
     let n = run("synthetic-8-slot", &Shape::EIGHT_SLOT);
     assert!(n.per_room(8) <= 8 * ROOM_BUDGET, "{}", n.row("synthetic-8-slot"));
+}
+
+/// Write `text` to a fresh temporary file named `name` and return its path.
+#[must_use]
+pub fn temp_file(name: &str, text: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("memory-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path
 }

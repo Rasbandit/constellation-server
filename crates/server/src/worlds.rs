@@ -5,8 +5,10 @@
 //! - `apworlds/<sha256>.apworld` and `yamls/<sha256>.yaml`, content-addressed, each with a
 //!   `<sha256>.json` holding the upload's name and what the sidecar's inspect found;
 //! - `worlds/<id>/` per generation: `apworlds/<module>.apworld` and `yamls/` (the chosen
-//!   files), `status.json`, and `bundle.json` on success. The server writes `bundle.json` from
-//!   the sidecar's stdout; no folder here is ever writable inside the sandbox.
+//!   files), `status.json`, and on success `bundle.seed` (seed file v2) with its game packages
+//!   in `packages/` (`docs/seed-bundle-v2.md`). The server converts the sidecar's stdout (v1
+//!   JSON from `tools/ap-import`) to v2 itself; no folder here is ever writable inside the
+//!   sandbox.
 //!
 //! The flow follows Archipelago's web host (`WebHostLib/upload.py` checks uploads before it
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
@@ -407,6 +409,20 @@ impl GenOut {
     }
 }
 
+/// Convert v1 bundle JSON to a v2 seed file at `path`, its packages in `packages/` beside it
+/// (each written once, atomically, before the seed that names them).
+pub(crate) fn write_v2(path: &Path, v1: &str) -> Result<(), String> {
+    let b = seed_bundle::SeedBundle::from_json(v1).map_err(|e| e.to_string())?;
+    let hash: [u8; 32] =
+        seed_bundle::bundle_hash(v1)?.try_into().map_err(|_| "bundle hash length".to_owned())?;
+    let e = seed_bundle::v2::encode(&b, &hash).map_err(|e| e.to_string())?;
+    let dir = path.parent().unwrap_or_else(|| Path::new(".")).join("packages");
+    for c in &e.packages {
+        seed_bundle::package::write(&dir, c).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    write_atomic(path, &e.seed).map_err(|e| e.to_string())
+}
+
 /// Run one queued generation (one at a time) and record how it ended.
 async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let Ok(_permit) = w.one_gen.acquire().await else { return };
@@ -427,10 +443,10 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
         Ok(stdout) => {
-            let (bundle, limits) = (world.join("bundle.json"), w.limits);
+            let (bundle, limits) = (world.join("bundle.seed"), w.limits);
             tokio::task::spawn_blocking(move || {
                 let out = GenOut::parse(&stdout)?;
-                write_atomic(&bundle, out.bundle.get().as_bytes()).map_err(|e| e.to_string())?;
+                write_v2(&bundle, out.bundle.get())?;
                 load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, out.report))
             })
             .await
@@ -443,8 +459,8 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
         Ok((bundle, loaded, report)) => {
             status["status"] = json!("done");
             status["bundle"] = json!(bundle.display().to_string());
-            status["seed_name"] = json!(loaded.bundle.seed_name);
-            status["slots"] = json!(loaded.bundle.slots.len());
+            status["seed_name"] = json!(loaded.bundle.seed_name());
+            status["slots"] = json!(loaded.bundle.slots().len());
             status["bundle_hash"] = json!(hex(&loaded.hash));
             status["generation"] = report;
         }

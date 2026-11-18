@@ -167,15 +167,18 @@ async fn upload_list_generate_poll_and_done() {
     // left in its scratch folder never reached the host.
     let bundle = PathBuf::from(done["bundle"].as_str().unwrap());
     assert!(std::fs::symlink_metadata(&bundle).unwrap().is_file());
+    // It is v2 (seed file and packages); decoded, it is the sidecar's v1 bundle.
+    let packages = bundle.with_file_name("packages");
+    let back = seed_bundle::v2::decode(std::fs::read(&bundle).unwrap(), &packages, 1 << 26);
     let read = |p: &Path| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
-    assert_eq!(read(&bundle), read(&e2e::fixture_path()));
+    assert_eq!(serde_json::to_value(back.unwrap()).unwrap(), read(&e2e::fixture_path()));
     let world_dir = bundle.parent().unwrap();
     let mut files: Vec<String> = std::fs::read_dir(world_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     files.sort();
-    assert_eq!(files, ["apworlds", "bundle.json", "status.json", "yamls"]);
+    assert_eq!(files, ["apworlds", "bundle.seed", "packages", "status.json", "yamls"]);
     // What the sandbox showed the sidecar, and what it let it do.
     let g = &done["generation"];
     assert_eq!(g["custom_worlds"], json!(["my_world.apworld"]), "only the chosen world, by module");

@@ -225,13 +225,3 @@ pub fn measure_bundle(load: &Path, b: &SeedBundle) -> Numbers {
         conn_full,
     }
 }
-
-/// Write `text` to a fresh temporary file named `name` and return its path.
-#[must_use]
-pub fn temp_file(name: &str, text: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("memory-harness-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    std::fs::write(&path, text).unwrap();
-    path
-}

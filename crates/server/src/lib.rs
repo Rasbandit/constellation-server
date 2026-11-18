@@ -24,7 +24,7 @@ use log::{LogStore, MemLogStore, OpenError, PgLogStore};
 use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
 use runtime::{Mailbox, RoomHandle, Stopped};
-use seed_bundle::SeedBundle;
+use seed_bundle::Seed;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -97,30 +97,33 @@ impl Args {
 }
 
 /// A validated bundle and the hash of its file's content ([`bundle_hash`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Loaded {
-    /// The bundle.
-    pub bundle: SeedBundle,
-    /// SHA-256 of the file's canonical JSON.
+    /// The seed, in its v2 form whatever the file was; shared by the room state and the edge.
+    pub bundle: Arc<Seed>,
+    /// SHA-256 of the canonical v1 JSON (for a v2 file, of the JSON it was made from).
     pub hash: Vec<u8>,
 }
 
-/// Read and validate a bundle, refusing files over `limits.bundle_max_bytes`.
+/// Read and validate a seed file, v1 JSON or v2 (`docs/seed-bundle-v2.md`; its packages in
+/// the `packages` folder beside it), refusing files over `limits.bundle_max_bytes`. The one
+/// way a server loads a seed.
 ///
 /// # Errors
 /// A message for an unreadable, oversized or invalid file.
 pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     let cap = limits.bundle_max_bytes;
     file.take(cap.saturating_add(1))
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > cap {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
         return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    let bundle = SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
-    Ok(Loaded { hash: bundle_hash(&text)?, bundle })
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let seed = seed_bundle::load(bytes, dir, cap)?;
+    Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed) })
 }
 
 /// A new room's state for a loaded bundle: the one place a room is built from a bundle.
@@ -128,8 +131,8 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
 /// # Errors
 /// When the bundle does not make a valid room.
 pub fn fresh_state(loaded: &Loaded) -> Result<RoomState, String> {
-    let b = &loaded.bundle;
-    RoomState::new(b.slot_nos(), b.placement()).map_err(|e| e.to_string())
+    let world: Arc<dyn room_core::World> = Arc::clone(&loaded.bundle) as _;
+    RoomState::from_world(world).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -241,10 +244,11 @@ pub async fn app(
 ) -> Result<(Router, JoinHandle<Stopped>), String> {
     let fresh = fresh_state(&loaded)?;
     let Loaded { bundle, hash } = loaded;
-    let room = room_id(&bundle.seed_name);
+    let room = room_id(bundle.seed_name());
     let (live, mailbox) = RoomHandle::mailbox(&limits);
-    let (seed_name, format) = (bundle.seed_name.clone(), bundle.format);
-    let compat = Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password, limits)?);
+    // The stored hash is of the v1 form, so the format recorded with it is v1's.
+    let (seed_name, format) = (bundle.seed_name().to_owned(), seed_bundle::FORMAT);
+    let compat = Arc::new(CompatRoom::new(bundle, live.clone(), password, limits)?);
     let task = if let Some(url) = database_url {
         let store = PgLogStore::connect(url, &limits)
             .await
@@ -413,7 +417,7 @@ pub async fn run(
             generation,
             limits,
         )?;
-        let seed = loaded.bundle.seed_name.clone();
+        let seed = loaded.bundle.seed_name().to_owned();
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;

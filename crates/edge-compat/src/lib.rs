@@ -17,8 +17,7 @@ use config::Limits;
 use limit::RateTable;
 use proto::Cid;
 use runtime::RoomHandle;
-use seed_bundle::SeedBundle;
-use std::collections::BTreeMap;
+use seed_bundle::Seed;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -37,15 +36,13 @@ const NO_GAME_MIN_VERSION: (u32, u32, u32) = (0, 5, 0);
 /// send checks (section `Tags`).
 const NO_GAME_TAGS: [&str; 3] = ["HintGame", "Tracker", "TextOnly"];
 
-/// One room's data, prepared once and shared by every session.
+/// One room's data, shared by every session. The seed is read in place and its game packages
+/// (with their JSON, serialized once: R4, no heavy work per request) are shared by every room
+/// of the same games.
 pub struct CompatRoom {
-    bundle: Arc<SeedBundle>,
+    bundle: Arc<Seed>,
     room: RoomHandle,
     password: Option<String>,
-    /// `(slot, location)` to item flags.
-    flags: BTreeMap<(u32, i64), u8>,
-    /// Game name to its data package as JSON, serialized once (R4: no heavy work per request).
-    packages: BTreeMap<String, String>,
     limits: Limits,
     /// Chat and bounce, per slot (they share the fan-out path).
     fanout: RateTable<u32>,
@@ -64,7 +61,7 @@ pub struct CompatRoom {
 impl std::fmt::Debug for CompatRoom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompatRoom")
-            .field("seed", &self.bundle.seed_name)
+            .field("seed", &self.bundle.seed_name())
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -75,42 +72,20 @@ impl CompatRoom {
     /// Prepare a room. `password` overrides the bundle's (`None` keeps it).
     ///
     /// # Errors
-    /// A message when a data package cannot be encoded.
+    /// None today; kept so the host treats every room setup step alike.
     pub fn new(
-        bundle: Arc<SeedBundle>,
+        bundle: Arc<Seed>,
         room: RoomHandle,
         password: Option<String>,
         limits: Limits,
     ) -> Result<Self, String> {
-        let flags = bundle
-            .slots
-            .iter()
-            .flat_map(|s| s.locations.iter().map(move |p| ((s.id, p.location), p.flags)))
-            .collect();
-        // Name groups are not part of the package clients get; they read them through `Get`
-        // (reference server: the reduced package, `MultiServer.py:624-641`).
-        let packages = bundle
-            .games
-            .iter()
-            .map(|(name, g)| {
-                let reduced = serde_json::json!({
-                    "item_name_to_id": g.item_name_to_id,
-                    "location_name_to_id": g.location_name_to_id,
-                    "checksum": g.checksum,
-                });
-                serde_json::to_string(&reduced).map(|json| (name.clone(), json))
-            })
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        let password = password.or_else(|| bundle.server_options.password.clone());
+        let password = password.or_else(|| bundle.password().map(str::to_owned));
         let l = limits;
         let keys = l.rate_table_max_keys;
         Ok(Self {
             bundle,
             room,
             password,
-            flags,
-            packages,
             limits,
             fanout: RateTable::new(l.fanout_burst, l.fanout_refill_milli_per_sec, keys),
             datapackage: RateTable::new(
@@ -127,10 +102,6 @@ impl CompatRoom {
             ),
             presence: presence::Presence::default(),
         })
-    }
-
-    fn flags(&self, slot: u32, location: i64) -> u8 {
-        self.flags.get(&(slot, location)).copied().unwrap_or(0)
     }
 }
 

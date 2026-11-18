@@ -10,10 +10,11 @@ use crate::wire::{
     StatusUpdate, TextPart,
 };
 use crate::{CompatRoom, NO_GAME_MIN_VERSION, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
+use bits::{BitSet, Packed};
 use proto::{Command, ErrorCode, Event, EventKind, Seq, SlotNo};
 use room_core::{CoreError, RESERVED_KEY_PREFIX, Reply};
 use runtime::{Note, Published, Subscription};
-use seed_bundle::{Slot, SlotKind};
+use seed_bundle::{Seed, SlotKind, SlotView};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,13 +83,12 @@ struct Joined {
     handling: Handling,
     /// Items sent to the client so far (positions in the filtered list).
     sent: usize,
-    /// Every item the slot received, in order, `player` being the finder.
-    items: Vec<NetworkItem>,
-    /// The slot's starting inventory. A client that asks for it (bit 2) gets these first, so
-    /// its index space is `start` then `items`; any other client indexes `items` from 0
-    /// (reference server: start items lead the list it indexes, `MultiServer.py:1146-1168`).
-    start: Vec<NetworkItem>,
-    checked: BTreeSet<i64>,
+    /// Every item the slot received, in order: each the room-wide ordinal of the location it
+    /// was found at (`Seed::ordinal`), in the fewest bits the room needs. The item, finder and
+    /// flags are read from the seed when sent.
+    items: Packed,
+    /// The slot's own checked locations, by location index.
+    checked: BitSet,
     live: mpsc::Receiver<Arc<Published>>,
     /// The last room `seq` folded into this view: where a resync resumes.
     cursor: Seq,
@@ -109,10 +109,22 @@ impl Joined {
         NO_GAME_TAGS.iter().any(|t| self.tags.contains(*t))
     }
 
-    fn wanted(&self) -> Vec<NetworkItem> {
-        let start = if self.handling.start { self.start.as_slice() } else { &[] };
-        let received = self.items.iter().filter(|i| self.handling.wants(self.slot, i));
-        start.iter().chain(received).copied().collect()
+    /// What this client indexes: the slot's starting inventory first when it asks for it (bit
+    /// 2), then the items it received (reference server: start items lead the list it
+    /// indexes, `MultiServer.py:1146-1168`).
+    fn wanted(&self, seed: &Seed) -> Vec<NetworkItem> {
+        let start = seed
+            .slot(self.slot)
+            .filter(|_| self.handling.start)
+            .into_iter()
+            .flat_map(|s| s.start_inventory())
+            .map(|item| NetworkItem { item, location: START_LOCATION, player: 0, flags: 0 });
+        let received = self
+            .items
+            .iter()
+            .filter_map(|o| network_item(seed, o))
+            .filter(|i| self.handling.wants(self.slot, i));
+        start.chain(received).collect()
     }
 }
 
@@ -183,8 +195,7 @@ impl Session {
     #[must_use]
     pub fn hello(&self) -> String {
         let b = &self.room.bundle;
-        let o = &b.server_options;
-        let g = b.generator_version;
+        let g = b.generator_version();
         let (major, minor, build) = PROTOCOL_VERSION;
         wire::frame(&[ServerPacket::RoomInfo {
             version: NetVersion::new(major, minor, build),
@@ -194,15 +205,15 @@ impl Session {
             // Release, collect and remaining are not implemented yet, so they are advertised as
             // disabled whatever the seed chose (docs/compat-status.md).
             permissions: Permissions { release: 0, collect: 0, remaining: 0 },
-            hint_cost: o.hint_cost,
-            location_check_points: o.location_check_points,
-            games: b.games.keys().cloned().collect(),
+            hint_cost: b.hint_cost(),
+            location_check_points: b.location_check_points(),
+            games: b.games().iter().map(|g| g.name().to_owned()).collect(),
             datapackage_checksums: b
-                .games
+                .games()
                 .iter()
-                .map(|(n, g)| (n.clone(), g.checksum.clone()))
+                .map(|g| (g.name().to_owned(), g.checksum().to_owned()))
                 .collect(),
-            seed_name: b.seed_name.clone(),
+            seed_name: b.seed_name().to_owned(),
             time: unix_now(),
         }])
     }
@@ -276,19 +287,15 @@ impl Session {
         };
         let Subscription { history, live } =
             self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
+        let total: usize = room.bundle.slots().map(|s| s.placed()).sum();
         let mut j = Joined {
             team,
-            slot: slot.id,
+            slot: slot.id(),
             tags: c.tags.iter().cloned().collect(),
             handling,
             sent: 0,
-            items: Vec::new(),
-            start: slot
-                .start_inventory
-                .iter()
-                .map(|&item| NetworkItem { item, location: START_LOCATION, player: 0, flags: 0 })
-                .collect(),
-            checked: BTreeSet::new(),
+            items: Packed::new(bits::width(total.saturating_sub(1) as u64)),
+            checked: BitSet::new(slot.placed()),
             live,
             cursor: Seq(0),
             watch,
@@ -297,8 +304,8 @@ impl Session {
         for e in &history {
             fold(&self.room, &mut j, e);
         }
-        let connected = self.connected(&j, slot, c.slot_data);
-        let wanted = j.wanted();
+        let connected = self.connected(&j, &slot, c.slot_data);
+        let wanted = j.wanted(&room.bundle);
         j.sent = wanted.len();
         self.joined = Some(j);
         let mut packets = vec![connected];
@@ -306,66 +313,62 @@ impl Session {
             packets.push(ServerPacket::ReceivedItems { index: 0, items: wanted });
         }
         // A re-Connect to the same slot announces nothing; to another slot it leaves the old one.
-        if previous.is_none_or(|(_, old)| old != slot.id) {
+        let id = slot.id();
+        if previous.is_none_or(|(_, old)| old != id) {
             if let Some((old_team, old)) = previous {
                 self.presence_part(old_team, old).await?;
                 self.fan(old, &Fanout::Print { print: part_print(old_team, old) }).await?;
             }
-            let who = self.who(team, slot.id).await?;
-            self.room.presence.join(who, async |c| self.publish_change(slot.id, c).await).await;
+            let who = self.who(team, id).await?;
+            self.room.presence.join(who, async |c| self.publish_change(id, c).await).await;
             let print = PrintJson {
                 kind: "Join".to_owned(),
-                data: json!([TextPart::player(slot.id), TextPart::text(" joined the room.")]),
+                data: json!([TextPart::player(id), TextPart::text(" joined the room.")]),
                 team: Some(team),
-                slot: Some(slot.id),
+                slot: Some(id),
                 tags: Some(c.tags),
                 ..PrintJson::default()
             };
-            self.fan(slot.id, &Fanout::Print { print }).await?;
+            self.fan(id, &Fanout::Print { print }).await?;
         }
         Ok(vec![wire::frame(&packets)])
     }
 
-    fn connected(&self, j: &Joined, slot: &Slot, with_data: bool) -> ServerPacket {
+    fn connected(&self, j: &Joined, slot: &SlotView<'_>, with_data: bool) -> ServerPacket {
         let b = &self.room.bundle;
+        let (checked, missing): (Vec<_>, Vec<_>) =
+            slot.locations().enumerate().partition(|(i, _)| j.checked.contains(*i));
         ServerPacket::Connected {
             team: j.team,
             slot: j.slot,
             players: b
-                .slots
-                .iter()
-                .filter(|s| s.kind == SlotKind::Player)
+                .slots()
+                .filter(|s| s.kind() == SlotKind::Player)
                 .map(|s| NetworkPlayer {
-                    team: s.team,
-                    slot: s.id,
-                    alias: s.name.clone(),
-                    name: s.name.clone(),
+                    team: s.team(),
+                    slot: s.id(),
+                    alias: s.name().to_owned(),
+                    name: s.name().to_owned(),
                 })
                 .collect(),
-            missing_locations: slot
-                .locations
-                .iter()
-                .map(|p| p.location)
-                .filter(|l| !j.checked.contains(l))
-                .collect(),
-            checked_locations: j.checked.iter().copied().collect(),
-            slot_data: with_data.then(|| slot.slot_data.clone()),
+            missing_locations: missing.into_iter().map(|(_, l)| l).collect(),
+            checked_locations: checked.into_iter().map(|(_, l)| l).collect(),
+            slot_data: with_data.then(|| storage::slot_data(slot)),
             slot_info: b
-                .slots
-                .iter()
+                .slots()
                 .map(|s| {
-                    let kind = match s.kind {
+                    let kind = match s.kind() {
                         SlotKind::Spectator => 0,
                         SlotKind::Player => 1,
                         SlotKind::Group => 2,
                     };
                     let info = NetworkSlot {
-                        name: s.name.clone(),
-                        game: s.game.clone(),
+                        name: s.name().to_owned(),
+                        game: s.game().to_owned(),
                         kind,
-                        group_members: s.group_members.clone(),
+                        group_members: s.group_members(),
                     };
-                    (s.id.to_string(), info)
+                    (s.id().to_string(), info)
                 })
                 .collect(),
             hint_points: hint_points(&self.room, j),
@@ -439,7 +442,7 @@ impl Session {
     async fn who(&self, team: u32, slot: u32) -> Result<Who, Step> {
         let goal = self.room.room.read(move |s| s.has_goal(SlotNo(slot))).await;
         let goal = goal.map_err(|_| Step::Closed)?;
-        let done = self.room.bundle.slot(slot).is_some_and(|s| storage::done(s, goal));
+        let done = self.room.bundle.slot(slot).is_some_and(|s| storage::done(&s, goal));
         Ok(Who { team, slot, done })
     }
 
@@ -462,20 +465,22 @@ impl Session {
     }
 
     fn data_package(&self, req: &GetDataPackage) -> String {
-        let wanted = |name: &String| req.games.as_ref().is_none_or(|g| g.contains(name));
+        let wanted = |name: &str| req.games.as_ref().is_none_or(|g| g.iter().any(|x| x == name));
+        // The packages' JSON is serialized once per process and shared; only joined here.
         let games: Vec<String> = self
             .room
-            .packages
+            .bundle
+            .games()
             .iter()
-            .filter(|(name, _)| wanted(name))
-            .map(|(name, json)| format!("{}:{json}", Value::String(name.clone())))
+            .filter(|g| wanted(g.name()))
+            .map(|g| format!("{}:{}", Value::String(g.name().to_owned()), g.data_package()))
             .collect();
         format!("[{{\"cmd\":\"DataPackage\",\"data\":{{\"games\":{{{}}}}}}}]", games.join(","))
     }
 
     fn full_items(&mut self) -> Option<String> {
         let j = self.joined.as_mut()?;
-        let items = j.wanted();
+        let items = j.wanted(&self.room.bundle);
         j.sent = items.len();
         // Nothing to send (no items yet, or a client that takes none): no empty packet.
         (!items.is_empty()).then(|| wire::frame(&[ServerPacket::ReceivedItems { index: 0, items }]))
@@ -491,8 +496,9 @@ impl Session {
             )));
         }
         let slot = SlotNo(j.slot);
-        let fresh: BTreeSet<i64> =
-            req.locations.into_iter().filter(|l| !j.checked.contains(l)).collect();
+        let world = self.room.bundle.slot(j.slot).ok_or(Step::Closed)?;
+        let checked = |l: &i64| world.find(*l).is_some_and(|i| j.checked.contains(i));
+        let fresh: BTreeSet<i64> = req.locations.into_iter().filter(|l| !checked(l)).collect();
         let cmds = fresh
             .into_iter()
             .map(|location| Command::Check { slot, cid: check_cid(location), location })
@@ -507,12 +513,11 @@ impl Session {
     fn scout(&self, req: &Locations) -> Result<String, Step> {
         let slot = self.joined.as_ref().and_then(|j| self.room.bundle.slot(j.slot));
         let slot = slot.ok_or(Step::Closed)?;
-        let world: BTreeMap<i64, _> = slot.locations.iter().map(|p| (p.location, p)).collect();
         let locations = req
             .locations
             .iter()
-            .map(|l| {
-                let p = world.get(l).ok_or_else(|| {
+            .map(|&l| {
+                let p = slot.find(l).and_then(|i| slot.placement(i)).ok_or_else(|| {
                     let text = format!("LocationScouts: location {l} is not in this world");
                     Step::from(invalid("arguments", Some("LocationScouts"), text))
                 })?;
@@ -569,7 +574,8 @@ impl Session {
             };
             return Ok(vec![wire::frame(&[ServerPacket::PrintJson(print)])]);
         }
-        let name = self.room.bundle.slot(j.slot).map_or("", |s| s.name.as_str());
+        let slot = self.room.bundle.slot(j.slot);
+        let name = slot.as_ref().map_or("", SlotView::name);
         let print = PrintJson {
             kind: "Chat".to_owned(),
             data: json!([TextPart::text(format!("{name}: {}", req.text))]),
@@ -621,7 +627,7 @@ impl Session {
         let stored: Vec<String> =
             req.keys.iter().filter(|k| !k.starts_with(RESERVED_KEY_PREFIX)).cloned().collect();
         let status: Vec<u32> =
-            req.keys.iter().filter_map(|k| storage::status_slot(room, k)).map(|s| s.id).collect();
+            req.keys.iter().filter_map(|k| storage::status_slot(room, k)).map(|s| s.id()).collect();
         let (values, goals) = room
             .room
             .read(move |s| {
@@ -645,8 +651,8 @@ impl Session {
             } else if let Some(v) = storage::read_only(room, &k) {
                 v
             } else if let Some(slot) = storage::status_slot(room, &k) {
-                let presence = room.presence.status(slot.id).await;
-                Value::from(storage::status_value(slot, goals.contains(&slot.id), presence))
+                let presence = room.presence.status(slot.id()).await;
+                Value::from(storage::status_value(&slot, goals.contains(&slot.id()), presence))
             } else {
                 Value::Null
             };
@@ -751,6 +757,15 @@ impl Session {
     }
 }
 
+/// The item found at a room-wide location ordinal, as the protocol names it (the finder is
+/// `player`).
+fn network_item(seed: &Seed, ordinal: u32) -> Option<NetworkItem> {
+    let (pos, i) = seed.from_ordinal(ordinal)?;
+    let finder = seed.slot_at(pos)?;
+    let p = finder.placement(i)?;
+    Some(NetworkItem { item: p.item, location: p.location, player: finder.id(), flags: p.flags })
+}
+
 /// Location id of a start item: the generic game's "Server" location (protocol doc, "Data
 /// Package Contents"); its player is 0, the server.
 const START_LOCATION: i64 = -2;
@@ -775,22 +790,22 @@ impl From<ServerPacket> for Step {
 fn refusals<'a>(
     room: &'a CompatRoom,
     c: &Connect,
-) -> (Vec<&'static str>, Option<(u32, &'a Slot, Handling)>) {
+) -> (Vec<&'static str>, Option<(u32, SlotView<'a>, Handling)>) {
     let mut errors = Vec::new();
     if room.password.as_ref().is_some_and(|p| c.password.as_ref() != Some(p)) {
         errors.push("InvalidPassword");
     }
     let b = &room.bundle;
-    let found = b.connect_names.get(&c.name).and_then(|&(team, id)| Some((team, b.slot(id)?)));
+    let found = b.connect(&c.name).and_then(|(team, id)| Some((team, b.slot(id)?)));
     let Some((team, slot)) = found else {
         errors.push("InvalidSlot");
         return (errors, None);
     };
     let no_game = c.game.is_empty() && c.tags.iter().any(|t| NO_GAME_TAGS.contains(&t.as_str()));
-    if !no_game && c.game != slot.game {
+    if !no_game && c.game != slot.game() {
         errors.push("InvalidGame");
     }
-    let min = slot.minimum_client_version;
+    let min = slot.minimum_client_version();
     // A client without a game is held to the server-wide minimum, not the world's.
     let min = if no_game { NO_GAME_MIN_VERSION } else { (min.major, min.minor, min.build) };
     if c.version.tuple() < min {
@@ -805,8 +820,8 @@ fn refusals<'a>(
 
 /// Points per check times checks; no hints are spent yet.
 fn hint_points(room: &CompatRoom, j: &Joined) -> i64 {
-    let per = i64::from(room.bundle.server_options.location_check_points);
-    per.saturating_mul(i64::try_from(j.checked.len()).unwrap_or(i64::MAX))
+    let per = i64::from(room.bundle.location_check_points());
+    per.saturating_mul(i64::try_from(j.checked.count()).unwrap_or(i64::MAX))
 }
 
 /// Apply a durable event to a session's view of the room. Returns the item an `Item` event
@@ -816,20 +831,27 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
     let slot = e.slot?.0;
     match e.kind {
         EventKind::Checked { location, .. } => {
-            if slot == j.slot {
-                j.checked.insert(location);
+            if slot == j.slot
+                && let Some(i) = room.bundle.slot(slot).and_then(|s| s.find(location))
+            {
+                j.checked.insert(i);
             }
             None
         }
         // The goal and stored values are read from the room when asked for.
         EventKind::Goal | EventKind::KvSet { .. } => None,
         EventKind::Item { from, location, item, .. } => {
-            let it =
-                NetworkItem { item, location, player: from.0, flags: room.flags(from.0, location) };
-            if slot == j.slot {
-                j.items.push(it);
+            let b = &room.bundle;
+            let pos = b.pos(from);
+            let at = pos.and_then(|p| Some((p, b.slot_at(p)?.find(location)?)));
+            let ordinal = at.and_then(|(p, i)| b.ordinal(p, i));
+            let flags = ordinal.and_then(|o| network_item(b, o)).map_or(0, |it| it.flags);
+            if slot == j.slot
+                && let Some(o) = ordinal
+            {
+                j.items.push(o);
             }
-            Some(it)
+            Some(NetworkItem { item, location, player: from.0, flags })
         }
     }
 }
@@ -847,7 +869,7 @@ fn events_packets(
     let mut replies = Vec::new();
     for e in evs {
         let slot = e.slot.map_or(0, |s| s.0);
-        let was = j.checked.len();
+        let was = j.checked.count();
         let item = fold(room, j, e);
         match (&e.kind, item) {
             (EventKind::KvSet { key, value }, _) => {
@@ -862,7 +884,7 @@ fn events_packets(
                     replies.push(ServerPacket::SetReply(reply));
                 }
             }
-            (&EventKind::Checked { location, .. }, _) if j.checked.len() != was => {
+            (&EventKind::Checked { location, .. }, _) if j.checked.count() != was => {
                 checked.push(location);
             }
             (&EventKind::Item { .. }, Some(it)) => {
@@ -877,7 +899,7 @@ fn events_packets(
                 if !j.no_text() {
                     prints.push(goal_print(j.team, slot));
                 }
-                let team = room.bundle.slot(slot).map_or(0, |s| s.team);
+                let team = room.bundle.slot(slot).map_or(0, |s| s.team());
                 let key = storage::status_key(team, slot);
                 if j.watch.contains(&key) {
                     let reply = storage::read_only_reply(&key, Value::from(CLIENT_GOAL));
@@ -954,7 +976,7 @@ fn goal_print(team: u32, slot: u32) -> ServerPacket {
 /// Section `Bounce`: `or` and `and` over the conditions given; `legacy` is
 /// `teams and (games or slots or tags)`. A missing team list means the sender's team.
 fn bounce_matches(room: &CompatRoom, j: &Joined, sender_team: u32, b: &Bounce) -> bool {
-    let game = room.bundle.slot(j.slot).map(|s| s.game.as_str());
+    let game = room.bundle.slot(j.slot).map(|s| s.game());
     let teams = b.teams.clone().unwrap_or_else(|| vec![sender_team]);
     let team_ok = teams.contains(&j.team);
     let others = [

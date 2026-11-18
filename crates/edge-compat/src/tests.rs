@@ -12,8 +12,23 @@ const GAME: &str = "G";
 
 /// Slot 1 (A): location 100 -> B's item 7 (progression), 101 -> A's own item 8.
 /// Slot 2 (B): location 100 -> A's item 7 (trap).
-fn bundle(password: &Value) -> Arc<SeedBundle> {
-    let v = json!({
+/// A v1 bundle as the room runs it (encoded to v2 in memory, the server's load path).
+fn seed(v: &Value) -> Arc<Seed> {
+    let dir = std::path::Path::new(".");
+    Arc::new(seed_bundle::load(v.to_string().into_bytes(), dir, 1 << 26).unwrap())
+}
+
+fn state_of(b: &Arc<Seed>) -> RoomState {
+    RoomState::from_world(Arc::clone(b) as Arc<dyn room_core::World>).unwrap()
+}
+
+fn bundle(password: &Value) -> Arc<Seed> {
+    seed(&bundle_json(password))
+}
+
+/// The bundle above as v1 JSON.
+fn bundle_json(password: &Value) -> Value {
+    json!({
         "format": 1, "seed_name": "seed-1",
         "generator_version": {"major": 0, "minor": 6, "build": 8},
         "server_options": {"password": password, "hint_cost": 10, "location_check_points": 2,
@@ -32,15 +47,14 @@ fn bundle(password: &Value) -> Arc<SeedBundle> {
         "connect_names": {"A": [0, 1], "B": [0, 2]},
         "games": {GAME: {"item_name_to_id": {"Seven": 7, "Eight": 8},
                          "location_name_to_id": {"L100": 100, "L101": 101}, "checksum": "ck"}}
-    });
-    Arc::new(SeedBundle::from_json(&v.to_string()).unwrap())
+    })
 }
 
 fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
     let b = bundle(password);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
     Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned), Limits::DESIGN).unwrap())
 }
@@ -456,7 +470,7 @@ fn big_room(end: i64, limits: &Limits) -> Arc<CompatRoom> {
 
 /// As [`big_room`], every item going to `receiver`.
 fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     let locs: Vec<Value> = (1000..end)
         .map(|l| json!({"location": l, "item": 7, "receiver": receiver, "flags": 0}))
         .collect();
@@ -464,10 +478,10 @@ fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
     for l in 1000..end {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
     }
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let b = seed(&v);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
     Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
@@ -524,7 +538,7 @@ fn limited(limits: &Limits) -> Arc<CompatRoom> {
     let b = bundle(&Value::Null);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
     Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
@@ -616,12 +630,12 @@ fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
 
 /// The test bundle with an edit applied.
 fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     edit(&mut v);
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let b = seed(&v);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
     Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap())
 }

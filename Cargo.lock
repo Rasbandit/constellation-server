@@ -348,6 +348,7 @@ dependencies = [
 name = "edge-compat"
 version = "0.0.0"
 dependencies = [
+ "bits",
  "config",
  "futures-util",
  "log 0.0.0",
