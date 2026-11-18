@@ -471,13 +471,122 @@ mod pg_only {
             .unwrap()
     }
 
+    async fn open(
+        s: &PgLogStore,
+        room: RoomId,
+        hash: &[u8],
+        key: &str,
+    ) -> Result<String, OpenError> {
+        s.open_room(room, "seed", 1, hash, key, b"{}").await.map(|o| o.key)
+    }
+
     #[tokio::test]
     async fn a_room_reopens_with_its_bundle_and_refuses_another() {
         let s = pg_store().await;
-        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
-        s.open_room(R, "seed", 1, &[1, 2]).await.unwrap();
-        assert_eq!(s.open_room(R, "seed", 1, &[1, 3]).await, Err(OpenError::OtherBundle));
-        s.open_room(RoomId(2), "seed", 1, &[1, 3]).await.unwrap();
+        open(&s, R, &[1, 2], "aaaaaaaaaa").await.unwrap();
+        open(&s, R, &[1, 2], "bbbbbbbbbb").await.unwrap();
+        assert_eq!(open(&s, R, &[1, 3], "cccccccccc").await, Err(OpenError::OtherBundle));
+        open(&s, RoomId(2), &[1, 3], "dddddddddd").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_room_keeps_the_key_it_first_opened_with_and_keys_are_unique() {
+        let s = pg_store().await;
+        assert_eq!(open(&s, R, &[1], "aaaaaaaaaa").await.unwrap(), "aaaaaaaaaa");
+        // A reopen draws a new key, but the stored one wins: the address never changes.
+        assert_eq!(open(&s, R, &[1], "bbbbbbbbbb").await.unwrap(), "aaaaaaaaaa");
+        // Another room cannot take a key in use; the caller draws again.
+        assert!(matches!(open(&s, RoomId(2), &[2], "aaaaaaaaaa").await, Err(OpenError::Store(_))));
+        assert_eq!(open(&s, RoomId(2), &[2], "cccccccccc").await.unwrap(), "cccccccccc");
+        // Only the form the server parses is stored: lowercase base32, 10 characters.
+        for bad in ["AAAAAAAAAB", "aaaaaaaab", "aaaaaaaaa1"] {
+            assert!(
+                matches!(open(&s, RoomId(3), &[3], bad).await, Err(OpenError::Store(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_directory_lists_open_rooms_with_their_bundles_and_drops_finished_ones() {
+        let s = pg_store().await;
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"bundle a").await.unwrap();
+        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", b"bundle b").await.unwrap();
+        let listed = s.list_rooms().await.unwrap();
+        let names: Vec<_> = listed.iter().map(|l| (l.seed_name.as_str(), l.key.as_str())).collect();
+        assert_eq!(names, [("alpha", "aaaaaaaaaa"), ("beta", "bbbbbbbbbb")]);
+        assert!(listed.iter().all(|l| l.idle_secs < 60), "a new room was just active");
+        assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
+        assert_eq!(s.room_bundle(RoomId(99)).await.unwrap(), None);
+        // A reopen never replaces the stored file.
+        s.open_room(R, "alpha", 1, &[1], "cccccccccc", b"other").await.unwrap();
+        assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
+        assert!(s.finish(R, "abandoned", 0).await.unwrap());
+        let left: Vec<_> = s.list_rooms().await.unwrap().into_iter().map(|l| l.seed_name).collect();
+        assert_eq!(left, ["beta"]);
+        assert_eq!(
+            s.open_room(R, "alpha", 1, &[1], "dddddddddd", b"bundle a").await,
+            Err(OpenError::Finished { reason: "abandoned".to_owned() })
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_sets_how_long_each_room_has_been_idle_in_one_call() {
+        let s = pg_store().await;
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"{}").await.unwrap();
+        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", b"{}").await.unwrap();
+        s.touch(&[]).await.unwrap();
+        s.touch(&[(R, 3 * 86_400), (RoomId(2), 86_400), (RoomId(99), 0)]).await.unwrap();
+        let idle: Vec<u64> = s.list_rooms().await.unwrap().iter().map(|l| l.idle_secs).collect();
+        let [a, b] = idle[..] else { panic!("{idle:?}") };
+        assert!((3 * 86_400..3 * 86_400 + 60).contains(&a), "{a}");
+        assert!((86_400..86_400 + 60).contains(&b), "{b}");
+        let reopened = s.open_room(R, "alpha", 1, &[1], "bbbbbbbbbb", b"{}").await.unwrap();
+        assert!(reopened.idle_secs >= 3 * 86_400, "opening is not a connection");
+    }
+
+    /// D-30 is decided by the database: a room used more recently than the limit is not
+    /// ended, whatever the caller's clock says.
+    #[tokio::test]
+    async fn finish_ends_a_room_only_when_the_database_says_it_was_idle_long_enough() {
+        let s = pg_store().await;
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"{}").await.unwrap();
+        assert!(!s.finish(R, "abandoned", 3_600).await.unwrap(), "used just now");
+        assert_eq!(s.list_rooms().await.unwrap().len(), 1);
+        s.touch(&[(R, 7_200)]).await.unwrap();
+        assert!(s.finish(R, "abandoned", 3_600).await.unwrap());
+        assert!(s.list_rooms().await.unwrap().is_empty());
+        assert!(!s.finish(R, "abandoned", 0).await.unwrap(), "a finished room ends once");
+        assert!(!s.finish(RoomId(99), "abandoned", 0).await.unwrap(), "unknown room");
+    }
+
+    /// A room stored under migration 0001 has no key and no bundle. It is not listed until
+    /// its next open fills both, and then keeps them.
+    #[tokio::test]
+    async fn a_room_stored_before_the_directory_gets_its_key_and_bundle_on_its_next_open() {
+        let s = pg_store().await;
+        sqlx::query(
+            "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash) \
+             VALUES ($1, 'alpha', 1, $2)",
+        )
+        .bind(i64::from_be_bytes(R.0.to_be_bytes()))
+        .bind(&[1_u8][..])
+        .execute(s.pool_for_tests())
+        .await
+        .unwrap();
+        assert!(s.list_rooms().await.unwrap().is_empty(), "no key or bundle yet");
+        assert_eq!(s.room_bundle(R).await.unwrap(), None);
+        // Another bundle for the same room id fills nothing.
+        assert_eq!(
+            s.open_room(R, "alpha", 1, &[2], "bbbbbbbbbb", b"other").await,
+            Err(OpenError::OtherBundle)
+        );
+        assert_eq!(s.room_bundle(R).await.unwrap(), None);
+        let opened = s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"bundle a").await.unwrap();
+        assert_eq!(opened.key, "aaaaaaaaaa");
+        let listed = s.list_rooms().await.unwrap();
+        assert_eq!((listed[0].seed_name.as_str(), listed[0].key.as_str()), ("alpha", "aaaaaaaaaa"));
+        assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
     }
 
     /// Two writers with the same epoch (a bug upstream, but the store must say so): both pass

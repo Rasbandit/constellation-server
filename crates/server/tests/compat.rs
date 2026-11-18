@@ -300,6 +300,220 @@ mod scenarios {
         assert!(body.ends_with("ok"), "{body}");
     }
 
+    /// `GET path` on a fresh connection (as a WebSocket upgrade when `upgrade`); the response,
+    /// read up to its `content-length` (the server may keep the connection open).
+    async fn http_get(server: &Server, path: &str, upgrade: bool) -> String {
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let ws = if upgrade {
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        } else {
+            "Connection: close\r\n"
+        };
+        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{ws}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let text = String::from_utf8_lossy(&got).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_owned)
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                if len.is_some_and(|n| body.len() >= n) {
+                    return text;
+                }
+            }
+            let n = tokio::time::timeout(e2e::GUARD, tcp.read(&mut buf)).await.unwrap().unwrap();
+            if n == 0 {
+                return text;
+            }
+            got.extend_from_slice(buf.get(..n).unwrap());
+        }
+    }
+
+    /// A rooms folder with the fixture under each seed name, and the server on it.
+    fn rooms_server(name: &str, seeds: &[&str]) -> (Server, std::path::PathBuf) {
+        rooms_server_env(name, seeds, &[])
+    }
+
+    fn rooms_server_env(
+        name: &str,
+        seeds: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Server, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("e2e-rooms-{name}-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        for seed in seeds {
+            add_bundle(&dir, seed);
+        }
+        (Server::start_rooms(Path::new(BIN), &dir, env).unwrap(), dir)
+    }
+
+    /// Put the fixture under `seed` into the folder the way an operator should: written under
+    /// another name, then renamed into place, so a scan never reads half a file.
+    fn add_bundle(dir: &Path, seed: &str) {
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+        v["seed_name"] = json!(seed);
+        let part = dir.join(format!("{seed}.json.part"));
+        std::fs::write(&part, v.to_string()).unwrap();
+        std::fs::rename(part, dir.join(format!("{seed}.json"))).unwrap();
+    }
+
+    /// The room key the server logged for `seed`.
+    fn key_of(server: &Server, seed: &str) -> String {
+        let line = server
+            .log()
+            .into_iter()
+            .find(|l| l.contains("room ready") && l.contains(&format!("seed=\"{seed}\"")))
+            .unwrap_or_else(|| panic!("no room ready line for {seed}: {:?}", server.log()));
+        line.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned()
+    }
+
+    /// A WebSocket URL naming `key` in the host; the TCP connection goes to the server.
+    fn room_url(server: &Server, key: &str) -> String {
+        format!("ws://{key}.example:{}", server.addr.port())
+    }
+
+    #[tokio::test]
+    async fn a_rooms_folder_starts_one_room_per_bundle_each_with_a_random_key() {
+        let (server, dir) = rooms_server("start", &["alpha", "beta"]);
+        let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
+        assert_ne!(a, b);
+        for key in [&a, &b] {
+            assert_eq!(key.len(), 10, "{key}");
+            assert!(key.bytes().all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7')), "{key}");
+        }
+        assert!(server.log().iter().any(|l| l.contains("listening") && l.contains("rooms=2")));
+        let health = http_get(&server, "/healthz", false).await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        // In memory, a restart draws new keys (the rooms are lost anyway).
+        drop(server);
+        let again = Server::start_rooms(Path::new(BIN), &dir, &[]).unwrap();
+        assert_ne!(key_of(&again, "alpha"), a);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn each_key_in_the_host_reaches_its_own_room() {
+        let (server, dir) = rooms_server("route", &["alpha", "beta"]);
+        let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
+        let (loc, item, _) = alice_locations_for(2)[0];
+        // Alice checks a location in room A; Bob in room A gets the item.
+        let (mut alice_a, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &a), "Alice").await.unwrap();
+        let (mut bob_a, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &a), "Bob").await.unwrap();
+        bob_a.next_cmd("ReceivedItems").await.unwrap(); // starting inventory
+        check(&mut alice_a, &[loc]).await;
+        let (got, _) = bob_a.next_cmd("ReceivedItems").await.unwrap();
+        assert_eq!(got["items"][0]["item"], item);
+        // Room B never saw that check; room A did. Upper case in the host is the same key.
+        let (_, connected_b, _) =
+            e2e::join_via(server.addr, &room_url(&server, &b.to_ascii_uppercase()), "Alice")
+                .await
+                .unwrap();
+        assert_eq!(connected_b["checked_locations"], json!([]));
+        let (_, connected_a, _) =
+            e2e::join_via(server.addr, &room_url(&server, &a), "Alice").await.unwrap();
+        assert_eq!(connected_a["checked_locations"], json!([loc]));
+        assert!(server.log().iter().any(|l| l.contains("websocket accepted") && l.contains(&a)));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_missing_key_is_refused_with_404() {
+        let (server, dir) = rooms_server("unknown", &["alpha", "beta"]);
+        let unknown = e2e::Client::connect_via(server.addr, &room_url(&server, "zzzzzzzzzz")).await;
+        assert!(unknown.unwrap_err().contains("404"));
+        // No key in the host at all: with two rooms the server does not guess.
+        let none = e2e::Client::connect(&server.url()).await;
+        assert!(none.unwrap_err().contains("404"));
+        let ws = http_get(&server, "/", true).await;
+        assert!(ws.contains("this server runs 2 rooms"), "{ws}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_added_to_the_folder_becomes_a_room_while_the_server_runs() {
+        let fast = [("CONSTELLATION_ROOMS_SCAN_MS", "100")];
+        let (server, dir) = rooms_server_env("live-add", &["alpha"], &fast);
+        let alpha = key_of(&server, "alpha");
+        let (mut alice_a, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
+        add_bundle(&dir, "beta");
+        server.wait_for_log("seed=\"beta\"").unwrap();
+        let beta = key_of(&server, "beta");
+        assert_ne!(alpha, beta);
+        e2e::join_via(server.addr, &room_url(&server, &beta), "Alice").await.unwrap();
+        // The open connection to alpha did not notice.
+        alice_a.send(&json!([{"cmd": "Get", "keys": []}])).await.unwrap();
+        assert_eq!(alice_a.next_cmd("Retrieved").await.unwrap().0["keys"], json!({}));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn an_idle_room_leaves_memory_and_its_next_connect_loads_it_with_its_checks() {
+        let env = [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_IDLE_SECS", "1")];
+        let (server, dir) = rooms_server_env("idle", &["alpha", "beta"], &env);
+        let alpha = key_of(&server, "alpha");
+        let (loc, _, _) = alice_locations_for(2)[0];
+        let (mut alice, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
+        check(&mut alice, &[loc]).await;
+        alice.next_cmd("RoomUpdate").await.unwrap();
+        alice.close().await.unwrap();
+        server.wait_for_log("room idle; left memory").unwrap();
+        let (_, connected, _) = e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice")
+            .await
+            .unwrap_or_else(|e| panic!("{e}; log:\n{}", server.log().join("\n")));
+        assert_eq!(connected["checked_locations"], json!([loc]));
+        let loads = server.log().iter().filter(|l| l.contains("room in memory")).count();
+        assert_eq!(loads, 2, "loaded on the first connect and again after it idled");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_room_ends_and_is_refused() {
+        let env =
+            [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_ABANDON_SECS", "1")];
+        let (server, dir) = rooms_server_env("abandon", &["alpha"], &env);
+        let alpha = key_of(&server, "alpha");
+        server.wait_for_log("room abandoned").unwrap();
+        let again = e2e::Client::connect_via(server.addr, &room_url(&server, &alpha)).await;
+        assert!(again.unwrap_err().contains("404"));
+        assert!(dir.join("alpha.json").exists(), "the file is left alone");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn one_bundle_takes_every_host() {
+        let server = start(&[]).unwrap();
+        // A host whose first label only looks like a key still reaches the one room.
+        e2e::join_via(server.addr, &room_url(&server, "playground"), "Alice").await.unwrap();
+        e2e::join(&server.url(), "Bob").await.unwrap();
+    }
+
+    /// The number of listed rooms changes while a rooms folder runs (a scan adds one, D-30
+    /// ends one), so routing never depends on it: an old link to another room must not land
+    /// in the only room left.
+    #[tokio::test]
+    async fn a_rooms_folder_with_one_room_refuses_another_key_and_no_key() {
+        let (server, dir) = rooms_server("one", &["alpha"]);
+        let alpha = key_of(&server, "alpha");
+        let other = e2e::Client::connect_via(server.addr, &room_url(&server, "zzzzzzzzzz")).await;
+        assert!(other.unwrap_err().contains("404"));
+        assert!(e2e::Client::connect(&server.url()).await.unwrap_err().contains("404"));
+        e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[tokio::test]
     async fn the_password_can_come_from_a_file_and_never_from_the_command_line() {
         let dir = std::env::temp_dir().join(format!("e2e-pw-{}", std::process::id()));
