@@ -89,7 +89,6 @@ struct Joined {
     /// (reference server: start items lead the list it indexes, `MultiServer.py:1146-1168`).
     start: Vec<NetworkItem>,
     checked: BTreeSet<i64>,
-    goals: BTreeSet<u32>,
     live: mpsc::Receiver<Arc<Published>>,
     /// The last room `seq` folded into this view: where a resync resumes.
     cursor: Seq,
@@ -290,7 +289,6 @@ impl Session {
                 .map(|&item| NetworkItem { item, location: START_LOCATION, player: 0, flags: 0 })
                 .collect(),
             checked: BTreeSet::new(),
-            goals: BTreeSet::new(),
             live,
             cursor: Seq(0),
             watch,
@@ -802,17 +800,14 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
     j.cursor = j.cursor.max(e.seq);
     let slot = e.slot?.0;
     match e.kind {
-        EventKind::KvSet { .. } => None,
         EventKind::Checked { location, .. } => {
             if slot == j.slot {
                 j.checked.insert(location);
             }
             None
         }
-        EventKind::Goal => {
-            j.goals.insert(slot);
-            None
-        }
+        // The goal and stored values are read from the room when asked for.
+        EventKind::Goal | EventKind::KvSet { .. } => None,
         EventKind::Item { from, location, item, .. } => {
             let it =
                 NetworkItem { item, location, player: from.0, flags: room.flags(from.0, location) };
