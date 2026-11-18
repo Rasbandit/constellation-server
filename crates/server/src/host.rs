@@ -951,10 +951,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_bundle_is_loaded_at_startup_never_abandoned_and_its_end_ends_the_process() {
-        let limits = Limits { room_abandon_secs: 0, ..Limits::DESIGN };
+    async fn one_bundle_is_loaded_at_startup_never_unloaded_or_abandoned_and_ends_the_process() {
+        let limits = Limits { room_abandon_secs: 0, room_idle_secs: 0, ..Limits::DESIGN };
         let (_, mut host) = app(&Source::Bundle(fixture()), None, None, limits).await.unwrap();
         assert_eq!(host.resident(), 1);
+        host.unload_idle();
+        assert_eq!(host.resident(), 1, "never leaves memory");
         host.end_abandoned().await;
         assert_eq!(host.len(), 1);
         let (key, run) = host.running.iter().map(|(k, r)| (k.clone(), r.run)).next().unwrap();
@@ -1042,6 +1044,15 @@ mod tests {
             let empty = TempDir::new("pg-cap-empty");
             let again = pg_host(&empty, &db, Limits { max_rooms: 1, ..Limits::DESIGN }).await;
             assert_eq!(again.len(), 1);
+        }
+
+        /// As if `by` passed for the room: its idle clock and the host's note of what the
+        /// database holds move back together. Aging only the clock would put its last use
+        /// before the last write, which real time never does.
+        fn elapse(host: &mut Host, key: &RoomKey, by: Duration) {
+            read(&host.rooms).get(key).unwrap().activity.age(by);
+            let written = host.recorded.get_mut(key).unwrap();
+            *written = written.minus(by);
         }
 
         const FORTY_DAYS: &str = "UPDATE rooms SET last_active = now() - interval '40 days'";
@@ -1136,7 +1147,7 @@ mod tests {
             let mut host = pg_host(&dir, &db, limits).await;
             let key = key_of(&host, "alpha");
             host.wake(&key).await.unwrap();
-            read(&host.rooms).get(&key).unwrap().activity.age(Duration::from_secs(120));
+            elapse(&mut host, &key, Duration::from_secs(120));
             host.tick().await;
             assert!(!in_memory(&host, &key));
             assert!((120..180).contains(&stored_idle_secs(&db).await));

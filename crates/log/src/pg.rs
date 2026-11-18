@@ -339,9 +339,6 @@ impl PgLogStore {
     /// # Errors
     /// When the database fails.
     pub async fn touch(&self, rooms: &[(RoomId, u64)]) -> Result<(), StoreError> {
-        if rooms.is_empty() {
-            return Ok(());
-        }
         let (ids, idle): (Vec<i64>, Vec<i64>) =
             rooms.iter().map(|&(room, idle)| (room_key(room), bound(idle))).unzip();
         self.isolated(move |c| {
