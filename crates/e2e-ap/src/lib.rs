@@ -10,8 +10,8 @@ mod tests {
     use flate2 as _; // only pins the version (see Cargo.toml)
 
     use archipelago_rs::{
-        Cache, Client, ClientStatus, ConnectionOptions, DataStorageOperation, Event, ItemHandling,
-        Print,
+        Cache, Client, ClientStatus, ConnectionOptions, CreateAsHint, DataStorageOperation, Event,
+        HintStatus, ItemHandling, Print,
     };
     use e2e::{GUARD, Server, fixture};
     use std::path::Path;
@@ -226,6 +226,57 @@ mod tests {
                 if *new_value == serde_json::json!(0))),
             "no status 0 after Bob left"
         );
+    }
+
+    /// Hints through the library's own calls: a scout that creates hints, the receiver's
+    /// `Hint` print and watched `_read_hints_` key, and `update_hint`.
+    #[test]
+    fn archipelago_rs_creates_watches_and_updates_hints() {
+        let b = fixture().unwrap();
+        let to_bob = b.slot(1).unwrap().locations.iter().find(|p| p.receiver == 2).unwrap();
+        let server = start();
+        let test = "hints";
+        let mut alice = connect(&server, "Alice", test);
+        let mut bob = connect(&server, "Bob", test);
+        let key = "_read_hints_0_2";
+        bob.watch([key]).unwrap();
+        pump(&mut bob, |_, _| true);
+        let rx = alice.scout_locations([to_bob.location], CreateAsHint::New);
+        let mut scouted = None;
+        pump(&mut alice, |_, _| {
+            scouted = rx.try_recv().ok();
+            scouted.is_some()
+        });
+        assert_eq!(scouted.unwrap().unwrap().len(), 1);
+        let mut printed = false;
+        let mut listed = None;
+        pump(&mut bob, |_, evs| {
+            for e in evs {
+                match e {
+                    Event::Print(Print::Hint { item, found, .. }) => {
+                        assert_eq!(item.location().id(), to_bob.location);
+                        assert_eq!((item.sender().slot(), item.receiver().slot()), (1, 2));
+                        assert!(!found);
+                        printed = true;
+                    }
+                    Event::KeyChanged { key: k, new_value, player, .. } if k == key => {
+                        assert!(player.is_none(), "a read-only key has no writer");
+                        listed = Some(new_value.clone());
+                    }
+                    _ => {}
+                }
+            }
+            printed && listed.is_some()
+        });
+        let list = listed.unwrap();
+        assert_eq!(list[0]["location"], to_bob.location);
+        assert_eq!((list[0]["status"].clone(), list[0]["class"].clone()), (0.into(), "Hint".into()));
+        // Bob receives it, so Bob may mark it.
+        bob.update_hint(1, to_bob.location, HintStatus::Avoid).unwrap();
+        pump(&mut bob, |_, evs| {
+            evs.iter().any(|e| matches!(e, Event::KeyChanged { key: k, new_value, .. }
+                if k == key && new_value[0]["status"] == 20))
+        });
     }
 
     #[test]
