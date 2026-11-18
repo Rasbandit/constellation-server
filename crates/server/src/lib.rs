@@ -564,6 +564,25 @@ mod tests {
         assert!(e.contains(&format!("larger than {} bytes", len - 1)), "{e}");
     }
 
+    /// The generation path's v2 file loads through the same `load_bundle` as the v1 file, as
+    /// the same room: same seed, same v1 hash (what Postgres keeps per room), same placements.
+    #[test]
+    fn a_v2_seed_loads_as_the_same_room_as_its_v1_bundle() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+        let dir = std::env::temp_dir().join(format!("server-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = dir.join("bundle.seed");
+        worlds::write_v2(&seed, &std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        let (v1, v2) =
+            (load_bundle(&fixture, &Limits::DESIGN), load_bundle(&seed, &Limits::DESIGN));
+        let (v1, v2) = (v1.unwrap(), v2.unwrap());
+        assert_eq!(v1.hash, v2.hash);
+        assert_eq!(v1.bundle.bytes(), v2.bundle.bytes());
+        assert!(fresh_state(&v2).is_ok());
+        // (A missing package is covered in seed-bundle, where no other test holds this one.)
+    }
+
     #[test]
     fn the_room_id_is_the_seed_names_sha256_prefix() {
         // The first 8 bytes of the published SHA-256 digests of "" and of "abc"
