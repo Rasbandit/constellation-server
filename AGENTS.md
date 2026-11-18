@@ -28,6 +28,7 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
 - Work in a git worktree, never in the main checkout. Pull `main` first, then `git worktree add -b <branch> ../constellation-server-<slug> main`. Remove it with `git worktree remove` once the PR merges.
 - Stay inside the issue's scope. New work you discover becomes a new issue (with `finding` if it surprised you), not part of your PR.
 - Never push to someone else's branch or edit a PR you did not open.
+- New code follows the Concurrency rules in `CONTRIBUTING.md` (many cores from day one). Do not rewrite existing code just for them.
 - One PR per issue. Follow-up fixes are commits on that PR.
 - Issues, PRs and comments in this repo are public. Anything that mentions Archipelago follows the rules in `CONTRIBUTING.md`, and a human reviews it before it is posted.
 - Do not run heavy work on a shared machine: targeted tests locally, the full suite on the manual `nightly` workflow.

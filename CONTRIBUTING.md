@@ -27,7 +27,7 @@ By opening a pull request you agree that:
 - Limits and environment variables live only in `crates/config`.
 
 ## Concurrency
-Write every crate as if it runs on many cores, so scaling out never needs a rewrite.
+Write all new code as if it runs on many cores, so scaling out never needs a rewrite. Existing code is not rewritten for this; it is brought in line when it is next changed.
 - Shared data is immutable and shared by reference (`&T`, `Arc<T>`). Mutable state is owned by one task and passed in, never global. No `static mut`, no `Rc`/`RefCell` in library types; core types must be `Send + Sync`.
 - Results never depend on thread count or scheduling. Each task gets its own RNG stream from `spec_rng::derive`, and parallel results are merged in a fixed order.
 - Parallelise across independent units (seeds, rooms, worlds, checks), not inside one inherently sequential step such as a single fill.
