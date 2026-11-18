@@ -522,6 +522,24 @@ fn unknown_key_errors_do_not_depend_on_map_order() {
     }
 }
 
+/// Defs compile in name order; named so the deepest def compiles first, each def is already
+/// compiled when the next one reads it. The chain's depth still counts at every `ref`.
+#[test]
+fn a_def_chain_compiled_deepest_first_is_still_too_deep() {
+    let mut m = manifest();
+    let n = 300;
+    // Position k is named so that later positions sort first.
+    let name = |k: usize| format!("c{:04}", n - k);
+    for k in 0..n {
+        let next = json!({"ref": name(k + 1)});
+        m["defs"][name(k)] = json!({"all": [next, {"has": "lamp"}]});
+    }
+    m["defs"][name(n)] = json!({"has": "rope"});
+    m["regions"][1]["checks"][0]["rule"] = json!({"ref": name(0)});
+    let err = data_fill::section::compile(&m).unwrap_err();
+    assert!(err.contains("nested"), "{err}");
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());

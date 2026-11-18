@@ -340,6 +340,11 @@ struct Compiler<'m> {
     def_reads: Vec<Reads>,
     /// Rule nodes open in the recursion, defs reached through `ref` included.
     depth: u32,
+    /// The deepest an evaluation from the rule being compiled goes so far.
+    peak: u32,
+    /// Per compiled def: how deep its body nests, defs it reaches included, so a `ref` to a
+    /// def compiled earlier still counts it (as the loader does).
+    def_depth: Vec<u32>,
     code: Vec<u8>,
     dedupe: HashMap<Vec<u8>, u32>,
     /// Item groups: (item, cap) members, `None` for an uncapped count.
@@ -456,6 +461,8 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         def_busy: vec![false; raw_defs.len()],
         def_reads: vec![Reads::default(); raw_defs.len()],
         depth: 0,
+        peak: 0,
+        def_depth: vec![0; raw_defs.len()],
         code: vec![op::TRUE, op::FALSE],
         dedupe: HashMap::new(),
         groups: Vec::new(),
@@ -701,7 +708,11 @@ impl<'m> Compiler<'m> {
         self.def_busy[k] = true;
         let raw = &self.raw_defs[name];
         let mut reads = Reads::default();
+        let (base, outer) = (self.depth, self.peak);
+        self.peak = base;
         let at = self.rule(raw, &format!("defs[{name:?}]"), &mut reads, false)?;
+        self.def_depth[k] = self.peak - base;
+        self.peak = self.peak.max(outer);
         self.def_at[k] = Some(at);
         self.def_reads[k] = reads;
         Ok(())
@@ -731,7 +742,13 @@ impl<'m> Compiler<'m> {
     /// One level deeper in the rule recursion; the loader enforces the same cap.
     fn deeper(&mut self, path: &str) -> R<()> {
         self.depth += 1;
-        if self.depth > config::RULES_MAX_DEPTH {
+        self.reach(self.depth, path)
+    }
+
+    /// An evaluation from the rule being compiled goes `deep` nodes down.
+    fn reach(&mut self, deep: u32, path: &str) -> R<()> {
+        self.peak = self.peak.max(deep);
+        if deep > config::RULES_MAX_DEPTH {
             return Err(format!("{path}: rules nested more than {} deep", config::RULES_MAX_DEPTH));
         }
         Ok(())
@@ -897,6 +914,7 @@ impl<'m> Compiler<'m> {
                     .position(|d| *d == name)
                     .ok_or_else(|| format!("{p}: unknown def {name:?}"))?;
                 self.def(k)?;
+                self.reach(self.depth + self.def_depth[k], &p)?;
                 let reads = self.def_reads[k].clone();
                 r.merge(&reads);
                 match self.def_at[k] {
