@@ -40,10 +40,11 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 /// Where the directory and the rooms' logs live.
 enum Store {
     Pg(Arc<PgLogStore>),
-    /// In memory: the log store, each listed room's bundle file, and the rooms that finished.
+    /// In memory: the log store, each listed room's loaded seed (kept, not the file: a v2
+    /// seed is a few KB and its packages are shared), and the rooms that finished.
     Mem {
         log: Arc<MemLogStore>,
-        bundles: BTreeMap<RoomId, Vec<u8>>,
+        bundles: BTreeMap<RoomId, Loaded>,
         finished: BTreeSet<RoomId>,
     },
 }
@@ -73,7 +74,7 @@ type LoadEnd = (RoomKey, Result<Ready, String>);
 /// Where a load reads the room from: the store, and for the in-memory one its bundle file.
 enum LoadFrom {
     Pg(Arc<PgLogStore>),
-    Mem(Arc<MemLogStore>, Option<Vec<u8>>),
+    Mem(Arc<MemLogStore>, Option<Loaded>),
 }
 
 /// A file's length and modification time: a scan rereads a file only when they change.
@@ -294,7 +295,7 @@ impl Host {
                     return Err(Skip::Final(why));
                 }
                 let key = RoomKey::random().map_err(Skip::Later)?;
-                bundles.insert(id, loaded.file);
+                bundles.insert(id, Loaded { file: Vec::new(), ..loaded });
                 (key, 0)
             }
         };
@@ -338,20 +339,23 @@ impl Host {
         let (password, limits, key) = (self.password.clone(), self.limits, key.clone());
         let seeds = self.seeds.clone();
         Ok(Some(async move {
-            let text = match &from {
+            let stored = match &from {
                 LoadFrom::Pg(store) => {
                     let file =
                         store.room_bundle(id).await.map_err(|e| format!("postgres: {e:?}"))?;
-                    file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?
+                    Err(file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?)
                 }
-                LoadFrom::Mem(_, text) => {
-                    text.clone().ok_or_else(|| format!("room {seed:?} has no bundle"))?
+                LoadFrom::Mem(_, loaded) => {
+                    Ok(loaded.clone().ok_or_else(|| format!("room {seed:?} has no bundle"))?)
                 }
             };
             // Parsing a bundle of up to `bundle_max_bytes` is CPU work: off the runtime.
             let p = tokio::task::spawn_blocking(move || {
-                let loaded = parse_bundle(text, &seeds, &limits)
-                    .map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?;
+                let loaded = match stored {
+                    Ok(loaded) => loaded,
+                    Err(file) => parse_bundle(file, &seeds, &limits)
+                        .map_err(|e| format!("room {seed:?}: stored bundle: {e}"))?,
+                };
                 prepare(loaded, password.as_ref(), limits)
             })
             .await

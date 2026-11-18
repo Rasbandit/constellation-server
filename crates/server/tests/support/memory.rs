@@ -179,9 +179,10 @@ fn state(load: &Path, b: &SeedBundle) -> (i64, i64) {
 pub fn measure_bundle(load: &Path, b: &SeedBundle) -> Numbers {
     let limits = Limits::DESIGN;
     let mut first = None;
-    let bundle_first = measure(|| first = Some(server::load_bundle(load, &limits).unwrap()));
+    // What a room keeps of a load is its seed; the file as read goes to the directory store.
+    let bundle_first = measure(|| first = Some(server::load_bundle(load, &limits).unwrap().bundle));
     let mut next = None;
-    let bundle_next = measure(|| next = Some(server::load_bundle(load, &limits).unwrap()));
+    let bundle_next = measure(|| next = Some(server::load_bundle(load, &limits).unwrap().bundle));
     drop(next);
     let (state_fresh, state_full) = state(load, b);
 
