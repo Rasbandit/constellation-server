@@ -112,6 +112,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bits"
+version = "0.0.0"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1221,6 +1225,7 @@ dependencies = [
 name = "room-core"
 version = "0.0.0"
 dependencies = [
+ "bits",
  "config",
  "proptest",
  "proto",
@@ -1354,10 +1359,13 @@ dependencies = [
 name = "seed-bundle"
 version = "0.0.0"
 dependencies = [
+ "bits",
+ "flate2",
  "proto",
  "room-core",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]

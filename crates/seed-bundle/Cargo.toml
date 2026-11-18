@@ -12,10 +12,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bits = { path = "../bits" }
+# Raw deflate for game packages and slot_data (already in the tree through yawc).
+flate2 = "1"
 proto = { path = "../proto" }
 room-core = { path = "../room-core" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
+# Content addresses and the file checksums (the same crate the server hashes bundles with).
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

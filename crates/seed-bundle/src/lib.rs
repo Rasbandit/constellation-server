@@ -4,12 +4,24 @@
 //!
 //! The per-game data package, `slot_data` and the server options are kept because a client
 //! compatible with Archipelago asks for them; only `edge-compat` interprets them.
+//!
+//! [`SeedBundle`] is the v1 schema (JSON, what `tools/ap-import` writes). Rooms run on the v2
+//! form, [`Seed`]: a compact binary file read in place ([`v2`]), with each game's data package
+//! stored once per content hash and shared across rooms ([`package`]). [`load`] reads either.
+
+pub mod package;
+pub mod v2;
+
+pub use package::GamePackage;
+pub use v2::{Seed, SlotView};
 
 use proto::SlotNo;
 use room_core::Placement;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 /// The bundle format this crate reads.
 pub const FORMAT: u32 = 1;
@@ -187,6 +199,36 @@ macro_rules! ensure {
             return Err(BundleError::Invalid(format!($($arg)+)));
         }
     };
+}
+
+/// SHA-256 of a bundle file's canonical JSON.
+///
+/// Canonical: parsed as plain JSON, every object's keys sorted, no whitespace. It depends on the
+/// file's content only, never on the `SeedBundle` type, so a new defaulted field in the type
+/// does not change a stored room's hash. A v2 seed carries the hash of the v1 file it was made
+/// from.
+///
+/// # Errors
+/// When the text is not JSON.
+pub fn bundle_hash(text: &str) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    Ok(Sha256::digest(package::canonical(v)).to_vec())
+}
+
+/// Open a seed file's `bytes`: v2 (its packages from the `packages` folder in `dir`), or v1
+/// JSON, encoded to v2 in memory. `max_bytes` caps what any part may inflate to. Returns the
+/// seed and the hash of its v1 form ([`bundle_hash`]).
+///
+/// # Errors
+/// A message naming the first problem.
+pub fn load(bytes: Vec<u8>, dir: &Path, max_bytes: u64) -> Result<Seed, String> {
+    if v2::is_v2(&bytes) {
+        return Seed::read(bytes, &dir.join("packages"), max_bytes).map_err(|e| e.to_string());
+    }
+    let text = String::from_utf8(bytes).map_err(|e| format!("seed bundle is not UTF-8: {e}"))?;
+    let bundle = SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
+    let hash: [u8; 32] = bundle_hash(&text)?.try_into().map_err(|_| "hash length")?;
+    Seed::from_v1(&bundle, &hash, max_bytes).map_err(|e| e.to_string())
 }
 
 fn id_ok(id: i64) -> bool {
