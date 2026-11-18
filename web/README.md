@@ -76,4 +76,6 @@ bun --bun run dev
 
 The admin port is the server's `admin api addr=` log line (it listens on loopback; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards, so the token never reaches the browser. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
 
-Still stubbed: the room pages, and the name a player connects with. Renaming a player on the create page does not change their YAML, and generation uses the YAML's name; the page says so when they differ. The shared demo admin key stands in for host sign-in.
+With the admin API configured, "Create room" also generates for real: it posts the uploaded ids to `POST /api/worlds`, polls `GET /api/worlds/:id` until the server hosts the world as a room (the server needs `--rooms` as well as `--data-dir`), then makes the stub room with the real join address (`{room_key}.{host}:{port}`, see the server's `--public-host`). Every player must come from an uploaded YAML.
+
+Still stubbed: the rest of the room pages (slots, feed, hints, admin actions), and the name a player connects with. Renaming a player on the create page does not change their YAML, and generation uses the YAML's name; the page says so when they differ. The shared demo admin key stands in for host sign-in.

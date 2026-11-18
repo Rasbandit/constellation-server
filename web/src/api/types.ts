@@ -56,6 +56,17 @@ export interface CreateRoomRequest {
   apworlds: ApWorld[];
   players: PlayerFile[];
   rules: RoomRules;
+  /** A world the server generated and hosts; the room shows its join address. */
+  world?: GeneratedWorld;
+}
+
+/** A generated world the server runs as a room (`GET /api/worlds/:id` once it has `room_key`). */
+export interface GeneratedWorld {
+  id: string;
+  seed: string;
+  roomKey: string;
+  /** `{room_key}.{host}:{port}`: what a player types into their client. */
+  address: string;
 }
 
 export interface Slot {

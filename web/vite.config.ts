@@ -11,6 +11,7 @@ export default defineConfig(({ mode }) => {
   if (mode !== 'test') console.log(`[constellation] ${admin.summary}`);
   return {
     plugins: [react(), mockApi(admin.passthrough)],
+    define: { __CONSTELLATION_ADMIN_API__: JSON.stringify(admin.passthrough !== undefined) },
     server: { port: 5173, proxy: admin.proxy },
     test: { environment: 'node' },
   };

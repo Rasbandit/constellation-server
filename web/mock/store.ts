@@ -332,6 +332,12 @@ function slotOf(rec: RoomRecord, slot: SlotNo): Slot {
   return s;
 }
 
+/** `{key}.{host}:{port}` from the server, split where the room page shows it. */
+export function hostPort(address: string): { host: string; port: number } {
+  const at = address.lastIndexOf(':');
+  return { host: address.slice(0, at), port: Number(address.slice(at + 1)) };
+}
+
 export const store = {
   builtinGames: () => BUILTIN_GAMES,
 
@@ -420,7 +426,8 @@ export const store = {
     const r: Room = {
       id: roomId,
       name: req.name.trim(),
-      state: 'generating',
+      // A world the server already generated and hosts goes straight to the lobby.
+      state: req.world ? 'lobby' : 'generating',
       createdAt: now,
       slots: slotList.length,
       slotsOnline: 0,
@@ -428,9 +435,8 @@ export const store = {
       games: [],
       code: newCode(roomId),
       adminKey: Math.random().toString(36).slice(2, 12),
-      host: 'constellation.example.net',
-      port: 38281 + rooms.size,
-      seed: Math.floor(Math.random() * 1e12).toString().padStart(12, '0'),
+      ...(req.world ? hostPort(req.world.address) : { host: 'constellation.example.net', port: 38281 + rooms.size }),
+      seed: req.world?.seed || Math.floor(Math.random() * 1e12).toString().padStart(12, '0'),
       rules: { ...req.rules },
       slotList,
     };
