@@ -110,7 +110,7 @@ where
                 tracing::debug!(error = %e, "connection ended");
                 break;
             }
-            Input::Live(Some(p)) => session.on_published(&p),
+            Input::Live(Some(p)) => session.on_published(&p).await,
             // Doc 11 R3: resync from our cursor; fails only when the room is gone.
             Input::Live(None) => session.resync().await,
         };

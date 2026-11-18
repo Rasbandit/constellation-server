@@ -9,7 +9,8 @@ It starts our server on a free loopback port with the fixture bundle (in-memory 
 two `CommonContext` clients (Alice and Bob), and checks what a standard client does on connect
 and with data storage: the `Get` and `SetNotify` every CommonClient sends after `Connected`
 (hints, item and location name groups), `Set` with a reply to the writer and to a watcher,
-a `Get` round trip, the starting inventory, and client status changes. Expected values come
+a `Get` round trip, the starting inventory, client status changes, and hints (`!hint`, the
+watched `_read_hints_` key, `UpdateHint`). Expected values come
 from the fixture bundle and the protocol document. Exits 0 when every check passes.
 
 Local only (CI has no Archipelago checkout). It runs their client library as a test client; it
@@ -101,6 +102,31 @@ async def run(CommonContext: type, url: str, bundle: dict[str, Any]) -> None:
                                                for c, a in alice.packets))
     got = next(a for c, a in alice.packets if c == "Retrieved" and a.get("probe") == 7)
     check(got["keys"] == {"shared": 15, "never-set": None}, "Get reads stored and missing keys")
+
+    # Hints: Alice earns a point with a check, then buys a hint with `!hint`; CommonClient
+    # watches its own `_read_hints_` key from connect, so the new hint reaches its store.
+    hints_key = "_read_hints_0_1"
+    first = bundle["slots"][0]["locations"][0]["location"]
+    await alice.send_msgs([{"cmd": "LocationChecks", "locations": [first]}])
+    await alice.until("a hint point", lambda: alice.hint_points == bundle["server_options"]["location_check_points"])
+    wanted = next(p for p in bundle["slots"][1]["locations"] if p["receiver"] == 1 and not p["flags"] & 4)
+    name = next(n for n, i in game["item_name_to_id"].items() if i == wanted["item"])
+    await alice.send_msgs([{"cmd": "Say", "text": f"!hint {name}"}])
+    await alice.until("the hint in the watched key",
+                      lambda: any(h["item"] == wanted["item"] for h in alice.stored_data.get(hints_key, [])))
+    hint = next(h for h in alice.stored_data[hints_key] if h["item"] == wanted["item"])
+    check(hint["receiving_player"] == 1 and hint["status"] == 30 and hint["class"] == "Hint",
+          "!hint stores a priority hint for Alice and the hints key tells her")
+    check(any(c == "PrintJSON" and a.get("type") == "Hint" for c, a in alice.packets),
+          "a Hint print reaches the receiver")
+    await alice.until("hint points spent", lambda: alice.hint_points == 0)
+    check(True, "the paid hint cost its point")
+    await alice.send_msgs([{"cmd": "UpdateHint", "player": hint["finding_player"],
+                            "location": hint["location"], "status": 10}])
+    await alice.until("the status change in the watched key",
+                      lambda: any(h["item"] == wanted["item"] and h["status"] == 10
+                                  for h in alice.stored_data[hints_key]))
+    check(True, "UpdateHint by the receiver reaches the hints key")
 
     await bob.send_msgs([{"cmd": "StatusUpdate", "status": 20}])
     await alice.until("Bob's status 20", lambda: alice.stored_data.get("_read_client_status_0_2") == 20)

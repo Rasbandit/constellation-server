@@ -60,8 +60,12 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def convert(multidata: dict[str, Any]) -> dict[str, Any]:
-    """Shape a decoded multidata mapping into a seed bundle (a JSON-ready dict)."""
+def convert(multidata: dict[str, Any], hint_blacklist: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Shape a decoded multidata mapping into a seed bundle (a JSON-ready dict).
+
+    `hint_blacklist` maps a game to the names its world forbids hinting. It is not in the
+    multidata (the reference server reads it from the loaded world classes), so `main` reads it
+    from Archipelago's world registry."""
     connect_names = {str(n): [int(t), int(s)] for n, (t, s) in multidata["connect_names"].items()}
     team_of = {slot: team for team, slot in connect_names.values()}
     client_min = multidata.get("minimum_versions", {}).get("clients", {})
@@ -69,6 +73,10 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
     locations = multidata["locations"]
     # Item ids only, in the generator's order (Main.py, the `precollected_items` entry).
     start = multidata.get("precollected_items", {})
+    entrances = multidata.get("er_hint_data", {})
+    # The generator's spheres, earliest first: a list of {slot: {location, ...}} (Main.py).
+    sphere_of = {(int(slot), int(loc)): i for i, sphere in enumerate(multidata.get("spheres", []))
+                 for slot, locs in sphere.items() for loc in locs}
 
     slots = []
     for slot_id in sorted(multidata["slot_info"]):
@@ -79,6 +87,9 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
             {"location": int(loc), "item": int(item), "receiver": int(receiver), "flags": int(flags)}
             for loc, (item, receiver, flags) in sorted(locations.get(slot_id, {}).items())
         ]
+        for p in placed:
+            if (int(slot_id), p["location"]) in sphere_of:
+                p["sphere"] = sphere_of[int(slot_id), p["location"]]
         slots.append({
             "id": int(slot_id),
             "team": team_of.get(int(slot_id), 0),
@@ -90,6 +101,7 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
             "locations": placed,
             "slot_data": _plain(slot_data.get(slot_id, {})),
             "start_inventory": [int(i) for i in start.get(slot_id, [])],
+            "entrances": {str(int(k)): str(v) for k, v in sorted(entrances.get(slot_id, {}).items())},
         })
 
     played = {s["game"] for s in slots}
@@ -105,6 +117,7 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
             "checksum": str(package["checksum"]),
             "item_name_groups": _plain(package.get("item_name_groups", {})),
             "location_name_groups": _plain(package.get("location_name_groups", {})),
+            "hint_blacklist": sorted(str(n) for n in (hint_blacklist or {}).get(name, ())),
         }
     missing = played - games.keys()
     if missing:
@@ -113,6 +126,11 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
     seed_options = multidata.get("server_options", {})
     options = {k: d if seed_options.get(k) is None else seed_options[k]
                for k, d in OPTION_DEFAULTS.items()}
+
+    # Each hint is stored under its finder and its receiver (Main.py, `precollect_hint`); the
+    # bundle keeps it once. Fields by position: finding player 1, location 2, status 7.
+    start_hints = {(int(h[1]), int(h[2])): int(h[7])
+                   for hints in multidata.get("precollected_hints", {}).values() for h in hints}
 
     return {
         "format": FORMAT,
@@ -123,6 +141,8 @@ def convert(multidata: dict[str, Any]) -> dict[str, Any]:
         "connect_names": connect_names,
         "games": games,
         "race_mode": int(multidata.get("race_mode", 0)),
+        "start_hints": [{"finding": f, "location": loc, "status": st}
+                        for (f, loc), st in sorted(start_hints.items())],
     }
 
 
@@ -153,11 +173,20 @@ def load_multidata(path: Path) -> dict[str, Any]:
     return restricted_loads(inflate(raw))
 
 
+def load_hint_blacklists() -> dict[str, Any]:
+    """Each world's names that may not be hinted, from Archipelago's world registry (the
+    reference server reads them the same way, MultiServer.py `_load_world_data`)."""
+    import worlds  # Archipelago, at runtime only
+
+    return {name: world.hint_blacklist for name, world in worlds.AutoWorldRegister.world_types.items()}
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    bundle = convert(load_multidata(Path(argv[1])))
+    multidata = load_multidata(Path(argv[1]))
+    bundle = convert(multidata, load_hint_blacklists())
     Path(argv[2]).write_text(json.dumps(bundle, sort_keys=True, indent=1) + "\n")
     print(f"wrote {argv[2]}: {len(bundle['slots'])} slots, seed {bundle['seed_name']}")
     return 0

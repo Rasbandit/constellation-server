@@ -6,6 +6,7 @@
 //! [`CompatRoom`] holds one room's fixed data, prepared once; [`Session`] is one connection's
 //! state machine; [`serve`] runs a session over a `yawc` WebSocket.
 
+mod hints;
 mod limit;
 mod presence;
 mod session;
@@ -18,6 +19,7 @@ pub mod wire;
 use config::Limits;
 use limit::RateTable;
 use proto::Cid;
+use room_core::HintRules;
 use runtime::RoomHandle;
 use seed_bundle::Seed;
 use std::net::IpAddr;
@@ -45,6 +47,8 @@ pub struct CompatRoom {
     bundle: Arc<Seed>,
     room: RoomHandle,
     password: Option<String>,
+    /// The hint economy, from the seed (the room holds the same rules).
+    hint_rules: HintRules,
     limits: Limits,
     /// Chat and bounce, per slot (they share the fan-out path).
     fanout: RateTable<u32>,
@@ -56,6 +60,8 @@ pub struct CompatRoom {
     kv_sets: RateTable<u32>,
     /// Bytes `Set` packets logged, per slot (every write is logged in full).
     kv_bytes: RateTable<u32>,
+    /// Packets that write hints (scouts creating hints, `UpdateHint`), per slot.
+    hint_writes: RateTable<u32>,
     /// Who is connected to each slot, and the client statuses they set.
     presence: presence::Presence,
 }
@@ -82,12 +88,14 @@ impl CompatRoom {
         limits: Limits,
     ) -> Result<Self, String> {
         let password = password.or_else(|| bundle.password().map(str::to_owned));
+        let hint_rules = bundle.hint_rules();
         let l = limits;
         let keys = l.rate_table_max_keys;
         Ok(Self {
             bundle,
             room,
             password,
+            hint_rules,
             limits,
             fanout: RateTable::new(l.fanout_burst, l.fanout_refill_milli_per_sec, keys),
             datapackage: RateTable::new(
@@ -102,6 +110,7 @@ impl CompatRoom {
                 l.kv_write_bytes_refill_milli_per_sec,
                 keys,
             ),
+            hint_writes: RateTable::new(l.hint_burst, l.hint_refill_milli_per_sec, keys),
             presence: presence::Presence::default(),
         })
     }

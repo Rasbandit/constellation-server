@@ -178,8 +178,18 @@ pub(crate) fn status_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<SlotVie
     slot_of(room, key.strip_prefix(RESERVED_KEY_PREFIX)?.strip_prefix("client_status_")?)
 }
 
-/// The value of a read-only key from the bundle alone, or `None` for the client status keys
-/// (the caller fills those). Unknown `_read_` keys are `null`, as in the reference.
+/// The read-only key of the hints a slot finds or receives.
+pub(crate) fn hints_key(team: u32, slot: u32) -> String {
+    format!("{RESERVED_KEY_PREFIX}hints_{team}_{slot}")
+}
+
+/// The slot whose hints a `_read_hints_` key names (the room holds them).
+pub(crate) fn hints_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<SlotView<'a>> {
+    slot_of(room, key.strip_prefix(RESERVED_KEY_PREFIX)?.strip_prefix("hints_")?)
+}
+
+/// The value of a read-only key from the bundle alone, or `None` for the client status and
+/// hint keys (the caller fills those). Unknown `_read_` keys are `null`, as in the reference.
 pub(crate) fn read_only(room: &CompatRoom, key: &str) -> Option<Value> {
     let b = &room.bundle;
     let rest = key.strip_prefix(RESERVED_KEY_PREFIX).unwrap_or_default();
@@ -187,10 +197,7 @@ pub(crate) fn read_only(room: &CompatRoom, key: &str) -> Option<Value> {
     let group = |game: &str, pick: fn(&GamePackage) -> &str| {
         b.game(game).and_then(|g| serde_json::from_str(pick(g)).ok()).unwrap_or(Value::Null)
     };
-    Some(if let Some(r) = rest.strip_prefix("hints_") {
-        // No hints yet: every slot's list is empty.
-        slot_of(room, r).map_or(Value::Null, |_| json!([]))
-    } else if let Some(r) = rest.strip_prefix("slot_data_") {
+    Some(if let Some(r) = rest.strip_prefix("slot_data_") {
         let slot =
             r.parse::<u32>().ok().and_then(|s| b.slot(s)).filter(|s| r == s.id().to_string());
         slot.map_or(Value::Null, |s| slot_data(&s))
@@ -200,7 +207,7 @@ pub(crate) fn read_only(room: &CompatRoom, key: &str) -> Option<Value> {
         group(game, GamePackage::location_groups)
     } else if rest == "race_mode" {
         json!(b.race_mode())
-    } else if status_slot(room, key).is_some() {
+    } else if status_slot(room, key).is_some() || hints_slot(room, key).is_some() {
         return None;
     } else {
         Value::Null

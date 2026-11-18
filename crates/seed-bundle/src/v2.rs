@@ -7,12 +7,13 @@
 //! indexes, then one record per set bit (item index in the receiver's game, receiver slot
 //! position, flags), each field in the fewest bits this seed needs.
 
+use crate::StartHint;
 use crate::package::{self, GamePackage, Key};
 use crate::{BundleError, GameData, Mode, Placed, SeedBundle, ServerOptions, Slot, SlotKind};
 use crate::{FORMAT, Version};
 use bits::{self, Packer};
 use proto::SlotNo;
-use room_core::World;
+use room_core::{World, hint_status};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +34,27 @@ const NONE: u32 = u32::MAX;
 const MAX_ITEM_BITS: u8 = 32;
 const MAX_RECV_BITS: u8 = 16;
 const MAX_FLAG_BITS: u8 = 3;
+const MAX_SPHERE_BITS: u8 = 16;
+const MAX_LOCATION_BITS: u8 = 32;
+const MAX_ENTRANCE_BITS: u8 = 24;
+/// The hint block's fixed part, then one entry per slot.
+const HINTS: usize = 20;
+const HINT_SLOT: usize = 12;
+/// Bits of a start hint's status code: its position in [`STATUSES`].
+const STATUS_BITS: u8 = 3;
+/// Hint status values by code (`room_core::hint_status`).
+const STATUSES: [u8; 5] = [
+    hint_status::UNSPECIFIED,
+    hint_status::NO_PRIORITY,
+    hint_status::AVOID,
+    hint_status::PRIORITY,
+    hint_status::FOUND,
+];
+
+/// The sphere value that means "none recorded" at `width` bits: all ones.
+const fn no_sphere(width: u8) -> u64 {
+    (1 << width) - 1
+}
 
 fn bad(why: impl Into<String>) -> BundleError {
     BundleError::Invalid(why.into())
@@ -141,6 +163,123 @@ impl Put for Vec<u8> {
     }
 }
 
+/// The hint block's content as indexes (`docs/seed-bundle-v2.md`, "Hint block"). Spheres stay
+/// sparse here: they are expanded to one value per location only while the block is written,
+/// after the seed was sized against its cap.
+#[derive(Default)]
+struct HintData {
+    /// (slot position, location index, status code), in bundle order.
+    start: Vec<(usize, usize, usize)>,
+    /// Per slot: its game's location count, and its spheres as (location index, sphere),
+    /// ascending (empty when it records none).
+    spheres: Vec<(usize, Vec<(usize, u32)>)>,
+    /// Per slot: (location index, entrance index), ascending.
+    entrances: Vec<Vec<(usize, usize)>>,
+    /// Every entrance name of the seed, sorted: an entrance index is a position here.
+    names: Vec<String>,
+}
+
+impl HintData {
+    fn is_empty(&self) -> bool {
+        self.start.is_empty()
+            && self.spheres.iter().all(|s| s.1.is_empty())
+            && self.entrances.iter().all(Vec::is_empty)
+    }
+
+    /// Bits per sphere, location index, entrance index and slot position.
+    fn widths(&self) -> (u8, u8, u8, u8) {
+        let spheres = self.spheres.iter().flat_map(|s| &s.1);
+        let ws = spheres.map(|&(_, x)| u64::from(x) + 1).max().map_or(0, bits::width);
+        let locs =
+            self.start.iter().map(|h| h.1).chain(self.entrances.iter().flatten().map(|e| e.0));
+        let wl = bits::width(locs.max().unwrap_or(0) as u64);
+        let we = bits::width(self.names.len().saturating_sub(1) as u64);
+        let wp = bits::width(self.start.iter().map(|h| h.0).max().unwrap_or(0) as u64);
+        (ws, wl, we, wp)
+    }
+
+    /// The block's size in bytes, from the counts alone (nothing is expanded).
+    fn size(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        let (ws, wl, we, wp) = self.widths();
+        let w_hint = usize::from(wp + wl + STATUS_BITS);
+        let w_entrance = usize::from(entrance_width(wl, we));
+        let fixed = HINTS + HINT_SLOT * self.spheres.len() + 8 * self.names.len();
+        self.spheres.iter().zip(&self.entrances).fold(
+            fixed + bits::bytes_for(self.start.len(), w_hint),
+            |n, ((locations, spheres), e)| {
+                let spheres = if spheres.is_empty() { 0 } else { *locations };
+                n.saturating_add(bits::bytes_for(spheres, usize::from(ws)))
+                    .saturating_add(bits::bytes_for(e.len(), w_entrance))
+            },
+        )
+    }
+
+    /// The block's bytes: header, slot table, entrance names (refs into `strings`), then the
+    /// bit fields.
+    fn bytes(&self, at: usize, strings: &mut Strings) -> Result<Vec<u8>, BundleError> {
+        let (ws, wl, we, wp) = self.widths();
+        if ws > MAX_SPHERE_BITS || wl > MAX_LOCATION_BITS || we > MAX_ENTRANCE_BITS {
+            return Err(bad("a hint field is too wide for a v2 seed file"));
+        }
+        let n = self.spheres.len();
+        let names_at = at + HINTS + HINT_SLOT * n;
+        let mut body = Vec::with_capacity(self.size());
+        for name in &self.names {
+            body.r#ref(strings.add(name)?);
+        }
+        let base = names_at;
+        let mut packer = Packer::default();
+        for &(pos, i, code) in &self.start {
+            packer.push(pos as u64, wp);
+            packer.push(i as u64, wl);
+            packer.push(code as u64, STATUS_BITS);
+        }
+        let start_at = u32_of(base + body.len())?;
+        body.extend_from_slice(&packer.finish());
+        let mut table = Vec::with_capacity(HINT_SLOT * n);
+        for ((locations, spheres), entrances) in self.spheres.iter().zip(&self.entrances) {
+            let spheres_at = if spheres.is_empty() { 0 } else { u32_of(base + body.len())? };
+            if !spheres.is_empty() {
+                let mut packer = Packer::default();
+                let mut given = spheres.iter().peekable();
+                for i in 0..*locations {
+                    let v = given.next_if(|g| g.0 == i).map_or(no_sphere(ws), |g| u64::from(g.1));
+                    packer.push(v, ws);
+                }
+                body.extend_from_slice(&packer.finish());
+            }
+            let entrances_at = u32_of(base + body.len())?;
+            let mut packer = Packer::default();
+            for &(i, e) in entrances {
+                packer.push(i as u64, wl);
+                packer.push(e as u64, entrance_width(wl, we) - wl);
+            }
+            body.extend_from_slice(&packer.finish());
+            for v in [spheres_at, entrances_at, u32_of(entrances.len())?] {
+                table.u32(v);
+            }
+        }
+        let mut out = Vec::with_capacity(HINTS + table.len() + body.len());
+        out.extend([ws, wl, we, wp]);
+        out.u32(u32_of(self.start.len())?);
+        out.u32(start_at);
+        out.u32(u32_of(self.names.len())?);
+        out.u32(u32_of(names_at)?);
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+}
+
+/// Bits per entrance record: location index and entrance index, but at least 1, so every
+/// record costs file bytes.
+const fn entrance_width(wl: u8, we: u8) -> u8 {
+    if wl + we == 0 { 1 } else { wl + we }
+}
+
 /// One slot's placements as indexes.
 struct Indexed {
     game: usize,
@@ -195,6 +334,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
             s.start_inventory.iter().map(|&i| own.item_index(i).ok_or_else(missing)).collect();
         indexed.push(Indexed { game: g, placed, start: start? });
     }
+    let hint_data = hint_data(b, &slots, &indexed, &tables)?;
     let max = |f: fn(&(usize, usize, usize, u8)) -> u64| {
         indexed.iter().flat_map(|x| x.placed.iter().map(f)).max().unwrap_or(0)
     };
@@ -233,6 +373,10 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
                 .saturating_add(s.group_members.len() * 4)
                 .saturating_add(bits::bytes_for(x.start.len(), usize::from(w_start)))
         });
+    // The hint block, bounded the same way: a fixed part and slot table, then its fields.
+    let need = need
+        .saturating_add(hint_data.size())
+        .saturating_add(hint_data.names.iter().map(String::len).sum::<usize>());
     if u64::try_from(need).unwrap_or(u64::MAX) > max_bytes {
         return Err(bad(format!("the seed would take {need} bytes, over the {max_bytes} cap")));
     }
@@ -297,6 +441,13 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
             t.u32(n);
         }
     }
+    let hints_at = if hint_data.is_empty() {
+        0
+    } else {
+        let at = data_start + data.len();
+        data.extend_from_slice(&hint_data.bytes(at, &mut strings)?);
+        u32_of(at)?
+    };
     let mut connect_table = Vec::with_capacity(CONNECT * connect.len());
     for (name, (team, slot)) in &connect {
         connect_table.r#ref(strings.add(name)?);
@@ -327,7 +478,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     out.u16(u16_of(slots.len())?);
     out.u16(u16_of(games.len())?);
     out.u16(0);
-    for n in [u32_of(connect.len())?, u32_of(strings_at)?, u32_of(total)?, 0] {
+    for n in [u32_of(connect.len())?, u32_of(strings_at)?, u32_of(total)?, hints_at] {
         out.u32(n);
     }
     out.extend_from_slice(hash);
@@ -344,6 +495,49 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     let body = body_hash(&out);
     out.get_mut(64..96).ok_or_else(missing)?.copy_from_slice(&body);
     Ok(Encoded { seed: out, packages })
+}
+
+/// The hint data of `b` as indexes: start hints, spheres and entrances (validated bundle).
+fn hint_data(
+    b: &SeedBundle,
+    slots: &[&Slot],
+    indexed: &[Indexed],
+    tables: &[GamePackage],
+) -> Result<HintData, BundleError> {
+    let missing = || bad("the bundle names something it lacks (validate it first)");
+    let mut out = HintData::default();
+    let names: std::collections::BTreeSet<&str> =
+        slots.iter().flat_map(|s| s.entrances.values().map(String::as_str)).collect();
+    out.names = names.iter().map(|&n| n.to_owned()).collect();
+    for (s, x) in slots.iter().zip(indexed) {
+        let own = tables.get(x.game).ok_or_else(missing)?;
+        let mut spheres: Vec<(usize, u32)> = s
+            .locations
+            .iter()
+            .filter_map(|p| Some((own.location_index(p.location)?, p.sphere?)))
+            .collect();
+        spheres.sort_unstable();
+        out.spheres.push((own.locations().len(), spheres));
+        let mut entrances = s
+            .entrances
+            .iter()
+            .map(|(&l, name)| {
+                let e = out.names.binary_search_by(|n| n.as_str().cmp(name)).ok();
+                Some((own.location_index(l)?, e?))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(missing)?;
+        entrances.sort_unstable();
+        out.entrances.push(entrances);
+    }
+    for h in &b.start_hints {
+        let pos = slots.iter().position(|s| s.id == h.finding).ok_or_else(missing)?;
+        let own = indexed.get(pos).and_then(|x| tables.get(x.game)).ok_or_else(missing)?;
+        let i = own.location_index(h.location).ok_or_else(missing)?;
+        let code = STATUSES.iter().position(|&v| v == h.status).ok_or_else(missing)?;
+        out.start.push((pos, i, code));
+    }
+    Ok(out)
 }
 
 /// Decode a v2 file back to the v1 bundle, each game's full data from its package file, which
@@ -576,6 +770,16 @@ impl Seed {
         self.r().u8(HEADER + 28)
     }
 
+    /// The room's hint economy: the one place it is read from a seed (the room and the edge
+    /// both use it).
+    #[must_use]
+    pub fn hint_rules(&self) -> room_core::HintRules {
+        room_core::HintRules {
+            cost_pct: self.hint_cost(),
+            check_points: self.location_check_points(),
+        }
+    }
+
     /// Hint points per checked location.
     #[must_use]
     pub fn location_check_points(&self) -> u32 {
@@ -702,7 +906,7 @@ impl Seed {
         let in_data = |at: usize, size: usize| {
             size == 0 || (at >= data_from && at.checked_add(size).is_some_and(|e| e <= strings))
         };
-        if r.u16(14) != 0 || r.u32(28) != 0 {
+        if r.u16(14) != 0 {
             return Err(bad("reserved header fields are not 0"));
         }
         let (w_item, w_recv, w_flags) = self.widths();
@@ -789,7 +993,117 @@ impl Seed {
                 return Err(bad(format!("connect name {name:?} points at no slot")));
             }
         }
+        self.check_hints(&in_data)
+    }
+
+    /// The hint block's rules: every area in the data, every index in range, every hinted
+    /// location placed, entrances ascending.
+    fn check_hints(&self, in_data: &dyn Fn(usize, usize) -> bool) -> Result<(), BundleError> {
+        let Some(at) = self.hints_at() else { return Ok(()) };
+        let n = self.ids.len();
+        if !in_data(at, HINTS + HINT_SLOT * n) {
+            return Err(bad("hint block out of range"));
+        }
+        let (ws, wl, we, wp) = self.hint_widths();
+        if ws > MAX_SPHERE_BITS
+            || wl > MAX_LOCATION_BITS
+            || we > MAX_ENTRANCE_BITS
+            || wp > MAX_RECV_BITS
+        {
+            return Err(bad("a hint field is too wide"));
+        }
+        let r = self.r();
+        let names = self.entrance_count();
+        if !in_data(r.u32(at + 16) as usize, names.saturating_mul(8))
+            || (0..names).any(|e| self.entrance_name(e).is_none())
+        {
+            return Err(bad("entrance names out of range or not UTF-8"));
+        }
+        if (1..names).any(|e| self.entrance_name(e - 1) >= self.entrance_name(e)) {
+            return Err(bad("entrance names are not sorted and distinct"));
+        }
+        let w_hint = usize::from(wp + wl + STATUS_BITS);
+        if !in_data(r.u32(at + 8) as usize, bits::bytes_for(r.u32(at + 4) as usize, w_hint)) {
+            return Err(bad("start hints out of range"));
+        }
+        for k in 0..r.u32(at + 4) as usize {
+            let (pos, i, code) = self.start_hint(k);
+            let placed = self.slot_at(pos).is_some_and(|s| s.present(i));
+            if !placed || code >= STATUSES.len() {
+                return Err(bad(format!("start hint {k} is out of range")));
+            }
+        }
+        for s in self.slots() {
+            let id = s.id();
+            let locations = s.package().locations().len();
+            let spheres = s.hint_field(0) as usize;
+            if spheres != 0 && (ws == 0 || !in_data(spheres, bits::bytes_for(locations, ws.into())))
+            {
+                return Err(bad(format!("slot {id} spheres out of range")));
+            }
+            let count = s.hint_field(8) as usize;
+            let w = usize::from(entrance_width(wl, we));
+            if !in_data(s.hint_field(4) as usize, bits::bytes_for(count, w)) {
+                return Err(bad(format!("slot {id} entrances out of range")));
+            }
+            let names = self.entrance_count();
+            let mut last = None;
+            for k in 0..count {
+                let (i, e) = s.entrance_record(k);
+                if !s.present(i) || e >= names || last.is_some_and(|l| l >= i) {
+                    return Err(bad(format!("slot {id} entrance {k} is out of range")));
+                }
+                last = Some(i);
+            }
+        }
         Ok(())
+    }
+
+    /// How many entrance names the hint block holds.
+    fn entrance_count(&self) -> usize {
+        self.hints_at().map_or(0, |at| self.r().u32(at + 12) as usize)
+    }
+
+    /// Entrance name `e` (a string reference in the hint block's name table).
+    fn entrance_name(&self, e: usize) -> Option<&str> {
+        let table = self.r().u32(self.hints_at()? + 16) as usize;
+        (e < self.entrance_count()).then(|| self.str_at(table + 8 * e)).flatten()
+    }
+
+    /// Where the hint block starts, if the seed has one (header field 28).
+    fn hints_at(&self) -> Option<usize> {
+        let at = self.r().u32(28) as usize;
+        (at != 0).then_some(at)
+    }
+
+    /// Bits per sphere, location index, entrance index and slot position (all 0 without a
+    /// hint block).
+    fn hint_widths(&self) -> (u8, u8, u8, u8) {
+        let r = self.r();
+        self.hints_at()
+            .map_or((0, 0, 0, 0), |at| (r.u8(at), r.u8(at + 1), r.u8(at + 2), r.u8(at + 3)))
+    }
+
+    /// Start hint `k`: (slot position, location index, status code).
+    fn start_hint(&self, k: usize) -> (usize, usize, usize) {
+        let (_, wl, _, wp) = self.hint_widths();
+        let at = self.hints_at().map_or(0, |at| self.r().u32(at + 8) as usize);
+        let bytes = self.bytes.get(at..).unwrap_or_default();
+        let bit = k * usize::from(wp + wl + STATUS_BITS);
+        let pos = bits::read(bytes, bit, wp) as usize;
+        let i = bits::read(bytes, bit + usize::from(wp), wl) as usize;
+        let code = bits::read(bytes, bit + usize::from(wp + wl), STATUS_BITS) as usize;
+        (pos, i, code)
+    }
+
+    /// The hints every room of this seed starts with: (finding slot, location id, status).
+    pub fn start_hints(&self) -> impl Iterator<Item = (SlotNo, i64, u8)> + '_ {
+        let count = self.hints_at().map_or(0, |at| self.r().u32(at + 4) as usize);
+        (0..count).filter_map(|k| {
+            let (pos, i, code) = self.start_hint(k);
+            let s = self.slot_at(pos)?;
+            Some((SlotNo(s.id()), *s.package().locations().get(i)?, *STATUSES.get(code)?))
+        })
     }
 
     /// Build the prefix sums (`bases`) and rank tables of a checked seed.
@@ -859,8 +1173,10 @@ impl Seed {
                             item: p.item,
                             receiver: p.receiver,
                             flags: p.flags,
+                            sphere: s.sphere(p.location),
                         })
                         .collect(),
+                    entrances: s.entrances().map(|(l, e)| (l, e.to_owned())).collect(),
                     slot_data: s.slot_data()?,
                     start_inventory: s.start_inventory().collect(),
                 })
@@ -875,6 +1191,10 @@ impl Seed {
             connect_names: self.connect_names().map(|(n, t)| (n.to_owned(), t)).collect(),
             games: out,
             race_mode: self.race_mode(),
+            start_hints: self
+                .start_hints()
+                .map(|(f, location, status)| StartHint { finding: f.0, location, status })
+                .collect(),
         })
     }
 
@@ -1131,6 +1451,74 @@ impl<'a> SlotView<'a> {
         self.locations().enumerate().map(move |(i, l)| me.resolve(i, l))
     }
 
+    /// Whether location index `i` of this slot's game is placed (its presence bit).
+    fn present(&self, i: usize) -> bool {
+        i < self.package().locations().len()
+            && Self::word(self.presence(), i / 64) >> (i % 64) & 1 == 1
+    }
+
+    /// Field `off` of this slot's hint block entry (0 without a hint block).
+    fn hint_field(&self, off: usize) -> u32 {
+        let at = self.seed.hints_at().map(|at| at + HINTS + HINT_SLOT * self.pos + off);
+        at.map_or(0, |at| self.r().u32(at))
+    }
+
+    /// The generator's sphere of location id `location`, if the seed records one.
+    #[must_use]
+    pub fn sphere(&self, location: i64) -> Option<u32> {
+        let (at, ws) = (self.hint_field(0) as usize, self.seed.hint_widths().0);
+        if at == 0 || ws == 0 {
+            return None;
+        }
+        let i = self.package().location_index(location)?;
+        let bytes = self.seed.bytes.get(at..).unwrap_or_default();
+        let v = bits::read(bytes, i * usize::from(ws), ws);
+        (v != no_sphere(ws)).then(|| u32::try_from(v).ok()).flatten()
+    }
+
+    /// Entrance record `k`: (location index, entrance index).
+    fn entrance_record(&self, k: usize) -> (usize, usize) {
+        let (_, wl, we, _) = self.seed.hint_widths();
+        let w = entrance_width(wl, we);
+        let bytes = self.seed.bytes.get(self.hint_field(4) as usize..).unwrap_or_default();
+        let bit = k * usize::from(w);
+        (
+            bits::read(bytes, bit, wl) as usize,
+            bits::read(bytes, bit + usize::from(wl), w - wl) as usize,
+        )
+    }
+
+    fn entrance_name(&self, e: usize) -> &'a str {
+        self.seed.entrance_name(e).unwrap_or_default()
+    }
+
+    /// The entrance a hint names for location id `location` (shuffled entrances only): a
+    /// binary search of the slot's records, which are by location index.
+    #[must_use]
+    pub fn entrance(&self, location: i64) -> Option<&'a str> {
+        let i = self.package().location_index(location)?;
+        let (mut lo, mut hi) = (0, self.hint_field(8) as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (at, e) = self.entrance_record(mid);
+            match at.cmp(&i) {
+                std::cmp::Ordering::Equal => return Some(self.entrance_name(e)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// Every (location id, entrance name), by location.
+    pub fn entrances(&self) -> impl Iterator<Item = (i64, &'a str)> + use<'a> {
+        let me = *self;
+        (0..self.hint_field(8) as usize).filter_map(move |k| {
+            let (i, e) = me.entrance_record(k);
+            Some((*me.package().locations().get(i)?, me.entrance_name(e)))
+        })
+    }
+
     /// Receiver position and item id of placement `i`.
     #[must_use]
     pub fn target(&self, i: usize) -> Option<(usize, i64)> {
@@ -1145,16 +1533,7 @@ impl<'a> SlotView<'a> {
 /// `Seed::open` refuses a seed with no games, so a slot always has one.
 fn unreachable_package() -> &'static GamePackage {
     static EMPTY: std::sync::OnceLock<GamePackage> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| {
-        let empty = GameData {
-            item_name_to_id: BTreeMap::new(),
-            location_name_to_id: BTreeMap::new(),
-            checksum: String::new(),
-            item_name_groups: BTreeMap::new(),
-            location_name_groups: BTreeMap::new(),
-        };
-        GamePackage::new([0; 32], "", &empty)
-    })
+    EMPTY.get_or_init(|| GamePackage::new([0; 32], "", &GameData::default()))
 }
 
 impl World for Seed {
@@ -1172,6 +1551,10 @@ impl World for Seed {
 
     fn target(&self, pos: usize, index: usize) -> Option<(usize, i64)> {
         self.slot_at(pos)?.target(index)
+    }
+
+    fn location(&self, pos: usize, index: usize) -> Option<i64> {
+        self.slot_at(pos)?.location(index)
     }
 }
 

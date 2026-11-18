@@ -1,5 +1,5 @@
-//! Commands in, events out (doc 05 7.1). Minimal: `Check`, `Ack`, `Goal` and `KvSet`; `Ext` and
-//! `Host` come later.
+//! Commands in, events out (doc 05 7.1). Minimal: `Check`, `Ack`, `Goal`, `KvSet` and the two
+//! hint commands; `Ext` and `Host` come later.
 //!
 //! Location and item ids are `i64`: worlds made by other generators use ids up to 2^53 - 1 and
 //! reserve negative ids, and a location id is only unique within the world of the slot that
@@ -65,6 +65,34 @@ pub struct KvWrite {
     pub ops: Vec<(KvOp, Value)>,
 }
 
+/// One location a hint request names, and the status a new hint for it starts with (an
+/// already checked location starts as found whatever is asked; `room_core::hint` has the values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HintAsk {
+    /// The slot whose world holds the location.
+    pub finding: SlotNo,
+    /// Location id in that world.
+    pub location: i64,
+    /// Status of a new hint.
+    pub status: u8,
+}
+
+/// Ask for hints (docs/protocol-plan.md section 2): scouts that create hints (free, found ones
+/// kept), and the `!hint` chat commands (new unfound hints cost points, found ones are shown
+/// but not kept).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HintRequest {
+    /// The asking slot; it pays when `pay` is set.
+    pub slot: SlotNo,
+    /// The locations, most wanted first: with points for only one new hint, the first new
+    /// unfound one is taken.
+    pub asks: Vec<HintAsk>,
+    /// New unfound hints cost points (one per request while the room's hint cost is not 0).
+    pub pay: bool,
+    /// Keep a new hint whose location is already checked (scouts do, `!hint` does not).
+    pub keep_found: bool,
+}
+
 /// A client command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -91,6 +119,19 @@ pub enum Command {
     },
     /// Write one key of the room's key-value store (boxed: much larger than the others).
     KvSet(Box<KvWrite>),
+    /// Create hints (boxed: a list).
+    Hint(Box<HintRequest>),
+    /// Change the status of a known hint; only its receiver may.
+    HintStatus {
+        /// The asking slot.
+        slot: SlotNo,
+        /// The slot whose world holds the hinted location.
+        finding: SlotNo,
+        /// The location.
+        location: i64,
+        /// The new status.
+        status: u8,
+    },
 }
 
 /// One log entry.
@@ -141,6 +182,27 @@ pub enum EventKind {
         /// Its value after the write.
         value: Box<Value>,
     },
+    /// A hint was created at the request of the event's slot. Item and receiver follow from
+    /// the placement; whether it is found, from the checks.
+    HintAdded {
+        /// The slot whose world holds the location.
+        finding: SlotNo,
+        /// The location.
+        location: i64,
+        /// Its status.
+        status: u8,
+        /// The event's slot spent points on it.
+        paid: bool,
+    },
+    /// The event's slot changed a known hint's status.
+    HintStatus {
+        /// The slot whose world holds the location.
+        finding: SlotNo,
+        /// The location.
+        location: i64,
+        /// The new status.
+        status: u8,
+    },
 }
 
 #[cfg(test)]
@@ -187,6 +249,31 @@ mod tests {
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+    }
+
+    #[test]
+    fn hint_commands_and_events_survive_a_json_round_trip() {
+        let ask = HintAsk { finding: SlotNo(2), location: -7, status: 30 };
+        let c = Command::Hint(Box::new(HintRequest {
+            slot: SlotNo(1),
+            asks: alloc::vec![ask],
+            pay: true,
+            keep_found: false,
+        }));
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&s).unwrap(), c);
+        let c =
+            Command::HintStatus { slot: SlotNo(1), finding: SlotNo(2), location: 3, status: 20 };
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&s).unwrap(), c);
+        for kind in [
+            EventKind::HintAdded { finding: SlotNo(2), location: 3, status: 0, paid: true },
+            EventKind::HintStatus { finding: SlotNo(2), location: 3, status: 10 },
+        ] {
+            let e = Event { seq: Seq(1), slot: Some(SlotNo(1)), kind };
+            let s = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+        }
     }
 
     #[test]

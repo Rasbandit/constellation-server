@@ -149,6 +149,63 @@ mod restart {
         assert!(loaded.contains("events=15"), "{loaded}");
     }
 
+    /// Hints and hint points are log events too: a free scout hint, a paid `!hint` and a
+    /// status change all survive `kill -9`, and the points spent stay spent.
+    #[tokio::test]
+    async fn hints_and_points_survive_kill_9() {
+        let db = database().await;
+        let server = start(&db);
+        let (mut alice, _, _) = join(&server.url(), "Alice").await.unwrap();
+        let (mut bob, _, _) = join(&server.url(), "Bob").await.unwrap();
+        // The fixture: one point per check, a hint costs Bob max(1, int(10% of 15)) = 1.
+        bob.check(&[locations_for(2, 1).unwrap()[0].0]).await.unwrap();
+        let (u, _) = bob.next_cmd("RoomUpdate").await.unwrap();
+        assert_eq!(u["hint_points"], 1);
+        // A free hint: Alice scouts a location of hers that holds an item for Bob.
+        let scouted = locations_for(1, 2).unwrap()[0].0;
+        let scout = json!([{"cmd": "LocationScouts", "locations": [scouted], "create_as_hint": 2}]);
+        alice.send(&scout).await.unwrap();
+        alice.next_cmd("LocationInfo").await.unwrap();
+        // A paid hint: Bob asks for an item by name.
+        let b = e2e::fixture().unwrap();
+        let (_, item, _) = locations_for(1, 2).unwrap()[3];
+        let game = &b.games[&b.slot(2).unwrap().game];
+        let name = game.item_name_to_id.iter().find(|(_, id)| **id == item).unwrap().0;
+        bob.send(&json!([{"cmd": "Say", "text": format!("!hint {name}")}])).await.unwrap();
+        loop {
+            let (u, _) = bob.next_cmd("RoomUpdate").await.unwrap();
+            if u["hint_points"] == 0 {
+                break;
+            }
+        }
+        // A status change, then a read: the session answers the read only after the change
+        // is durable.
+        let key = "_read_hints_0_2";
+        let up = json!([{"cmd": "UpdateHint", "player": 1, "location": scouted, "status": 10},
+            {"cmd": "Get", "keys": [key]}]);
+        bob.send(&up).await.unwrap();
+        let (before, _) = bob.next_cmd("Retrieved").await.unwrap();
+        let status = server.kill().unwrap();
+        assert!(!status.success(), "{status}");
+        let server = start(&db);
+        let loaded = server.wait_for_log("room loaded").unwrap();
+        // One check (two events), two new hints and one status change.
+        assert!(loaded.contains("events=5"), "{loaded}");
+        let (mut bob, connected, _) = join(&server.url(), "Bob").await.unwrap();
+        assert_eq!(connected["hint_points"], 0, "the paid hint stays paid");
+        bob.send(&json!([{"cmd": "Get", "keys": [key]}])).await.unwrap();
+        let (after, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(after["keys"][key], before["keys"][key]);
+        let hints = after["keys"][key].as_array().unwrap();
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        let at = |l: i64| hints.iter().find(|h| h["location"] == l && h["finding_player"] == 1);
+        assert_eq!(at(scouted).unwrap()["status"], 10);
+        assert!(
+            hints.iter().any(|h| h["item"] == item && h["status"] == 30),
+            "the paid hint is kept: {hints:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_room_survives_a_graceful_sigterm_restart() {
         let db = database().await;

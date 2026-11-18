@@ -179,7 +179,8 @@ def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]
     zips = sorted(out.glob("AP_*.zip"))
     if len(zips) != 1:
         raise Refused(f"expected one AP_*.zip in the output, found {len(zips)}")
-    bundle = ap_import.convert(ap_import.load_multidata(zips[0]))
+    # The worlds are loaded (generation imported them), so their hint blacklists are at hand.
+    bundle = ap_import.convert(ap_import.load_multidata(zips[0]), ap_import.load_hint_blacklists())
     report = {
         "seed_name": bundle["seed_name"],
         "slots": len(bundle["slots"]),

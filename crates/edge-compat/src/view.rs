@@ -41,7 +41,8 @@ impl CompatRoom {
         self.bundle.slot(slot)?.package().location_name(location)
     }
 
-    fn flags(&self, slot: u32, location: i64) -> u8 {
+    /// The flags of the item at `slot`'s `location` (0 when it places nothing there).
+    pub(crate) fn flags(&self, slot: u32, location: i64) -> u8 {
         let s = self.bundle.slot(slot);
         s.and_then(|s| s.flags(s.find(location)?)).unwrap_or(0)
     }
@@ -114,7 +115,7 @@ impl CompatRoom {
     }
 
     /// What a host sees of one durable event; `None` for events with nothing to show (data
-    /// storage writes).
+    /// storage writes and hints).
     #[must_use]
     pub fn describe_event(&self, e: &Event) -> Option<Value> {
         let slot = e.slot.map(|s| s.0);
@@ -143,7 +144,9 @@ impl CompatRoom {
             EventKind::Goal => {
                 json!({"kind": "goal", "seq": e.seq.0, "slot": slot, "name": self.player(slot)})
             }
-            EventKind::KvSet { .. } => return None,
+            EventKind::KvSet { .. }
+            | EventKind::HintAdded { .. }
+            | EventKind::HintStatus { .. } => return None,
         })
     }
 

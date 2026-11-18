@@ -20,7 +20,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle, 
 - `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
 - `tools/ap-gen`: the generation sidecar the server runs in its sandbox: inspects uploaded `.apworld` and player `.yaml` files, and generates a seed with an Archipelago checkout, converted by `tools/ap-import` (see "Uploads and seed generation").
-- `tools/ap-client-check`: drives the real server with Archipelago's own `CommonClient` from the sibling checkout (connect, `SetNotify`, `Set`, `Get`, start items, client status). Local only: `just ap-client-check`.
+- `tools/ap-client-check`: drives the real server with Archipelago's own `CommonClient` from the sibling checkout (connect, `SetNotify`, `Set`, `Get`, start items, client status, `!hint`, the hints key and `UpdateHint`). Local only: `just ap-client-check`.
 
 Next crates, in doc 05 section 20 order: `edge-native`.
 

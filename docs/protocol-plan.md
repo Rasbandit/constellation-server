@@ -15,6 +15,7 @@ Build order steps 1 to 3 (section 7) are implemented on `feat/data-storage`; `do
 - Section 0.6 (a connection id) was not needed: the room's reply to a `Set` carries the event's `seq`, and the writing session skips that `seq` when the event reaches it, live or after a resync. Notes (section 0.5) are `runtime::Note { seq, reply, extra }`.
 - Client status presence lives in `edge-compat` (`presence.rs`) under a lock held while each change is published, so watchers see changes in order.
 - Found by running Archipelago's own `CommonClient` against the server: the reference tags `NetworkItem`, `NetworkPlayer` and `NetworkSlot` with `"class"` (`NetUtils.py:98-107`) and its client only builds them from tagged objects; we tag them now.
+- Step 4 (hints) is implemented on `feat/hints`, except `CreateHints` and the fuzzy name match (both listed in `docs/compat-status.md`). Choices beyond section 2: start hints are part of the fresh room state, built from the bundle on every start, not log events; hint prints are fanned out as non-durable messages after the room's reply, for new and known hints alike, instead of following from `HintAdded`; the edge orders `!hint` candidates (sphere, then another player's world, then slot and location) and room-core takes the first new unfound one it can pay for, so no random pick is recorded; a session rereads a watched `_read_hints_` list from the room when an event may have changed it, instead of the runtime attaching lists as notes.
 ---
 
 ## 0. Cross-cutting changes (do these first, every feature below needs them)

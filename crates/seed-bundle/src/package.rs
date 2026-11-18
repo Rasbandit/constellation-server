@@ -196,13 +196,16 @@ pub struct GamePackage {
     locations: Box<[i64]>,
     /// Every item id, ascending.
     items: Box<[i64]>,
-    /// Names by index: what the host's room view shows, once per process, not per room.
-    location_names: Box<[Box<str>]>,
-    item_names: Box<[Box<str>]>,
+    /// Names by index and by name, and the name groups: what the host's room view shows and
+    /// `!hint` looks up, once per process, not per room.
+    location_names: Names,
+    item_names: Names,
     /// The package clients get in `DataPackage`: names to ids and the checksum, as JSON.
     data_package: Box<str>,
     item_groups: Box<str>,
     location_groups: Box<str>,
+    /// Names `!hint` refuses, sorted.
+    hint_blacklist: Box<[Box<str>]>,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +213,73 @@ pub struct GamePackage {
 struct File {
     data: GameData,
     game: String,
+}
+
+/// One kind of name of a game (items or locations): names by index, indexes in name order (a
+/// binary search finds a name, 4 bytes a name), and the name groups as index lists in name
+/// order. Built once per package, so a lookup never scans every name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Names {
+    by_index: Box<[Box<str>]>,
+    by_name: Box<[u32]>,
+    groups: Box<[Group]>,
+}
+
+/// A name group: its name and its member indexes.
+type Group = (Box<str>, Box<[u32]>);
+
+impl Names {
+    /// The names `by_index` (one per index) and their `groups`; a member that is not a name
+    /// of the game is left out of its group.
+    fn new(by_index: Box<[Box<str>]>, groups: &BTreeMap<String, Vec<String>>) -> Self {
+        let mut by_name: Vec<u32> =
+            (0..by_index.len()).filter_map(|i| u32::try_from(i).ok()).collect();
+        by_name.sort_unstable_by(|&a, &b| by_index[a as usize].cmp(&by_index[b as usize]));
+        let mut names = Self { by_index, by_name: by_name.into(), groups: Box::new([]) };
+        names.groups = groups
+            .iter()
+            .map(|(g, members)| {
+                let ids = members.iter().filter_map(|m| names.index(m));
+                (g.as_str().into(), ids.filter_map(|i| u32::try_from(i).ok()).collect())
+            })
+            .collect();
+        names
+    }
+
+    /// The name at index `i`.
+    #[must_use]
+    pub fn name(&self, i: usize) -> Option<&str> {
+        self.by_index.get(i).map(|n| &**n)
+    }
+
+    /// The index of `name`.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<usize> {
+        let at = |&i: &u32| self.by_index.get(i as usize).map_or("", |n| &**n);
+        let k = self.by_name.binary_search_by(|i| at(i).cmp(name)).ok()?;
+        self.by_name.get(k).map(|&i| i as usize)
+    }
+
+    /// The member indexes of group `name`.
+    #[must_use]
+    pub fn group(&self, name: &str) -> Option<&[u32]> {
+        let k = self.groups.binary_search_by(|g| (*g.0).cmp(name)).ok()?;
+        self.groups.get(k).map(|g| &*g.1)
+    }
+
+    /// `name` as stored here: a group of that name (a group wins, as in the reference), else
+    /// the item or location of that name.
+    #[must_use]
+    pub fn stored(&self, name: &str) -> Option<&str> {
+        let group = self.groups.binary_search_by(|g| (*g.0).cmp(name)).ok();
+        let group = group.and_then(|k| self.groups.get(k)).map(|g| &*g.0);
+        group.or_else(|| self.name(self.index(name)?))
+    }
+
+    /// Every name, then every group name.
+    pub fn all(&self) -> impl Iterator<Item = &str> + Clone {
+        self.by_index.iter().chain(self.groups.iter().map(|g| &g.0)).map(|n| &**n)
+    }
 }
 
 /// The canonical JSON of `v`: object keys sorted, no whitespace (the form `bundle_hash`
@@ -274,11 +344,12 @@ impl GamePackage {
             checksum: g.checksum.as_str().into(),
             locations,
             items,
-            location_names,
-            item_names,
+            location_names: Names::new(location_names, &g.location_name_groups),
+            item_names: Names::new(item_names, &g.item_name_groups),
             data_package: reduced.to_string().into(),
             item_groups: serde_json::json!(g.item_name_groups).to_string().into(),
             location_groups: serde_json::json!(g.location_name_groups).to_string().into(),
+            hint_blacklist: g.hint_blacklist.iter().map(|n| n.as_str().into()).collect(),
         }
     }
 
@@ -344,13 +415,31 @@ impl GamePackage {
     /// The name of location id `id`.
     #[must_use]
     pub fn location_name(&self, id: i64) -> Option<&str> {
-        self.location_names.get(self.location_index(id)?).map(|n| &**n)
+        self.location_names.name(self.location_index(id)?)
     }
 
     /// The name of item id `id`.
     #[must_use]
     pub fn item_name(&self, id: i64) -> Option<&str> {
-        self.item_names.get(self.item_index(id)?).map(|n| &**n)
+        self.item_names.name(self.item_index(id)?)
+    }
+
+    /// Location names and location groups.
+    #[must_use]
+    pub const fn location_names(&self) -> &Names {
+        &self.location_names
+    }
+
+    /// Item names and item groups.
+    #[must_use]
+    pub const fn item_names(&self) -> &Names {
+        &self.item_names
+    }
+
+    /// Whether the world forbids hinting the item or location called `name`.
+    #[must_use]
+    pub fn hint_blacklisted(&self, name: &str) -> bool {
+        self.hint_blacklist.binary_search_by(|n| (**n).cmp(name)).is_ok()
     }
 
     /// The JSON object clients get for this game in `DataPackage`.
@@ -459,7 +548,22 @@ mod tests {
             checksum: "c0ffee".into(),
             item_name_groups: BTreeMap::from([("all".into(), vec!["a".into(), "b".into()])]),
             location_name_groups: BTreeMap::new(),
+            ..GameData::default()
         }
+    }
+
+    #[test]
+    fn names_and_groups_are_found_by_binary_search() {
+        let mut g = game();
+        g.item_name_groups.insert("odd".into(), vec!["b".into(), "nope".into()]);
+        let p = GamePackage::new([0; 32], "G", &g);
+        let n = p.item_names();
+        // Items by id: a (-1) is index 0, b (9) index 1.
+        assert_eq!((n.index("a"), n.index("b"), n.index("c")), (Some(0), Some(1), None));
+        assert_eq!(n.group("all"), Some(&[0, 1][..]));
+        assert_eq!(n.group("odd"), Some(&[1][..]), "an unknown member is left out");
+        assert_eq!(n.group("none"), None);
+        assert_eq!(n.all().collect::<Vec<_>>(), ["a", "b", "all", "odd"]);
     }
 
     #[test]

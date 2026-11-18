@@ -42,6 +42,18 @@ def multidata():
     }
 
 
+class Hint(NamedTuple):
+    # The reference's Hint field order (NetUtils.py:393-401).
+    receiving_player: int
+    finding_player: int
+    location: int
+    item: int
+    found: bool
+    entrance: str = ""
+    item_flags: int = 0
+    status: int = 0
+
+
 class ConvertTests(unittest.TestCase):
     def test_slots_come_out_in_slot_order_with_sorted_locations(self):
         b = convert(multidata())
@@ -69,7 +81,7 @@ class ConvertTests(unittest.TestCase):
         games = convert(md)["games"]
         self.assertEqual(list(games), ["G"])
         self.assertEqual(set(games["G"]), {"item_name_to_id", "location_name_to_id", "checksum",
-                                           "item_name_groups", "location_name_groups"})
+                                           "item_name_groups", "location_name_groups", "hint_blacklist"})
 
     def test_name_groups_are_kept_and_missing_ones_are_empty(self):
         md = multidata()
@@ -107,6 +119,34 @@ class ConvertTests(unittest.TestCase):
         md["slot_info"][3] = Slot("Grp", "G", Kind.GROUP, (1, 2))
         with self.assertRaisesRegex(ValueError, "group slot"):
             convert(md)
+
+    def test_start_hints_are_kept_once_per_location(self):
+        md = multidata()
+        # The generator stores each hint under the finder and the receiver (Main.py:281-291).
+        h = Hint(2, 1, 11, 7, False, "", 1, 30)
+        md["precollected_hints"] = {1: {h}, 2: {h, Hint(1, 2, 10, 7, False, "", 4, 0)}}
+        self.assertEqual(convert(md)["start_hints"], [
+            {"finding": 1, "location": 11, "status": 30},
+            {"finding": 2, "location": 10, "status": 0},
+        ])
+        self.assertEqual(convert(multidata())["start_hints"], [])
+
+    def test_entrances_and_spheres_are_kept_per_location(self):
+        md = multidata()
+        md["er_hint_data"] = {1: {11: "Cave"}}
+        md["spheres"] = [{1: {10}}, {1: {11}, 2: {10}}]
+        b = convert(md)
+        self.assertEqual(b["slots"][0]["entrances"], {"11": "Cave"})
+        self.assertEqual(b["slots"][1]["entrances"], {})
+        self.assertEqual([p["sphere"] for p in b["slots"][0]["locations"]], [0, 1])
+        self.assertEqual(b["slots"][1]["locations"][0]["sphere"], 1)
+        self.assertNotIn("sphere", convert(multidata())["slots"][0]["locations"][0])
+
+    def test_hint_blacklists_are_kept_per_played_game(self):
+        b = convert(multidata(), {"G": frozenset({"I8", "I7"}), "Unplayed": {"x"}})
+        self.assertEqual(b["games"]["G"]["hint_blacklist"], ["I7", "I8"])
+        self.assertNotIn("Unplayed", b["games"])
+        self.assertEqual(convert(multidata())["games"]["G"]["hint_blacklist"], [])
 
     def test_race_mode_is_carried(self):
         self.assertEqual(convert(multidata())["race_mode"], 0)

@@ -177,8 +177,7 @@ pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
 /// # Errors
 /// When the bundle does not make a valid room.
 pub fn fresh_state(loaded: &Loaded) -> Result<RoomState, String> {
-    let world: Arc<dyn room_core::World> = Arc::clone(&loaded.bundle) as _;
-    RoomState::from_world(world).map_err(|e| e.to_string())
+    seed_bundle::room_state(&loaded.bundle).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +256,7 @@ async fn start_room<S: LogStore>(
     limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
-        Some(snap) => match RoomState::from_snapshot(fresh.world(), &snap.data) {
+        Some(snap) => match RoomState::from_snapshot(&fresh, &snap.data) {
             // A snapshot of an older shape is not corrupt: the log alone rebuilds the room.
             Err(room_core::CoreError::BadSnapshot(room_core::UNKNOWN_SNAPSHOT)) => {
                 tracing::warn!(

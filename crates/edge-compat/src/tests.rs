@@ -4,7 +4,6 @@
 use super::*;
 use log::MemLogStore;
 use proto::RoomId;
-use room_core::RoomState;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -17,8 +16,8 @@ fn seed(v: &Value) -> Arc<Seed> {
     Arc::new(seed_bundle::import_v1(v.to_string().as_bytes(), 1 << 26).unwrap().0)
 }
 
-fn state_of(b: &Arc<Seed>) -> RoomState {
-    RoomState::from_world(Arc::clone(b) as Arc<dyn room_core::World>).unwrap()
+fn state_of(b: &Arc<Seed>) -> room_core::RoomState {
+    seed_bundle::room_state(b).unwrap()
 }
 
 fn bundle(password: &Value) -> Arc<Seed> {
@@ -51,11 +50,16 @@ fn bundle_json(password: &Value) -> Value {
 
 fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
     let b = bundle(password);
+    spawn_with(b, override_pw, &Limits::DESIGN)
+}
+
+/// A room task for `b` on an in-memory log, and its compatible edge.
+fn spawn_with(b: Arc<Seed>, password: Option<&str>, limits: &Limits) -> Arc<CompatRoom> {
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
     let state = state_of(&b);
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
-    Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned), Limits::DESIGN).unwrap())
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
+    Arc::new(CompatRoom::new(b, h, password.map(str::to_owned), *limits).unwrap())
 }
 
 fn room() -> Arc<CompatRoom> {
@@ -94,7 +98,7 @@ async fn pump(s: &mut Session) -> Vec<Value> {
             None => return Vec::new(),
         };
         match next {
-            Ok(p) => frames.extend(s.on_published(&p).unwrap()),
+            Ok(p) => frames.extend(s.on_published(&p).await.unwrap()),
             Err(TryRecvError::Empty) => return packets(&frames),
             Err(TryRecvError::Disconnected) => {
                 // A resync that does not resubscribe leaves the queue closed: fail, do not spin.
@@ -403,7 +407,7 @@ async fn chat_reaches_everyone_and_no_text_clients_skip_prints() {
     assert_eq!(chat[0]["type"], "Chat");
     assert_eq!(chat[0]["message"], "hello");
     assert_eq!(pump(&mut quiet).await, Vec::<Value>::new());
-    let ps = send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await;
+    let ps = send(&mut a, &json!([{"cmd": "Say", "text": "!release"}])).await;
     assert_eq!(ps[0]["type"], "CommandResult");
 }
 
@@ -447,7 +451,7 @@ async fn connect_update_changes_items_handling_and_resends_items() {
 #[tokio::test]
 async fn unsupported_commands_say_so() {
     let mut a = joined(&room(), "A").await;
-    for cmd in ["CreateHints", "UpdateHint"] {
+    for cmd in ["CreateHints"] {
         let ps = send(&mut a, &json!([{"cmd": cmd}])).await;
         assert_eq!(ps[0]["original_cmd"], cmd);
         assert!(ps[0]["text"].as_str().unwrap().contains("not supported"));
@@ -477,12 +481,7 @@ fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
     for l in 1000..end {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
     }
-    let b = seed(&v);
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = state_of(&b);
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
-    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
+    spawn_with(seed(&v), None, limits)
 }
 
 fn indexes(ps: &[Value]) -> Vec<u64> {
@@ -535,11 +534,7 @@ async fn a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_orde
 
 fn limited(limits: &Limits) -> Arc<CompatRoom> {
     let b = bundle(&Value::Null);
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = state_of(&b);
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
-    Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
+    spawn_with(b, None, limits)
 }
 
 /// A burst of 2 that never refills, so the test does not depend on the clock.
@@ -631,12 +626,7 @@ fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
 fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
     let mut v: Value = bundle_json(&Value::Null);
     edit(&mut v);
-    let b = seed(&v);
-    let store = Arc::new(MemLogStore::new());
-    let epoch = store.claim(RoomId(1));
-    let state = state_of(&b);
-    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
-    Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap())
+    spawn_with(seed(&v), None, &Limits::DESIGN)
 }
 
 fn tracker_packet(name: &str, version: (u32, u32, u32)) -> Value {
@@ -1080,9 +1070,9 @@ async fn chat_and_command_prints_have_the_shape_clients_display() {
             "team": 0, "slot": 1, "message": "hello"})]
     );
     assert_eq!(
-        send(&mut a, &json!([{"cmd": "Say", "text": "!hint x"}])).await,
+        send(&mut a, &json!([{"cmd": "Say", "text": "!release"}])).await,
         [json!({"cmd": "PrintJSON", "type": "CommandResult",
-            "data": [{"text": "Commands are not supported by this server yet."}]})]
+            "data": [{"text": "!release is not supported by this server yet."}]})]
     );
 }
 
@@ -1736,6 +1726,7 @@ async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
     assert!(text.contains("room.storage_full") && text.contains("3003"), "{text}");
 }
 
+mod hints;
 // The host's room view (view.rs): numbers from the room and its sessions, events as shown.
 
 fn slot(summary: &Value, id: u64) -> &Value {

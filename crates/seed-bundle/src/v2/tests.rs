@@ -235,13 +235,7 @@ fn packages_must_be_the_ones_the_seed_names() {
     let text = small().to_string();
     let (_, e) = encoded(&text);
     assert!(Seed::open(e.seed.clone(), Vec::new(), 1 << 26).is_err());
-    let other = GameData {
-        item_name_to_id: BTreeMap::new(),
-        location_name_to_id: BTreeMap::new(),
-        checksum: String::new(),
-        item_name_groups: BTreeMap::new(),
-        location_name_groups: BTreeMap::new(),
-    };
+    let other = GameData::default();
     let wrong = Arc::new(GamePackage::new([3; 32], "G", &other));
     assert!(Seed::open(e.seed, vec![wrong], 1 << 26).is_err());
 }
@@ -408,4 +402,152 @@ fn a_placement_across_games_resolves_against_the_receivers_game() {
     assert_eq!(w.placed(2), 0);
     // Item indexes up to 3 (B's b3 is unused; b2 is index 2): 2 bits.
     assert_eq!(seed.bit_widths().0, 2);
+}
+
+/// `small` with every hint field set: start hints, spheres (one location without), entrances,
+/// and the hint blacklist.
+fn hinted() -> Value {
+    let mut v = small();
+    v["start_hints"] = json!([
+        {"finding": 2, "location": 101, "status": 30},
+        {"finding": 1, "location": 100, "status": 0}
+    ]);
+    v["slots"][0]["locations"][0]["sphere"] = json!(3);
+    v["slots"][1]["locations"][0]["sphere"] = json!(0);
+    v["slots"][0]["entrances"] = json!({"100": "Back Door", "101": "Cave"});
+    v["games"]["G"]["hint_blacklist"] = json!(["Eight"]);
+    v
+}
+
+#[test]
+fn hint_data_round_trips_v1_to_v2_to_v1() {
+    let text = hinted().to_string();
+    let (seed, data) = opened(&text);
+    let mut want = SeedBundle::from_json(&text).unwrap();
+    want.slots.sort_by_key(|s| s.id);
+    for s in &mut want.slots {
+        s.locations.sort_by_key(|p| p.location);
+    }
+    assert_eq!(seed.to_v1(&data).unwrap(), want);
+    let b = seed.slot(2).unwrap();
+    assert_eq!((b.sphere(101), b.sphere(100), b.sphere(102)), (Some(3), None, None));
+    assert_eq!(
+        (b.entrance(100), b.entrance(101), b.entrance(102)),
+        (Some("Back Door"), Some("Cave"), None)
+    );
+    assert_eq!(seed.slot(1).unwrap().entrance(100), None);
+    let start: Vec<_> = seed.start_hints().collect();
+    assert_eq!(start, [(SlotNo(2), 101, 30), (SlotNo(1), 100, 0)]);
+    assert!(seed.game("G").unwrap().hint_blacklisted("Eight"));
+    assert!(!seed.game("G").unwrap().hint_blacklisted("Seven"));
+}
+
+#[test]
+fn hint_fields_take_the_fewest_bits_and_no_hint_data_means_no_block() {
+    // Spheres up to 3 plus the "none" value: 3 bits. Location indexes up to 1 (L101): 1 bit.
+    // Entrance indexes up to 1 (Back Door, Cave): 1 bit. Slot positions up to 1: 1 bit.
+    let (_, e) = encoded(&hinted().to_string());
+    let at = u32::from_le_bytes(e.seed[28..32].try_into().unwrap()) as usize;
+    assert_ne!(at, 0);
+    assert_eq!(e.seed[at..at + 4], [3, 1, 1, 1]);
+    // Without hint data the reserved field stays 0: a seed made before hints is unchanged,
+    // and so is its package (no empty blacklist or entrance list is written).
+    let (_, plain) = encoded(&small().to_string());
+    assert_eq!(plain.seed[28..32], [0; 4]);
+    let content = package::game_of(&plain.packages[0], 1 << 20).unwrap();
+    assert!(
+        !String::from_utf8(GamePackage::content(&content.0, &content.1)).unwrap().contains("hint")
+    );
+}
+
+#[test]
+fn a_hostile_hint_block_is_an_error_not_a_panic() {
+    let text = hinted().to_string();
+    let (_, e) = encoded(&text);
+    let good = e.seed;
+    let at = u32::from_le_bytes(good[28..32].try_into().unwrap()) as usize;
+    let start = u32::from_le_bytes(good[at + 8..at + 12].try_into().unwrap()) as usize;
+    // Slot 2 (position 1): its entrance count is the third field of its hint entry.
+    let count = at + HINTS + HINT_SLOT + 8;
+    let field =
+        |b: &mut Vec<u8>, off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    type Edit<'a> = Box<dyn Fn(&mut Vec<u8>) + 'a>;
+    let cases: [(&str, Edit<'_>); 9] = [
+        ("block past the data", Box::new(|b| field(b, 28, u32::MAX - 4))),
+        ("sphere field too wide", Box::new(move |b| b[at] = 17)),
+        ("start hint count past the data", Box::new(move |b| field(b, at + 4, 1 << 20))),
+        // The first start hint's status code (bits 2 to 4 of its first byte) becomes 7.
+        ("start hint status code", Box::new(move |b| b[start] |= 0b1_1100)),
+        ("entrance count past the data", Box::new(move |b| field(b, count, 1 << 20))),
+        ("entrances out of order", Box::new(move |b| field(b, count, 3))),
+        ("spheres with zero bits", Box::new(move |b| b[at] = 0)),
+        ("entrance names past the data", Box::new(move |b| field(b, at + 12, 1 << 20))),
+        (
+            "entrance name ref out of range",
+            Box::new(move |b| {
+                let names = u32::from_le_bytes(b[at + 16..at + 20].try_into().unwrap()) as usize;
+                field(b, names, u32::MAX - 1);
+            }),
+        ),
+    ];
+    for (name, edit) in cases {
+        let mut b = good.clone();
+        edit(&mut b);
+        rehash(&mut b);
+        assert!(reopen(b, &text).is_err(), "{name}");
+    }
+    assert!(reopen(good.clone(), &text).is_ok());
+    // The entrance name table is sorted by name, as the format says: swapping its two
+    // references ("Back Door", "Cave") is refused.
+    let mut b = good;
+    let names = u32::from_le_bytes(b[at + 16..at + 20].try_into().unwrap()) as usize;
+    let (first, second) = (b[names..names + 8].to_vec(), b[names + 8..names + 16].to_vec());
+    b[names..names + 8].copy_from_slice(&second);
+    b[names + 8..names + 16].copy_from_slice(&first);
+    rehash(&mut b);
+    assert!(reopen(b, &text).unwrap_err().to_string().contains("entrance names"));
+}
+
+/// Review finding: the encoder expanded every slot's spheres to one value per location of its
+/// game before it checked the cap (8 bytes each in memory), so a small bundle of many slots of
+/// a huge game, each with one sphere, allocated gigabytes before it was refused. Now spheres
+/// stay sparse until the seed is sized: 400 slots of a 50,000-location game would need 20 M
+/// sphere values, and the cap refuses them from the counts alone.
+#[test]
+fn many_slots_with_one_sphere_each_are_sized_from_counts_and_refused() {
+    let mut v: Value = serde_json::from_str(&wide(50_000, 400, 0)).unwrap();
+    for s in v["slots"].as_array_mut().unwrap() {
+        s["locations"] =
+            json!([{"location": 1, "item": 1, "receiver": 1, "flags": 0, "sphere": 0}]);
+    }
+    let text = v.to_string();
+    let b = SeedBundle::from_json(&text).unwrap();
+    let err = encode(&b, &hash_of(&text), 1 << 20).unwrap_err().to_string();
+    assert!(err.contains("cap"), "{err}");
+    // What the encoder holds before the cap check: one entry per sphere given, not per location.
+    let tables = vec![GamePackage::new([0; 32], "G", &game(&text))];
+    let mut slots: Vec<&Slot> = b.slots.iter().collect();
+    slots.sort_by_key(|s| s.id);
+    let indexed: Vec<Indexed> =
+        slots.iter().map(|_| Indexed { game: 0, placed: Vec::new(), start: Vec::new() }).collect();
+    let held = hint_data(&b, &slots, &indexed, &tables).unwrap();
+    assert_eq!(held.spheres.iter().map(|s| s.1.len()).sum::<usize>(), 400);
+}
+
+fn game(text: &str) -> GameData {
+    SeedBundle::from_json(text).unwrap().games["G"].clone()
+}
+
+/// Review finding: entrance names were in the package, so every seed with shuffled entrances
+/// made its own package of the same game. Now they are in the seed's string table.
+#[test]
+fn seeds_with_different_entrances_share_one_package() {
+    let mut other = hinted();
+    other["slots"][0]["entrances"] = json!({"100": "Attic"});
+    let (_, a) = encoded(&hinted().to_string());
+    let (_, b) = encoded(&other.to_string());
+    assert_eq!(package::key_of(&a.packages[0]), package::key_of(&b.packages[0]));
+    let (seed, data) = opened(&other.to_string());
+    assert_eq!(seed.slot(2).unwrap().entrance(100), Some("Attic"));
+    assert_eq!(seed.to_v1(&data).unwrap().slots[1].entrances[&100], "Attic");
 }
