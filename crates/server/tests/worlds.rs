@@ -261,7 +261,10 @@ async fn hosted_world(setup: &Setup) -> (Server, String, Value) {
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
     let id = generate_one(&server, b"Alice").await;
+    // The seed reaches the rooms folder (and a scan may list it) before the job writes its
+    // status, so wait for both signals.
     server.wait_for_log("room ready").unwrap();
+    server.wait_for_log("generation done").unwrap();
     let st = status(&server, &id).await;
     assert!(st["room_key"].is_string(), "{st}");
     (server, id, st)
