@@ -309,6 +309,9 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     assert_eq!(code, 200, "{room}");
     assert_eq!((&room["seed"], &room["room_key"]), (&json!(fixture.seed_name), &st["room_key"]));
     assert_eq!(room["address"], st["address"]);
+    let opts = &fixture.server_options;
+    assert_eq!(room["options"]["password"], opts.password.is_some(), "a flag, never the password");
+    assert_eq!(room["options"]["hint_cost"], opts.hint_cost);
     let slots = room["slots"].as_array().unwrap();
     assert_eq!(slots.len(), fixture.slots.len());
     let (alice, bob) = (&slots[0], &slots[1]);
@@ -345,6 +348,7 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
         (&json!(1), &json!(2), &json!(loc), &json!(item))
     );
     assert!(ev["item_name"].is_string() && ev["location_name"].is_string(), "{ev}");
+    assert_eq!((&ev["from_name"], &ev["to_name"]), (&json!("Alice"), &json!("Bob")));
     let (_, room) = view(&server).await;
     assert_eq!(
         (&room["slots"][0]["checked"], &room["slots"][1]["items_received"]),

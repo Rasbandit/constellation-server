@@ -33,6 +33,10 @@ impl CompatRoom {
         self.names(slot)?.items.get(&item).map(String::as_str)
     }
 
+    fn player(&self, slot: Option<u32>) -> Option<&str> {
+        Some(self.bundle.slot(slot?)?.name.as_str())
+    }
+
     fn location_name(&self, slot: u32, location: i64) -> Option<&str> {
         self.names(slot)?.locations.get(&location).map(String::as_str)
     }
@@ -77,7 +81,15 @@ impl CompatRoom {
                 })
             })
             .collect();
-        Ok(json!({"seed": self.bundle.seed_name, "slots": slots}))
+        let o = &self.bundle.server_options;
+        let options = json!({
+            // Whether one is set, never the password itself.
+            "password": self.password.is_some(),
+            "hint_cost": o.hint_cost,
+            "release_mode": o.release_mode,
+            "collect_mode": o.collect_mode,
+        });
+        Ok(json!({"seed": self.bundle.seed_name, "options": options, "slots": slots}))
     }
 
     /// The room's durable events after `after`, then everything it publishes live.
@@ -98,6 +110,7 @@ impl CompatRoom {
                 "kind": "checked",
                 "seq": e.seq.0,
                 "slot": slot,
+                "name": self.player(slot),
                 "location": location,
                 "location_name": slot.and_then(|s| self.location_name(s, *location)),
             }),
@@ -105,14 +118,18 @@ impl CompatRoom {
                 "kind": "item",
                 "seq": e.seq.0,
                 "from": from.0,
+                "from_name": self.player(Some(from.0)),
                 "to": slot,
+                "to_name": self.player(slot),
                 "item": item,
                 "item_name": slot.and_then(|s| self.item_name(s, *item)),
                 "location": location,
                 "location_name": self.location_name(from.0, *location),
                 "flags": slot.map(|_| self.flags(from.0, *location)),
             }),
-            EventKind::Goal => json!({"kind": "goal", "seq": e.seq.0, "slot": slot}),
+            EventKind::Goal => {
+                json!({"kind": "goal", "seq": e.seq.0, "slot": slot, "name": self.player(slot)})
+            }
             EventKind::KvSet { .. } => return None,
         })
     }
@@ -138,7 +155,7 @@ impl CompatRoom {
                     _ => return Vec::new(),
                 };
                 vec![
-                    json!({"kind": kind, "slot": print.slot, "team": print.team, "text": print.message}),
+                    json!({"kind": kind, "slot": print.slot, "name": self.player(print.slot), "team": print.team, "text": print.message}),
                 ]
             }
         }
