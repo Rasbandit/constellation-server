@@ -404,6 +404,20 @@ pub fn package_keys(bytes: &[u8]) -> Result<Vec<Key>, BundleError> {
         .collect()
 }
 
+/// The hash of the v1 bundle a v2 file was made from, after checking its header (the body
+/// hash is checked on open).
+///
+/// # Errors
+/// When the header is malformed.
+pub fn bundle_hash_of(bytes: &[u8]) -> Result<[u8; 32], BundleError> {
+    header(Reader(bytes))?;
+    Ok(hash_field(bytes))
+}
+
+fn hash_field(bytes: &[u8]) -> [u8; 32] {
+    bytes.get(32..64).and_then(|h| h.try_into().ok()).unwrap_or([0; 32])
+}
+
 fn header(r: Reader<'_>) -> Result<(), BundleError> {
     if !is_v2(r.0) || r.0.len() < HEADER {
         return Err(BundleError::Parse("not a v2 seed file".to_owned()));
@@ -519,7 +533,7 @@ impl Seed {
     /// SHA-256 of the canonical v1 JSON this seed was made from (`crate::bundle_hash`).
     #[must_use]
     pub fn hash(&self) -> [u8; 32] {
-        self.bytes.get(32..64).and_then(|h| h.try_into().ok()).unwrap_or([0; 32])
+        hash_field(&self.bytes)
     }
 
     /// The generator's name for this seed.

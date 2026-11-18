@@ -1364,6 +1364,7 @@ dependencies = [
  "bits",
  "config",
  "flate2",
+ "log 0.0.0",
  "proto",
  "room-core",
  "serde",

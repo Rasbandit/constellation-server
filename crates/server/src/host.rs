@@ -71,23 +71,52 @@ type Ready = (crate::rooms::Room, JoinHandle<Stopped>);
 /// The end of a load run apart from the host ([`Host::load`]).
 type LoadEnd = (RoomKey, Result<Ready, String>);
 
-/// Where a load reads the room from.
+/// Where a load (or an import) reads and writes the room.
 enum LoadFrom {
     Pg(Arc<PgLogStore>),
     Mem(Arc<MemLogStore>),
 }
 
-/// Put a room's package files, then its seed, into the store (both write once): the store is
-/// where a room is loaded from, never a file.
-async fn store_seed<S: LogStore + BlobStore>(s: &S, id: RoomId, l: &Loaded) -> Result<(), String> {
+/// Put a room's package files into the store (write once, by key): the store is where a room
+/// is loaded from, never a file. Its seed goes in with the room ([`import_work`]).
+async fn store_packages<S: BlobStore>(s: &S, l: &Loaded) -> Result<(), String> {
     for f in &l.packages {
         s.put(&log::blob_key(f), f).await.map_err(|e| format!("store a package: {e:?}"))?;
     }
-    s.seed_put(id, l.bundle.bytes()).await.map_err(|e| format!("store the seed: {e:?}"))
+    Ok(())
+}
+
+/// What an import stored: the room's key and idle time when it is to be listed.
+type Stored = Result<Option<(RoomKey, u64)>, Skip>;
+
+/// The store side of an import, which needs nothing from the host so it runs in its own
+/// task: the packages, then the seed. On Postgres a listed room's seed is written with the
+/// room (`open_room`, after its hash check); a seed that is not listed (generated, not
+/// hosted) is refused for a stored room, and on either store a different seed is refused.
+async fn import_work(from: LoadFrom, loaded: Loaded, list: bool, limits: Limits) -> Stored {
+    let id = crate::room_id(loaded.bundle.seed_name());
+    let seed = |e| Skip::Final(format!("seed {:?}: {e:?}", loaded.bundle.seed_name()));
+    match from {
+        LoadFrom::Pg(store) => {
+            store_packages(&*store, &loaded).await.map_err(Skip::Later)?;
+            if list {
+                return open_with_key(&store, id, &loaded, limits, RoomKey::random).await.map(Some);
+            }
+            store.seed_put(id, loaded.bundle.bytes()).await.map_err(seed)?;
+        }
+        LoadFrom::Mem(log) => {
+            store_packages(&*log, &loaded).await.map_err(Skip::Later)?;
+            log.seed_put(id, loaded.bundle.bytes()).await.map_err(seed)?;
+            if list {
+                return Ok(Some((RoomKey::random().map_err(Skip::Later)?, 0)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// A room's stored seed and the package files this process lacks, each checked against its
-/// key ([`log::blob_get`]), with this process's copies of the others held so they stay.
+/// key ([`BlobStore::get`]), with this process's copies of the others held so they stay.
 type Fetched = (Vec<u8>, BTreeMap<BlobKey, Vec<u8>>, Vec<Arc<GamePackage>>);
 
 async fn fetch_seed<S: LogStore + BlobStore>(s: &S, seed: Vec<u8>) -> Result<Fetched, String> {
@@ -98,22 +127,28 @@ async fn fetch_seed<S: LogStore + BlobStore>(s: &S, seed: Vec<u8>) -> Result<Fet
             held.push(p);
             continue;
         }
-        let file = log::blob_get(s, &key).await.map_err(|e| format!("a package: {e:?}"))?;
+        let file = s.get(&key).await.map_err(|e| format!("a package: {e:?}"))?;
         files.insert(key, file.ok_or("a package the seed names is not in the store")?);
     }
     Ok((seed, files, held))
 }
 
-/// Room `room`'s stored seed as v1 JSON, every package read from the store (checked).
+/// Room `room`'s stored seed as v1 JSON text, every package read from the store (checked). A
+/// seed of another bundle than `hash` (hex, the world's) is refused.
 async fn export<S: LogStore + BlobStore>(
     s: &S,
     room: RoomId,
+    hash: &str,
     limits: &Limits,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     let seed = s.seed_get(room).await.map_err(|e| format!("{e:?}"))?.ok_or("no stored seed")?;
+    let made_from = seed_bundle::v2::bundle_hash_of(&seed).map_err(|e| e.to_string())?;
+    if crate::hex(&made_from) != hash {
+        return Err("the stored seed is of another bundle with this seed name".to_owned());
+    }
     let mut files = BTreeMap::new();
     for key in seed_bundle::v2::package_keys(&seed).map_err(|e| e.to_string())? {
-        let file = log::blob_get(s, &key).await.map_err(|e| format!("a package: {e:?}"))?;
+        let file = s.get(&key).await.map_err(|e| format!("a package: {e:?}"))?;
         files.insert(key, file.ok_or("a package the seed names is not in the store")?);
     }
     let max = limits.bundle_max_bytes;
@@ -124,7 +159,7 @@ async fn export<S: LogStore + BlobStore>(
         seed_bundle::v2::decode(seed, fetch, max).map_err(|e| e.to_string())
     });
     let v1 = decoded.await.map_err(|e| e.to_string())??;
-    serde_json::to_value(v1).map_err(|e| e.to_string())
+    serde_json::to_string(&v1).map_err(|e| e.to_string())
 }
 
 /// Open a fetched seed (CPU work: run it off the runtime).
@@ -174,8 +209,13 @@ struct Import {
 /// A request for a stored seed decoded back to its v1 JSON (the debugging view).
 struct Export {
     room: RoomId,
-    done: oneshot::Sender<Result<serde_json::Value, String>>,
+    /// The world's bundle hash (hex): the seed must be of it.
+    hash: String,
+    done: oneshot::Sender<Result<String, String>>,
 }
+
+/// An import whose store side ended: list the room, then answer.
+type ImportEnd = (Loaded, Stored, oneshot::Sender<Result<Option<RoomKey>, String>>);
 
 /// What the host's channel carries.
 enum Request {
@@ -216,14 +256,16 @@ impl Waker {
         answer.await.map_err(|_| stopping())?
     }
 
-    /// The stored seed of room `room`, decoded to its v1 JSON with its stored packages.
+    /// The stored seed of room `room`, decoded to its v1 JSON text with its stored packages;
+    /// `hash` (hex) is the bundle it must be of.
     ///
     /// # Errors
-    /// No such seed, a package missing or not matching its key, or the server stopping.
-    pub(crate) async fn export(&self, room: RoomId) -> Result<serde_json::Value, String> {
+    /// No such seed, one of another bundle, a package missing or not matching its key, or the
+    /// server stopping.
+    pub(crate) async fn export(&self, room: RoomId, hash: String) -> Result<String, String> {
         let (done, answer) = oneshot::channel();
         let stopping = || "the server is stopping".to_owned();
-        self.0.send(Request::Export(Export { room, done })).map_err(|_| stopping())?;
+        self.0.send(Request::Export(Export { room, hash, done })).map_err(|_| stopping())?;
         answer.await.map_err(|_| stopping())?
     }
 }
@@ -251,6 +293,9 @@ pub struct Host {
     loads: JoinSet<LoadEnd>,
     /// The wakes waiting on each running load.
     waiting: BTreeMap<RoomKey, Vec<oneshot::Sender<Result<(), String>>>>,
+    /// Imports and exports from the generation API, apart from the loop like loads.
+    imports: JoinSet<ImportEnd>,
+    exports: JoinSet<()>,
 }
 
 impl core::fmt::Debug for Host {
@@ -299,6 +344,8 @@ impl Host {
             waker: Waker(tx),
             loads: JoinSet::new(),
             waiting: BTreeMap::new(),
+            imports: JoinSet::new(),
+            exports: JoinSet::new(),
         };
         Ok(host)
     }
@@ -350,7 +397,8 @@ impl Host {
             // One bad row skips its room, never the others.
             let listed =
                 RoomKey::parse(&room.key).map_err(|e| format!("stored {e}")).and_then(|key| {
-                    self.list(key, room.room, room.seed_name, Duration::from_secs(room.idle_secs))
+                    let idle = Duration::from_secs(room.idle_secs);
+                    self.list(key, room.room, room.seed_name, room.bundle_hash, idle)
                 });
             if let Err(why) = listed {
                 tracing::warn!(room = room.room.0, "stored room not listed: {why}");
@@ -364,12 +412,14 @@ impl Host {
         key: RoomKey,
         id: RoomId,
         seed: String,
+        hash: Vec<u8>,
         idle: Duration,
     ) -> Result<(), String> {
         tracing::info!(%key, seed, "room ready");
         let activity = Activity::new(idle);
         let used = activity.last_used(Moment::now());
-        write(&self.rooms).insert(key.clone(), Listing { id, seed, room: None, activity })?;
+        let listing = Listing { id, seed, hash, room: None, activity };
+        write(&self.rooms).insert(key.clone(), listing)?;
         self.recorded.insert(key, used);
         Ok(())
     }
@@ -377,48 +427,96 @@ impl Host {
     /// Add a room to the directory (cold) from its bundle and return its key. A seed that is
     /// already listed returns its key unchanged.
     pub(crate) async fn import(&mut self, loaded: Loaded) -> Result<RoomKey, Skip> {
-        let id = crate::room_id(loaded.bundle.seed_name());
+        let work = match self.admit(&loaded, true)? {
+            Ok(work) => work,
+            Err(key) => return Ok(key),
+        };
+        let stored = work.await;
+        self.finish_import(&loaded, stored)?.ok_or_else(|| Skip::Later("not listed".to_owned()))
+    }
+
+    /// Check an import against the directory: `Err(key)` for a seed listed already (with
+    /// `list`), else the store work to run ([`import_work`]). A seed that is not to be listed
+    /// is refused when this host serves or has ended a room of that seed name.
+    fn admit(
+        &self,
+        loaded: &Loaded,
+        list: bool,
+    ) -> Result<Result<impl Future<Output = Stored> + Send + 'static, RoomKey>, Skip> {
+        let seed = loaded.bundle.seed_name();
+        let id = crate::room_id(seed);
+        let hosted = || Skip::Final(format!("seed {seed:?} is already hosted on this server"));
         if let Some(key) = read(&self.rooms).key_of(id) {
-            return Ok(key.clone());
+            return if list { Ok(Err(key.clone())) } else { Err(hosted()) };
         }
-        if self.len() >= self.limits.max_rooms {
+        if list && self.len() >= self.limits.max_rooms {
             let why = format!("the server lists {} rooms, its most", self.limits.max_rooms);
             return Err(Skip::Later(why));
         }
-        let seed = loaded.bundle.seed_name().to_owned();
-        let (key, idle) = match &mut self.store {
-            Store::Pg(store) => {
-                store_seed(&**store, id, &loaded).await.map_err(Skip::Later)?;
-                open_with_key(store, id, &loaded, self.limits, RoomKey::random).await?
-            }
+        let from = match &self.store {
+            Store::Pg(store) => LoadFrom::Pg(Arc::clone(store)),
             Store::Mem { log, finished } => {
                 if finished.contains(&id) {
                     let why = format!("room {seed:?} has finished; it is not served again");
                     return Err(Skip::Final(why));
                 }
-                store_seed(&**log, id, &loaded).await.map_err(Skip::Later)?;
-                (RoomKey::random().map_err(Skip::Later)?, 0)
+                LoadFrom::Mem(Arc::clone(log))
             }
         };
-        self.list(key.clone(), id, seed, Duration::from_secs(idle)).map_err(Skip::Later)?;
-        Ok(key)
+        Ok(Ok(import_work(from, loaded.clone(), list, self.limits)))
     }
 
-    /// An import from the generation API: store the seed, and list it when asked.
-    async fn import_request(
-        &mut self,
-        loaded: Loaded,
-        list: bool,
-    ) -> Result<Option<RoomKey>, String> {
-        if list {
-            return self.import(loaded).await.map(Some).map_err(String::from);
+    /// List what an import stored (when it was to be listed). A seed another import listed
+    /// meanwhile keeps that listing.
+    fn finish_import(&mut self, loaded: &Loaded, stored: Stored) -> Result<Option<RoomKey>, Skip> {
+        let Some((key, idle)) = stored? else { return Ok(None) };
+        let seed = loaded.bundle.seed_name().to_owned();
+        let id = crate::room_id(&seed);
+        if let Some(listed) = read(&self.rooms).key_of(id) {
+            return Ok(Some(listed.clone()));
         }
-        let id = crate::room_id(loaded.bundle.seed_name());
-        match &self.store {
-            Store::Pg(store) => store_seed(&**store, id, &loaded).await?,
-            Store::Mem { log, .. } => store_seed(&**log, id, &loaded).await?,
+        let hash = loaded.hash.clone();
+        self.list(key.clone(), id, seed, hash, Duration::from_secs(idle)).map_err(Skip::Later)?;
+        Ok(Some(key))
+    }
+
+    /// An import from the generation API: store the seed in a task of its own, and list it
+    /// when asked once that ends ([`Host::imported`]).
+    fn import_request(&mut self, i: Import) {
+        match self.admit(&i.loaded, i.list) {
+            Ok(Ok(work)) => {
+                self.imports.spawn(async move {
+                    let stored = tokio::spawn(work).await.unwrap_or_else(|e| {
+                        Err(Skip::Later(format!("the import ended without a value: {e}")))
+                    });
+                    (i.loaded, stored, i.done)
+                });
+            }
+            Ok(Err(key)) => drop(i.done.send(Ok(Some(key)))),
+            Err(why) => drop(i.done.send(Err(why.into()))),
         }
-        Ok(None)
+    }
+
+    /// An import's store side ended: list it, and answer.
+    fn imported(&mut self, (loaded, stored, done): ImportEnd) {
+        drop(done.send(self.finish_import(&loaded, stored).map_err(String::from)));
+    }
+
+    /// An export from the generation API, in a task of its own: it reads the store and
+    /// decodes, and needs nothing from the host.
+    fn export_request(&mut self, x: Export) {
+        let from = match &self.store {
+            Store::Pg(s) => LoadFrom::Pg(Arc::clone(s)),
+            Store::Mem { log, .. } => LoadFrom::Mem(Arc::clone(log)),
+        };
+        let limits = self.limits;
+        self.exports.spawn(async move {
+            let res = match from {
+                LoadFrom::Pg(s) => export(&*s, x.room, &x.hash, &limits).await,
+                LoadFrom::Mem(s) => export(&*s, x.room, &x.hash, &limits).await,
+            };
+            drop(x.done.send(res));
+        });
     }
 
     /// Load the cold room `key` into memory now: claim it, rebuild it from the log and start
@@ -440,13 +538,13 @@ impl Host {
         &self,
         key: &RoomKey,
     ) -> Result<Option<impl Future<Output = Result<Ready, String>> + Send + 'static>, String> {
-        let (id, seed) = {
+        let (id, seed, hash) = {
             let rooms = read(&self.rooms);
             let listing = rooms.get(key).ok_or_else(|| format!("no room with key {key}"))?;
             if listing.room.is_some() {
                 return Ok(None);
             }
-            (listing.id, listing.seed.clone())
+            (listing.id, listing.seed.clone(), listing.hash.clone())
         };
         let from = match &self.store {
             Store::Pg(store) => LoadFrom::Pg(Arc::clone(store)),
@@ -478,6 +576,10 @@ impl Host {
                     Err(file) => parse_bundle(&file, &limits),
                 };
                 let loaded = loaded.map_err(|e| format!("room {seed:?}: stored seed: {e}"))?;
+                // The room plays the world it was listed with, never another bundle's seed.
+                if loaded.hash != hash {
+                    return Err(format!("room {seed:?}: its stored seed is of another bundle"));
+                }
                 prepare(loaded, password.as_ref(), limits)
             })
             .await
@@ -578,18 +680,16 @@ impl Host {
                 },
                 Some(r) = self.wakes.recv() => match r {
                     Request::Wake(Wake { key, done }) => self.request(key, done),
-                    Request::Import(i) => {
-                        let res = self.import_request(i.loaded, i.list).await;
-                        drop(i.done.send(res));
-                    }
-                    Request::Export(x) => {
-                        let res = match &self.store {
-                            Store::Pg(s) => export(&**s, x.room, &self.limits).await,
-                            Store::Mem { log, .. } => export(&**log, x.room, &self.limits).await,
-                        };
-                        drop(x.done.send(res));
-                    }
+                    Request::Import(i) => self.import_request(i),
+                    Request::Export(x) => self.export_request(x),
                 },
+                Some(end) = self.imports.join_next() => match end {
+                    Ok(end) => self.imported(end),
+                    // The work runs in a task of its own inside this one, so this cannot happen.
+                    Err(e) => tracing::error!(error = %e, "an import ended without a value"),
+                },
+                // An export answers its request itself.
+                Some(_) = self.exports.join_next() => {}
                 Some(end) = self.loads.join_next() => match end {
                     Ok(end) => self.loaded(end),
                     // The load runs in a task of its own inside this one, so this cannot happen.
@@ -1064,7 +1164,7 @@ mod tests {
         let log = mem(&host);
         assert_eq!(log.blobs(), 2, "the game and the generic game, once for both rooms");
         for k in &keys {
-            assert!(log::blob_get(&*log, k).await.unwrap().is_some());
+            assert!(log.get(k).await.unwrap().is_some());
         }
         let id = |seed| crate::room_id(seed);
         assert_eq!(log.seed_get(id("store-a")).await.unwrap(), Some(seed_a));
@@ -1073,6 +1173,76 @@ mod tests {
 
     /// The room loads from the store alone: after it leaves memory and no copy of its packages
     /// is left in the process, a wake reads its seed and its packages (checked) back.
+    /// A stored seed swapped for another bundle's (same seed name) is refused on load: the
+    /// room never plays a world it was not listed with.
+    #[tokio::test]
+    async fn a_stored_seed_of_another_bundle_is_refused_on_load() {
+        let dir = TempDir::new("swapped-seed");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let key = host.import(own_game("swapped", "one")).await.unwrap();
+        let other = own_game("swapped", "two");
+        let log = mem(&host);
+        for f in &other.packages {
+            log.put(&log::blob_key(f), f).await.unwrap();
+        }
+        let id = crate::room_id("swapped");
+        log.forget_seed(id);
+        log.seed_put(id, other.bundle.bytes()).await.unwrap();
+        let why = host.wake(&key).await.unwrap_err();
+        assert!(why.contains("another bundle"), "{why}");
+        assert!(!in_memory(&host, &key));
+    }
+
+    /// A generated world (not listed) naming a seed this host serves is refused, and the room
+    /// keeps its world.
+    #[tokio::test]
+    async fn a_generated_world_naming_a_hosted_seed_is_refused() {
+        let dir = TempDir::new("hosted-name");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let mine = own_game("hosted", "one");
+        let key = host.import(mine.clone()).await.unwrap();
+        let (done, answer) = oneshot::channel();
+        host.import_request(Import { loaded: own_game("hosted", "two"), list: false, done });
+        assert!(answer.await.unwrap().is_err());
+        let stored = mem(&host).seed_get(crate::room_id("hosted")).await.unwrap();
+        assert_eq!(stored.as_deref(), Some(mine.bundle.bytes()));
+        host.wake(&key).await.unwrap();
+    }
+
+    /// An import's store work runs apart from the loop: the request returns at once, and the
+    /// room is listed when the work ends.
+    #[tokio::test]
+    async fn an_import_runs_apart_from_the_supervisor_loop() {
+        let dir = TempDir::new("import-task");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let (done, answer) = oneshot::channel();
+        host.import_request(Import { loaded: own_game("tasked", "one"), list: true, done });
+        assert!(host.is_empty(), "not listed while the work runs");
+        let end = host.imports.join_next().await.unwrap().unwrap();
+        host.imported(end);
+        let key = answer.await.unwrap().unwrap().unwrap();
+        host.wake(&key).await.unwrap();
+    }
+
+    /// The export refuses a seed of another bundle than the world's, and decodes its own.
+    #[tokio::test]
+    async fn the_export_refuses_a_seed_of_another_bundle() {
+        let dir = TempDir::new("export-hash");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let mine = own_game("exported", "one");
+        host.import(mine.clone()).await.unwrap();
+        let id = crate::room_id("exported");
+        let ask = |host: &mut Host, hash: String| {
+            let (done, answer) = oneshot::channel();
+            host.export_request(Export { room: id, hash, done });
+            answer
+        };
+        let other = crate::hex(&own_game("exported", "two").hash);
+        assert!(ask(&mut host, other).await.unwrap().is_err());
+        let v1 = ask(&mut host, crate::hex(&mine.hash)).await.unwrap().unwrap();
+        assert_eq!(crate::bundle_hash(&v1).unwrap(), mine.hash);
+    }
+
     #[tokio::test]
     async fn a_cold_room_wakes_from_its_stored_seed_and_packages() {
         let dir = TempDir::new("from-store");
@@ -1105,9 +1275,8 @@ mod tests {
         let mut host = host(&dir, Limits::DESIGN).await;
         let loaded = own_game("tampered", "bad");
         let keys = seed_bundle::v2::package_keys(loaded.bundle.bytes()).unwrap();
-        // The row exists before the import (write once), with other bytes.
-        mem(&host).put(&keys[0], b"not this package").await.unwrap();
         let key = host.import(loaded).await.unwrap();
+        mem(&host).tamper_blob(keys[0], b"not this package");
         let e = host.wake(&key).await.unwrap_err();
         assert!(e.contains("does not match its key"), "{e}");
         assert!(!in_memory(&host, &key));

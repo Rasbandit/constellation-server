@@ -15,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const BIN: &str = env!("CARGO_BIN_EXE_constellation-server");
 const TOKEN: &str = "test-admin-token-test-admin-token";
 
+/// The seed name of every world the fake sidecar generates.
+const GENERATED: &str = "generated-seed";
+
 /// A fresh folder with the data dir, a fake checkout and the fake sidecar's tools folder.
 struct Setup {
     root: PathBuf,
@@ -38,7 +41,12 @@ impl Setup {
         }
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         std::fs::copy(here.join("tests/fake_ap_gen.py"), tools.join("ap_gen.py")).unwrap();
-        std::fs::copy(e2e::fixture_path(), tools.join("bundle.json")).unwrap();
+        // Under its own seed name: the server also hosts the fixture (`--bundle`), and a world
+        // naming a hosted seed is refused.
+        let mut bundle: Value =
+            serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+        bundle["seed_name"] = json!(GENERATED);
+        std::fs::write(tools.join("bundle.json"), bundle.to_string()).unwrap();
         // What the fake sidecar must not see: the token (in the server's environment) and
         // host folders.
         let hidden: Vec<String> = ["data", "ap", "tools", ""]
@@ -161,13 +169,13 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(st, 200);
     assert_eq!(done["status"], "done", "{done}");
     let fixture = e2e::fixture().unwrap();
-    assert_eq!(done["seed_name"], fixture.seed_name);
+    assert_eq!(done["seed_name"], GENERATED);
     assert_eq!(done["slots"], fixture.slots.len());
     // The seed went into the store, made from the sidecar's v1 bundle (its hash says which);
     // no world data is left in the job folder, and the symlink and FIFO the sidecar left in
     // its scratch folder never reached the host.
     assert!(done.get("bundle").is_none(), "{done}");
-    let fixture_text = std::fs::read_to_string(e2e::fixture_path()).unwrap();
+    let fixture_text = std::fs::read_to_string(setup.root.join("tools/fake/bundle.json")).unwrap();
     let hash: String = seed_bundle::bundle_hash(&fixture_text)
         .unwrap()
         .iter()
@@ -232,8 +240,7 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
     let left: Vec<_> = std::fs::read_dir(&rooms).unwrap().filter_map(Result::ok).collect();
     assert_eq!(left.len(), 1, "only the other room's bundle");
 
-    let seed = e2e::fixture().unwrap().seed_name;
-    let ready = server.wait_for_log(&format!("seed=\"{seed}\"")).unwrap();
+    let ready = server.wait_for_log(&format!("seed=\"{GENERATED}\"")).unwrap();
     let key = ready.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned();
     let st = status(&server, &id).await;
     assert_eq!(st["status"], "done", "{st}");
@@ -317,7 +324,7 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     };
     let (code, room) = view(&server).await;
     assert_eq!(code, 200, "{room}");
-    assert_eq!((&room["seed"], &room["room_key"]), (&json!(fixture.seed_name), &st["room_key"]));
+    assert_eq!((&room["seed"], &room["room_key"]), (&json!(GENERATED), &st["room_key"]));
     assert_eq!(room["address"], st["address"]);
     let opts = &fixture.server_options;
     assert_eq!(room["options"]["password"], opts.password.is_some(), "a flag, never the password");
@@ -515,9 +522,11 @@ async fn generations_run_one_at_a_time() {
     assert_eq!(status(&server, &second).await["status"], "queued");
     assert_eq!(status(&server, &first).await["status"], "running");
     std::fs::write(setup.root.join("tools/fake/release"), "").unwrap();
-    server.wait_for_log(&format!("generation done world={second}")).unwrap();
+    // The fake prints one seed name, so the second ends refused (its name is the first's).
+    server.wait_for_log(&format!("generation failed world={second}")).unwrap();
     assert_eq!(status(&server, &first).await["status"], "done");
-    assert_eq!(status(&server, &second).await["status"], "done");
+    let st = status(&server, &second).await;
+    assert!(st["error"].as_str().unwrap_or_default().contains("already hosted"), "{st}");
 }
 
 #[tokio::test]

@@ -372,6 +372,37 @@ mod restart {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// A room stored before seeds were kept (its v1 file in rooms.bundle, no seed row) keeps
+    /// its own world when another bundle with its seed name comes in: the import is refused
+    /// and writes no seed for it.
+    #[tokio::test]
+    async fn a_legacy_room_keeps_its_world_when_another_bundle_takes_its_name() {
+        use sqlx::Connection;
+        let db = database().await;
+        let dir = rooms_dir("legacy", &["alpha"]);
+        let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        let a = key_of(&server, "alpha");
+        assert!(server.stop().unwrap().success());
+        let file = std::fs::read(dir.join("alpha.json")).unwrap();
+        let mut c = sqlx::PgConnection::connect(&db).await.unwrap();
+        sqlx::query("UPDATE rooms SET bundle = $1").bind(&file).execute(&mut c).await.unwrap();
+        sql(&db, "DELETE FROM room_seeds").await;
+        let mut other: Value = serde_json::from_slice(&file).unwrap();
+        for g in other["games"].as_object_mut().unwrap().values_mut() {
+            g["checksum"] = json!(format!("other-{}", g["checksum"]));
+        }
+        std::fs::write(dir.join("alpha.json"), other.to_string()).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        server.wait_for_log("different bundle").unwrap();
+        let seeds: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM room_seeds").fetch_one(&mut c).await.unwrap();
+        assert_eq!(seeds, 0, "no seed of the other bundle was written");
+        let url = format!("ws://{a}.example:{}", server.addr.port());
+        e2e::join_via(server.addr, &url, "Alice").await.unwrap();
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     /// A rooms folder holding the fixture under each seed name.
     fn rooms_dir(name: &str, seeds: &[&str]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("e2e-pg-{name}-{}", std::process::id()));

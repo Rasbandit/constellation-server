@@ -92,7 +92,11 @@ fn internal(e: impl core::fmt::Display) -> (StatusCode, String) {
 }
 
 fn json_reply(status: StatusCode, v: &Value) -> Response {
-    let mut r = (status, v.to_string()).into_response();
+    json_text(status, v.to_string())
+}
+
+fn json_text(status: StatusCode, text: String) -> Response {
+    let mut r = (status, text).into_response();
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r
 }
@@ -528,10 +532,9 @@ async fn publish(w: &Worlds, stdout: Vec<u8>) -> Result<(Loaded, Value), String>
         parse_bundle(out.bundle.get().as_bytes(), &limits).map(|loaded| (loaded, out.report))
     });
     let (loaded, report) = parsed.await.unwrap_or_else(|e| Err(e.to_string()))?;
+    // The world's code chose the seed name: a hosted one is refused, listed or not.
     let list = w.rooms.is_some();
-    if list {
-        w.claim_seed(loaded.bundle.seed_name())?;
-    }
+    w.claim_seed(loaded.bundle.seed_name())?;
     let importer = w.importer.as_ref().ok_or("no host to store the seed in")?;
     importer.import(loaded.clone(), list).await?;
     Ok((loaded, report))
@@ -585,9 +588,10 @@ async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>
     let status = read_status(&w, &id)?;
     let seed =
         status["seed_name"].as_str().ok_or((StatusCode::NOT_FOUND, "not done".to_owned()))?;
+    let hash = status["bundle_hash"].as_str().unwrap_or_default().to_owned();
     let importer = w.importer.as_ref().ok_or_else(no_room)?;
-    let v1 = importer.export(crate::room_id(seed)).await.map_err(unavailable)?;
-    Ok(json_reply(StatusCode::OK, &v1))
+    let v1 = importer.export(crate::room_id(seed), hash).await.map_err(unavailable)?;
+    Ok(json_text(StatusCode::OK, v1))
 }
 
 async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {

@@ -58,7 +58,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 
 ## Package file
 
-Package files are blobs keyed by the SHA-256 of the whole file, kept in the server's blob store (`log::BlobStore`: the `game_packages` table, migration 0003, or memory); every read is checked against its key (`log::blob_get`). Seeds are kept per room (`room_seeds`). In a process each key has one in-memory copy, shared by every room that uses it. The `bundle` CLI reads and writes `<hex key>.pkg` files in a folder, for debugging only.
+Package files are blobs keyed by the SHA-256 of the whole file, kept in the server's blob store (`log::BlobStore`: the `game_packages` table, migration 0003, or memory); every put and every read is checked against its key (`log::BlobStore::put` and `get`). Seeds are kept per room (`room_seeds`), written once with the room after its bundle hash check, and every load and export refuses a seed whose bundle hash is not the room's. In a process each key has one in-memory copy, shared by every room that uses it. The `bundle` CLI reads and writes `<hex key>.pkg` files in a folder, for debugging only.
 
 | At | Size | Field |
 |---|---|---|

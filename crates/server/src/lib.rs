@@ -372,8 +372,8 @@ async fn open_with_key(
     let (seed, format) = (loaded.bundle.seed_name(), seed_bundle::FORMAT);
     for _ in 0..limits.room_key_draws {
         let new_key = draw().map_err(Skip::Later)?;
-        // The seed is in room_seeds (written first), so no file goes in rooms.bundle.
-        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), None).await {
+        let world = log::World::Seed(loaded.bundle.bytes());
+        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), world).await {
             Ok(o) => {
                 let key = RoomKey::parse(&o.key).map_err(|e| Skip::Final(format!("stored {e}")))?;
                 return Ok((key, o.idle_secs));

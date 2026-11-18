@@ -247,7 +247,7 @@ impl GamePackage {
     }
 
     /// The package of a package `file` stored under `key` (checked against it where it was
-    /// read: `log::blob_get`), from its game section.
+    /// read: `log::BlobStore::get`), from its game section.
     ///
     /// # Errors
     /// A malformed file, no game section, or one over `max` bytes.
@@ -398,11 +398,8 @@ pub fn inflate(bytes: &[u8], max: u64) -> Result<Vec<u8>, BundleError> {
     Ok(out)
 }
 
-/// The key of a package file: its SHA-256 (the blob store's content address).
-#[must_use]
-pub fn key_of(file: &[u8]) -> Key {
-    Sha256::digest(file).into()
-}
+/// The key of a package file: the blob store's content address (one function for both).
+pub use log::blob_key as key_of;
 
 /// The game's name and data in a package file (its game section).
 ///
