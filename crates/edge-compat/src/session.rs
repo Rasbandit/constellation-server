@@ -686,8 +686,8 @@ impl Session {
         let cmd = Command::KvSet(Box::new(req.write));
         let out = self.room.room.noted_commands(vec![(cmd, Some(Arc::clone(&packet)))]);
         let out = out.await.map_err(|_| Step::Closed)?.pop().ok_or(Step::Closed)?;
-        let (seq, original, value) = match out {
-            Ok(Reply::KvSet { seq, original, value }) => (seq, original, value),
+        let done = match out {
+            Ok(Reply::KvSet(done)) => done,
             Err(CoreError::Kv(r)) => {
                 return Err(Step::from(invalid(
                     "arguments",
@@ -699,13 +699,14 @@ impl Session {
         };
         let j = self.joined.as_mut().ok_or(Step::Closed)?;
         // The published copy of this write reaches this session later; it is skipped then.
-        j.own_writes.insert(seq);
-        let logged = key.len().saturating_add(value.to_string().len());
-        self.room.kv_bytes.charge(slot, u64::try_from(logged).unwrap_or(u64::MAX), Instant::now());
+        j.own_writes.insert(done.seq);
+        // The room measured the logged bytes (`room_core` `entry_bytes`); charge them as is.
+        self.room.kv_bytes.charge(slot, done.bytes, Instant::now());
         if !(req.want_reply || j.watch.contains(&key)) {
             return Ok(Vec::new());
         }
-        let reply = storage::set_reply(Some(&packet), &key, &value, Some(&original), slot);
+        let reply =
+            storage::set_reply(Some(&packet), &key, &done.value, Some(&done.original), slot);
         Ok(vec![wire::frame(&[ServerPacket::SetReply(reply)])])
     }
 
@@ -853,7 +854,7 @@ fn events_packets(
                 if !j.own_writes.remove(&e.seq) && j.watch.contains(key) {
                     let note = notes.iter().find(|n| n.seq == e.seq);
                     let original = note.and_then(|n| match &n.reply {
-                        Reply::KvSet { original, .. } => Some(&**original),
+                        Reply::KvSet(done) => Some(&done.original),
                         _ => None,
                     });
                     let request = note.map(|n| &*n.extra);

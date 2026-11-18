@@ -63,11 +63,12 @@ async fn a_noted_command_publishes_its_note_with_its_events() {
         .noted_commands(vec![(check(1, 10), None), (kv_add(2, "k", 5), Some(Arc::clone(&note)))])
         .await
         .unwrap();
-    let want = Reply::KvSet {
+    let want = Reply::KvSet(Box::new(room_core::KvDone {
         seq: Seq(3),
-        original: Box::new(serde_json::json!(0)),
-        value: Box::new(serde_json::json!(5)),
-    };
+        original: serde_json::json!(0),
+        value: serde_json::json!(5),
+        bytes: 2, // "k" and `5`
+    }));
     assert_eq!(got, [Ok(Reply::Checked { seq: Seq(1) }), Ok(want.clone())]);
     let p = sub.live.try_recv().unwrap();
     let Published::Events { events, notes } = &*p else { panic!("{p:?}") };

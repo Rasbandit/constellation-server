@@ -825,15 +825,24 @@ mod key_value {
             vec![Event {
                 seq: Seq(1),
                 slot: Some(SlotNo(1)),
-                kind: EventKind::KvSet { key: "k".into(), value: five.clone() },
+                kind: EventKind::KvSet { key: "k".into(), value: five },
             }]
         );
         assert_eq!(
             (a.reply, a.depends_on),
-            (Reply::KvSet { seq: Seq(1), original: Box::new(json!(0)), value: five }, Some(Seq(1)))
+            // "k" and `5`: 2 bytes logged.
+            (
+                Reply::KvSet(Box::new(crate::KvDone {
+                    seq: Seq(1),
+                    original: json!(0),
+                    value: json!(5),
+                    bytes: 2
+                })),
+                Some(Seq(1))
+            )
         );
         let b = apply(&mut s, &at(0), add("k", 2)).unwrap();
-        assert!(matches!(b.reply, Reply::KvSet { ref original, .. } if **original == json!(5)));
+        assert!(matches!(b.reply, Reply::KvSet(ref d) if d.original == json!(5) && d.bytes == 2));
         assert_eq!(s.kv_get("k"), Some(&json!(7)));
         assert_eq!(s.kv_get("other"), None);
     }

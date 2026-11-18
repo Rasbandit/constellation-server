@@ -118,15 +118,22 @@ pub enum Reply {
         /// The slot's applied cursor after the ack.
         applied: ItemSeq,
     },
-    /// The key was written; `seq` is its `KvSet` event.
-    KvSet {
-        /// Seq of the `KvSet` event.
-        seq: Seq,
-        /// The value before the write: the stored one, else the default, else 0.
-        original: Box<Value>,
-        /// The value after.
-        value: Box<Value>,
-    },
+    /// The key was written (boxed: much larger than the other replies).
+    KvSet(Box<KvDone>),
+}
+
+/// A key write that was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvDone {
+    /// Seq of the `KvSet` event.
+    pub seq: Seq,
+    /// The value before the write: the stored one, else the default, else 0.
+    pub original: Value,
+    /// The value after.
+    pub value: Value,
+    /// Bytes the write logs (the key plus the value as compact JSON), measured once here
+    /// (`entry_bytes`); the edge charges them to the slot's byte budget.
+    pub bytes: u64,
 }
 
 /// Output of one command.
@@ -487,7 +494,10 @@ fn entry_bytes(key: &str, value: &Value) -> u64 {
 
 /// Evaluate a key write against the limits, without changing the state: the value before and
 /// after.
-fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<(Value, Value), KvRefusal> {
+/// The value before, the value after, and the bytes the write logs.
+type KvWritten = (Value, Value, u64);
+
+fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<KvWritten, KvRefusal> {
     let l = ctx.limits;
     if w.key.starts_with(RESERVED_KEY_PREFIX) {
         return Err(KvRefusal::ReservedKey);
@@ -516,7 +526,7 @@ fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<(Value, Val
     if state.kv_log_bytes.saturating_add(new) > l.kv_max_room_log_bytes {
         return Err(KvRefusal::LogFull);
     }
-    Ok((original, value))
+    Ok((original, value, new))
 }
 
 /// Apply one command. On `Err` the state is unchanged.
@@ -529,19 +539,18 @@ pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Appli
             if !state.slots.contains_key(&w.slot) {
                 return Err(CoreError::UnknownSlot(w.slot));
             }
-            let (original, value) = kv_write(state, ctx, &w).map_err(CoreError::Kv)?;
+            let (original, value, bytes) = kv_write(state, ctx, &w).map_err(CoreError::Kv)?;
             let seq = next_seq(state.head)?;
             let KvWrite { slot, key, .. } = *w;
-            let value = Box::new(value);
             let events = vec![Event {
                 seq,
                 slot: Some(slot),
-                kind: EventKind::KvSet { key, value: value.clone() },
+                kind: EventKind::KvSet { key, value: Box::new(value.clone()) },
             }];
             for e in &events {
                 state.record(e, ctx.limits)?;
             }
-            let reply = Reply::KvSet { seq, original: Box::new(original), value };
+            let reply = Reply::KvSet(Box::new(KvDone { seq, original, value, bytes }));
             Ok(Applied { events, reply, depends_on: Some(seq) })
         }
         Command::Ack { slot, applied } => {
