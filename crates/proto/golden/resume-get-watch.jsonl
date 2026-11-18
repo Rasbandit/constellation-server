@@ -1,0 +1,16 @@
+{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_slot_one","client":{"kind":"game"},"exts":{"org.cwp.deathlink":{"v":[1]}},"want":{"items":{"from_others":true,"own":false,"starting":true},"slot_data":true},"resume":{"after":2,"epoch":1}}}
+{"dir":"s2c","frame":{"op":"welcome","proto":{"major":1,"minor":0},"session":"s_golden_2","caller":{"kind":"slot","slot":1,"scopes":["play"],"roles":[]},"slot":{"index":1,"name":"Rowan","game":"dev.example.mosscave"},"exts":{"org.cwp.deathlink":{"v":1,"minor":0}},"limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":20,"max_watches":64,"max_paths_per_watch":16},"epoch":1,"head":5,"applied":1,"replay":{"from":3,"to":5},"resume":{"status":"ok"},"slot_data":{"goal":"boss"},"server_time_ms":1790000001000}}
+{"dir":"s2c","frame":{"op":"event","seq":3,"type":"item.grant","slot":1,"data":{"source":"check","from":2,"location":9,"item":2,"item_seq":2,"item_uid":"iu_4C9R1T0WBC9R1T0WBC9R1T0WBC","flags":[]}}}
+{"dir":"s2c","frame":{"op":"event","seq":5,"type":"slot.goal","slot":2,"data":{}}}
+{"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"slot/2/status"}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-1","upto":5,"ok":{"path":"slot/2/status","value":{"connection":"online","goal":true},"ver":5}}}
+{"dir":"c2s","frame":{"op":"watch","cid":"w-1","paths":["slot/2/status","kv/legacy/EnergyLink0"]}}
+{"dir":"s2c","frame":{"op":"result","cid":"w-1","upto":5,"ok":{"paths":[{"path":"slot/2/status","value":{"connection":"online","goal":true},"ver":5},{"path":"kv/legacy/EnergyLink0","value":1000,"ver":4}]}}}
+{"dir":"s2c","frame":{"op":"event","eseq":1,"type":"state.changed","data":{"path":"kv/legacy/EnergyLink0","value":1200,"ver":6,"prev":1000,"by":2}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"d-1","type":"org.cwp.deathlink/death","data":{"cause":"fell in a pit"}}}
+{"dir":"s2c","frame":{"op":"result","cid":"d-1","upto":5,"ok":{}}}
+{"dir":"s2c","frame":{"op":"event","eseq":2,"type":"org.cwp.deathlink/death","slot":2,"data":{"cause":"ran out of air"}}}
+{"dir":"c2s","frame":{"op":"unwatch","cid":"w-2","paths":["kv/legacy/EnergyLink0"]}}
+{"dir":"s2c","frame":{"op":"result","cid":"w-2","upto":5,"ok":{}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"su-1","type":"session.update","data":{"exts":{}}}}
+{"dir":"s2c","frame":{"op":"result","cid":"su-1","upto":5,"ok":{"exts":{}}}}
