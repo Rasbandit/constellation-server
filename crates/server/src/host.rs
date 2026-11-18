@@ -446,8 +446,20 @@ impl Host {
         let seed = loaded.bundle.seed_name();
         let id = crate::room_id(seed);
         let hosted = || Skip::Final(format!("seed {seed:?} is already hosted on this server"));
-        if let Some(key) = read(&self.rooms).key_of(id) {
-            return if list { Ok(Err(key.clone())) } else { Err(hosted()) };
+        {
+            let rooms = read(&self.rooms);
+            if let Some(key) = rooms.key_of(id) {
+                if !list {
+                    return Err(hosted());
+                }
+                // A listed room keeps the world it was listed with; another bundle is refused.
+                if rooms.get(key).is_some_and(|l| l.hash != loaded.hash) {
+                    return Err(Skip::Final(format!(
+                        "room {seed:?} is listed from a different bundle with this seed name"
+                    )));
+                }
+                return Ok(Err(key.clone()));
+            }
         }
         if list && self.len() >= self.limits.max_rooms {
             let why = format!("the server lists {} rooms, its most", self.limits.max_rooms);
@@ -1191,6 +1203,17 @@ mod tests {
         let why = host.wake(&key).await.unwrap_err();
         assert!(why.contains("another bundle"), "{why}");
         assert!(!in_memory(&host, &key));
+    }
+
+    /// A bundle of another world under a listed seed name is refused, not taken as the room.
+    #[tokio::test]
+    async fn another_bundle_under_a_listed_seed_name_is_refused() {
+        let dir = TempDir::new("listed-name");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let key = host.import(own_game("listed", "one")).await.unwrap();
+        assert_eq!(host.import(own_game("listed", "one")).await.unwrap(), key, "same bundle");
+        let why = String::from(host.import(own_game("listed", "two")).await.unwrap_err());
+        assert!(why.contains("different bundle"), "{why}");
     }
 
     /// A generated world (not listed) naming a seed this host serves is refused, and the room
