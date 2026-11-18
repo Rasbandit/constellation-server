@@ -2,7 +2,7 @@
 resolver = "2"
 # Needs the sibling Archipela-Go checkout; its own workspace (see its Cargo.toml).
 exclude = ["crates/e2e-ap"]
-members = ["crates/bits", "crates/proto", "crates/config", "crates/spec-rng", "crates/room-core", "crates/log", "crates/sim", "crates/seed-bundle", "crates/runtime", "crates/edge-compat", "crates/server", "crates/e2e"]
+members = ["crates/bits", "crates/proto", "crates/config", "crates/spec-rng", "crates/room-core", "crates/log", "crates/sim", "crates/seed-bundle", "crates/runtime", "crates/edge-compat", "crates/server", "crates/e2e", "crates/data-fill"]
 
 [workspace.package]
 edition = "2024"
