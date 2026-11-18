@@ -364,7 +364,7 @@ mod restart {
         let db = database().await;
         let dir = rooms_dir("directory", &["alpha"]);
         let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
-        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         let a = key_of(&server, "alpha");
         let url = |s: &Server| format!("ws://{a}.example:{}", s.addr.port());
         let loc = locations_for(1, 2).unwrap()[0].0;
@@ -374,7 +374,7 @@ mod restart {
         assert!(server.stop().unwrap().success());
         std::fs::remove_file(dir.join("alpha.json")).unwrap();
 
-        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         assert_eq!(key_of(&server, "alpha"), a);
         let (_, room, _) = e2e::join_via(server.addr, &url(&server), "Alice").await.unwrap();
         assert_eq!(locations(&room["checked_locations"]), [loc]);
@@ -392,7 +392,7 @@ mod restart {
             ("CONSTELLATION_ROOMS_SCAN_MS", "100"),
             ("CONSTELLATION_ROOM_ABANDON_SECS", "1"),
         ];
-        let server = Server::start_rooms(Path::new(BIN), &dir, &fast).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &fast).unwrap();
         let a = key_of(&server, "alpha");
         server.wait_for_log("room abandoned").unwrap();
         assert!(server.stop().unwrap().success());
@@ -407,7 +407,7 @@ mod restart {
         }
 
         let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
-        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         server.wait_for_log("has finished (abandoned)").unwrap();
         let url = format!("ws://{a}.example:{}", server.addr.port());
         assert!(e2e::Client::connect_via(server.addr, &url).await.unwrap_err().contains("404"));
