@@ -1,6 +1,6 @@
 //! In-memory `LogStore`. One mutex makes the fence check and the write one atomic step.
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, Snapshot, StoreError,
+    AppendBatch, AppendError, AppendReceipt, BlobKey, CursorUpdate, LogStore, Snapshot, StoreError,
 };
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 use std::collections::BTreeMap;
@@ -31,6 +31,27 @@ impl Room {
 #[derive(Debug, Default)]
 pub struct MemLogStore {
     rooms: Mutex<BTreeMap<RoomId, Room>>,
+    /// Blobs (game packages) and room seeds: write once, like the tables.
+    packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
+    seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
+}
+
+/// Insert unless present, under the lock; what is stored after.
+fn put_once<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: K, v: &[u8]) -> Vec<u8> {
+    m.lock().unwrap_or_else(PoisonError::into_inner).entry(k).or_insert_with(|| v.to_vec()).clone()
+}
+
+/// A write-once seed: the same bytes again are fine, others are refused.
+pub(crate) fn same_or_refused(stored: &[u8], seed: &[u8]) -> Result<(), StoreError> {
+    if stored == seed {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt("the room already has a different seed".to_owned()))
+    }
+}
+
+fn get<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: &K) -> Option<Vec<u8>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner).get(k).cloned()
 }
 
 impl MemLogStore {
@@ -45,6 +66,22 @@ impl MemLogStore {
         // A panicking test thread must not hide the data from the assertions that follow.
         let mut g = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         f(g.entry(room).or_default())
+    }
+
+    /// Drop a finished room's seed (the database keeps its rows; memory need not).
+    pub fn forget_seed(&self, room: RoomId) {
+        self.seeds.lock().unwrap_or_else(PoisonError::into_inner).remove(&room);
+    }
+
+    /// Replace a blob's bytes with no check: for tests of the read check (a tampered row).
+    pub fn tamper_blob(&self, key: BlobKey, bytes: &[u8]) {
+        self.packages.lock().unwrap_or_else(PoisonError::into_inner).insert(key, bytes.to_vec());
+    }
+
+    /// How many distinct blobs (game packages) are stored: for tests and metrics.
+    #[must_use]
+    pub fn blobs(&self) -> usize {
+        self.packages.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// Bump the room's owner epoch and return it (the directory's claim). Every older epoch is
@@ -147,5 +184,63 @@ impl LogStore for MemLogStore {
         epoch: Epoch,
     ) -> impl Future<Output = Result<(), AppendError>> + Send {
         ready(self.with(room, |r| r.put_snapshot(snap, epoch)))
+    }
+
+    fn seed_put(
+        &self,
+        room: RoomId,
+        seed: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        ready(same_or_refused(&put_once(&self.seeds, room, seed), seed))
+    }
+
+    fn seed_get(
+        &self,
+        room: RoomId,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        ready(Ok(get(&self.seeds, &room)))
+    }
+}
+
+/// The in-memory blob store (tests and the no-database server).
+impl crate::raw::RawBlobs for MemLogStore {
+    fn put_raw(
+        &self,
+        key: &BlobKey,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        // Write once; a row whose bytes are not its key's (torn) is healed, as on Postgres.
+        let mut packages = self.packages.lock().unwrap_or_else(PoisonError::into_inner);
+        let row = packages.entry(*key).or_insert_with(|| bytes.to_vec());
+        if crate::blob_key(row) != *key {
+            bytes.clone_into(row);
+        }
+        ready(Ok(()))
+    }
+
+    fn get_raw(
+        &self,
+        key: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        ready(Ok(get(&self.packages, key)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BlobStore, blob_key};
+
+    /// The read check, and a put healing the tampered row (the `PgLogStore` side is in the
+    /// server's restart tests).
+    #[tokio::test]
+    async fn a_tampered_blob_is_refused_on_read_and_healed_by_a_put() {
+        let s = MemLogStore::new();
+        let key = blob_key(b"package");
+        s.put(&key, b"package").await.unwrap();
+        s.tamper_blob(key, b"other bytes");
+        assert!(matches!(s.get(&key).await, Err(StoreError::Corrupt(_))));
+        s.put(&key, b"package").await.unwrap();
+        assert_eq!(s.get(&key).await.unwrap().as_deref(), Some(&b"package"[..]));
     }
 }

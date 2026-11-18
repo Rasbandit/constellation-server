@@ -12,8 +12,22 @@ const GAME: &str = "G";
 
 /// Slot 1 (A): location 100 -> B's item 7 (progression), 101 -> A's own item 8.
 /// Slot 2 (B): location 100 -> A's item 7 (trap).
-fn bundle(password: &Value) -> Arc<SeedBundle> {
-    let v = json!({
+/// A v1 bundle as the room runs it (encoded to v2 in memory, the server's load path).
+fn seed(v: &Value) -> Arc<Seed> {
+    Arc::new(seed_bundle::import_v1(v.to_string().as_bytes(), 1 << 26).unwrap().0)
+}
+
+fn state_of(b: &Arc<Seed>) -> RoomState {
+    RoomState::from_world(Arc::clone(b) as Arc<dyn room_core::World>).unwrap()
+}
+
+fn bundle(password: &Value) -> Arc<Seed> {
+    seed(&bundle_json(password))
+}
+
+/// The bundle above as v1 JSON.
+fn bundle_json(password: &Value) -> Value {
+    json!({
         "format": 1, "seed_name": "seed-1",
         "generator_version": {"major": 0, "minor": 6, "build": 8},
         "server_options": {"password": password, "hint_cost": 10, "location_check_points": 2,
@@ -32,15 +46,14 @@ fn bundle(password: &Value) -> Arc<SeedBundle> {
         "connect_names": {"A": [0, 1], "B": [0, 2]},
         "games": {GAME: {"item_name_to_id": {"Seven": 7, "Eight": 8},
                          "location_name_to_id": {"L100": 100, "L101": 101}, "checksum": "ck"}}
-    });
-    Arc::new(SeedBundle::from_json(&v.to_string()).unwrap())
+    })
 }
 
 fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
     let b = bundle(password);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
     Arc::new(CompatRoom::new(b, h, override_pw.map(str::to_owned), Limits::DESIGN).unwrap())
 }
@@ -456,7 +469,7 @@ fn big_room(end: i64, limits: &Limits) -> Arc<CompatRoom> {
 
 /// As [`big_room`], every item going to `receiver`.
 fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     let locs: Vec<Value> = (1000..end)
         .map(|l| json!({"location": l, "item": 7, "receiver": receiver, "flags": 0}))
         .collect();
@@ -464,10 +477,10 @@ fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
     for l in 1000..end {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
     }
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let b = seed(&v);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
     Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
@@ -524,7 +537,7 @@ fn limited(limits: &Limits) -> Arc<CompatRoom> {
     let b = bundle(&Value::Null);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
     Arc::new(CompatRoom::new(b, h, None, *limits).unwrap())
 }
@@ -616,12 +629,12 @@ fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
 
 /// The test bundle with an edit applied.
 fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     edit(&mut v);
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
+    let b = seed(&v);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = RoomState::new(b.slot_nos(), b.placement()).unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, Limits::DESIGN);
     Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap())
 }
@@ -717,6 +730,59 @@ async fn a_self_found_item_reads_found_their() {
     let texts: Vec<&str> =
         print["data"].as_array().unwrap().iter().filter_map(|p| p["text"].as_str()).collect();
     assert_eq!(texts, ["1", " found their ", "8", " (", "101", ")"]);
+}
+
+/// Two games with disjoint item ids (`crates/e2e/fixtures/cross-games.json`): P1 plays A and
+/// finds B's item 202 for P2; P2 plays B and finds A's item 2 (a trap) for P1; P3 places
+/// nothing. Ids at the wire come from the receiver's game.
+#[tokio::test]
+async fn items_across_games_carry_the_receivers_ids_at_the_wire() {
+    let v: Value =
+        serde_json::from_str(include_str!("../../e2e/fixtures/cross-games.json")).unwrap();
+    let b = seed(&v);
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state_of(&b), store, Limits::DESIGN);
+    let room = Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap());
+    let join = async |name: &str, game: &str| {
+        let mut s = Session::new(Arc::clone(&room));
+        let mut c = connect_packet(name, &json!(7));
+        c[0]["game"] = json!(game);
+        let ps = send(&mut s, &c).await;
+        assert_eq!(ps[0]["cmd"], "Connected", "{ps:?}");
+        pump(&mut s).await;
+        s
+    };
+    let (mut p1, mut p2, mut p3) =
+        (join("P1", "A").await, join("P2", "B").await, join("P3", "A").await);
+    let ps = send(&mut p1, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(
+        ps[0]["locations"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 2, "flags": 1}])
+    );
+    check(&mut p1, &[11]).await;
+    check(&mut p2, &[21]).await;
+    let to_p2 = pump(&mut p2).await;
+    assert_eq!(
+        of(&to_p2, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 1, "flags": 1}])
+    );
+    let to_p1 = pump(&mut p1).await;
+    assert_eq!(
+        of(&to_p1, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 2, "location": 21, "player": 2, "flags": 4}])
+    );
+    // A reconnect rebuilds the same inventory from the log and the seed.
+    let again = send(&mut Session::new(Arc::clone(&room)), &{
+        let mut c = connect_packet("P2", &json!(7));
+        c[0]["game"] = json!("B");
+        c
+    })
+    .await;
+    assert_eq!(of(&again, "ReceivedItems")[0]["items"][0]["item"], 202);
+    let ps = send(&mut p3, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(ps[0]["cmd"], "InvalidPacket", "P3 places nothing: {ps:?}");
+    assert_eq!(pump(&mut p3).await.iter().filter(|p| p["cmd"] == "ReceivedItems").count(), 0);
 }
 
 #[tokio::test]

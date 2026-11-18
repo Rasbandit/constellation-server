@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,6 +110,10 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "bits"
+version = "0.0.0"
 
 [[package]]
 name = "block-buffer"
@@ -338,6 +348,7 @@ dependencies = [
 name = "edge-compat"
 version = "0.0.0"
 dependencies = [
+ "bits",
  "config",
  "futures-util",
  "log 0.0.0",
@@ -853,6 +864,7 @@ dependencies = [
  "config",
  "proto",
  "serde_json",
+ "sha2 0.11.1",
  "sqlx",
  "tokio",
  "tracing",
@@ -1215,6 +1227,7 @@ dependencies = [
 name = "room-core"
 version = "0.0.0"
 dependencies = [
+ "bits",
  "config",
  "proptest",
  "proto",
@@ -1348,10 +1361,15 @@ dependencies = [
 name = "seed-bundle"
 version = "0.0.0"
 dependencies = [
+ "bits",
+ "config",
+ "flate2",
+ "log 0.0.0",
  "proto",
  "room-core",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1412,6 +1430,7 @@ dependencies = [
 name = "server"
 version = "0.0.0"
 dependencies = [
+ "allocation-counter",
  "axum",
  "config",
  "e2e",

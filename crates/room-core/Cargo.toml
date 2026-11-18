@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bits = { path = "../bits" }
 config = { path = "../config", default-features = false }
 proto = { path = "../proto" }
 serde.workspace = true

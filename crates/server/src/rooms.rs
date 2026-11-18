@@ -98,6 +98,8 @@ pub struct Listing {
     pub id: RoomId,
     /// The seed name it was made from.
     pub seed: String,
+    /// The hash of the v1 bundle it was listed with: a load refuses a seed of another.
+    pub hash: Vec<u8>,
     /// The room while it is in memory; `None` while it is cold.
     pub room: Option<Room>,
     /// Its connections, open and past.

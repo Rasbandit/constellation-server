@@ -5,17 +5,19 @@
 //! - `apworlds/<sha256>.apworld` and `yamls/<sha256>.yaml`, content-addressed, each with a
 //!   `<sha256>.json` holding the upload's name and what the sidecar's inspect found;
 //! - `worlds/<id>/` per generation: `apworlds/<module>.apworld` and `yamls/` (the chosen
-//!   files), `status.json`, and `bundle.json` on success. The server writes `bundle.json` from
-//!   the sidecar's stdout; no folder here is ever writable inside the sandbox.
+//!   files), `status.json`, and on success `bundle.seed` (seed file v2) with its game packages
+//!   in `packages/` (`docs/seed-bundle-v2.md`). The server converts the sidecar's stdout (v1
+//!   JSON from `tools/ap-import`) to v2 itself; no folder here is ever writable inside the
+//!   sandbox.
 //!
 //! The flow follows Archipelago's web host (`WebHostLib/upload.py` checks uploads before it
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
-use crate::host::RoomsFolder;
+use crate::host::{RoomsFolder, Waker};
 use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
-use crate::{hex, load_bundle};
+use crate::{Loaded, hex, parse_bundle};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request, State};
@@ -50,6 +52,8 @@ pub(crate) struct Worlds {
     /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
     /// `<world id>.json`, and the public `host:port` its join address is under.
     rooms: Option<(RoomsFolder, String)>,
+    /// The host's store, where every finished world's seed and packages go.
+    importer: Option<Waker>,
 }
 
 /// The two kinds of upload.
@@ -88,7 +92,11 @@ fn internal(e: impl core::fmt::Display) -> (StatusCode, String) {
 }
 
 fn json_reply(status: StatusCode, v: &Value) -> Response {
-    let mut r = (status, v.to_string()).into_response();
+    json_text(status, v.to_string())
+}
+
+fn json_text(status: StatusCode, text: String) -> Response {
+    let mut r = (status, text).into_response();
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r
 }
@@ -123,6 +131,7 @@ pub(crate) fn open(
         published: std::sync::Mutex::default(),
         seq: AtomicU64::new(0),
         rooms: None,
+        importer: None,
     })
 }
 
@@ -150,8 +159,13 @@ impl Worlds {
 
     /// The routes, rooted at `/api`. With `rooms` (the host's rooms folder and the public
     /// `host:port`), finished worlds are hosted as rooms.
-    pub(crate) fn router(mut self, rooms: Option<(RoomsFolder, String)>) -> Router {
+    pub(crate) fn router(
+        mut self,
+        importer: Waker,
+        rooms: Option<(RoomsFolder, String)>,
+    ) -> Router {
         self.rooms = rooms;
+        self.importer = Some(importer);
         routes(Arc::new(self))
     }
 }
@@ -164,6 +178,7 @@ fn routes(state: Arc<Worlds>) -> Router {
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route("/api/worlds/{id}/room", get(room_summary))
+        .route("/api/worlds/{id}/bundle", get(world_bundle))
         .route("/api/worlds/{id}/room/events", get(room_events))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
         .layer(DefaultBodyLimit::max(body_cap))
@@ -473,34 +488,21 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
     let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
-        Ok(stdout) => {
-            let (bundle, limits) = (world.join("bundle.json"), w.limits);
-            let room_file = room_file(&w, &id);
-            let worlds = Arc::clone(&w);
-            tokio::task::spawn_blocking(move || {
-                let out = GenOut::parse(&stdout)?;
-                let text = out.bundle.get().as_bytes();
-                write_atomic(&bundle, text).map_err(|e| e.to_string())?;
-                let loaded = load_bundle(&bundle, &limits)?;
-                // Only a bundle that loads reaches the rooms folder, and never half written.
-                if let Some(file) = room_file {
-                    worlds.claim_seed(&loaded.bundle.seed_name)?;
-                    write_atomic(&file, text).map_err(|e| format!("rooms folder: {e}"))?;
-                }
-                Ok((bundle, loaded, out.report))
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        }
+        Ok(stdout) => publish(&w, stdout).await,
         Err(e) => Err(e.to_string()),
     };
+    // The job's copies of its inputs; the uploads they came from stay in the data folder.
+    for sub in ["apworlds", "yamls"] {
+        if let Err(e) = std::fs::remove_dir_all(world.join(sub)) {
+            tracing::warn!(world = %id, error = %e, "job folder not cleaned up");
+        }
+    }
     let done = result.is_ok();
     match result {
-        Ok((bundle, loaded, report)) => {
+        Ok((loaded, report)) => {
             status["status"] = json!("done");
-            status["bundle"] = json!(bundle.display().to_string());
-            status["seed_name"] = json!(loaded.bundle.seed_name);
-            status["slots"] = json!(loaded.bundle.slots.len());
+            status["seed_name"] = json!(loaded.bundle.seed_name());
+            status["slots"] = json!(loaded.bundle.slots().len());
             status["bundle_hash"] = json!(hex(&loaded.hash));
             status["generation"] = report;
         }
@@ -520,9 +522,22 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     }
 }
 
-/// Where a world's bundle goes in the rooms folder (`--rooms` only). `id` is a checked world id.
-fn room_file(w: &Worlds, id: &str) -> Option<PathBuf> {
-    w.rooms.as_ref().map(|(folder, _)| folder.dir().join(format!("{id}.json")))
+/// Import the sidecar's v1 bundle (encoded to v2 off the runtime) into the host's store: its
+/// seed and packages, never a file. With `--rooms` it is also listed as a room, after its seed
+/// name is claimed.
+async fn publish(w: &Worlds, stdout: Vec<u8>) -> Result<(Loaded, Value), String> {
+    let limits = w.limits;
+    let parsed = tokio::task::spawn_blocking(move || {
+        let out = GenOut::parse(&stdout)?;
+        parse_bundle(out.bundle.get().as_bytes(), &limits).map(|loaded| (loaded, out.report))
+    });
+    let (loaded, report) = parsed.await.unwrap_or_else(|e| Err(e.to_string()))?;
+    // The world's code chose the seed name: a hosted one is refused, listed or not.
+    let list = w.rooms.is_some();
+    w.claim_seed(loaded.bundle.seed_name())?;
+    let importer = w.importer.as_ref().ok_or("no host to store the seed in")?;
+    importer.import(loaded.clone(), list).await?;
+    Ok((loaded, report))
 }
 
 /// The listed room of a finished world (`--rooms` only): its rooms folder, key and join address
@@ -567,6 +582,18 @@ fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) {
 
 /// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
 /// cold room is loaded to answer, as a connection would load it.
+/// A finished world's seed, decoded from the store to its v1 JSON: the human view of what the
+/// server keeps as binary (`docs/seed-bundle-v2.md`).
+async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
+    let status = read_status(&w, &id)?;
+    let seed =
+        status["seed_name"].as_str().ok_or((StatusCode::NOT_FOUND, "not done".to_owned()))?;
+    let hash = status["bundle_hash"].as_str().unwrap_or_default().to_owned();
+    let importer = w.importer.as_ref().ok_or_else(no_room)?;
+    let v1 = importer.export(crate::room_id(seed), hash).await.map_err(unavailable)?;
+    Ok(json_text(StatusCode::OK, v1))
+}
+
 async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
     let status = read_status(&w, &id)?;
     let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;

@@ -32,7 +32,7 @@ use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
 use rooms::{Room, RoomKey, Rooms, read};
 use runtime::{Mailbox, RoomHandle, Stopped};
-use seed_bundle::SeedBundle;
+use seed_bundle::Seed;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -129,41 +129,56 @@ impl Args {
     }
 }
 
-/// A validated bundle and the hash of its file's content ([`bundle_hash`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A validated seed (v2, `docs/seed-bundle-v2.md`) and the hash of the v1 file it came from
+/// ([`bundle_hash`]).
+#[derive(Debug, Clone)]
 pub struct Loaded {
-    /// The bundle.
-    pub bundle: SeedBundle,
-    /// SHA-256 of the file's canonical JSON.
+    /// The seed; shared by the room state and the edge.
+    pub bundle: Arc<Seed>,
+    /// SHA-256 of the canonical v1 JSON it was made from: the room's identity in Postgres.
     pub hash: Vec<u8>,
-    /// The file as read, which the directory stores so the room can be loaded again.
-    pub text: String,
+    /// Package files an import made, for the host to put in its store; empty for a seed read
+    /// from the store.
+    pub packages: Vec<Vec<u8>>,
 }
 
-/// Read and validate a bundle, refusing files over `limits.bundle_max_bytes`.
+/// Import a v1 bundle file (`--bundle`, the `--rooms` folder), refusing files over
+/// `limits.bundle_max_bytes`. Seeds and packages then live in the store, never in files.
 ///
 /// # Errors
 /// A message for an unreadable, oversized or invalid file.
 pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     let cap = limits.bundle_max_bytes;
     file.take(cap.saturating_add(1))
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > cap {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
         return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    parse_bundle(text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_bundle(&bytes, limits).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Validate a bundle file's text.
+/// Import a v1 bundle's bytes: validate and encode them to v2 (packages shared in-process).
 ///
 /// # Errors
-/// When it is not a valid bundle.
-pub fn parse_bundle(text: String) -> Result<Loaded, String> {
-    let bundle = SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
-    Ok(Loaded { hash: bundle_hash(&text)?, bundle, text })
+/// When it is not a valid v1 bundle (a v2 seed file is refused: seeds come from the store).
+pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
+    if seed_bundle::v2::is_v2(file) {
+        return Err("a v2 seed file is not imported from disk; seeds live in the store".into());
+    }
+    let (seed, packages) = seed_bundle::import_v1(file, limits.bundle_max_bytes)?;
+    Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages })
+}
+
+/// A new room's state for a loaded bundle: the one place a room is built from a bundle.
+///
+/// # Errors
+/// When the bundle does not make a valid room.
+pub fn fresh_state(loaded: &Loaded) -> Result<RoomState, String> {
+    let world: Arc<dyn room_core::World> = Arc::clone(&loaded.bundle) as _;
+    RoomState::from_world(world).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -220,19 +235,7 @@ fn worlds_api(
     worlds::open(dir, token, generation, limits).map(Some)
 }
 
-/// SHA-256 of the bundle file's canonical JSON.
-///
-/// Canonical: parsed as plain JSON, every object's keys sorted, no whitespace. It depends on the file's content only, never on the `SeedBundle`
-/// type, so a new defaulted field in the type does not change a stored room's hash.
-///
-/// # Errors
-/// When the text is not JSON.
-pub fn bundle_hash(text: &str) -> Result<Vec<u8>, String> {
-    let mut v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    v.sort_all_objects();
-    let canonical = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
-    Ok(Sha256::digest(&canonical).to_vec())
-}
+pub use seed_bundle::bundle_hash;
 
 /// `/healthz`: 200 while every room task runs, 503 once one stopped.
 const fn health(running: bool) -> (StatusCode, &'static str) {
@@ -254,12 +257,22 @@ async fn start_room<S: LogStore>(
     limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
-        Some(snap) => {
-            let state: RoomState = serde_json::from_slice(&snap.data)
-                .map_err(|e| format!("stored snapshot at {}: {e}", snap.seq.0))?;
-            state.validate(snap.seq).map_err(|e| e.to_string())?;
-            (state, snap.seq)
-        }
+        Some(snap) => match RoomState::from_snapshot(fresh.world(), &snap.data) {
+            // A snapshot of an older shape is not corrupt: the log alone rebuilds the room.
+            Err(room_core::CoreError::BadSnapshot(room_core::UNKNOWN_SNAPSHOT)) => {
+                tracing::warn!(
+                    room = room.0,
+                    at = snap.seq.0,
+                    "old snapshot shape; replaying the log"
+                );
+                (fresh, Seq(0))
+            }
+            Err(e) => return Err(format!("stored snapshot at {}: {e}", snap.seq.0)),
+            Ok(state) => {
+                state.validate(snap.seq).map_err(|e| e.to_string())?;
+                (state, snap.seq)
+            }
+        },
         None => (fresh, Seq(0)),
     };
     let tail = store.read_tail(room, from, usize::MAX).await.map_err(|e| format!("{e:?}"))?;
@@ -281,14 +294,13 @@ struct Prepared {
 }
 
 fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<Prepared, String> {
+    let fresh =
+        fresh_state(&loaded).map_err(|e| format!("seed {:?}: {e}", loaded.bundle.seed_name()))?;
     let Loaded { bundle, .. } = loaded;
-    let id = room_id(&bundle.seed_name);
-    let fresh = RoomState::new(bundle.slot_nos(), bundle.placement())
-        .map_err(|e| format!("seed {:?}: {e}", bundle.seed_name))?;
+    let id = room_id(bundle.seed_name());
     let (live, mailbox) = RoomHandle::mailbox(&limits);
-    let seed = bundle.seed_name.clone();
-    let compat =
-        Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password.cloned(), limits)?);
+    let seed = bundle.seed_name().to_owned();
+    let compat = Arc::new(CompatRoom::new(bundle, live.clone(), password.cloned(), limits)?);
     Ok(Prepared { id, fresh, room: Room { seed, compat, live }, mailbox })
 }
 
@@ -356,11 +368,12 @@ async fn open_with_key(
     mut draw: impl FnMut() -> Result<RoomKey, String>,
 ) -> Result<(RoomKey, u64), Skip> {
     let mut last = Skip::Later("no room key drawn".to_owned());
-    let (seed, format) = (&loaded.bundle.seed_name, loaded.bundle.format);
+    // The stored hash is of the v1 form, so the format recorded with it is v1's.
+    let (seed, format) = (loaded.bundle.seed_name(), seed_bundle::FORMAT);
     for _ in 0..limits.room_key_draws {
         let new_key = draw().map_err(Skip::Later)?;
-        let text = loaded.text.as_bytes();
-        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), text).await {
+        let world = log::World::Seed(loaded.bundle.bytes());
+        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), world).await {
             Ok(o) => {
                 let key = RoomKey::parse(&o.key).map_err(|e| Skip::Final(format!("stored {e}")))?;
                 return Ok((key, o.idle_secs));
@@ -636,7 +649,7 @@ pub async fn run(
                 .await?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
-        let admin = match api.map(|w| w.router(host.folder().map(published))) {
+        let admin = match api.map(|w| w.router(host.waker(), host.folder().map(published))) {
             Some(api) => {
                 let at = SocketAddr::new(args.admin_host, args.admin_port);
                 let l = tokio::net::TcpListener::bind(at)
@@ -790,6 +803,18 @@ mod tests {
         assert!(e.contains(&format!("larger than {} bytes", len - 1)), "{e}");
     }
 
+    /// Seeds are never read from disk: a v2 seed file is refused at import (seeds and
+    /// packages live in the store).
+    #[test]
+    fn a_v2_seed_file_is_not_imported_from_disk() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+        let v1 = load_bundle(&fixture, &Limits::DESIGN).unwrap();
+        assert_eq!(v1.packages.len(), 2, "the import hands its two package files to the host");
+        let e = parse_bundle(v1.bundle.bytes(), &Limits::DESIGN).unwrap_err();
+        assert!(e.contains("seeds live in the store"), "{e}");
+    }
+
     #[test]
     fn the_room_id_is_the_seed_names_sha256_prefix() {
         // The first 8 bytes of the published SHA-256 digests of "" and of "abc"
@@ -915,7 +940,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let api = worlds.router(host.folder().map(|f| (f, "localhost:1".to_owned())));
+        let api = worlds.router(host.waker(), host.folder().map(|f| (f, "localhost:1".to_owned())));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, api).await });
