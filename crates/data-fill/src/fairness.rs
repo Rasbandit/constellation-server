@@ -238,7 +238,7 @@ pub fn sample(
 ) -> Sampled {
     let mut out = Sampled::default();
     for s in 1..=seeds {
-        match crate::fill(w, plan, &mut seeded(s, b"fill\0\0\0\0"), 20) {
+        match crate::fill(w, plan, &mut seeded(s, b"fill\0\0\0\0"), config::FILL_MAX_ATTEMPTS) {
             Ok(filled) => {
                 out.fill.add(&filled.placed, |_| true);
                 out.fills.push(filled.placed);

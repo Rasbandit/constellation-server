@@ -91,12 +91,15 @@ fn main() -> Result<(), String> {
     let mut sb = [0u8; 32];
     sb[..8].copy_from_slice(&seed.to_le_bytes());
     let mut rng = SpecRng::from_seed(sb);
-    let filled =
-        run.phase("fill", || fill(&w, &plan, &mut rng, 20)).map_err(|x| format!("{x:?}"))?;
+    let filled = run
+        .phase("fill", || fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS))
+        .map_err(|x| format!("{x:?}"))?;
     // Beatability and spheres come from the fill's own state, no fresh sweep.
     let (beatable, reached) = (filled.beatable, filled.reached);
     let mut rng2 = SpecRng::from_seed(sb);
-    let sp = run.phase("fill + spheres", || fill_spheres(&w, &plan, &mut rng2, 20, &progression));
+    let sp = run.phase("fill + spheres", || {
+        fill_spheres(&w, &plan, &mut rng2, config::FILL_MAX_ATTEMPTS, &progression)
+    });
     let rounds = sp.map_err(|x| format!("{x:?}"))?.1.spheres.len();
     let bytes = run.phase("write", || {
         serde_json::to_string(&placements(&w, &filled, &progression)).map(|s| s.len())

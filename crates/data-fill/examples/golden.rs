@@ -26,8 +26,8 @@ fn run(dir: &str, golden: &str) -> Result<usize, String> {
         for seed in 1u64..=20 {
             let mut sb = [0u8; 32];
             sb[..8].copy_from_slice(&seed.to_le_bytes());
-            let filled =
-                fill(&w, &plan, &mut SpecRng::from_seed(sb), 20).map_err(|x| format!("{x:?}"))?;
+            let filled = fill(&w, &plan, &mut SpecRng::from_seed(sb), config::FILL_MAX_ATTEMPTS)
+                .map_err(|x| format!("{x:?}"))?;
             let got =
                 serde_json::to_string(&placements(&w, &filled, &progression)).map_err(|x| e(&x))?;
             let want = std::fs::read_to_string(format!("{golden}/{name}_{seed}.json"))

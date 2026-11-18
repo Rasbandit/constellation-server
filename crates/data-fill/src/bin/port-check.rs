@@ -500,9 +500,14 @@ fn run(a: &Args) -> R<Value> {
                 sb[..8].copy_from_slice(&fill_seed.to_le_bytes());
                 let t = Instant::now();
                 // Spheres come from the fill's own final state, not a fresh sweep.
-                let (filled, sp) =
-                    fill_spheres(s.w, &s.plan, &mut SpecRng::from_seed(sb), 20, &s.progression)
-                        .map_err(|e| format!("fill {seed}: {e:?}"))?;
+                let (filled, sp) = fill_spheres(
+                    s.w,
+                    &s.plan,
+                    &mut SpecRng::from_seed(sb),
+                    config::FILL_MAX_ATTEMPTS,
+                    &s.progression,
+                )
+                .map_err(|e| format!("fill {seed}: {e:?}"))?;
                 model = Some(sp);
                 cx.engine_seconds += t.elapsed().as_secs_f64();
                 cx.work.0.absorb(&filled.stats);

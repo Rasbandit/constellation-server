@@ -674,11 +674,24 @@ mod tests {
             let mut sb = [0u8; 32];
             sb[..8].copy_from_slice(&seed.to_le_bytes());
             let progression = inst.progression(&w);
-            let (a, sa) =
-                fill_with(&w, &plan, &mut SpecRng::from_seed(sb), 20, true, Some(&progression))
-                    .unwrap();
-            let (b, _) =
-                fill_with(&w, &plan, &mut SpecRng::from_seed(sb), 20, false, None).unwrap();
+            let (a, sa) = fill_with(
+                &w,
+                &plan,
+                &mut SpecRng::from_seed(sb),
+                config::FILL_MAX_ATTEMPTS,
+                true,
+                Some(&progression),
+            )
+            .unwrap();
+            let (b, _) = fill_with(
+                &w,
+                &plan,
+                &mut SpecRng::from_seed(sb),
+                config::FILL_MAX_ATTEMPTS,
+                false,
+                None,
+            )
+            .unwrap();
             assert_eq!(a.placed, b.placed, "seed {seed}, clocks {clocks}");
             // The report read off the fill's state is the fresh sweep's.
             assert_eq!((a.beatable, a.reached), validate(&w, &plan, &a.placed), "seed {seed}");

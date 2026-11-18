@@ -155,7 +155,8 @@ fn run(args: &[String]) -> Result<Value, String> {
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
     let mut rng = SpecRng::from_seed(seed_bytes);
     let t = Instant::now();
-    let filled = fill(&w, &plan, &mut rng, 20).map_err(|e| format!("{e:?}"))?;
+    let filled =
+        fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;
     let fill_ms = ms(t);
     let t = Instant::now();
     let (beatable, reached) = validate(&w, &plan, &filled.placed);

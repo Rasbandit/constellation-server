@@ -207,12 +207,15 @@ fn fill_is_beatable_confined_and_deterministic() {
     let well = w.loc("well").unwrap() as usize;
     for seed in 0u8..32 {
         let mut a = SpecRng::from_seed([seed; 32]);
-        let filled = fill(&w, &plan, &mut a, 20).unwrap();
+        let filled = fill(&w, &plan, &mut a, config::FILL_MAX_ATTEMPTS).unwrap();
         assert_eq!(filled.placed.iter().flatten().count(), 6);
         assert_eq!(filled.placed[well], Some(charm), "seed {seed}: charm confined to the well");
         assert_eq!(validate(&w, &plan, &filled.placed), (true, 6), "seed {seed}");
         let mut b = SpecRng::from_seed([seed; 32]);
-        assert_eq!(fill(&w, &plan, &mut b, 20).unwrap().placed, filled.placed);
+        assert_eq!(
+            fill(&w, &plan, &mut b, config::FILL_MAX_ATTEMPTS).unwrap().placed,
+            filled.placed
+        );
     }
 }
 
