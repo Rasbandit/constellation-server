@@ -53,9 +53,9 @@ fn opened(text: &str) -> (Seed, BTreeMap<Key, GameData>) {
     let games = e
         .packages
         .iter()
-        .map(|c| {
-            let key = GamePackage::key_of(c);
-            let (name, g) = GamePackage::parse(c).unwrap();
+        .map(|f| {
+            let key = package::key_of(f);
+            let (name, g) = package::game_of(f, 1 << 26).unwrap();
             assert!(b.games.contains_key(&name));
             let p = Arc::new(GamePackage::new(key, &name, &g));
             data.insert(key, g);
@@ -177,10 +177,7 @@ fn reopen(bytes: Vec<u8>, text: &str) -> Result<Seed, BundleError> {
     let games = e
         .packages
         .iter()
-        .map(|c| {
-            let (name, g) = GamePackage::parse(c).unwrap();
-            Arc::new(GamePackage::new(GamePackage::key_of(c), &name, &g))
-        })
+        .map(|f| Arc::new(GamePackage::from_file(package::key_of(f), f, 1 << 26).unwrap()))
         .collect();
     Seed::open(bytes, games, 1 << 26)
 }
@@ -250,27 +247,27 @@ fn packages_must_be_the_ones_the_seed_names() {
 }
 
 #[test]
-fn a_seed_written_to_disk_reads_back_through_load() {
+fn a_stored_seed_reads_back_on_its_packages_and_decodes_to_its_v1() {
     let text = fixture_text();
-    let dir = std::env::temp_dir().join(format!("v2-load-{}", std::process::id()));
     let (_, e) = encoded(&text);
-    for c in &e.packages {
-        package::write(&dir.join("packages"), c).unwrap();
-    }
-    let from_disk = crate::load(e.seed.clone(), &dir, 1 << 26).unwrap();
-    let from_json = crate::load(text.into_bytes(), &dir, 1 << 26).unwrap();
-    assert_eq!(from_disk.bytes(), from_json.bytes());
+    // A blob store stand-in: package files by key.
+    let store: BTreeMap<Key, Vec<u8>> =
+        e.packages.iter().map(|f| (package::key_of(f), f.clone())).collect();
+    let fetch = |k: &Key| store.get(k).cloned().ok_or_else(|| BundleError::Parse("missing".into()));
+    let (imported, files) = crate::import_v1(text.as_bytes(), 1 << 26).unwrap();
+    assert_eq!(files, e.packages, "the import hands back the package files to store");
+    let stored = Seed::read(e.seed.clone(), fetch, 1 << 26).unwrap();
+    assert_eq!(stored.bytes(), imported.bytes());
     // Both share this process's one copy of each package.
-    assert!(Arc::ptr_eq(&from_disk.games()[0], &from_json.games()[0]));
-    // While a room holds the packages, a seed needs no package files; once none does, it does.
-    let empty_dir = std::env::temp_dir().join(format!("v2-none-{}", std::process::id()));
-    assert!(crate::load(e.seed.clone(), &empty_dir, 1 << 26).is_ok());
-    drop((from_disk, from_json));
-    let empty = std::env::temp_dir().join(format!("v2-none-{}", std::process::id()));
-    let missing = crate::load(e.seed.clone(), &empty, 1 << 26).unwrap_err();
-    assert!(missing.contains(".pkg"), "{missing}");
-    assert!(crate::load(b"{not json".to_vec(), &dir, 1 << 26).is_err());
-    let back = decode(e.seed, &dir.join("packages"), 1 << 26).unwrap();
+    assert!(Arc::ptr_eq(&stored.games()[0], &imported.games()[0]));
+    // While a room holds the packages, a seed needs no fetch; once none does, it needs one.
+    let none = |_: &Key| Err(BundleError::Parse("not in the store".into()));
+    assert!(Seed::read(e.seed.clone(), none, 1 << 26).is_ok());
+    drop((stored, imported));
+    let missing = Seed::read(e.seed.clone(), none, 1 << 26).unwrap_err();
+    assert!(missing.to_string().contains("not in the store"), "{missing}");
+    assert!(crate::import_v1(b"{not json", 1 << 26).is_err());
+    let back = decode(e.seed, fetch, 1 << 26).unwrap();
     let input: Value = serde_json::from_str(&fixture_text()).unwrap();
     assert_eq!(canonical_of(&back), package::canonical(input));
 }

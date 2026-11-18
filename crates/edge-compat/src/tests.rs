@@ -14,8 +14,7 @@ const GAME: &str = "G";
 /// Slot 2 (B): location 100 -> A's item 7 (trap).
 /// A v1 bundle as the room runs it (encoded to v2 in memory, the server's load path).
 fn seed(v: &Value) -> Arc<Seed> {
-    let dir = std::path::Path::new(".");
-    Arc::new(seed_bundle::load(v.to_string().into_bytes(), dir, 1 << 26).unwrap())
+    Arc::new(seed_bundle::import_v1(v.to_string().as_bytes(), 1 << 26).unwrap().0)
 }
 
 fn state_of(b: &Arc<Seed>) -> RoomState {

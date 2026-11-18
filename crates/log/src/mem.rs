@@ -1,6 +1,7 @@
 //! In-memory `LogStore`. One mutex makes the fence check and the write one atomic step.
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, Snapshot, StoreError,
+    AppendBatch, AppendError, AppendReceipt, BlobKey, BlobStore, CursorUpdate, LogStore, Snapshot,
+    StoreError,
 };
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 use std::collections::BTreeMap;
@@ -31,6 +32,18 @@ impl Room {
 #[derive(Debug, Default)]
 pub struct MemLogStore {
     rooms: Mutex<BTreeMap<RoomId, Room>>,
+    /// Blobs (game packages) and room seeds: write once, like the tables.
+    packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
+    seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
+}
+
+/// Insert unless present, under the lock.
+fn put_once<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: K, v: &[u8]) {
+    m.lock().unwrap_or_else(PoisonError::into_inner).entry(k).or_insert_with(|| v.to_vec());
+}
+
+fn get<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: &K) -> Option<Vec<u8>> {
+    m.lock().unwrap_or_else(PoisonError::into_inner).get(k).cloned()
 }
 
 impl MemLogStore {
@@ -45,6 +58,17 @@ impl MemLogStore {
         // A panicking test thread must not hide the data from the assertions that follow.
         let mut g = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         f(g.entry(room).or_default())
+    }
+
+    /// Drop a finished room's seed (the database keeps its rows; memory need not).
+    pub fn forget_seed(&self, room: RoomId) {
+        self.seeds.lock().unwrap_or_else(PoisonError::into_inner).remove(&room);
+    }
+
+    /// How many distinct blobs (game packages) are stored: for tests and metrics.
+    #[must_use]
+    pub fn blobs(&self) -> usize {
+        self.packages.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// Bump the room's owner epoch and return it (the directory's claim). Every older epoch is
@@ -147,5 +171,40 @@ impl LogStore for MemLogStore {
         epoch: Epoch,
     ) -> impl Future<Output = Result<(), AppendError>> + Send {
         ready(self.with(room, |r| r.put_snapshot(snap, epoch)))
+    }
+
+    fn seed_put(
+        &self,
+        room: RoomId,
+        seed: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        put_once(&self.seeds, room, seed);
+        ready(Ok(()))
+    }
+
+    fn seed_get(
+        &self,
+        room: RoomId,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        ready(Ok(get(&self.seeds, &room)))
+    }
+}
+
+/// The in-memory blob store (tests and the no-database server).
+impl BlobStore for MemLogStore {
+    fn put(
+        &self,
+        key: &BlobKey,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        put_once(&self.packages, *key, bytes);
+        ready(Ok(()))
+    }
+
+    fn get_unchecked(
+        &self,
+        key: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        ready(Ok(get(&self.packages, key)))
     }
 }

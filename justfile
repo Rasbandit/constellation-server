@@ -84,6 +84,6 @@ ap-gen-check apworld=(home_directory() / "Downloads/mm_2ship.apworld") yaml=(hom
 # Archipelago's own CommonClient joins it by room key as `slot` and checks a location. The
 # files are never copied into the repo.
 e2e-full apworld=(home_directory() / "Downloads/mm_2ship.apworld") yaml=(home_directory() / "Downloads/Majoras Mask.yaml") slot="Rasbandit-MM" game="2 Ship 2 Harkinian (MM)":
-    cargo build -p server --bin constellation-server -p seed-bundle --bin bundle --locked
+    cargo build -p server --bin constellation-server --locked
     tools/ap-gen/check.sh "{{apworld}}" "{{yaml}}" {{justfile_directory()}}/../Archipela-Go/.ap {{justfile_directory()}}/../Archipela-Go/apworld/.venv/bin/python \
         {{justfile_directory()}}/../Archipela-Go/apworld/.venv/bin/python tools/ap-client-check/play_generated.py --ap {{justfile_directory()}}/../Archipela-Go/.ap --slot "{{slot}}" --game "{{game}}"

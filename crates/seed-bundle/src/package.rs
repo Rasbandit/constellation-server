@@ -1,23 +1,22 @@
 //! Game data packages, stored once per content hash and shared by every room in the process.
 //!
-//! A package is one game's names and ids (`GameData`) plus the game's name. Its content is
-//! the canonical JSON of `{"data": <GameData>, "game": <name>}` (keys sorted, no whitespace),
-//! its key the SHA-256 of that content. Its file `<hex key>.pkg` in a seed's `packages` folder
-//! is sectioned so other per-game data can join it later: a table of contents, then each
-//! section (layout in `docs/seed-bundle-v2.md`). Section [`SECTION_GAME`] holds the content as
-//! raw deflate (RFC 1951); [`SECTION_RULES`] is reserved for a rules and regions section.
+//! A package is one game's names and ids (`GameData`) plus the game's name, as a sectioned
+//! file: a table of contents, then each section (layout in `docs/seed-bundle-v2.md`). Section
+//! [`SECTION_GAME`] holds the canonical JSON of `{"data": <GameData>, "game": <name>}` as raw
+//! deflate (RFC 1951); [`SECTION_RULES`] is reserved for a rules and regions section. The key
+//! is the SHA-256 of the whole file, so a blob store can check every read against it. This
+//! crate does no IO: the server keeps package files in its blob store (`log::BlobStore`).
 //! In memory a package keeps only what rooms use: the sorted id tables that map ids to dense
-//! indexes, and the JSON clients are sent, serialized once.
+//! indexes, names by index, and the JSON clients are sent, serialized once.
 
 use crate::{BundleError, GameData, id_ok};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-/// A package's content address: SHA-256 of its content.
+/// A package's content address: the SHA-256 of its file ([`key_of`]).
 pub type Key = [u8; 32];
 
 /// The first four bytes of a package file.
@@ -187,19 +186,6 @@ pub fn stored(file: &[u8], id: u16) -> Result<Option<&[u8]>, BundleError> {
     Ok(Some(e.stored))
 }
 
-/// Section `id` of package `key` in `dir`, read from the file on request: a room keeps only
-/// [`GamePackage`]'s tables in memory, never other sections, so each call costs one file read
-/// (and an inflate for a deflated section) and holds nothing after.
-///
-/// # Errors
-/// As [`read`], plus a section over `max` bytes.
-pub fn section(dir: &Path, key: &Key, id: u16, max: u64) -> Result<Option<Vec<u8>>, BundleError> {
-    let path = file(dir, key);
-    let bytes =
-        std::fs::read(&path).map_err(|e| BundleError::Parse(format!("{}: {e}", path.display())))?;
-    section_of(&bytes, id, max)
-}
-
 /// One game's package as rooms use it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GamePackage {
@@ -250,10 +236,24 @@ impl GamePackage {
         canonical(serde_json::json!({"data": g, "game": name}))
     }
 
-    /// The key of `content`.
-    #[must_use]
-    pub fn key_of(content: &[u8]) -> Key {
-        Sha256::digest(content).into()
+    /// The package file of game `name`: one section, the game's content, deflated. Its
+    /// SHA-256 ([`key_of`]) is the package's key.
+    ///
+    /// # Errors
+    /// Never in practice (writes go to memory).
+    pub fn file(name: &str, g: &GameData) -> std::io::Result<Vec<u8>> {
+        let game = Section { id: SECTION_GAME, bytes: Self::content(name, g), deflate: true };
+        file_bytes(&[game])
+    }
+
+    /// The package of a package `file` stored under `key` (checked against it where it was
+    /// read: `log::blob_get`), from its game section.
+    ///
+    /// # Errors
+    /// A malformed file, no game section, or one over `max` bytes.
+    pub fn from_file(key: Key, file: &[u8], max: u64) -> Result<Self, BundleError> {
+        let (name, g) = game_of(file, max)?;
+        Ok(Self::new(key, &name, &g))
     }
 
     /// The package of game `name`, keyed by `key` (the key of its content).
@@ -372,18 +372,6 @@ impl GamePackage {
     }
 }
 
-/// The file of package `key` in folder `dir`.
-#[must_use]
-pub fn file(dir: &Path, key: &Key) -> PathBuf {
-    use core::fmt::Write as _;
-    let hex = key.iter().fold(String::with_capacity(64), |mut h, b| {
-        // Writing to a String cannot fail.
-        let _ = write!(h, "{b:02x}");
-        h
-    });
-    dir.join(format!("{hex}.pkg"))
-}
-
 /// Raw deflate of `bytes`.
 ///
 /// # Errors
@@ -410,50 +398,31 @@ pub fn inflate(bytes: &[u8], max: u64) -> Result<Vec<u8>, BundleError> {
     Ok(out)
 }
 
-/// Write the package with this content (its [`SECTION_GAME`]) into `dir` (created if missing)
-/// unless it is there. Atomic: a reader never sees half a file.
-///
-/// # Errors
-/// When the folder or file cannot be written.
-pub fn write(dir: &Path, content: &[u8]) -> std::io::Result<Key> {
-    let key = GamePackage::key_of(content);
-    let path = file(dir, &key);
-    if !path.exists() {
-        std::fs::create_dir_all(dir)?;
-        // A nonce per call: two threads of one process writing the same key never share a
-        // temporary file.
-        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp{}-{n}", std::process::id()));
-        let bytes =
-            file_bytes(&[Section { id: SECTION_GAME, bytes: content.to_vec(), deflate: true }])?;
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &path)?;
-    }
-    Ok(key)
+/// The key of a package file: its SHA-256 (the blob store's content address).
+#[must_use]
+pub fn key_of(file: &[u8]) -> Key {
+    Sha256::digest(file).into()
 }
 
-/// Read package `key` from `dir`: its [`SECTION_GAME`], checked to be the content the key
-/// names.
+/// The game's name and data in a package file (its game section).
 ///
 /// # Errors
-/// A missing or unreadable file, a malformed one, more than `max` bytes, or content that does
-/// not hash to `key`.
-pub fn read(dir: &Path, key: &Key, max: u64) -> Result<Vec<u8>, BundleError> {
-    let path = file(dir, key);
-    let bytes =
-        std::fs::read(&path).map_err(|e| BundleError::Parse(format!("{}: {e}", path.display())))?;
-    let content = section_of(&bytes, SECTION_GAME, max)?
-        .ok_or_else(|| BundleError::Invalid(format!("{}: no game section", path.display())))?;
-    if GamePackage::key_of(&content) != *key {
-        return Err(BundleError::Invalid(format!("{} does not match its key", path.display())));
-    }
-    Ok(content)
+/// A malformed file, no game section, or one over `max` bytes.
+pub fn game_of(file: &[u8], max: u64) -> Result<(String, GameData), BundleError> {
+    let content = section_of(file, SECTION_GAME, max)?
+        .ok_or_else(|| BundleError::Invalid("package file: no game section".to_owned()))?;
+    GamePackage::parse(&content)
 }
 
 /// Packages in use in this process, by key. Entries are weak: a package is dropped once no
 /// room holds it, and loaded again on next use.
 static SHARED: Mutex<BTreeMap<Key, Weak<GamePackage>>> = Mutex::new(BTreeMap::new());
+
+/// The process's copy of package `key`, if a room holds one (what a loader need not fetch).
+#[must_use]
+pub fn cached(key: &Key) -> Option<Arc<GamePackage>> {
+    SHARED.lock().unwrap_or_else(PoisonError::into_inner).get(key).and_then(Weak::upgrade)
+}
 
 /// The process's copy of package `key`, made by `load` when no room holds one.
 ///
@@ -517,24 +486,17 @@ mod tests {
     }
 
     #[test]
-    fn a_written_package_reads_back_and_a_tampered_one_does_not() {
-        let dir = std::env::temp_dir().join(format!("pkg-test-{}", std::process::id()));
-        let content = GamePackage::content("G", &game());
-        let key = write(&dir, &content).unwrap();
-        assert_eq!(key, GamePackage::key_of(&content));
-        assert_eq!(write(&dir, &content).unwrap(), key, "a second write is a no-op");
-        assert_eq!(read(&dir, &key, 1 << 20).unwrap(), content);
-        assert_eq!(GamePackage::parse(&content).unwrap(), ("G".to_owned(), game()));
-        // Over the cap: refused, not inflated without bound.
-        assert!(read(&dir, &key, 10).is_err());
-        let other =
-            file_bytes(&[Section { id: SECTION_GAME, bytes: b"{}".to_vec(), deflate: true }])
-                .unwrap();
-        std::fs::write(file(&dir, &key), other).unwrap();
-        assert!(read(&dir, &key, 1 << 20).is_err(), "content that is not the key's");
-        assert!(read(&dir, &[1; 32], 1 << 20).is_err(), "missing");
-        std::fs::write(file(&dir, &key), b"not deflate").unwrap();
-        assert!(read(&dir, &key, 1 << 20).is_err());
+    fn a_package_file_reads_back_and_its_key_is_its_hash() {
+        let f = GamePackage::file("G", &game()).unwrap();
+        assert_eq!(key_of(&f), <[u8; 32]>::from(Sha256::digest(&f)));
+        assert_eq!(game_of(&f, 1 << 20).unwrap(), ("G".to_owned(), game()));
+        let p = GamePackage::from_file(key_of(&f), &f, 1 << 20).unwrap();
+        assert_eq!((p.name(), p.key()), ("G", &key_of(&f)));
+        assert!(game_of(&f, 10).is_err(), "over the cap");
+        assert!(game_of(b"not a package", 1 << 20).is_err());
+        let rules_only =
+            file_bytes(&[Section { id: SECTION_RULES, bytes: b"r".to_vec(), deflate: true }]);
+        assert!(game_of(&rules_only.unwrap(), 1 << 20).is_err(), "no game section");
     }
 
     #[test]
@@ -565,33 +527,19 @@ mod tests {
         assert!(sections(&v2, 1 << 20).is_err());
     }
 
-    #[test]
-    fn a_section_loads_on_request_from_the_package_file() {
-        let dir = std::env::temp_dir().join(format!("pkg-section-{}", std::process::id()));
-        let content = GamePackage::content("G", &game());
-        let key = write(&dir, &content).unwrap();
-        assert_eq!(section(&dir, &key, SECTION_GAME, 1 << 20).unwrap(), Some(content));
-        assert_eq!(section(&dir, &key, SECTION_RULES, 1 << 20).unwrap(), None);
-        assert!(section(&dir, &[9; 32], SECTION_GAME, 1 << 20).is_err());
-    }
-
     /// Review finding: readers inflated every section to pick one, so a small file with big
     /// sections held them all. A reader of the game section never inflates another, and
     /// repeated or overlapping sections are refused.
     #[test]
     fn reading_one_section_never_inflates_another() {
-        let dir = std::env::temp_dir().join(format!("pkg-lazy-{}", std::process::id()));
         let content = GamePackage::content("G", &game());
-        let key = GamePackage::key_of(&content);
         let big = Section { id: SECTION_RULES, bytes: vec![0; 2 << 20], deflate: true };
         let game_section = Section { id: SECTION_GAME, bytes: content.clone(), deflate: true };
         let f = file_bytes(&[game_section.clone(), big]).unwrap();
         assert!(f.len() < 10_000, "2 MiB of zeros deflate small: {}", f.len());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(file(&dir, &key), &f).unwrap();
         // Capped at 1 MiB: the 2 MiB rules section is never opened by the game reader.
-        assert_eq!(read(&dir, &key, 1 << 20).unwrap(), content);
-        assert!(section(&dir, &key, SECTION_RULES, 1 << 20).is_err());
+        assert_eq!(game_of(&f, 1 << 20).unwrap(), ("G".to_owned(), game()));
+        assert!(section_of(&f, SECTION_RULES, 1 << 20).is_err());
         assert!(sections(&f, 1 << 20).is_err(), "all of them together are over the cap");
         let twice = file_bytes(&[game_section.clone(), game_section]).unwrap();
         assert!(section_of(&twice, SECTION_GAME, 1 << 20).is_err(), "a repeated id");
@@ -614,9 +562,10 @@ mod tests {
     fn indexes_are_fixed_by_the_package_key() {
         let mut reversed = game();
         reversed.item_name_to_id = game().item_name_to_id.into_iter().rev().collect();
-        let (a, b) = (GamePackage::content("G", &game()), GamePackage::content("G", &reversed));
-        assert_eq!(GamePackage::key_of(&a), GamePackage::key_of(&b));
-        let (name, parsed) = GamePackage::parse(&a).unwrap();
+        let (a, b) =
+            (GamePackage::file("G", &game()).unwrap(), GamePackage::file("G", &reversed).unwrap());
+        assert_eq!(key_of(&a), key_of(&b), "the same file, so the same key");
+        let (name, parsed) = game_of(&a, 1 << 20).unwrap();
         let (p, q) =
             (GamePackage::new([0; 32], "G", &game()), GamePackage::new([0; 32], &name, &parsed));
         assert_eq!((p.items(), p.locations()), (q.items(), q.locations()));

@@ -5,7 +5,8 @@
 //! The race tests (fence race, cancel safety) are gate G-DB items (doc 11 section 4.8).
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, MemLogStore, Snapshot,
+    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, MemLogStore,
+    Snapshot, StoreError, blob_get, blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore {
+trait Store: LogStore + BlobStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
 }
 
@@ -233,6 +234,36 @@ async fn an_older_snapshot_never_replaces_a_newer_one<S: Store>(s: Arc<S>) {
     assert_eq!(s.snapshot_get(R).await.unwrap(), Some(snap(2, vec![])));
 }
 
+/// One package for two rooms of a game: stored once, read back whole; a second put of the
+/// same key is a no-op, and bytes under a key they do not hash to are refused on read.
+async fn blobs_are_stored_once_by_key_and_checked_on_read<S: Store>(s: Arc<S>) {
+    let (a, b) = (b"package a".to_vec(), b"package b".to_vec());
+    let (ka, kb) = (blob_key(&a), blob_key(&b));
+    assert_eq!(blob_get(&*s, &ka).await.unwrap(), None);
+    s.put(&ka, &a).await.unwrap();
+    s.put(&ka, &a).await.unwrap();
+    assert_eq!(blob_get(&*s, &ka).await.unwrap(), Some(a.clone()));
+    // A tampered row: bytes stored under another blob's key.
+    s.put(&kb, &a).await.unwrap();
+    assert!(matches!(blob_get(&*s, &kb).await, Err(StoreError::Corrupt(_))));
+    // The first bytes under a key stay (write once), so the tampered row is not healed by a
+    // later honest put either: the reader keeps refusing it.
+    s.put(&kb, &b).await.unwrap();
+    assert!(matches!(blob_get(&*s, &kb).await, Err(StoreError::Corrupt(_))));
+    assert_eq!(blob_get(&*s, &ka).await.unwrap(), Some(a));
+}
+
+/// A room's seed is written once and read back; rooms keep their own.
+async fn a_seed_is_written_once_per_room<S: Store>(s: Arc<S>) {
+    assert_eq!(s.seed_get(R).await.unwrap(), None);
+    s.seed_put(R, b"seed one").await.unwrap();
+    s.seed_put(R, b"seed two").await.unwrap();
+    assert_eq!(s.seed_get(R).await.unwrap(), Some(b"seed one".to_vec()));
+    assert_eq!(s.seed_get(RoomId(u64::MAX)).await.unwrap(), None);
+    s.seed_put(RoomId(u64::MAX), b"").await.unwrap();
+    assert_eq!(s.seed_get(RoomId(u64::MAX)).await.unwrap(), Some(Vec::new()));
+}
+
 async fn rooms_do_not_see_each_other<S: Store>(s: Arc<S>) {
     let e = s.bump(R).await;
     put(&*s, R, e, &[ev(1)], &[cur(1, 1)]).await.unwrap();
@@ -406,6 +437,8 @@ macro_rules! contract {
                 snapshots_are_fenced_and_cannot_be_ahead_of_the_log,
                 an_older_snapshot_never_replaces_a_newer_one,
                 rooms_do_not_see_each_other,
+                blobs_are_stored_once_by_key_and_checked_on_read,
+                a_seed_is_written_once_per_room,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,
                 a_cancelled_append_lands_whole_or_not_at_all_and_the_next_one_works,
@@ -477,7 +510,7 @@ mod pg_only {
         hash: &[u8],
         key: &str,
     ) -> Result<String, OpenError> {
-        s.open_room(room, "seed", 1, hash, key, b"{}").await.map(|o| o.key)
+        s.open_room(room, "seed", 1, hash, key, Some(b"{}")).await.map(|o| o.key)
     }
 
     #[tokio::test]
@@ -510,8 +543,8 @@ mod pg_only {
     #[tokio::test]
     async fn the_directory_lists_open_rooms_with_their_bundles_and_drops_finished_ones() {
         let s = pg_store().await;
-        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"bundle a").await.unwrap();
-        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", b"bundle b").await.unwrap();
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", Some(b"bundle a")).await.unwrap();
+        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", Some(b"bundle b")).await.unwrap();
         let listed = s.list_rooms().await.unwrap();
         let names: Vec<_> = listed.iter().map(|l| (l.seed_name.as_str(), l.key.as_str())).collect();
         assert_eq!(names, [("alpha", "aaaaaaaaaa"), ("beta", "bbbbbbbbbb")]);
@@ -519,13 +552,13 @@ mod pg_only {
         assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
         assert_eq!(s.room_bundle(RoomId(99)).await.unwrap(), None);
         // A reopen never replaces the stored file.
-        s.open_room(R, "alpha", 1, &[1], "cccccccccc", b"other").await.unwrap();
+        s.open_room(R, "alpha", 1, &[1], "cccccccccc", Some(b"other")).await.unwrap();
         assert_eq!(s.room_bundle(R).await.unwrap().as_deref(), Some(&b"bundle a"[..]));
         assert!(s.finish(R, "abandoned", 0).await.unwrap());
         let left: Vec<_> = s.list_rooms().await.unwrap().into_iter().map(|l| l.seed_name).collect();
         assert_eq!(left, ["beta"]);
         assert_eq!(
-            s.open_room(R, "alpha", 1, &[1], "dddddddddd", b"bundle a").await,
+            s.open_room(R, "alpha", 1, &[1], "dddddddddd", Some(b"bundle a")).await,
             Err(OpenError::Finished { reason: "abandoned".to_owned() })
         );
     }
@@ -533,15 +566,15 @@ mod pg_only {
     #[tokio::test]
     async fn touch_sets_how_long_each_room_has_been_idle_in_one_call() {
         let s = pg_store().await;
-        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"{}").await.unwrap();
-        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", b"{}").await.unwrap();
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", Some(b"{}")).await.unwrap();
+        s.open_room(RoomId(2), "beta", 1, &[2], "bbbbbbbbbb", Some(b"{}")).await.unwrap();
         s.touch(&[]).await.unwrap();
         s.touch(&[(R, 3 * 86_400), (RoomId(2), 86_400), (RoomId(99), 0)]).await.unwrap();
         let idle: Vec<u64> = s.list_rooms().await.unwrap().iter().map(|l| l.idle_secs).collect();
         let [a, b] = idle[..] else { panic!("{idle:?}") };
         assert!((3 * 86_400..3 * 86_400 + 60).contains(&a), "{a}");
         assert!((86_400..86_400 + 60).contains(&b), "{b}");
-        let reopened = s.open_room(R, "alpha", 1, &[1], "bbbbbbbbbb", b"{}").await.unwrap();
+        let reopened = s.open_room(R, "alpha", 1, &[1], "bbbbbbbbbb", Some(b"{}")).await.unwrap();
         assert!(reopened.idle_secs >= 3 * 86_400, "opening is not a connection");
     }
 
@@ -550,7 +583,7 @@ mod pg_only {
     #[tokio::test]
     async fn finish_ends_a_room_only_when_the_database_says_it_was_idle_long_enough() {
         let s = pg_store().await;
-        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"{}").await.unwrap();
+        s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", Some(b"{}")).await.unwrap();
         assert!(!s.finish(R, "abandoned", 3_600).await.unwrap(), "used just now");
         assert_eq!(s.list_rooms().await.unwrap().len(), 1);
         s.touch(&[(R, 7_200)]).await.unwrap();
@@ -578,11 +611,12 @@ mod pg_only {
         assert_eq!(s.room_bundle(R).await.unwrap(), None);
         // Another bundle for the same room id fills nothing.
         assert_eq!(
-            s.open_room(R, "alpha", 1, &[2], "bbbbbbbbbb", b"other").await,
+            s.open_room(R, "alpha", 1, &[2], "bbbbbbbbbb", Some(b"other")).await,
             Err(OpenError::OtherBundle)
         );
         assert_eq!(s.room_bundle(R).await.unwrap(), None);
-        let opened = s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", b"bundle a").await.unwrap();
+        let opened =
+            s.open_room(R, "alpha", 1, &[1], "aaaaaaaaaa", Some(b"bundle a")).await.unwrap();
         assert_eq!(opened.key, "aaaaaaaaaa");
         let listed = s.list_rooms().await.unwrap();
         assert_eq!((listed[0].seed_name.as_str(), listed[0].key.as_str()), ("alpha", "aaaaaaaaaa"));

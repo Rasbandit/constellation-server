@@ -21,7 +21,8 @@
 //! accepts them; no real room gets near that.
 
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, Snapshot, StoreError,
+    AppendBatch, AppendError, AppendReceipt, BlobKey, BlobStore, CursorUpdate, LogStore, Snapshot,
+    StoreError,
 };
 use config::Limits;
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
@@ -203,7 +204,8 @@ impl PgLogStore {
     /// Record the room the first time it opens, and return its room key.
     ///
     /// A new room is stored with `new_key` (a random key the caller drew) and its `bundle`
-    /// file; a room stored before keys or bundles were kept gets them now; a room that has a
+    /// file when given (`None` for a room whose seed is in `room_seeds`, written first with
+    /// `seed_put`); a room stored before keys or bundles were kept gets them now; a room that has a
     /// key keeps it, so a restart serves it under the same key. A reopen must come from the
     /// same bundle (by hash).
     ///
@@ -219,10 +221,10 @@ impl PgLogStore {
         bundle_format: u32,
         bundle_hash: &[u8],
         new_key: &str,
-        bundle: &[u8],
+        bundle: Option<&[u8]>,
     ) -> Result<Opened, OpenError> {
         let (seed, hash, key) = (seed_name.to_owned(), bundle_hash.to_vec(), new_key.to_owned());
-        let file = bundle.to_vec();
+        let file = bundle.map(<[u8]>::to_vec);
         let (stored_hash, stored_key, idle, finished) = self
             .isolated(move |c| {
                 Box::pin(async move {
@@ -292,7 +294,8 @@ impl PgLogStore {
                         "SELECT room_id, seed_name, room_key, \
                          GREATEST(0, EXTRACT(EPOCH FROM now() - last_active))::bigint \
                          FROM rooms WHERE finished_at IS NULL AND room_key IS NOT NULL \
-                         AND bundle IS NOT NULL ORDER BY room_id",
+                         AND (bundle IS NOT NULL OR room_id IN (SELECT room_id FROM room_seeds)) \
+                         ORDER BY room_id",
                     )
                     .fetch_all(&mut *c)
                     .await
@@ -312,8 +315,9 @@ impl PgLogStore {
             .collect()
     }
 
-    /// The bundle file a room was made from, to load it (`None` for an unknown room or one
-    /// stored before bundles were kept).
+    /// The v1 bundle file a room stored before seeds were kept was made from (`None` for an
+    /// unknown room, one stored before bundles were kept, or one whose seed is in
+    /// `room_seeds`: read that with `seed_get`).
     ///
     /// # Errors
     /// When the database fails.
@@ -541,6 +545,42 @@ impl Job {
     }
 }
 
+/// Blobs in the `game_packages` table (migration 0003).
+impl BlobStore for PgLogStore {
+    async fn put(&self, key: &BlobKey, bytes: &[u8]) -> Result<(), StoreError> {
+        let (key, bytes) = (key.to_vec(), bytes.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO game_packages (key, bytes) VALUES ($1, $2) \
+                     ON CONFLICT (key) DO NOTHING",
+                )
+                .bind(&key)
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn get_unchecked(&self, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = key.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT bytes FROM game_packages WHERE key = $1")
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
 impl LogStore for PgLogStore {
     async fn append(&self, batch: AppendBatch<'_>) -> Result<AppendReceipt, AppendError> {
         let job = Job::new(&batch)?;
@@ -611,6 +651,38 @@ impl LogStore for PgLogStore {
                         })
                     })
                     .collect()
+            })
+        })
+        .await
+    }
+
+    async fn seed_put(&self, room: RoomId, seed: &[u8]) -> Result<(), StoreError> {
+        let seed = seed.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO room_seeds (room_id, seed) VALUES ($1, $2) \
+                     ON CONFLICT (room_id) DO NOTHING",
+                )
+                .bind(room_key(room))
+                .bind(&seed)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn seed_get(&self, room: RoomId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT seed FROM room_seeds WHERE room_id = $1")
+                    .bind(room_key(room))
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
             })
         })
         .await

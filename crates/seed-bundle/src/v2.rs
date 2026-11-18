@@ -15,7 +15,6 @@ use proto::SlotNo;
 use room_core::World;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 /// The first four bytes of a v2 seed file.
@@ -163,12 +162,15 @@ struct Indexed {
 /// When the bundle is too large for the format's fields or for `max_bytes`.
 pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded, BundleError> {
     let games: Vec<(&String, &GameData)> = b.games.iter().collect();
-    let packages: Vec<Vec<u8>> =
-        games.iter().map(|(name, g)| GamePackage::content(name, g)).collect();
+    let packages: Vec<Vec<u8>> = games
+        .iter()
+        .map(|(name, g)| GamePackage::file(name, g))
+        .collect::<Result<_, _>>()
+        .map_err(|e| bad(e.to_string()))?;
     let tables: Vec<GamePackage> = games
         .iter()
         .zip(&packages)
-        .map(|((name, g), c)| GamePackage::new(GamePackage::key_of(c), name, g))
+        .map(|((name, g), f)| GamePackage::new(package::key_of(f), name, g))
         .collect();
     let game_of = |name: &str| games.iter().position(|(n, _)| n.as_str() == name);
     let mut slots: Vec<&Slot> = b.slots.iter().collect();
@@ -344,17 +346,22 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     Ok(Encoded { seed: out, packages })
 }
 
-/// Decode a v2 file back to the v1 bundle, each game's full data read from the package files
-/// in `packages` (the debugging view: `bundle v2-decode`).
+/// Decode a v2 file back to the v1 bundle, each game's full data from its package file, which
+/// `fetch` returns by key (checked by whoever stored it; the debugging view: `bundle
+/// v2-decode`).
 ///
 /// # Errors
 /// A malformed seed or a missing or bad package.
-pub fn decode(bytes: Vec<u8>, packages: &Path, max_bytes: u64) -> Result<SeedBundle, BundleError> {
+pub fn decode(
+    bytes: Vec<u8>,
+    mut fetch: impl FnMut(&Key) -> Result<Vec<u8>, BundleError>,
+    max_bytes: u64,
+) -> Result<SeedBundle, BundleError> {
     let mut data = BTreeMap::new();
     let games = package_keys(&bytes)?
         .into_iter()
         .map(|key| {
-            let (name, g) = GamePackage::parse(&package::read(packages, &key, max_bytes)?)?;
+            let (name, g) = package::game_of(&fetch(&key)?, max_bytes)?;
             let p = Arc::new(GamePackage::new(key, &name, &g));
             data.insert(key, g);
             Ok(p)
@@ -858,36 +865,44 @@ impl Seed {
     }
 
     /// Encode `b` (validated; `hash` is its `crate::bundle_hash`) and open it on this
-    /// process's shared packages: how a v1 bundle loads.
+    /// process's shared packages: how a v1 bundle is imported. Also returns its package files,
+    /// for the caller to store.
     ///
     /// # Errors
     /// When it does not encode.
-    pub fn from_v1(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Self, BundleError> {
+    pub fn from_v1(
+        b: &SeedBundle,
+        hash: &[u8; 32],
+        max_bytes: u64,
+    ) -> Result<(Self, Vec<Vec<u8>>), BundleError> {
         let Encoded { seed, packages } = encode(b, hash, max_bytes)?;
         let games = b
             .games
             .iter()
             .zip(&packages)
-            .map(|((name, g), c)| {
-                let key = GamePackage::key_of(c);
+            .map(|((name, g), f)| {
+                let key = package::key_of(f);
                 package::shared(&key, || Ok(GamePackage::new(key, name, g)))
             })
             .collect::<Result<_, _>>()?;
-        Self::open(seed, games, max_bytes)
+        Ok((Self::open(seed, games, max_bytes)?, packages))
     }
 
-    /// Open a v2 file's `bytes`, loading its packages from `dir` (or this process's copies).
+    /// Open a v2 file's `bytes` on its packages: this process's copy of each, or one made from
+    /// the package file `fetch` returns for its key (already checked against the key by the
+    /// blob store that held it).
     ///
     /// # Errors
-    /// A malformed seed, or a package that is missing or does not match its key.
-    pub fn read(bytes: Vec<u8>, dir: &Path, max_bytes: u64) -> Result<Self, BundleError> {
+    /// A malformed seed, or a package that is missing or malformed.
+    pub fn read(
+        bytes: Vec<u8>,
+        mut fetch: impl FnMut(&Key) -> Result<Vec<u8>, BundleError>,
+        max_bytes: u64,
+    ) -> Result<Self, BundleError> {
         let games = package_keys(&bytes)?
             .iter()
             .map(|key| {
-                package::shared(key, || {
-                    let (name, g) = GamePackage::parse(&package::read(dir, key, max_bytes)?)?;
-                    Ok(GamePackage::new(*key, &name, &g))
-                })
+                package::shared(key, || GamePackage::from_file(*key, &fetch(key)?, max_bytes))
             })
             .collect::<Result<_, _>>()?;
         Self::open(bytes, games, max_bytes)

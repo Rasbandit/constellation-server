@@ -129,21 +129,21 @@ impl Args {
     }
 }
 
-/// A validated bundle and the hash of its file's content ([`bundle_hash`]).
+/// A validated seed (v2, `docs/seed-bundle-v2.md`) and the hash of the v1 file it came from
+/// ([`bundle_hash`]).
 #[derive(Debug, Clone)]
 pub struct Loaded {
-    /// The seed, in its v2 form whatever the file was; shared by the room state and the edge.
+    /// The seed; shared by the room state and the edge.
     pub bundle: Arc<Seed>,
-    /// SHA-256 of the canonical v1 JSON (for a v2 file, of the JSON it was made from).
+    /// SHA-256 of the canonical v1 JSON it was made from: the room's identity in Postgres.
     pub hash: Vec<u8>,
-    /// The file as read (v1 JSON or v2), which the directory stores so the room can be loaded
-    /// again.
-    pub file: Vec<u8>,
+    /// Package files an import made, for the host to put in its store; empty for a seed read
+    /// from the store.
+    pub packages: Vec<Vec<u8>>,
 }
 
-/// Read and validate a seed file, v1 JSON or v2 (`docs/seed-bundle-v2.md`; its packages in
-/// the `packages` folder beside it), refusing files over `limits.bundle_max_bytes`. The one
-/// way a server loads a seed.
+/// Import a v1 bundle file (`--bundle`, the `--rooms` folder), refusing files over
+/// `limits.bundle_max_bytes`. Seeds and packages then live in the store, never in files.
 ///
 /// # Errors
 /// A message for an unreadable, oversized or invalid file.
@@ -157,21 +157,19 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
         return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    parse_bundle(bytes, dir, limits).map_err(|e| format!("{}: {e}", path.display()))
+    parse_bundle(&bytes, limits).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Validate a seed file's bytes (v1 JSON or v2; a v2 file's packages are in `dir/packages`).
+/// Import a v1 bundle's bytes: validate and encode them to v2 (packages shared in-process).
 ///
 /// # Errors
-/// When it is not a valid seed.
-pub fn parse_bundle(
-    file: Vec<u8>,
-    dir: &std::path::Path,
-    limits: &Limits,
-) -> Result<Loaded, String> {
-    let seed = seed_bundle::load(file.clone(), dir, limits.bundle_max_bytes)?;
-    Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), file })
+/// When it is not a valid v1 bundle (a v2 seed file is refused: seeds come from the store).
+pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
+    if seed_bundle::v2::is_v2(file) {
+        return Err("a v2 seed file is not imported from disk; seeds live in the store".into());
+    }
+    let (seed, packages) = seed_bundle::import_v1(file, limits.bundle_max_bytes)?;
+    Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages })
 }
 
 /// A new room's state for a loaded bundle: the one place a room is built from a bundle.
@@ -334,9 +332,6 @@ pub async fn app(
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
             let mut host = Host::new(database_url, password, limits, None).await?;
-            host.seeds_in(
-                path.parent().map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf),
-            );
             let key = host.import(loaded).await?;
             host.wake(&key).await?;
             host
@@ -377,8 +372,8 @@ async fn open_with_key(
     let (seed, format) = (loaded.bundle.seed_name(), seed_bundle::FORMAT);
     for _ in 0..limits.room_key_draws {
         let new_key = draw().map_err(Skip::Later)?;
-        let text = loaded.file.as_slice();
-        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), text).await {
+        // The seed is in room_seeds (written first), so no file goes in rooms.bundle.
+        match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), None).await {
             Ok(o) => {
                 let key = RoomKey::parse(&o.key).map_err(|e| Skip::Final(format!("stored {e}")))?;
                 return Ok((key, o.idle_secs));
@@ -654,7 +649,7 @@ pub async fn run(
                 .await?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
-        let admin = match api.map(|w| w.router(host.folder().map(published))) {
+        let admin = match api.map(|w| w.router(host.waker(), host.folder().map(published))) {
             Some(api) => {
                 let at = SocketAddr::new(args.admin_host, args.admin_port);
                 let l = tokio::net::TcpListener::bind(at)
@@ -805,24 +800,16 @@ mod tests {
         assert!(e.contains(&format!("larger than {} bytes", len - 1)), "{e}");
     }
 
-    /// The generation path's v2 file loads through the same `load_bundle` as the v1 file, as
-    /// the same room: same seed, same v1 hash (what Postgres keeps per room), same placements.
+    /// Seeds are never read from disk: a v2 seed file is refused at import (seeds and
+    /// packages live in the store).
     #[test]
-    fn a_v2_seed_loads_as_the_same_room_as_its_v1_bundle() {
+    fn a_v2_seed_file_is_not_imported_from_disk() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
-        let dir = std::env::temp_dir().join(format!("server-v2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let seed = dir.join("bundle.seed");
-        worlds::write_v2(&seed, &std::fs::read_to_string(&fixture).unwrap(), &Limits::DESIGN)
-            .unwrap();
-        let (v1, v2) =
-            (load_bundle(&fixture, &Limits::DESIGN), load_bundle(&seed, &Limits::DESIGN));
-        let (v1, v2) = (v1.unwrap(), v2.unwrap());
-        assert_eq!(v1.hash, v2.hash);
-        assert_eq!(v1.bundle.bytes(), v2.bundle.bytes());
-        assert!(fresh_state(&v2).is_ok());
-        // (A missing package is covered in seed-bundle, where no other test holds this one.)
+        let v1 = load_bundle(&fixture, &Limits::DESIGN).unwrap();
+        assert_eq!(v1.packages.len(), 2, "the import hands its two package files to the host");
+        let e = parse_bundle(v1.bundle.bytes(), &Limits::DESIGN).unwrap_err();
+        assert!(e.contains("seeds live in the store"), "{e}");
     }
 
     #[test]
@@ -950,7 +937,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let api = worlds.router(host.folder().map(|f| (f, "localhost:1".to_owned())));
+        let api = worlds.router(host.waker(), host.folder().map(|f| (f, "localhost:1".to_owned())));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, api).await });

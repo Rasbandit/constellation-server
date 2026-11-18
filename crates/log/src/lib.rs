@@ -123,6 +123,61 @@ pub trait LogStore: Send + Sync + 'static {
         snap: Snapshot,
         epoch: Epoch,
     ) -> impl Future<Output = Result<(), AppendError>> + Send;
+
+    /// Store a room's seed. Write once: a room that has a seed keeps it.
+    fn seed_put(
+        &self,
+        room: RoomId,
+        seed: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// A room's seed, if one is stored.
+    fn seed_get(
+        &self,
+        room: RoomId,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+}
+
+/// A blob's content address: the SHA-256 of its bytes.
+pub type BlobKey = [u8; 32];
+
+/// Content-addressed immutable blobs (game packages): the seam a Postgres table, memory, or
+/// later an object store with a local cache sit behind. Read through [`blob_get`], the one
+/// place a blob is checked against its key.
+pub trait BlobStore: Send + Sync + 'static {
+    /// Store `bytes` under `key` (their SHA-256). Idempotent: a stored key keeps its bytes.
+    fn put(
+        &self,
+        key: &BlobKey,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The bytes stored under `key`, as stored; use [`blob_get`], which checks them.
+    fn get_unchecked(
+        &self,
+        key: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+}
+
+/// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
+#[must_use]
+pub fn blob_key(bytes: &[u8]) -> BlobKey {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// The blob stored under `key`, checked: bytes that do not hash to `key` (a tampered or torn
+/// row) are [`StoreError::Corrupt`], never returned.
+///
+/// # Errors
+/// When the store fails or the stored bytes do not match the key.
+pub async fn blob_get<B: BlobStore>(b: &B, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+    match b.get_unchecked(key).await? {
+        Some(bytes) if blob_key(&bytes) != *key => {
+            Err(StoreError::Corrupt("a stored blob does not match its key".to_owned()))
+        }
+        found => Ok(found),
+    }
 }
 
 #[cfg(test)]

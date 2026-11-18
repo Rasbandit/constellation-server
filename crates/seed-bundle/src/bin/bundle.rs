@@ -1,4 +1,5 @@
-//! Seed file converter and decoder (`docs/seed-bundle-v2.md`).
+//! Seed file converter and decoder for debugging (`docs/seed-bundle-v2.md`). It reads and
+//! writes plain files; the server keeps seeds and packages only in its store.
 //!
 //! - `bundle v2-encode <v1.json> <out-dir>`: writes `<out-dir>/<name>.seed` and the game
 //!   packages in `<out-dir>/packages/`, and prints the sizes and bit widths.
@@ -14,6 +15,27 @@ const MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
 const USAGE: &str =
     "usage: bundle v2-encode <v1.json> <out-dir> | bundle v2-decode <seed> [--packages <dir>]";
 
+/// A package file in a debugging folder: `<hex key>.pkg`. The server never writes these; it
+/// keeps packages in its blob store.
+fn package_file(dir: &Path, key: &[u8; 32]) -> PathBuf {
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{hex}.pkg"))
+}
+
+/// Read a package from a debugging folder and check it against its key.
+fn fetch(dir: &Path, key: &[u8; 32]) -> Result<Vec<u8>, seed_bundle::BundleError> {
+    let path = package_file(dir, key);
+    let bytes = std::fs::read(&path)
+        .map_err(|e| seed_bundle::BundleError::Parse(format!("{}: {e}", path.display())))?;
+    if seed_bundle::package::key_of(&bytes) != *key {
+        return Err(seed_bundle::BundleError::Invalid(format!(
+            "{} does not match its key",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 fn encode(input: &Path, out: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let b = seed_bundle::SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
@@ -21,13 +43,16 @@ fn encode(input: &Path, out: &Path) -> Result<String, String> {
         seed_bundle::bundle_hash(&text)?.try_into().map_err(|_| "hash length".to_owned())?;
     let e = seed_bundle::v2::encode(&b, &hash, MAX_BYTES).map_err(|e| e.to_string())?;
     let packages = out.join("packages");
-    for c in &e.packages {
-        seed_bundle::package::write(&packages, c).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&packages).map_err(|e| e.to_string())?;
+    for f in &e.packages {
+        let path = package_file(&packages, &seed_bundle::package::key_of(f));
+        std::fs::write(&path, f).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let stem = input.file_stem().map_or("bundle".into(), |s| s.to_string_lossy());
     let path = out.join(format!("{stem}.seed"));
     std::fs::write(&path, &e.seed).map_err(|e| format!("{}: {e}", path.display()))?;
-    let seed = seed_bundle::load(e.seed.clone(), out, MAX_BYTES)?;
+    let seed = seed_bundle::Seed::read(e.seed.clone(), |k| fetch(&packages, k), MAX_BYTES)
+        .map_err(|e| e.to_string())?;
     let (wi, wr, wf) = seed.bit_widths();
     Ok(format!(
         "{} bytes={} json_bytes={} item_bits={wi} receiver_bits={wr} flag_bits={wf} packages={}",
@@ -40,7 +65,8 @@ fn encode(input: &Path, out: &Path) -> Result<String, String> {
 
 fn decode(seed: &Path, packages: &Path) -> Result<String, String> {
     let bytes = std::fs::read(seed).map_err(|e| format!("{}: {e}", seed.display()))?;
-    let b = seed_bundle::v2::decode(bytes, packages, MAX_BYTES).map_err(|e| e.to_string())?;
+    let b = seed_bundle::v2::decode(bytes, |k| fetch(packages, k), MAX_BYTES)
+        .map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&b).map_err(|e| e.to_string())
 }
 

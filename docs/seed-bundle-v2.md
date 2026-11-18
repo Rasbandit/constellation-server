@@ -2,7 +2,7 @@
 
 One room's seed as compact binary, read in place, plus one package file per game, shared across rooms. The v1 JSON (`tools/ap-import` output, `seed_bundle::SeedBundle`) stays the debugging view: `bundle v2-decode` turns v2 back into it, and `bundle v2-encode` turns v1 into v2. Code: `crates/seed-bundle/src/v2.rs`, `package.rs`, and `crates/bits`.
 
-**Stability.** The room record, slot record and placement records are stable, because rooms run on them. These parts are still unstable and may change before the first release: the package file's reserved sections (id 2 and up), the reserved header fields, and the meaning of a slot's `kind` 2 (group slots, refused today).
+**Stability.** The room record, slot record and placement records are stable, because rooms run on them. These parts are still unstable and may change before the first release: the package file's reserved sections (id 2 and up), the reserved header fields, and the meaning of a slot's `kind` 2 (group slots, refused today). A package's key is the hash of its whole file, so adding a section (such as rules) makes a new key; seeds name the file they were made with.
 
 All integers are little-endian. Offsets are bytes from the start of the file. A string reference is `u32 offset` into the string table plus `u32 length`. A length of `0xFFFFFFFF` means "no string".
 
@@ -58,7 +58,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 
 ## Package file
 
-`packages/<hex key>.pkg` sits next to the seed file. The key is the SHA-256 of the game section's content. On disk each world folder keeps its own copies; sharing is in memory (one copy per key per process), not across folders.
+Package files are blobs keyed by the SHA-256 of the whole file, kept in the server's blob store (`log::BlobStore`: the `game_packages` table, migration 0003, or memory); every read is checked against its key (`log::blob_get`). Seeds are kept per room (`room_seeds`). In a process each key has one in-memory copy, shared by every room that uses it. The `bundle` CLI reads and writes `<hex key>.pkg` files in a folder, for debugging only.
 
 | At | Size | Field |
 |---|---|---|
@@ -69,7 +69,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 
 Each id appears once and no two sections share bytes (a reader refuses the file otherwise), and a reader inflates only the section it asks for, each under the caller's cap. Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
 
-**Index stability.** A game's location and item indexes are the positions of its ids, sorted ascending, in section 1. That section is exactly what the key hashes, so for a given package key the indexes never change, whatever order the names were listed in. Other sections, and seeds, may refer to them by index (test: `indexes_are_fixed_by_the_package_key`).
+**Index stability.** A game's location and item indexes are the positions of its ids, sorted ascending, in section 1. The key hashes the file, section 1 included, so for a given package key the indexes never change, whatever order the names were listed in. Other sections, and seeds, may refer to them by index (test: `indexes_are_fixed_by_the_package_key`).
 
 ## Decoding by hand
 
