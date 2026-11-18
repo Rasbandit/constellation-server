@@ -111,6 +111,9 @@ struct Joined {
     /// Checked (finder, location) since the last reread, with a watched list it can change
     /// (the finder's or the receiver's): changed only if the room holds a hint there.
     checked_hints: Vec<(u32, SlotNo, i64)>,
+    /// Hint list work so far, for tests: (list entries a check touched, lists reread).
+    #[cfg(test)]
+    hint_work: (u64, u64),
 }
 
 impl Joined {
@@ -188,6 +191,12 @@ impl Session {
                 format!("{cmd}: rate limited, slow down"),
             )))
         }
+    }
+
+    /// Hint list work so far (list entries checks touched, lists reread), for tests.
+    #[cfg(test)]
+    pub(crate) fn hint_work(&self) -> (u64, u64) {
+        self.joined.as_ref().map_or((0, 0), |j| j.hint_work)
     }
 
     /// Whether a `Connect` has succeeded on this socket.
@@ -318,6 +327,8 @@ impl Session {
             hint_lists,
             stale_hints: BTreeSet::new(),
             checked_hints: Vec::new(),
+            #[cfg(test)]
+            hint_work: (0, 0),
         };
         for e in &history {
             fold(&self.room, &mut j, e);
@@ -406,7 +417,12 @@ impl Session {
         if slots.is_empty() && checked.is_empty() {
             return Ok(Vec::new());
         }
-        let lists = changed_hint_lists(&room, slots, checked, j.hint_lists.clone()).await?;
+        let (_reread, lists) =
+            changed_hint_lists(&room, slots, checked, j.hint_lists.clone()).await?;
+        #[cfg(test)]
+        {
+            j.hint_work.1 += _reread as u64;
+        }
         let mut out = Vec::new();
         for (slot, digest, list) in lists {
             let team = room.bundle.slot(slot).map_or(0, |s| s.team());
@@ -604,10 +620,10 @@ impl Session {
         let info = ServerPacket::LocationInfo { locations };
         if create != 0 {
             // The answer is sent even when the hints are limited: clients wait for it.
-            if let Err(Step::Reply(refused)) =
-                Self::rate(&self.room.hint_writes, j.slot, "LocationScouts")
-            {
-                return Ok(vec![wire::frame(&[info, *refused])]);
+            match Self::rate(&self.room.hint_writes, j.slot, "LocationScouts") {
+                Ok(()) => {}
+                Err(Step::Reply(refused)) => return Ok(vec![wire::frame(&[info, *refused])]),
+                Err(other) => return Err(other),
             }
             let asks = req
                 .locations
@@ -917,7 +933,8 @@ impl Session {
             .collect();
         j.watch.extend(req.keys);
         if !fresh.is_empty() {
-            let lists = changed_hint_lists(&self.room, fresh, Vec::new(), BTreeMap::new()).await?;
+            let (_, lists) =
+                changed_hint_lists(&self.room, fresh, Vec::new(), BTreeMap::new()).await?;
             let j = self.joined.as_mut().ok_or(Step::Closed)?;
             j.hint_lists.extend(lists.into_iter().map(|(n, d, _)| (n, d)));
         }
@@ -1041,24 +1058,30 @@ fn digest(list: &[Hint]) -> u64 {
     h.finish()
 }
 
+/// A hint list that changed: its slot, digest and hints.
+type ChangedList = (u32, u64, Vec<Hint>);
+
 /// From the room, in one read: the lists of `slots`, and of each `checked` list whose
-/// location is hinted, that differ from their `known` digest, as (slot, digest, list).
+/// location is hinted, that differ from their `known` digest, as (slot, digest, list); and
+/// how many lists were reread.
 async fn changed_hint_lists(
     room: &CompatRoom,
     mut slots: BTreeSet<u32>,
     checked: Vec<(u32, SlotNo, i64)>,
     known: BTreeMap<u32, u64>,
-) -> Result<Vec<(u32, u64, Vec<Hint>)>, Step> {
+) -> Result<(usize, Vec<ChangedList>), Step> {
     let read = room.room.read(move |s| {
         slots.extend(checked.into_iter().filter(|c| s.is_hinted(c.1, c.2)).map(|c| c.0));
-        slots
+        let reread = slots.len();
+        let changed = slots
             .into_iter()
             .filter_map(|n| {
                 let list = s.hints_of(SlotNo(n));
                 let d = digest(&list);
                 (known.get(&n) != Some(&d)).then_some((n, d, list))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (reread, changed)
     });
     read.await.map_err(|_| Step::Closed)
 }
@@ -1137,6 +1160,10 @@ fn events_packets(
                 let receiver = room.bundle.slot(slot).and_then(|s| s.placement(s.find(location)?));
                 let lists = lists_of_hint(&j.hint_lists, slot, receiver.map(|p| p.receiver));
                 let lists: Vec<u32> = lists.collect();
+                #[cfg(test)]
+                {
+                    j.hint_work.0 += lists.len() as u64;
+                }
                 j.checked_hints.extend(lists.into_iter().map(|n| (n, SlotNo(slot), location)));
             }
             (
