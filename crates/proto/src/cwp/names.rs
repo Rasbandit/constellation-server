@@ -246,7 +246,11 @@ const fn is_crockford(c: u8) -> bool {
 }
 
 fn is_item_uid(s: &str) -> bool {
-    s.strip_prefix("iu_").is_some_and(|b| b.len() == 26 && b.bytes().all(is_crockford))
+    s.strip_prefix("iu_").is_some_and(|b| {
+        b.len() == 26
+            && b.bytes().all(is_crockford)
+            && b.as_bytes().first().is_some_and(|c| (b'0'..=b'7').contains(c))
+    })
 }
 
 validated!(
@@ -319,7 +323,7 @@ validated!(
     /// 128-bit hash).
     ItemUid,
     is_item_uid,
-    "^iu_[0-9A-HJKMNP-TV-Z]{26}$",
+    "^iu_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
     NAME_MAX
 );
 printable!(ItemUid);

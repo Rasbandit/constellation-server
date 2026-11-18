@@ -81,7 +81,8 @@
       "type": "object"
     },
     "CallerKind": {
-      "anyOf": [
+      "description": "`welcome.caller.kind`.",
+      "oneOf": [
         {
           "const": "slot",
           "description": "A slot token.",
@@ -104,10 +105,17 @@
         },
         {
           "description": "A value this version does not know; it grants nothing.",
+          "not": {
+            "enum": [
+              "slot",
+              "spectator",
+              "integration",
+              "account"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "`welcome.caller.kind`."
+      ]
     },
     "Check": {
       "description": "`check` payload.",
@@ -147,7 +155,8 @@
       "type": "string"
     },
     "ClientFrame": {
-      "anyOf": [
+      "description": "Everything a client may send.",
+      "oneOf": [
         {
           "$ref": "#/$defs/Hello",
           "description": "First frame of a session.",
@@ -250,6 +259,17 @@
           "description": "An `op` this version does not know. A server answers it with `op.unknown` (rule 1).",
           "properties": {
             "op": {
+              "not": {
+                "enum": [
+                  "hello",
+                  "cmd",
+                  "get",
+                  "watch",
+                  "unwatch",
+                  "ack",
+                  "ping"
+                ]
+              },
               "type": "string"
             }
           },
@@ -258,8 +278,7 @@
           ],
           "type": "object"
         }
-      ],
-      "description": "Everything a client may send."
+      ]
     },
     "ClientInfo": {
       "description": "`hello.client` (doc 09 section 4.6).",
@@ -296,7 +315,8 @@
       "type": "object"
     },
     "ClientKind": {
-      "anyOf": [
+      "description": "`hello.client.kind` (doc 09 section 4.6).",
+      "oneOf": [
         {
           "const": "game",
           "description": "A game or mod.",
@@ -339,13 +359,25 @@
         },
         {
           "description": "A kind this version does not know.",
+          "not": {
+            "enum": [
+              "game",
+              "browser",
+              "device",
+              "bot",
+              "tracker",
+              "spectator",
+              "console",
+              "legacy"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "`hello.client.kind` (doc 09 section 4.6)."
+      ]
     },
     "ClientState": {
-      "anyOf": [
+      "description": "`slot/{n}/status.client_state`.",
+      "oneOf": [
         {
           "const": "ready",
           "description": "The client says it is ready.",
@@ -358,10 +390,15 @@
         },
         {
           "description": "A state this version does not know.",
+          "not": {
+            "enum": [
+              "ready",
+              "playing"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "`slot/{n}/status.client_state`."
+      ]
     },
     "Cmd": {
       "description": "A command (doc 01 D1.10 rule 3).",
@@ -446,19 +483,13 @@
           "description": "Last durable `seq` the command committed (rule 4)."
         },
         "upto": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Seq"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The last durable `seq` sent to this session when the result was produced; over HTTP\nthe client applies the result once its stream has reached it (rule 4)."
+          "$ref": "#/$defs/Seq",
+          "description": "The last durable `seq` sent to this session when the result was produced (required);\nover HTTP the client applies the result once its stream has reached it (rule 4)."
         }
       },
       "required": [
-        "cid"
+        "cid",
+        "upto"
       ],
       "type": "object"
     },
@@ -895,7 +926,8 @@
       "type": "object"
     },
     "ItemFlag": {
-      "anyOf": [
+      "description": "Item classification. Unknown flags from newer servers read as `Other`.",
+      "oneOf": [
         {
           "const": "progression",
           "description": "Can unlock logical progress.",
@@ -913,10 +945,16 @@
         },
         {
           "description": "A flag this version does not know.",
+          "not": {
+            "enum": [
+              "progression",
+              "useful",
+              "trap"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "Item classification. Unknown flags from newer servers read as `Other`."
+      ]
     },
     "ItemGrant": {
       "description": "`item.grant` payload; the frame's `slot` is the receiver.",
@@ -989,7 +1027,7 @@
       "description": "Stable item identity (doc 01 D1.10 rule 11): `iu_` and 26 Crockford base32 digits (a\n128-bit hash).",
       "maxLength": 128,
       "minLength": 1,
-      "pattern": "^iu_[0-9A-HJKMNP-TV-Z]{26}$",
+      "pattern": "^iu_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "type": "string"
     },
     "Limits": {
@@ -1148,7 +1186,8 @@
       "type": "object"
     },
     "ResumeStatus": {
-      "anyOf": [
+      "description": "`welcome.resume.status`.",
+      "oneOf": [
         {
           "const": "ok",
           "description": "Replay follows (also for a first connect).",
@@ -1166,13 +1205,20 @@
         },
         {
           "description": "A status this version does not know; treat it as `new_timeline`.",
+          "not": {
+            "enum": [
+              "ok",
+              "too_old",
+              "new_timeline"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "`welcome.resume.status`."
+      ]
     },
     "Retry": {
-      "anyOf": [
+      "description": "Retry hint carried by every error frame (doc 01 D1.7).",
+      "oneOf": [
         {
           "const": "never",
           "description": "Retrying will not help.",
@@ -1195,13 +1241,21 @@
         },
         {
           "description": "A hint this version does not know; treat it as `never`.",
+          "not": {
+            "enum": [
+              "never",
+              "backoff",
+              "after",
+              "immediate"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "Retry hint carried by every error frame (doc 01 D1.7)."
+      ]
     },
     "RoomRole": {
-      "anyOf": [
+      "description": "Room roles (doc 10 section 2.3).",
+      "oneOf": [
         {
           "const": "owner",
           "description": "Owns the room.",
@@ -1219,13 +1273,20 @@
         },
         {
           "description": "A value this version does not know; it grants nothing.",
+          "not": {
+            "enum": [
+              "owner",
+              "co_host",
+              "moderator"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "Room roles (doc 10 section 2.3)."
+      ]
     },
     "Scope": {
-      "anyOf": [
+      "description": "Token scopes (doc 01 D1.2).",
+      "oneOf": [
         {
           "const": "play",
           "description": "Sends checks, receives items.",
@@ -1238,10 +1299,15 @@
         },
         {
           "description": "A value this version does not know; it grants nothing.",
+          "not": {
+            "enum": [
+              "play",
+              "observe"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "Token scopes (doc 01 D1.2)."
+      ]
     },
     "Secret": {
       "description": "A credential or session id: slot token, integration credential, connect ticket, session.\nIts `Debug` and `Display` never print the value, so it cannot leak into logs.",
@@ -1292,7 +1358,8 @@
       "type": "integer"
     },
     "ServerFrame": {
-      "anyOf": [
+      "description": "Everything a server may send.",
+      "oneOf": [
         {
           "$ref": "#/$defs/Welcome",
           "description": "Answer to `hello`.",
@@ -1367,6 +1434,15 @@
           "description": "An `op` this version does not know. Clients ignore it (rule 1).",
           "properties": {
             "op": {
+              "not": {
+                "enum": [
+                  "welcome",
+                  "result",
+                  "event",
+                  "error",
+                  "pong"
+                ]
+              },
               "type": "string"
             }
           },
@@ -1375,8 +1451,7 @@
           ],
           "type": "object"
         }
-      ],
-      "description": "Everything a server may send."
+      ]
     },
     "SessionUpdate": {
       "description": "`session.update` payload.",
@@ -1459,7 +1534,8 @@
       "type": "integer"
     },
     "Source": {
-      "anyOf": [
+      "description": "Where an item grant came from (rule 11).",
+      "oneOf": [
         {
           "const": "check",
           "description": "A check of a location.",
@@ -1492,10 +1568,19 @@
         },
         {
           "description": "A source this version does not know; its `from` and `location` are not checked.",
+          "not": {
+            "enum": [
+              "check",
+              "release",
+              "collect",
+              "link",
+              "start",
+              "admin"
+            ]
+          },
           "type": "string"
         }
-      ],
-      "description": "Where an item grant came from (rule 11)."
+      ]
     },
     "StateChanged": {
       "description": "`state.changed` payload, also one entry of a `watch` result.",

@@ -107,6 +107,10 @@ fn game_ids_checksums_and_item_uids_have_their_grammars() {
     assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q").is_ok(), "26 Crockford base32 digits");
     assert!(ItemUid::new("iu_7QK2M4XH").is_err(), "too short for 128 bits");
     assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XI").is_err(), "I is not Crockford");
+    assert!(
+        ItemUid::new("iu_8QK2M4XH7QK2M4XH7QK2M4XH7Q").is_err(),
+        "a 128-bit value starts 0 to 7"
+    );
 }
 
 /// Every string over a small alphabet, up to `len` pieces.
@@ -243,24 +247,29 @@ fn unknown_ops_decode_as_unknown_and_unknown_fields_are_ignored() {
 fn a_result_has_exactly_one_of_ok_and_error_whatever_the_key_order() {
     let e = r#"{"code":1002,"key":"type.unknown","retry":"never"}"#;
     for both in [
-        format!(r#"{{"op":"result","cid":"c","ok":{{}},"error":{e}}}"#),
-        format!(r#"{{"op":"result","cid":"c","error":{e},"ok":{{}}}}"#),
+        format!(r#"{{"op":"result","cid":"c","upto":0,"ok":{{}},"error":{e}}}"#),
+        format!(r#"{{"op":"result","cid":"c","upto":0,"error":{e},"ok":{{}}}}"#),
     ] {
         assert!(one_server(&both).is_err(), "both keys: {both}");
     }
-    assert!(one_server(r#"{"op":"result","cid":"c"}"#).is_err(), "neither key");
-    let ServerFrame::Result(r) = one_server(r#"{"op":"result","cid":"c","ok":null}"#).unwrap()
+    assert!(one_server(r#"{"op":"result","cid":"c","upto":0}"#).is_err(), "neither key");
+    let ServerFrame::Result(r) =
+        one_server(r#"{"op":"result","cid":"c","upto":0,"ok":null}"#).unwrap()
     else {
         panic!("not a result")
     };
     assert_eq!(r.outcome, Outcome::Ok(Value::Null), "ok: null is a value");
-    let ok = ServerFrame::Result(CmdResult::ok(cid("c"), json!({})));
-    assert_eq!(serde_json::to_value(&ok).unwrap(), json!({"op":"result","cid":"c","ok":{}}));
-    let err = ServerFrame::Result(CmdResult::error(cid("c"), ErrorCode::TypeUnknown));
+    let ok = ServerFrame::Result(CmdResult::ok(cid("c"), Seq(4), json!({})));
+    assert_eq!(
+        serde_json::to_value(&ok).unwrap(),
+        json!({"op":"result","cid":"c","upto":4,"ok":{}})
+    );
+    let err = ServerFrame::Result(CmdResult::error(cid("c"), Seq(4), ErrorCode::TypeUnknown));
     assert_eq!(
         serde_json::to_value(&err).unwrap(),
-        json!({"op":"result","cid":"c","error":{"code":1002,"key":"type.unknown","retry":"never","detail":{}}})
+        json!({"op":"result","cid":"c","upto":4,"error":{"code":1002,"key":"type.unknown","retry":"never","detail":{}}})
     );
+    assert!(one_server(r#"{"op":"result","cid":"c","ok":{}}"#).is_err(), "upto is required");
 }
 
 #[test]
@@ -289,11 +298,11 @@ fn clients_ping_with_presence_and_servers_pong() {
 #[test]
 fn values_a_newer_peer_adds_are_tolerated() {
     let r = one_server(
-        r#"{"op":"result","cid":"c","error":{"code":6104,"key":"lobby.stale_ready","retry":"immediate"}}"#,
+        r#"{"op":"result","cid":"c","upto":0,"error":{"code":6104,"key":"lobby.stale_ready","retry":"immediate"}}"#,
     );
     assert!(r.is_ok(), "doc 09's immediate retry decodes");
     let r = one_server(
-        r#"{"op":"result","cid":"c","error":{"code":6999,"key":"x.new","retry":"later"}}"#,
+        r#"{"op":"result","cid":"c","upto":0,"error":{"code":6999,"key":"x.new","retry":"later"}}"#,
     )
     .unwrap();
     let ServerFrame::Result(CmdResult { outcome: Outcome::Error(e), .. }) = r else {
@@ -340,10 +349,7 @@ fn error_bodies_carry_a_ref_and_know_their_code() {
 
 fn answer_key(f: Result<ClientFrame, BadFrame>) -> (Option<String>, String) {
     match f {
-        Err(BadFrame::Answer(r)) => match r.outcome {
-            Outcome::Error(e) => (Some(r.cid.to_string()), e.key),
-            Outcome::Ok(_) => panic!("an answer is an error"),
-        },
+        Err(BadFrame::Answer { cid, error }) => (Some(cid.to_string()), error.key),
         Err(BadFrame::Error(e)) => (None, e.key),
         Ok(f) => panic!("decoded: {f:?}"),
     }
@@ -741,32 +747,32 @@ fn schema_document() -> Value {
     })
 }
 
-/// Catch-all variants (`unknown` ops, `other` values) accept any string in the schema, as
-/// they do in Rust: such a branch loses its `const`, and its `oneOf` becomes `anyOf`, since a
-/// known value then matches two branches.
+/// Catch-all variants (`unknown` ops, `other` values) accept, in the schema as in Rust, any
+/// string that is not one of the known values: the catch-all branch's `const` becomes
+/// `not: {enum: [known values]}`, so the branches stay mutually exclusive (`oneOf`) and a
+/// malformed known frame is not accepted as "unknown".
 fn open_enums(mut defs: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
-    fn catch_all(branch: &mut Value) -> bool {
-        let open = |v: &Value| matches!(v.as_str(), Some("unknown" | "other"));
-        if branch.get("const").is_some_and(open) {
-            branch.as_object_mut().unwrap().remove("const");
-            return true;
-        }
-        if let Some(op) = branch.pointer_mut("/properties/op")
-            && op.get("const").is_some_and(open)
-        {
-            op.as_object_mut().unwrap().remove("const");
-            return true;
-        }
-        false
+    fn tag(branch: &Value) -> Option<&Value> {
+        branch.get("const").or_else(|| branch.pointer("/properties/op/const"))
     }
+    let is_open = |v: &Value| matches!(v.as_str(), Some("unknown" | "other"));
     for def in defs.values_mut() {
-        let Some(obj) = def.as_object_mut() else { continue };
-        let Some(Value::Array(mut branches)) = obj.remove("oneOf") else { continue };
-        let mut open = false;
-        for b in &mut branches {
-            open |= catch_all(b);
+        let Some(Value::Array(branches)) = def.get_mut("oneOf") else { continue };
+        let known: Vec<Value> =
+            branches.iter().filter_map(tag).filter(|v| !is_open(v)).cloned().collect();
+        for b in branches.iter_mut() {
+            if !tag(b).is_some_and(is_open) {
+                continue;
+            }
+            let open = json!({"type": "string", "not": {"enum": known.clone()}});
+            if b.get("const").is_some() {
+                let obj = b.as_object_mut().unwrap();
+                obj.remove("const");
+                obj.insert("not".into(), json!({"enum": known.clone()}));
+            } else if let Some(op) = b.pointer_mut("/properties/op") {
+                *op = open;
+            }
         }
-        obj.insert(if open { "anyOf" } else { "oneOf" }.into(), Value::Array(branches));
     }
     defs
 }
@@ -835,8 +841,10 @@ struct Session {
     eseq: u64,
     applied: u64,
     own_item_seq: u64,
-    granted: BTreeSet<String>,
+    granted: BTreeMap<String, u64>,
     last_ack: u64,
+    paging: bool,
+    paged_max: u64,
     expect_error: Vec<&'static str>,
     pongs: Vec<Option<u64>>,
 }
@@ -937,9 +945,11 @@ impl Session {
             }
             ClientFrame::Ack(a) => {
                 let no_slot = self.caller()?.slot.is_none();
-                if no_slot || a.applied.0 > self.own_item_seq || a.applied.0 < self.last_ack {
+                let delivered = self.own_item_seq.max(self.paged_max);
+                if no_slot || a.applied.0 > delivered {
                     self.expect_error.push("ack.invalid");
                 } else {
+                    // An ack below the stored cursor lowers it: the game reloaded an older save.
                     self.last_ack = a.applied.0;
                 }
                 Ok(())
@@ -1076,6 +1086,12 @@ impl Session {
             return Err("caller.slot and slot.index differ".into());
         }
         let after = h.resume.map_or(0, |r| r.after.0);
+        if h.resume.is_some_and(|r| r.after.0 > 0 && r.epoch.is_none()) {
+            return Err("a resume after 0 needs its epoch".into());
+        }
+        if w.resume.status == ResumeStatus::Ok && w.head.0 < after {
+            return Err("a head below the resume cursor needs new_timeline".into());
+        }
         match (w.resume.status, &w.replay, &w.resume.epoch_change) {
             (ResumeStatus::TooOld, Some(_), _) => return Err("too_old comes with no replay".into()),
             (ResumeStatus::NewTimeline, _, None) => {
@@ -1090,8 +1106,12 @@ impl Session {
             if w.head < r.to {
                 return Err("replay range outside the log".into());
             }
-            if r.from.0 <= after {
-                return Err("replay starts at or before the resume cursor".into());
+            // From after + 1, or earlier: items above the applied cursor (doc 02 D3) or a new
+            // timeline's recovered head (rule 4).
+            if let Some(ec) = &w.resume.epoch_change
+                && r.from.0 != ec.recovered_head.0.saturating_add(1)
+            {
+                return Err("a new timeline replays from recovered_head + 1".into());
             }
             self.replay = Some((r.from.0, r.to.0));
         } else {
@@ -1100,7 +1120,9 @@ impl Session {
         self.enabled = w.exts.keys().map(ToString::to_string).collect();
         self.epoch = w.epoch.0;
         self.head = w.head.0;
-        self.last_seq = if w.replay.is_some() { after } else { after.max(w.head.0) };
+        self.last_seq =
+            w.replay.map_or_else(|| after.max(w.head.0), |r| r.from.0.saturating_sub(1));
+        self.paging = w.resume.status == ResumeStatus::TooOld;
         self.applied = w.applied.0;
         self.own_item_seq = w.applied.0;
         self.last_ack = w.applied.0;
@@ -1118,11 +1140,19 @@ impl Session {
         if let Outcome::Error(e) = &r.outcome {
             registered(e)?;
         }
-        if r.epoch.is_some_and(|e| e.0 != self.epoch) {
+        let repeat = matches!(open.expect, Expect::Same(_));
+        if r.epoch.is_some_and(|e| e.0 > self.epoch || (!repeat && e.0 != self.epoch)) {
             return Err(format!("{c}: result epoch differs from the session's"));
         }
-        if r.upto.is_some_and(|u| u.0 != self.last_seq) {
+        if r.upto.0 != self.last_seq {
             return Err(format!("{c}: upto must be the last seq sent to the session"));
+        }
+        // A retryable refusal (rate, pause, unavailable) may answer any command; it is never
+        // kept for dedupe, so the retry with the same cid gets a fresh answer (rule 3).
+        if let Outcome::Error(e) = &r.outcome
+            && e.retry != Retry::Never
+        {
+            return Ok(());
         }
         match (&open.expect, &r.outcome) {
             (Expect::Err(k), Outcome::Error(e)) if e.key == *k => {}
@@ -1139,6 +1169,7 @@ impl Session {
                 if ok.path != *p {
                     return Err(format!("{c}: get answered for another path"));
                 }
+                self.inventory_page(p, &ok)?;
             }
             (Expect::Watch(ps), Outcome::Ok(v)) => {
                 let ok: WatchOk = serde_json::from_value(v.clone())
@@ -1177,7 +1208,7 @@ impl Session {
                     .map_err(|e| format!("{c}: check result: {e}"))?;
                 let own = self.caller()?.slot;
                 for item in ok.items.iter().filter(|i| Some(i.to) == own) {
-                    if !self.granted.contains(item.item_uid.as_str()) {
+                    if !self.granted.contains_key(item.item_uid.as_str()) {
                         return Err(format!(
                             "{c}: result came before its events ({})",
                             item.item_uid
@@ -1282,14 +1313,52 @@ impl Session {
         if !wanted {
             return Err(format!("an item the session did not want (source {:?})", g.source));
         }
+        self.deliver(g)?;
         let n = g.item_seq.0;
-        if n > self.applied {
+        let filtered = !(want.own && want.from_others && want.starting);
+        if self.paging || filtered {
+            // Live grants may run ahead of an open inventory read, and filtered grants leave
+            // gaps (rule 7): no continuity check, only the high-water mark.
+            self.paged_max = self.paged_max.max(n);
+        } else if n > self.applied {
             if n != self.own_item_seq.saturating_add(1) {
                 return Err(format!("item_seq {n} after {}", self.own_item_seq));
             }
             self.own_item_seq = n;
         }
-        self.granted.insert(g.item_uid.to_string());
+        Ok(())
+    }
+
+    /// Records a grant by `item_uid`; the same uid never comes with another `item_seq`.
+    fn deliver(&mut self, g: &ItemGrant) -> Result<(), String> {
+        let uid = g.item_uid.to_string();
+        match self.granted.insert(uid.clone(), g.item_seq.0) {
+            Some(prev) if prev != g.item_seq.0 => {
+                Err(format!("{uid} came with item_seq {prev} and {}", g.item_seq.0))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// An inventory page counts as delivery (rule 10); the last page ends a `too_old` read.
+    fn inventory_page(&mut self, path: &StatePath, ok: &GetOk) -> Result<(), String> {
+        let own = self.caller()?.slot;
+        let Ok(CorePath::Slot(n, SlotPart::Inventory)) = CorePath::parse(path) else {
+            return Ok(());
+        };
+        if Some(n) != own {
+            return Ok(());
+        }
+        let items: Vec<ItemGrant> = serde_json::from_value(ok.value.clone())
+            .map_err(|e| format!("an inventory page holds item.grant data: {e}"))?;
+        for g in &items {
+            self.deliver(g)?;
+            self.paged_max = self.paged_max.max(g.item_seq.0);
+        }
+        if ok.next.is_none() {
+            self.paging = false;
+            self.own_item_seq = self.own_item_seq.max(self.paged_max);
+        }
         Ok(())
     }
 
@@ -1351,6 +1420,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("resume-get-watch", include_str!("../../golden/resume-get-watch.jsonl")),
     ("refusals", include_str!("../../golden/refusals.jsonl")),
     ("spectator", include_str!("../../golden/spectator.jsonl")),
+    ("too-old", include_str!("../../golden/too-old.jsonl")),
 ];
 
 #[test]
@@ -1363,7 +1433,7 @@ fn golden_transcripts_parse_round_trip_and_keep_the_protocol_rules() {
 }
 
 const U1: &str = "iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q";
-const U2: &str = "iu_C9R1T0WBC9R1T0WBC9R1T0WBC9";
+const U2: &str = "iu_4C9R1T0WBC9R1T0WBC9R1T0WBC";
 
 /// Sets or (with `null`) removes the top-level keys of `patch` in `base`.
 fn patched(mut base: Value, patch: &Value) -> Value {
@@ -1420,15 +1490,20 @@ fn cmd(cid: &str, ty: &str, data: &Value) -> String {
 }
 
 fn ok(cid: &str, extra: &Value, v: &Value) -> String {
-    s2c(&patched(json!({"op":"result","cid":cid,"ok":v}), extra))
+    s2c(&patched(json!({"op":"result","cid":cid,"upto":1,"ok":v}), extra))
 }
 
 fn err(cid: &str, code: u16, key: &str) -> String {
-    s2c(&json!({"op":"result","cid":cid,"error":{"code":code,"key":key,"retry":"never"}}))
+    s2c(&json!({"op":"result","cid":cid,"upto":1,"error":{"code":code,"key":key,"retry":"never"}}))
 }
 
 fn relay(eseq: u64, slot: u32) -> String {
     s2c(&json!({"op":"event","eseq":eseq,"type":"org.cwp.deathlink/death","slot":slot,"data":{}}))
+}
+
+/// One inventory entry: the `data` of an `item.grant`.
+fn inv(item_seq: u64, uid: &str) -> Value {
+    json!({"source":"check","from":2,"location":9,"item":3,"item_seq":item_seq,"item_uid":uid,"flags":[]})
 }
 
 fn sent(uid: &str) -> Value {
@@ -1542,7 +1617,11 @@ fn wrong_transcripts() -> Vec<(&'static str, String, &'static str)> {
         ("seq going back", vec![grant(2, 1, U1, 1), grant(1, 2, U2, 1)], "seq must increase"),
         (
             "seq at the resume cursor",
-            vec![hello(&json!({"resume":{"after":5}})), welcome(&none), grant(5, 1, U1, 1)],
+            vec![
+                hello(&json!({"resume":{"after":5,"epoch":1}})),
+                welcome(&json!({"head":5})),
+                grant(5, 1, U1, 1),
+            ],
             "seq must increase",
         ),
         (
@@ -1555,7 +1634,7 @@ fn wrong_transcripts() -> Vec<(&'static str, String, &'static str)> {
             vec![
                 hello(&none),
                 welcome(&json!({"head":7,"replay":{"from":5,"to":7}})),
-                grant(3, 1, U1, 1),
+                grant(8, 1, U1, 1),
             ],
             "outside the replay",
         ),
@@ -1717,6 +1796,46 @@ fn wrong_transcripts() -> Vec<(&'static str, String, &'static str)> {
             ],
             "expected error path.forbidden",
         ),
+        (
+            "resume without its epoch",
+            vec![hello(&json!({"resume":{"after":5}})), welcome(&json!({"head":5}))],
+            "needs its epoch",
+        ),
+        (
+            "head below the cursor called ok",
+            vec![hello(&json!({"resume":{"after":5,"epoch":1}})), welcome(&json!({"head":3}))],
+            "needs new_timeline",
+        ),
+        (
+            "new timeline replayed from the old cursor",
+            vec![
+                hello(&json!({"resume":{"after":5,"epoch":1}})),
+                welcome(
+                    &json!({"epoch":2,"head":6,"replay":{"from":6,"to":6},"resume":{"status":"new_timeline","epoch_change":{"from":1,"to":2,"recovered_head":3}}}),
+                ),
+            ],
+            "recovered_head + 1",
+        ),
+        (
+            "one uid with two item_seqs",
+            vec![grant(2, 1, U1, 1), grant(3, 2, U1, 1)],
+            "came with item_seq",
+        ),
+        (
+            "ack beyond the inventory",
+            vec![
+                hello(&json!({"resume":{"after":2,"epoch":1}})),
+                welcome(&json!({"head":9,"resume":{"status":"too_old"}})),
+                c2s(&json!({"op":"get","cid":"inv","path":"slot/1/inventory"})),
+                ok(
+                    "inv",
+                    &json!({"upto":9}),
+                    &json!({"path":"slot/1/inventory","value":[inv(1, U1)],"ver":9}),
+                ),
+                c2s(&json!({"op":"ack","applied":2})),
+            ],
+            "ack.invalid",
+        ),
     ];
     rows.into_iter()
         .map(|(name, lines, why)| {
@@ -1744,6 +1863,7 @@ fn every_wrong_transcript_is_caught_with_its_reason() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one row per edge case")]
 fn correct_edge_cases_pass_the_checker() {
     let none = json!({});
     let cases = [
@@ -1786,10 +1906,69 @@ fn correct_edge_cases_pass_the_checker() {
         (
             "a replayed item at or below applied",
             vec![
-                hello(&json!({"resume":{"after":1}})),
+                hello(&json!({"resume":{"after":1,"epoch":1}})),
                 welcome(&json!({"head":3,"applied":2,"replay":{"from":2,"to":3}})),
                 grant(2, 2, U1, 1),
                 grant(3, 3, U2, 1),
+            ],
+        ),
+        (
+            "a retryable refusal, then the retry succeeds",
+            vec![
+                hello(&none),
+                welcome(&none),
+                cmd("loc5", "check", &json!({"location":5})),
+                s2c(
+                    &json!({"op":"result","cid":"loc5","upto":1,"error":{"code":4001,"key":"rate.limited","retry":"after","after_ms":500}}),
+                ),
+                cmd("loc5", "check", &json!({"location":5})),
+                grant(2, 1, U1, 1),
+                ok("loc5", &json!({"seq":2,"epoch":1,"upto":2}), &sent(U1)),
+            ],
+        ),
+        (
+            "too_old, an inventory page, then its ack",
+            vec![
+                hello(&json!({"resume":{"after":2,"epoch":1}})),
+                welcome(&json!({"head":9,"resume":{"status":"too_old"}})),
+                c2s(&json!({"op":"get","cid":"inv","path":"slot/1/inventory"})),
+                ok(
+                    "inv",
+                    &json!({"upto":9}),
+                    &json!({"path":"slot/1/inventory","value":[inv(1, U1)],"ver":9}),
+                ),
+                c2s(&json!({"op":"ack","applied":1})),
+            ],
+        ),
+        (
+            "a new timeline replays from its recovered head",
+            vec![
+                hello(&json!({"resume":{"after":5,"epoch":1}})),
+                welcome(
+                    &json!({"epoch":2,"head":6,"replay":{"from":4,"to":6},"resume":{"status":"new_timeline","epoch_change":{"from":1,"to":2,"recovered_head":3}}}),
+                ),
+                s2c(
+                    &json!({"op":"event","seq":4,"type":"room.epoch_change","data":{"from":1,"to":2,"recovered_head":3}}),
+                ),
+                grant(6, 1, U1, 1),
+            ],
+        ),
+        (
+            "an ack below the stored cursor (an older save)",
+            vec![
+                hello(&none),
+                welcome(&json!({"applied":3})),
+                c2s(&json!({"op":"ack","applied":2})),
+            ],
+        ),
+        (
+            "filtered items leave gaps",
+            vec![
+                hello(&json!({"want":{"items":{"own":false}}})),
+                welcome(&none),
+                s2c(
+                    &json!({"op":"event","seq":2,"type":"item.grant","slot":1,"data":{"source":"check","from":2,"location":5,"item":7,"item_seq":2,"item_uid":U1,"flags":[]}}),
+                ),
             ],
         ),
     ];

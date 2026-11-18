@@ -557,10 +557,10 @@ pub struct CmdResult {
     /// Epoch of that commit.
     #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_u")]
     pub epoch: Option<Epoch>,
-    /// The last durable `seq` sent to this session when the result was produced; over HTTP
-    /// the client applies the result once its stream has reached it (rule 4).
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_u")]
-    pub upto: Option<Seq>,
+    /// The last durable `seq` sent to this session when the result was produced (required);
+    /// over HTTP the client applies the result once its stream has reached it (rule 4).
+    #[serde(serialize_with = "ser_u")]
+    pub upto: Seq,
     /// Success or failure.
     #[serde(flatten)]
     pub outcome: Outcome,
@@ -585,8 +585,8 @@ struct RawResult {
     seq: Option<Seq>,
     #[serde(default, deserialize_with = "de_opt_u")]
     epoch: Option<Epoch>,
-    #[serde(default, deserialize_with = "de_opt_u")]
-    upto: Option<Seq>,
+    #[serde(deserialize_with = "de_u")]
+    upto: Seq,
     #[serde(default, deserialize_with = "present")]
     ok: Option<Value>,
     #[serde(default)]
@@ -607,16 +607,16 @@ impl<'de> Deserialize<'de> for CmdResult {
 }
 
 impl CmdResult {
-    /// A success with no commit.
+    /// A success with no commit; `upto` is the last durable `seq` sent to the session.
     #[must_use]
-    pub const fn ok(cid: CmdId, value: Value) -> Self {
-        Self { cid, seq: None, epoch: None, upto: None, outcome: Outcome::Ok(value) }
+    pub const fn ok(cid: CmdId, upto: Seq, value: Value) -> Self {
+        Self { cid, seq: None, epoch: None, upto, outcome: Outcome::Ok(value) }
     }
 
-    /// A refusal.
+    /// A refusal; `upto` is the last durable `seq` sent to the session.
     #[must_use]
-    pub fn error(cid: CmdId, e: impl Into<ErrorBody>) -> Self {
-        Self { cid, seq: None, epoch: None, upto: None, outcome: Outcome::Error(e.into()) }
+    pub fn error(cid: CmdId, upto: Seq, e: impl Into<ErrorBody>) -> Self {
+        Self { cid, seq: None, epoch: None, upto, outcome: Outcome::Error(e.into()) }
     }
 }
 

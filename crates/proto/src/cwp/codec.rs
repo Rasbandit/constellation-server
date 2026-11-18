@@ -1,7 +1,7 @@
 //! Reading transport messages (doc 01 D1.10 rules 1 and 3). A message is one frame or a JSON
 //! array of frames. A frame that does not decode still gets its answer: when its `cid` is
 //! readable the server answers with a `result` for it, otherwise with an `error` frame.
-use super::frame::{ClientFrame, CmdResult, ErrorBody, ServerFrame};
+use super::frame::{ClientFrame, ErrorBody, ServerFrame};
 use super::names::{CmdId, StatePath, TypeName};
 use super::serde_util::in_range;
 use crate::ErrorCode;
@@ -13,8 +13,14 @@ use serde_json::{Value, json};
 /// frame's `ref` names the frame it answers: its `cid` when it had a readable one, else its `op`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadFrame {
-    /// The `cid` was readable: answer with this `result`.
-    Answer(Box<CmdResult>),
+    /// The `cid` was readable: answer it with a `result` carrying this error (the server adds
+    /// `upto`, which only it knows).
+    Answer {
+        /// The frame's `cid`.
+        cid: CmdId,
+        /// The error to answer with.
+        error: Box<ErrorBody>,
+    },
     /// No usable `cid`: answer with this `error` frame.
     Error(Box<ErrorBody>),
 }
@@ -44,7 +50,7 @@ fn answer(raw: &Value, code: ErrorCode, reason: &str) -> BadFrame {
     let cid = raw.get("cid").and_then(Value::as_str).and_then(|c| CmdId::new(c).ok());
     match (op, cid) {
         (Some(op), Some(cid)) if ANSWERED.contains(&op) => {
-            BadFrame::Answer(Box::new(CmdResult::error(cid, body)))
+            BadFrame::Answer { cid, error: Box::new(body) }
         }
         (_, Some(cid)) => BadFrame::Error(Box::new(body.with_ref(cid.as_str()))),
         (Some(op), None) => BadFrame::Error(Box::new(body.with_ref(op))),

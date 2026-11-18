@@ -3,10 +3,10 @@
 {"dir":"s2c","frame":{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":104}}}
 {"dir":"s2c","frame":{"op":"event","seq":7,"type":"slot.goal","slot":1,"data":{}}}
 {"dir":"c2s","frame":{"op":"cmd","cid":"c-1","type":"check","data":{"location":1}}}
-{"dir":"s2c","frame":{"op":"result","cid":"c-1","error":{"code":2021,"key":"auth.scope_insufficient","retry":"never"}}}
+{"dir":"s2c","frame":{"op":"result","cid":"c-1","upto":7,"error":{"code":2021,"key":"auth.scope_insufficient","retry":"never"}}}
 {"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"room/slots"}}
-{"dir":"s2c","frame":{"op":"result","cid":"g-1","ok":{"path":"room/slots","value":[{"index":1,"name":"Rowan","game":"dev.example.mosscave"}],"ver":0}}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-1","upto":7,"ok":{"path":"room/slots","value":[{"index":1,"name":"Rowan","game":"dev.example.mosscave"}],"ver":0}}}
 {"dir":"c2s","frame":{"op":"get","cid":"g-2","path":"slot/1/inventory"}}
-{"dir":"s2c","frame":{"op":"result","cid":"g-2","error":{"code":2022,"key":"path.forbidden","retry":"never"}}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-2","upto":7,"error":{"code":2022,"key":"path.forbidden","retry":"never"}}}
 {"dir":"c2s","frame":{"op":"ack","applied":1}}
 {"dir":"s2c","frame":{"op":"error","code":3051,"key":"ack.invalid","retry":"never","ref":"ack"}}
