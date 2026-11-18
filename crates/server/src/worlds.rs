@@ -41,6 +41,8 @@ pub(crate) struct Worlds {
     limits: Limits,
     /// One generation at a time.
     one_gen: Semaphore,
+    /// Room view streams open at once (`view_streams`).
+    view_streams: Arc<Semaphore>,
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
     /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
@@ -115,6 +117,7 @@ pub(crate) fn open(
         sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Semaphore::new(1),
+        view_streams: Arc::new(Semaphore::new(limits.view_streams)),
         seq: AtomicU64::new(0),
         rooms: None,
     })
@@ -536,20 +539,27 @@ fn no_room() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "this world does not run as a room on this server".to_owned())
 }
 
+/// The room is listed but could not answer now (it failed to load, or stopped): try again.
+fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) {
+    tracing::warn!(%why, "room view unavailable");
+    (StatusCode::SERVICE_UNAVAILABLE, "the room is not available right now; try again".to_owned())
+}
+
 /// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
 /// cold room is loaded to answer, as a connection would load it.
 async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
     let status = read_status(&w, &id)?;
     let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;
-    let (room, _visit) = folder.enter(key.clone()).await.map_err(|_| no_room())?;
-    let mut summary = room.summary().await.map_err(|_| no_room())?;
+    let (room, _visit) = folder.enter(key.clone()).await.map_err(unavailable)?;
+    let mut summary = room.summary().await.map_err(|e| unavailable(format!("{e:?}")))?;
     summary["room_key"] = json!(key.as_str());
     summary["address"] = json!(address);
     Ok(json_reply(StatusCode::OK, &summary))
 }
 
-/// The world's room events as server-sent events, resuming after `Last-Event-ID`. The stream
-/// counts as a visit, so the room stays in memory while someone watches it.
+/// The world's room events as server-sent events, resuming after `Last-Event-ID`
+/// ([`crate::room_view::events`]). The stream counts as a visit, so the room stays in memory
+/// while someone watches it; at most `view_streams` are open at once.
 async fn room_events(
     State(w): State<Arc<Worlds>>,
     UrlPath(id): UrlPath<String>,
@@ -557,12 +567,18 @@ async fn room_events(
 ) -> Reply {
     let status = read_status(&w, &id)?;
     let (folder, key, _) = hosted(&w, &status).ok_or_else(no_room)?;
-    let (room, visit) = folder.enter(key).await.map_err(|_| no_room())?;
+    let permit = Arc::clone(&w.view_streams).try_acquire_owned().map_err(|_| {
+        (StatusCode::SERVICE_UNAVAILABLE, "too many room views are open; try again".to_owned())
+    })?;
+    let (room, visit) = folder.enter(key).await.map_err(unavailable)?;
     let after = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .map_or(proto::Seq(0), proto::Seq);
-    crate::room_view::events(room, visit, after).await.map_err(|_| no_room())
+    let held = crate::room_view::Held { _visit: visit, _permit: permit };
+    crate::room_view::events(room, held, after, w.limits.view_history_events)
+        .await
+        .map_err(|e| unavailable(format!("{e:?}")))
 }
 
 /// A job a previous process left queued or running will never finish: mark it failed.

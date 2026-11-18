@@ -77,6 +77,12 @@ pub struct Limits {
     pub rate_table_max_keys: usize,
     /// Open WebSocket connections per process; more get HTTP 503 (`CONSTELLATION_MAX_CONNECTIONS`).
     pub max_connections: usize,
+    /// Durable events a host's room view stream replays at most when it opens or resumes; an
+    /// older start gets the newest ones and a reset (the web UI keeps 400 lines).
+    pub view_history_events: u64,
+    /// Room view streams (admin API, server-sent events) open at once per process; more get
+    /// HTTP 503.
+    pub view_streams: usize,
     /// A socket that has not connected to a slot within this long is closed
     /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
     pub connect_timeout_ms: u64,
@@ -202,6 +208,8 @@ impl Limits {
         connect_refill_milli_per_sec: 1000,
         rate_table_max_keys: 100_000,
         max_connections: 10_000,
+        view_history_events: 400,
+        view_streams: 64,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
@@ -676,6 +684,7 @@ mod tests {
     fn connection_limits_are_design_values_and_the_ping_beats_the_idle_timeout() {
         let l = Limits::DESIGN;
         assert_eq!(l.max_connections, 10_000);
+        assert_eq!((l.view_history_events, l.view_streams), (400, 64), "the room view caps");
         assert_eq!(
             (l.connect_timeout_ms, l.idle_timeout_ms, l.ping_interval_ms),
             (30_000, 60_000, 20_000)

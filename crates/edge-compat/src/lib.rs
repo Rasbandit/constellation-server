@@ -12,6 +12,7 @@ mod session;
 mod socket;
 mod storage;
 mod view;
+pub use view::view_start;
 pub mod wire;
 
 use config::Limits;

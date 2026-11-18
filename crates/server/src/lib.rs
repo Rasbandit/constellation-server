@@ -854,18 +854,7 @@ mod tests {
     #[test]
     fn the_admin_api_is_off_without_a_data_dir_and_refused_without_its_token() {
         let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
-        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
-        let g = || {
-            Some(Generation {
-                ap_dir: root.join("ap"),
-                python: "/usr/bin/python3".into(),
-                sidecar: root.join("tools/ap-gen/ap_gen.py"),
-                private: vec![],
-            })
-        };
+        let g = || Some(fake_generation(&root));
         assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
         assert!(worlds_api(None, Some("t"), g(), Limits::DESIGN).unwrap().is_none());
         let dir = root.join("data");
@@ -878,6 +867,62 @@ mod tests {
         assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
         assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
         assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
+    }
+
+    /// A fake Archipelago checkout and sidecar path under `root`: enough for the sandbox to
+    /// accept the settings (nothing here is run).
+    fn fake_generation(root: &std::path::Path) -> Generation {
+        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
+        Generation {
+            ap_dir: root.join("ap"),
+            python: "/usr/bin/python3".into(),
+            sidecar: root.join("tools/ap-gen/ap_gen.py"),
+            private: vec![],
+        }
+    }
+
+    /// The status code of one HTTP/1.1 GET to `addr`.
+    async fn status_of(addr: SocketAddr, path: &str, token: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let head =
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut first = [0_u8; 12];
+        s.read_exact(&mut first).await.unwrap();
+        String::from_utf8_lossy(&first[9..12]).parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_room_view_routes_need_the_admin_token() {
+        let root = std::env::temp_dir().join(format!("server-view-auth-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        let (_, host) =
+            app(&Source::Rooms(root.join("rooms")), None, None, Limits::DESIGN).await.unwrap();
+        let worlds = worlds_api(
+            Some(&root.join("data")),
+            Some("s3cret"),
+            Some(fake_generation(&root)),
+            Limits::DESIGN,
+        )
+        .unwrap()
+        .unwrap();
+        let api = worlds.router(host.folder().map(|f| (f, "localhost:1".to_owned())));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, api).await });
+        let id = "a".repeat(64);
+        for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
+            assert_eq!(status_of(addr, &path, None).await, 401, "{path} without the token");
+            assert_eq!(status_of(addr, &path, Some("wrong")).await, 401, "{path}, wrong token");
+            assert_eq!(status_of(addr, &path, Some("s3cret")).await, 404, "{path}: no such world");
+        }
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]

@@ -10,6 +10,23 @@ use runtime::{Published, RoomError, Subscription};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+/// Where a view that last saw `after` starts in a room whose log ends at `head`, keeping at most
+/// `cap` events of history, and whether it must reset (drop what it showed). A cursor past the
+/// head means the room restarted from an empty log (an in-memory store); one more than `cap`
+/// behind means the viewer would miss events. A new view (`after` 0) gets the newest `cap`
+/// events without a reset.
+#[must_use]
+pub fn view_start(after: Seq, head: Seq, cap: u64) -> (Seq, bool) {
+    let floor = Seq(head.0.saturating_sub(cap));
+    if after > head {
+        (floor, true)
+    } else if after < floor {
+        (floor, after.0 > 0)
+    } else {
+        (after, false)
+    }
+}
+
 /// Item and location names of one game, by id.
 #[derive(Debug, Default)]
 pub(crate) struct Names {
@@ -92,12 +109,20 @@ impl CompatRoom {
         Ok(json!({"seed": self.bundle.seed_name, "options": options, "slots": slots}))
     }
 
-    /// The room's durable events after `after`, then everything it publishes live.
+    /// A host's view of the room's stream: the durable events from where [`view_start`] puts
+    /// `after` (at most `cap` of them), then everything the room publishes live. Also returns
+    /// that start and whether the viewer must drop what it showed (`reset`).
     ///
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.
-    pub async fn watch(&self, after: Seq) -> Result<Subscription, RoomError> {
-        self.room.subscribe(after).await
+    pub async fn watch(
+        &self,
+        after: Seq,
+        cap: u64,
+    ) -> Result<(Subscription, Seq, bool), RoomError> {
+        let head = self.room.read(|s| s.durable()).await?;
+        let (start, reset) = view_start(after, head, cap);
+        Ok((self.room.subscribe(start).await?, start, reset))
     }
 
     /// What a host sees of one durable event; `None` for events with nothing to show (data
