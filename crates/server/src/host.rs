@@ -67,6 +67,24 @@ const DAY_SECS: u64 = 24 * 60 * 60;
 /// A file's length and modification time: a scan rereads a file only when they change.
 type Seen = (u64, Option<SystemTime>);
 
+/// Why a bundle was not listed.
+#[derive(Debug)]
+pub(crate) enum Skip {
+    /// Not until the file changes: an invalid bundle, a room made from another bundle, or a
+    /// finished room.
+    Final(String),
+    /// Maybe on a later scan: the database failed, or the room cap is reached.
+    Later(String),
+}
+
+impl From<Skip> for String {
+    fn from(skip: Skip) -> Self {
+        match skip {
+            Skip::Final(why) | Skip::Later(why) => why,
+        }
+    }
+}
+
 /// A request to load a cold room, answered once it is in memory.
 struct Wake {
     key: RoomKey,
@@ -102,8 +120,9 @@ pub struct Host {
     runs: u64,
     /// For each listed room, the time of last use the database holds (`rooms.last_active`).
     recorded: BTreeMap<RoomKey, Moment>,
-    /// Every bundle file as the last scan saw it, whatever came of it.
-    seen: BTreeMap<PathBuf, Seen>,
+    /// Every bundle file as the last scan saw it, and whether that was final (listed, or
+    /// [`Skip::Final`]); a file skipped with [`Skip::Later`] is tried again.
+    seen: BTreeMap<PathBuf, (Seen, bool)>,
     // Unbounded, but every request holds a connection permit (`max_connections`).
     wakes: mpsc::UnboundedReceiver<Wake>,
 }
@@ -212,26 +231,31 @@ impl Host {
 
     /// Add a room to the directory (cold) from its bundle and return its key. A seed that is
     /// already listed returns its key unchanged.
-    pub(crate) async fn import(&mut self, loaded: Loaded) -> Result<RoomKey, String> {
+    pub(crate) async fn import(&mut self, loaded: Loaded) -> Result<RoomKey, Skip> {
         let id = crate::room_id(&loaded.bundle.seed_name);
         if let Some(key) = read(&self.rooms).key_of(id) {
             return Ok(key.clone());
         }
         if self.len() >= self.limits.max_rooms {
-            return Err(format!("the server lists {} rooms, its most", self.limits.max_rooms));
+            let why = format!("the server lists {} rooms, its most", self.limits.max_rooms);
+            return Err(Skip::Later(why));
         }
         let seed = loaded.bundle.seed_name.clone();
         let (key, idle) = match &mut self.store {
-            Store::Pg(store) => open_with_key(store, id, &loaded).await?,
+            Store::Pg(store) => {
+                open_with_key(store, id, &loaded, self.limits, RoomKey::random).await?
+            }
             Store::Mem { bundles, finished, .. } => {
                 if finished.contains(&id) {
-                    return Err(format!("room {seed:?} has finished; it is not served again"));
+                    let why = format!("room {seed:?} has finished; it is not served again");
+                    return Err(Skip::Final(why));
                 }
+                let key = RoomKey::random().map_err(Skip::Later)?;
                 bundles.insert(id, loaded.text);
-                (RoomKey::random()?, 0)
+                (key, 0)
             }
         };
-        self.list(key.clone(), id, seed, Duration::from_secs(idle))?;
+        self.list(key.clone(), id, seed, Duration::from_secs(idle)).map_err(Skip::Later)?;
         Ok(key)
     }
 
@@ -465,7 +489,9 @@ impl Host {
     }
 
     /// List a room for each bundle in the folder that is new or changed since the last scan.
-    /// A file that does not make a room is skipped with a warning until it changes.
+    /// A file that does not make a room is skipped with a warning: until it changes for a
+    /// [`Skip::Final`] reason, and tried again quietly on every scan for a [`Skip::Later`] one
+    /// (while the server is at its room cap, only once it is not).
     pub(crate) async fn scan(&mut self) {
         let Some(folder) = self.folder.clone() else { return };
         let files = match bundle_files(&folder) {
@@ -477,16 +503,29 @@ impl Host {
         };
         self.seen.retain(|path, _| files.iter().any(|(p, _)| p == path));
         for (path, seen) in files {
-            if self.seen.get(&path) == Some(&seen) {
-                continue;
-            }
-            self.seen.insert(path.clone(), seen);
+            let retry = match self.seen.get(&path) {
+                Some(&(was, settled)) if was == seen => {
+                    if settled || self.len() >= self.limits.max_rooms {
+                        continue;
+                    }
+                    true
+                }
+                _ => false,
+            };
             let listed = match load_bundle(&path, &self.limits) {
                 Ok(loaded) => self.import(loaded).await.map(drop),
-                Err(e) => Err(e),
+                Err(e) => Err(Skip::Final(e)),
             };
-            if let Err(why) = listed {
-                tracing::warn!(file = %path.display(), "skipped: {why}");
+            self.seen.insert(path.clone(), (seen, !matches!(listed, Err(Skip::Later(_)))));
+            match listed {
+                Ok(()) => {}
+                Err(Skip::Later(why)) if retry => {
+                    tracing::debug!(file = %path.display(), "still skipped: {why}");
+                }
+                Err(Skip::Later(why)) => {
+                    tracing::warn!(file = %path.display(), "skipped for now, tried again: {why}");
+                }
+                Err(Skip::Final(why)) => tracing::warn!(file = %path.display(), "skipped: {why}"),
             }
         }
     }
@@ -625,6 +664,24 @@ mod tests {
         assert_eq!(key_of(&host, "alpha"), alpha, "a listed room keeps its key");
         host.scan().await;
         assert_eq!(host.len(), 2);
+    }
+
+    /// Review of #55, M1: a bundle skipped for a reason that goes away on its own (the room
+    /// cap here, a database failure in production) is tried again on the next scan.
+    #[tokio::test]
+    async fn a_bundle_skipped_at_the_cap_is_listed_once_a_room_ends() {
+        let dir = TempDir::new("cap-retry");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let mut host = host(&dir, Limits { max_rooms: 1, ..Limits::DESIGN }).await;
+        assert_eq!(seeds(&host), ["alpha"]);
+        host.scan().await;
+        assert_eq!(seeds(&host), ["alpha"], "still at the cap");
+        host.limits.room_abandon_secs = 0;
+        host.end_abandoned().await;
+        assert!(host.is_empty());
+        host.scan().await;
+        assert_eq!(seeds(&host), ["beta"]);
     }
 
     #[tokio::test]

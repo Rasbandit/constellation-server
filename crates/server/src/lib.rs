@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use config::{Generation, Limits, Secrets};
 use edge_compat::CompatRoom;
-use host::Host;
+use host::{Host, Skip};
 use log::{LogStore, OpenError, PgLogStore};
 use proto::{Epoch, RoomId, Seq};
 use room_core::RoomState;
@@ -290,10 +290,6 @@ fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<
     Ok(Prepared { id, fresh, room: Room { seed, compat, live }, mailbox })
 }
 
-/// Draws of a new room key before giving up; each draw collides with an existing key only
-/// with odds of about one in 2^50 per stored room.
-const KEY_DRAWS: usize = 3;
-
 /// List the rooms of `source` and build the router.
 ///
 /// Also returns the [`Host`], which loads rooms on their first connect, unloads idle ones,
@@ -348,35 +344,38 @@ pub async fn app(
     Ok((router, host))
 }
 
-/// Record the room in Postgres and return its key: the stored one, or a new random one for a
-/// new room (drawn again when it collides with another room's).
+/// Record the room in Postgres and return its key and how long it has been idle: the stored
+/// key, or a new one from `draw` for a new room (drawn again, up to `room_key_draws` times,
+/// when it collides with another room's).
 async fn open_with_key(
     store: &PgLogStore,
     id: RoomId,
     loaded: &Loaded,
-) -> Result<(RoomKey, u64), String> {
-    let mut last = String::new();
+    limits: Limits,
+    mut draw: impl FnMut() -> Result<RoomKey, String>,
+) -> Result<(RoomKey, u64), Skip> {
+    let mut last = Skip::Later("no room key drawn".to_owned());
     let (seed, format) = (&loaded.bundle.seed_name, loaded.bundle.format);
-    for _ in 0..KEY_DRAWS {
-        let new_key = RoomKey::random()?;
+    for _ in 0..limits.room_key_draws {
+        let new_key = draw().map_err(Skip::Later)?;
         let text = loaded.text.as_bytes();
         match store.open_room(id, seed, format, &loaded.hash, new_key.as_str(), text).await {
             Ok(o) => {
-                let key = RoomKey::parse(&o.key).map_err(|e| format!("stored {e}"))?;
+                let key = RoomKey::parse(&o.key).map_err(|e| Skip::Final(format!("stored {e}")))?;
                 return Ok((key, o.idle_secs));
             }
             Err(OpenError::Finished { reason }) => {
-                return Err(format!(
+                return Err(Skip::Final(format!(
                     "room {seed:?} has finished ({reason}); it is not served again"
-                ));
+                )));
             }
             Err(OpenError::OtherBundle) => {
-                return Err(format!(
+                return Err(Skip::Final(format!(
                     "the database holds room {seed:?} made from a different bundle with this seed \
                      name; refusing to start"
-                ));
+                )));
             }
-            Err(OpenError::Store(e)) => last = format!("postgres: {e:?}"),
+            Err(OpenError::Store(e)) => last = Skip::Later(format!("postgres: {e:?}")),
         }
     }
     Err(last)
