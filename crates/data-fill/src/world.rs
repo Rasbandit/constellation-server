@@ -57,6 +57,17 @@ struct Memo {
     rules: HashMap<u32, (bool, u32)>,
     depth: u32,
     peak: u32,
+    /// The goal is being checked: the one rule that may read regions (`reach`).
+    goal: bool,
+}
+
+/// What a rule reads, through the defs it references: items and counters as sorted sets, and
+/// whether it reads time.
+#[derive(Debug, Clone, Default)]
+struct Reads {
+    items: Vec<u16>,
+    counters: Vec<u16>,
+    time: bool,
 }
 
 impl Memo {
@@ -353,16 +364,6 @@ impl World {
         w.check_groups()?;
         w.hot.starts = (0..w.region_starts.len).map(|k| w.at(w.region_starts, k)).collect();
         let mut memo = w.check()?;
-        let mut seen = vec![0u8; w.counts[DEFS]];
-        let mut dt = BitSet::new(w.counts[DEFS]);
-        let mut reads = (BitSet::new(w.counts[ITEMS]), BitSet::new(w.counts[COUNTERS]));
-        for d in 0..w.counts[DEFS] {
-            if w.def_time(d, &mut memo, &mut seen, &mut reads) {
-                dt.insert(d);
-            }
-        }
-        w.hot.def_time = dt;
-        (w.hot.def_items, w.hot.def_counters) = reads;
         w.hot.item_sites = w.csr(w.item_sites);
         w.hot.counter_sites = w.csr(w.counter_sites);
         let mut td = BitSet::new(w.counts[SITES]);
@@ -371,6 +372,7 @@ impl World {
             td.insert(s);
         });
         w.hot.time_dep = td;
+        w.check_index(&mut memo)?;
         for k in [ITEMS, LOCS, N_REGIONS] {
             let mut v: Vec<u16> = (0..u16::try_from(w.names[k].spans.len()).unwrap_or(0)).collect();
             let bytes = if k == N_REGIONS { &w.rules } else { &w.game };
@@ -445,7 +447,8 @@ impl World {
     /// Every layout rule a solve relies on (`docs/world-rules-section.md`, rules for writers).
     fn check(&mut self) -> R<Memo> {
         let c = self.counts;
-        let mut memo = Memo { defs: vec![0; c[DEFS]], rules: HashMap::new(), depth: 0, peak: 0 };
+        let mut memo =
+            Memo { defs: vec![0; c[DEFS]], rules: HashMap::new(), depth: 0, peak: 0, goal: false };
         let starts = self.region_starts;
         if starts.len != GROUPS * c[REGIONS] + 1
             || self.at(starts, 0) != 0
@@ -532,60 +535,104 @@ impl World {
                 self.rule_ok(self.half(h).1, &mut memo)?;
             }
         }
+        memo.goal = true;
         self.rule_ok(self.goal, &mut memo)?;
+        memo.goal = false;
         Ok(memo)
     }
 
-    /// Whether def `d` reads time, directly or through another def (`seen`: 0 unknown, 1 no,
-    /// 2 yes), and mark every item and counter a def reads in `read`. Runs on a checked
-    /// section: defs form a DAG, so this ends.
-    fn def_time(
-        &self,
-        d: usize,
-        memo: &mut Memo,
-        seen: &mut Vec<u8>,
-        read: &mut (BitSet, BitSet),
-    ) -> bool {
-        if seen[d] != 0 {
-            return seen[d] == 2;
+    /// What def `d` reads, memoised in `defs`.
+    fn def_reads<'d>(&self, d: usize, memo: &mut Memo, defs: &'d mut [Option<Reads>]) -> &'d Reads {
+        if defs[d].is_none() {
+            let r = self.reads(self.def(d) as usize, memo, defs);
+            defs[d] = Some(r);
         }
+        defs[d].get_or_insert_with(Reads::default)
+    }
+
+    /// What the rule at `start` reads, through the defs it references. Runs on a checked
+    /// section: defs form a DAG and nest at most `config::RULES_MAX_DEPTH`, so this ends.
+    fn reads(&self, start: usize, memo: &mut Memo, defs: &mut [Option<Reads>]) -> Reads {
         let code = self.code();
-        let start = self.def(d) as usize;
         let end = self.node_ok(code, start, memo, true).map_or(start, |x| x.0);
-        let (mut pc, mut time) = (start, false);
+        let (mut pc, mut out) = (start, Reads::default());
         // Prefix order: decoding node after node visits every node of the rule.
-        while pc < end && !time {
+        while pc < end {
             let Some((n, at)) = node(code, pc, self.widths) else { break };
             pc = at;
             match n {
-                Node::TimeAny(_) => time = true,
-                Node::Ref(e) => time = self.def_time(usize::from(e), memo, seen, read),
+                Node::TimeAny(_) => out.time = true,
+                Node::Ref(e) => {
+                    let r = self.def_reads(usize::from(e), memo, defs);
+                    out.items.extend_from_slice(&r.items);
+                    out.counters.extend_from_slice(&r.counters);
+                    out.time |= r.time;
+                }
                 Node::HasAny(k) => {
                     let iw = self.widths.item;
                     for j in 0..usize::from(k) {
                         let i = section::operand(code, at + j * usize::from(iw), iw).unwrap_or(0);
-                        read.0.insert(usize::from(i));
+                        out.items.push(i);
                     }
                     pc += usize::from(k) * usize::from(iw);
                 }
-                Node::Has(i, _) | Node::Count(i) => {
-                    read.0.insert(usize::from(i));
-                }
-                Node::Counter(c) => {
-                    read.1.insert(usize::from(c));
-                }
-                Node::Group(g) => {
-                    let members: Vec<u16> =
-                        self.group_members(usize::from(g)).map(|m| m.0).collect();
-                    members.into_iter().for_each(|i| {
-                        read.0.insert(usize::from(i));
-                    });
-                }
+                Node::Has(i, _) | Node::Count(i) => out.items.push(i),
+                Node::Counter(c) => out.counters.push(c),
+                Node::Group(g) => out.items.extend(self.group_members(usize::from(g)).map(|m| m.0)),
                 _ => {}
             }
         }
-        seen[d] = 1 + u8::from(time);
-        time
+        for v in [&mut out.items, &mut out.counters] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        out
+    }
+
+    /// Rebuild the dependency index (readers per item and counter, time-dependent sites) from
+    /// the rules and refuse a section that ships another one: a reader missing from it would
+    /// never be rechecked, a silently wrong solve. Also fills the def summaries.
+    fn check_index(&mut self, memo: &mut Memo) -> R<()> {
+        let c = self.counts;
+        let mut defs = vec![None; c[DEFS]];
+        let (mut dt, mut di, mut dc) =
+            (BitSet::new(c[DEFS]), BitSet::new(c[ITEMS]), BitSet::new(c[COUNTERS]));
+        for d in 0..c[DEFS] {
+            let r = self.def_reads(d, memo, &mut defs);
+            if r.time {
+                dt.insert(d);
+            }
+            r.items.iter().for_each(|i| _ = di.insert(usize::from(*i)));
+            r.counters.iter().for_each(|k| _ = dc.insert(usize::from(*k)));
+        }
+        let halves = self.time.owned.map_or(0, |o| o.halves);
+        let (mut items, mut counters) = (vec![Vec::new(); c[ITEMS]], vec![Vec::new(); c[COUNTERS]]);
+        let mut td = BitSet::new(c[SITES]);
+        for id in 0..c[SITES] + halves {
+            let rule = if id < c[SITES] { self.site(id).1 } else { self.half(id - c[SITES]).1 };
+            let r = self.reads(rule as usize, memo, &mut defs);
+            let site = u32::try_from(id).map_err(|_| bad("too many sites"))?;
+            r.items.iter().for_each(|i| items[usize::from(*i)].push(site));
+            r.counters.iter().for_each(|k| counters[usize::from(*k)].push(site));
+            if r.time && id < c[SITES] {
+                td.insert(id);
+            }
+        }
+        let csr = |lists: Vec<Vec<u32>>| {
+            let mut at = vec![0u32];
+            lists.iter().for_each(|l| {
+                at.push(at[at.len() - 1] + u32::try_from(l.len()).unwrap_or(u32::MAX))
+            });
+            (at, lists.concat())
+        };
+        if csr(items) != self.hot.item_sites
+            || csr(counters) != self.hot.counter_sites
+            || td != self.hot.time_dep
+        {
+            return Err(bad("the dependency index does not match the rules"));
+        }
+        (self.hot.def_time, self.hot.def_items, self.hot.def_counters) = (dt, di, dc);
+        Ok(())
     }
 
     /// Defs whose value does not depend on the region's time mask (a solve may cache them).
@@ -634,7 +681,10 @@ impl World {
             _ => {}
         }
         memo.defs[usize::from(d)] = 1;
+        // A def is never the goal itself, so it may not read regions either.
+        let goal = std::mem::replace(&mut memo.goal, false);
         let state = self.rule_ok(self.def(usize::from(d)), memo)?;
+        memo.goal = goal;
         memo.defs[usize::from(d)] = 2 + u8::from(state);
         Ok(state)
     }
@@ -733,6 +783,9 @@ impl World {
             }
             Node::Reach(r) => {
                 idx(r, c[REGIONS])?;
+                if !memo.goal {
+                    return Err(bad("`reach` outside the goal"));
+                }
                 state = true;
             }
             Node::Not => {

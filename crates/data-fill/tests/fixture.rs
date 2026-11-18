@@ -448,6 +448,40 @@ fn start_counts_out_of_range_are_rejected() {
     assert!(Plan::new(&w, &inst).is_ok(), "as many as there are locations");
 }
 
+/// A rules section whose dependency index or `reach` placement disagrees with its rules
+/// loads but solves wrong (a site never rechecked), so the loader refuses it.
+#[test]
+fn an_index_that_disagrees_with_the_rules_is_rejected() {
+    use data_fill::section::{HEADER, op, sub};
+    let (rules, game) = data_fill::section::sections(&manifest()).unwrap();
+    let span = |b: &[u8], k: usize| {
+        let at = HEADER + 8 * k;
+        let n = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        n(at)..n(at) + n(at + 4)
+    };
+    let load = |b: Vec<u8>| World::from_sections(b, game.clone());
+    assert!(load(rules.clone()).is_ok());
+    // No site reads time any more, by the index.
+    let mut b = rules.clone();
+    b[span(&rules, sub::TIME_SITES)].fill(0);
+    assert!(load(b).unwrap_err().contains("dependency index"));
+    // Every item's readers become site 0 (in range, so only a rebuild sees it).
+    let mut b = rules.clone();
+    let items = span(&rules, sub::ITEM_SITES);
+    let starts = u32::from_le_bytes(b[items.start..items.start + 4].try_into().unwrap());
+    let sw = usize::from(b[items.start + 4]);
+    let list = items.start + 5 + (starts as usize * sw).div_ceil(8) + 5;
+    b[list..items.end].fill(0);
+    assert!(load(b).unwrap_err().contains("dependency index"));
+    // `has lamp, n: 2` in the cave check becomes `reach region 0`.
+    let code = span(&rules, sub::CODE);
+    let at =
+        code.start + rules[code.clone()].windows(3).position(|x| x == [op::HAS_N, 0, 2]).unwrap();
+    let mut b = rules.clone();
+    b[at..at + 3].copy_from_slice(&[op::REACH, 0, 0]);
+    assert!(load(b).unwrap_err().contains("goal"));
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());

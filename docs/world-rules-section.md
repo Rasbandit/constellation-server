@@ -192,5 +192,5 @@ The section is 68 KB against the 66 KB estimate; the peak is above the 160 KB es
 ## What is not decided here
 
 - Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. Today's typed JSON instance is 0.27 MB held, which alone fits the budget but is most of it.
-- Whether the converter or the loader computes the dependency index. It is shipped here (the converter computes it); the item group membership index is computed at load.
+- Whether the dependency index stays in the section. The converter computes it and the loader rebuilds it from the rules and refuses a section whose index differs (a missing reader would never be rechecked); the item group membership index is computed at load. `reach` is allowed in the goal only, by compiler and loader, so no index of region readers is needed.
 - Versioning: a change to any layout here bumps the header's format version; section 2 is listed as unstable in the v2 document until the first release.
