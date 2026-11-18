@@ -104,6 +104,21 @@ pub struct Limits {
     /// Most data storage bytes a room may ever log (the log is not compacted yet), bytes
     /// (estimate; a room past it refuses writes with `room.storage_full`).
     pub kv_max_room_log_bytes: u64,
+    /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
+    /// ones are tens of MB).
+    pub apworld_max_bytes: usize,
+    /// Largest player `.yaml` upload, bytes (design value: real ones are a few KB).
+    pub yaml_max_bytes: usize,
+    /// Wall-clock limit of one sandboxed inspect call, after which it is killed (design value).
+    pub inspect_timeout_ms: u64,
+    /// Wall-clock limit of one sandboxed generation, after which it is killed
+    /// (`CONSTELLATION_GEN_TIMEOUT_MS`; design value: one real world took about 22 s here).
+    pub gen_timeout_ms: u64,
+    /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
+    /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
+    pub gen_memory_bytes: u64,
+    /// Most bytes of the sidecar's error output kept in a failed job's status (design value).
+    pub gen_error_max_bytes: usize,
 }
 
 impl Limits {
@@ -150,6 +165,12 @@ impl Limits {
         kv_write_bytes_burst: 256 * 1024,
         kv_write_bytes_refill_milli_per_sec: 4096 * 1000,
         kv_max_room_log_bytes: 512 * 1024 * 1024,
+        apworld_max_bytes: 64 * 1024 * 1024,
+        yaml_max_bytes: 1024 * 1024,
+        inspect_timeout_ms: 30_000,
+        gen_timeout_ms: 15 * 60 * 1000,
+        gen_memory_bytes: 4 * 1024 * 1024 * 1024,
+        gen_error_max_bytes: 16 * 1024,
     };
 }
 
@@ -181,6 +202,8 @@ pub fn load() -> Limits {
         ("CONSTELLATION_CONNECT_TIMEOUT_MS", &mut l.connect_timeout_ms),
         ("CONSTELLATION_IDLE_TIMEOUT_MS", &mut l.idle_timeout_ms),
         ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
+        ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
+        ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -200,6 +223,9 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
+    /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
+    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. That API is refused without it.
+    pub admin_token: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -207,7 +233,12 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Secrets").field("room_password", &pw).field("database_url", &db).finish()
+        let admin = self.admin_token.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Secrets")
+            .field("room_password", &pw)
+            .field("database_url", &db)
+            .field("admin_token", &admin)
+            .finish()
     }
 }
 
@@ -254,7 +285,52 @@ fn secrets_from(
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
+        admin_token: var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?,
     })
+}
+
+/// Where seed generation finds Archipelago and our sidecar. All three are needed for the
+/// upload and generation API (`--data-dir`).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    /// An Archipelago checkout (`Generate.py`, `custom_worlds/`): `CONSTELLATION_AP_DIR`.
+    pub ap_dir: std::path::PathBuf,
+    /// A Python with Archipelago's dependencies installed: `CONSTELLATION_AP_PYTHON`.
+    pub python: std::path::PathBuf,
+    /// The sidecar script, normally `tools/ap-gen/ap_gen.py`: `CONSTELLATION_AP_GEN_SCRIPT`.
+    pub sidecar: std::path::PathBuf,
+}
+
+/// Read [`Generation`] from the environment: `None` when none of its variables is set.
+///
+/// # Errors
+/// Some but not all set, or a path that is not absolute (the sandbox mounts them by path).
+#[cfg(feature = "std")]
+pub fn load_generation() -> Result<Option<Generation>, String> {
+    generation_from(|k| std::env::var(k).ok())
+}
+
+#[cfg(feature = "std")]
+fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Generation>, String> {
+    const KEYS: [&str; 3] =
+        ["CONSTELLATION_AP_DIR", "CONSTELLATION_AP_PYTHON", "CONSTELLATION_AP_GEN_SCRIPT"];
+    let [ap, py, side] = KEYS.map(|k| var(k).filter(|v| !v.is_empty()));
+    let (Some(ap), Some(py), Some(side)) = (&ap, &py, &side) else {
+        if ap.is_none() && py.is_none() && side.is_none() {
+            return Ok(None);
+        }
+        return Err(format!("set all of {} or none", KEYS.join(", ")));
+    };
+    let path = |v: &str, k: &str| {
+        let p = std::path::PathBuf::from(v);
+        if p.is_absolute() { Ok(p) } else { Err(format!("{k} must be an absolute path")) }
+    };
+    Ok(Some(Generation {
+        ap_dir: path(ap, KEYS[0])?,
+        python: path(py, KEYS[1])?,
+        sidecar: path(side, KEYS[2])?,
+    }))
 }
 
 /// URL parameters sqlx 0.9.0 understands (`sqlx-postgres` `options/parse.rs`), plus
@@ -373,8 +449,8 @@ mod tests {
         assert!(empty.unwrap_err().contains("empty"));
         assert_eq!(secrets_from(env(&[]), file).unwrap().database_url, None);
         let s = Secrets {
-            room_password: None,
             database_url: Some("postgres://u:hunter2@h".to_owned()),
+            ..Secrets::default()
         };
         assert!(!format!("{s:?}").contains("hunter2"), "the URL can hold a password");
     }
@@ -427,6 +503,8 @@ mod tests {
             .env("CONSTELLATION_CONNECT_TIMEOUT_MS", "11")
             .env("CONSTELLATION_IDLE_TIMEOUT_MS", "not-a-number")
             .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
+            .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
+            .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
             .env("CONSTELLATION_DATABASE_URL_FILE", &url_file)
             .env_remove("CONSTELLATION_ROOM_PASSWORD_FILE")
@@ -437,8 +515,10 @@ mod tests {
         assert!(out.status.success(), "{text}");
         let d = Limits::DESIGN;
         // Bad numbers keep the design value.
-        let want =
-            format!("probe limits 77 5 Some(9) 3 11 {} {}", d.idle_timeout_ms, d.ping_interval_ms);
+        let want = format!(
+            "probe limits 77 5 Some(9) 3 11 {} {} 1234 5678",
+            d.idle_timeout_ms, d.ping_interval_ms
+        );
         assert!(text.contains(&want), "want {want:?} in {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
@@ -454,14 +534,16 @@ mod tests {
         }
         let l = load();
         println!(
-            "probe limits {} {} {:?} {} {} {} {}",
+            "probe limits {} {} {:?} {} {} {} {} {} {}",
             l.dedupe_window_secs,
             l.sim_seeds,
             l.sim_replay_seed,
             l.max_connections,
             l.connect_timeout_ms,
             l.idle_timeout_ms,
-            l.ping_interval_ms
+            l.ping_interval_ms,
+            l.gen_timeout_ms,
+            l.gen_memory_bytes
         );
         let s = load_secrets().unwrap();
         println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
@@ -469,7 +551,7 @@ mod tests {
 
     #[test]
     fn secrets_print_redacted() {
-        let s = Secrets { room_password: Some("hunter2".to_owned()), database_url: None };
+        let s = Secrets { room_password: Some("hunter2".to_owned()), ..Secrets::default() };
         let text = format!("{s:?}");
         assert!(!text.contains("hunter2") && text.contains("redacted"), "{text}");
     }
@@ -498,6 +580,56 @@ mod tests {
             (262_144, 4_096_000)
         );
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn upload_and_generation_limits_are_design_values() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
+        assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
+        assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
+    }
+
+    #[test]
+    fn the_admin_token_comes_from_the_variable_or_a_file_and_prints_redacted() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        let file = |_: &std::path::Path| Ok("t0ken-from-file\n".to_owned());
+        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", "t0ken")]), file).unwrap();
+        assert_eq!(direct.admin_token.as_deref(), Some("t0ken"));
+        assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
+        let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
+        assert_eq!(from_file.unwrap().admin_token.as_deref(), Some("t0ken-from-file"));
+        let both: &'static [(&str, &str)] =
+            &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
+        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
+        assert_eq!(secrets_from(env(&[]), file).unwrap().admin_token, None);
+    }
+
+    #[test]
+    fn generation_paths_come_from_the_environment_and_are_all_or_nothing() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(generation_from(env(&[])), Ok(None));
+        let all: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "/ap"),
+            ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
+        ];
+        let g = generation_from(env(all)).unwrap().unwrap();
+        assert_eq!(g.ap_dir, std::path::PathBuf::from("/ap"));
+        assert_eq!(g.python, std::path::PathBuf::from("/venv/bin/python"));
+        assert_eq!(g.sidecar, std::path::PathBuf::from("/tools/ap-gen/ap_gen.py"));
+        let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
+        assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");
+        let rel: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "ap"),
+            ("CONSTELLATION_AP_PYTHON", "/p"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/s"),
+        ];
+        assert!(generation_from(env(rel)).unwrap_err().contains("absolute"));
     }
 
     #[test]
