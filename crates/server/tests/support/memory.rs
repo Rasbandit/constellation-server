@@ -21,7 +21,8 @@ pub struct Numbers {
     pub bundle_first: i64,
     /// A second load of the same bundle (what a further room of the same game costs).
     pub bundle_next: i64,
-    /// The room built from the loaded bundle: edge, room task and state (`server::app`).
+    /// The room built from the loaded bundle: edge, room task, state and the host's directory
+    /// entry, which in memory mode keeps the file as read (`server::app`, minus its load).
     pub room: i64,
     /// room-core state alone, fresh.
     pub state_fresh: i64,
@@ -189,11 +190,13 @@ pub fn measure_bundle(load: &Path, b: &SeedBundle) -> Numbers {
     let (done_tx, mut done_rx) = mpsc::channel(1);
     let client = client_thread(b.clone(), step_rx, done_tx);
     let mut router = None;
+    // `app` loads the file itself (the host's one path); the package is already shared by
+    // `first`, so that load costs `bundle_next`, which `room` leaves out.
+    let source = server::Source::Bundle(load.to_path_buf());
     let room = measure(|| {
-        let loaded = first.take().unwrap();
-        router = Some(rt.block_on(server::app(loaded, None, None, limits)).unwrap());
+        router = Some(rt.block_on(server::app(&source, None, None, limits)).unwrap());
     });
-    let (router, _task) = router.unwrap();
+    let (router, _host) = router.unwrap();
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let _serve = rt.spawn(async move {
@@ -217,7 +220,7 @@ pub fn measure_bundle(load: &Path, b: &SeedBundle) -> Numbers {
     Numbers {
         bundle_first: bundle_first.bytes_current,
         bundle_next: bundle_next.bytes_current,
-        room: room.bytes_current,
+        room: room.bytes_current - bundle_next.bytes_current,
         state_fresh,
         state_full,
         conn_first,

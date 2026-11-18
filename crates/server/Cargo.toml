@@ -47,6 +47,7 @@ allocation-counter = { version = "0.8", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
 edge-compat = { path = "../edge-compat" }
+getrandom = { version = "0.4", default-features = false }
 log = { path = "../log", features = ["postgres"] }
 proto = { path = "../proto" }
 room-core = { path = "../room-core" }
