@@ -993,6 +993,46 @@ mod tests {
                 .unwrap()
         }
 
+        /// The fixture under another seed name, as read.
+        fn loaded(seed: &str) -> Loaded {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(fixture()).unwrap()).unwrap();
+            v["seed_name"] = serde_json::json!(seed);
+            parse_bundle(v.to_string()).unwrap()
+        }
+
+        /// A key source that hands out `keys` in order.
+        fn draws(keys: &'static [&'static str]) -> impl FnMut() -> Result<RoomKey, String> {
+            let mut keys = keys.iter();
+            move || RoomKey::parse(keys.next().ok_or("out of keys")?)
+        }
+
+        #[tokio::test]
+        async fn a_new_room_draws_its_key_again_on_a_collision_and_gives_up_after_its_draws() {
+            let db = database().await;
+            let store = PgLogStore::connect(&db, &Limits::DESIGN).await.unwrap();
+            let open = |seed: &'static str, limits, keys| {
+                let (store, loaded) = (&store, loaded(seed));
+                async move {
+                    open_with_key(store, crate::room_id(seed), &loaded, limits, draws(keys)).await
+                }
+            };
+            let d = Limits::DESIGN;
+            let (alpha, idle) = open("alpha", d, &["aaaaaaaaaa"]).await.unwrap();
+            assert_eq!((alpha.as_str(), idle), ("aaaaaaaaaa", 0));
+            let (beta, _) = open("beta", d, &["aaaaaaaaaa", "bbbbbbbbbb"]).await.unwrap();
+            assert_eq!(beta.as_str(), "bbbbbbbbbb", "drawn again after the collision");
+            let two = Limits { room_key_draws: 2, ..d };
+            let given_up = open("gamma", two, &["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]).await;
+            assert!(matches!(given_up, Err(Skip::Later(_))), "{given_up:?}");
+            // A reopen keeps the stored key, whatever is drawn.
+            let (again, _) = open("alpha", d, &["dddddddddd"]).await.unwrap();
+            assert_eq!(again, alpha);
+            assert!(store.finish(crate::room_id("beta"), ABANDONED, 0).await.unwrap());
+            let finished = open("beta", d, &["eeeeeeeeee"]).await;
+            assert!(matches!(finished, Err(Skip::Final(_))), "{finished:?}");
+        }
+
         const FORTY_DAYS: &str = "UPDATE rooms SET last_active = now() - interval '40 days'";
 
         /// Review of #55, H1: a connection open longer than the abandon time kept
