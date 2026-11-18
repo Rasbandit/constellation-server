@@ -829,13 +829,15 @@ mod tests {
     async fn a_room_just_woken_waits_a_full_idle_time_for_its_connection() {
         let dir = TempDir::new("woken");
         dir.bundle("a.json", "alpha");
-        let mut host = host(&dir, Limits { room_idle_secs: 1, ..Limits::DESIGN }).await;
+        let mut host = host(&dir, Limits { room_idle_secs: 60, ..Limits::DESIGN }).await;
         let key = key_of(&host, "alpha");
+        let activity = Arc::clone(&read(&host.rooms).get(&key).unwrap().activity);
         host.wake(&key).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        activity.age(Duration::from_secs(61));
         host.unload_idle();
         assert!(!in_memory(&host, &key), "idle for longer than the idle time");
-        // Woken after a long sleep: the clock starts at the wake, not at the last connection.
+        // Cold for long: the clock starts again at the wake, not at the last connection.
+        activity.age(Duration::from_secs(3_600));
         host.wake(&key).await.unwrap();
         host.unload_idle();
         assert!(in_memory(&host, &key));
