@@ -140,9 +140,12 @@ async fn connected_lists_the_slot_players_and_every_location_as_missing() {
     assert_eq!(c["hint_points"], 0);
     assert_eq!(
         c["slot_info"]["2"],
-        json!({"name": "B", "game": GAME, "type": 1, "group_members": []})
+        json!({"class": "NetworkSlot", "name": "B", "game": GAME, "type": 1, "group_members": []})
     );
-    assert_eq!(c["players"][1], json!({"team": 0, "slot": 2, "alias": "B", "name": "B"}));
+    assert_eq!(
+        c["players"][1],
+        json!({"class": "NetworkPlayer", "team": 0, "slot": 2, "alias": "B", "name": "B"})
+    );
 }
 
 #[tokio::test]
@@ -247,7 +250,7 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
     assert_eq!(
         *items[0],
         json!({"cmd": "ReceivedItems", "index": 0,
-        "items": [{"item": 7, "location": 100, "player": 1, "flags": 1}]})
+        "items": [{"class": "NetworkItem", "item": 7, "location": 100, "player": 1, "flags": 1}]})
     );
     let to_a = pump(&mut a).await;
     assert_eq!(of(&to_a, "ReceivedItems"), Vec::<&Value>::new());
@@ -257,7 +260,10 @@ async fn a_check_sends_the_item_to_its_receiver_with_the_next_index() {
     );
     let send = of(&to_a, "PrintJSON").into_iter().find(|p| p["type"] == "ItemSend").unwrap();
     assert_eq!(send["receiving"], 2);
-    assert_eq!(send["item"], json!({"item": 7, "location": 100, "player": 1, "flags": 1}));
+    assert_eq!(
+        send["item"],
+        json!({"class": "NetworkItem", "item": 7, "location": 100, "player": 1, "flags": 1})
+    );
 }
 
 #[tokio::test]
@@ -271,7 +277,7 @@ async fn an_own_item_comes_back_only_to_a_client_that_wants_own_items() {
     let got = pump(&mut a).await;
     assert_eq!(
         of(&got, "ReceivedItems")[0]["items"],
-        json!([{"item": 8, "location": 101, "player": 1, "flags": 0}])
+        json!([{"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}])
     );
     assert_eq!(of(&pump(&mut remote_only).await, "ReceivedItems"), Vec::<&Value>::new());
 }
@@ -303,8 +309,8 @@ async fn a_reconnect_and_a_sync_resend_every_item_from_index_zero() {
     assert_eq!(
         ps[1],
         json!({"cmd": "ReceivedItems", "index": 0, "items": [
-        {"item": 8, "location": 101, "player": 1, "flags": 0},
-        {"item": 7, "location": 100, "player": 2, "flags": 4}]})
+        {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0},
+        {"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 4}]})
     );
     pump(&mut again).await;
     let ps = send(&mut again, &json!([{"cmd": "Sync"}])).await;
@@ -396,8 +402,8 @@ async fn scouts_answer_with_the_receiver_of_each_item() {
     assert_eq!(
         ps,
         [json!({"cmd": "LocationInfo", "locations": [
-        {"item": 7, "location": 100, "player": 2, "flags": 1},
-        {"item": 8, "location": 101, "player": 1, "flags": 0}]})]
+        {"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 1},
+        {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}]})]
     );
 }
 
@@ -1062,7 +1068,7 @@ fn start_room() -> Arc<CompatRoom> {
 }
 
 fn start_item(item: i64) -> Value {
-    json!({"item": item, "location": -2, "player": 0, "flags": 0})
+    json!({"class": "NetworkItem", "item": item, "location": -2, "player": 0, "flags": 0})
 }
 
 #[tokio::test]
@@ -1082,7 +1088,7 @@ async fn a_client_with_the_start_inventory_flag_gets_start_items_first_from_inde
     assert_eq!(
         *of(&got, "ReceivedItems")[0],
         json!({"cmd": "ReceivedItems", "index": 2,
-               "items": [{"item": 7, "location": 100, "player": 2, "flags": 4}]})
+               "items": [{"class": "NetworkItem", "item": 7, "location": 100, "player": 2, "flags": 4}]})
     );
     let sync = send(&mut a, &json!([{"cmd": "Sync"}])).await;
     assert_eq!(sync[0]["items"].as_array().unwrap().len(), 3, "{sync:?}");
@@ -1115,7 +1121,7 @@ async fn turning_on_the_start_inventory_flag_resends_everything_from_zero() {
     assert_eq!(
         ps[0],
         json!({"cmd": "ReceivedItems", "index": 0, "items": [start_item(8), start_item(7),
-               {"item": 8, "location": 101, "player": 1, "flags": 0}]})
+               {"class": "NetworkItem", "item": 8, "location": 101, "player": 1, "flags": 0}]})
     );
 }
 
@@ -1491,4 +1497,24 @@ async fn a_spectator_slot_reads_as_done() {
     let room = room_edit(|v| v["slots"][1]["kind"] = json!("spectator"));
     let mut a = joined(&room, "A").await;
     assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}
+
+/// The reference server tags `NetworkItem`, `NetworkPlayer` and `NetworkSlot` with a `class`
+/// field (`NetUtils.py:98-107`), and its client library builds them only from tagged objects
+/// (`NetUtils.py:147-170`): without the tag, `CommonClient` reads no player names and crashes on
+/// the first print naming a player (found by `just ap-client-check`).
+#[tokio::test]
+async fn network_items_players_and_slots_carry_their_class() {
+    let room = room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(7))).await;
+    assert_eq!(ps[0]["players"][0]["class"], "NetworkPlayer", "{}", ps[0]);
+    assert_eq!(ps[0]["slot_info"]["1"]["class"], "NetworkSlot");
+    check(&mut a, &[101]).await;
+    let got = pump(&mut a).await;
+    assert_eq!(of(&got, "ReceivedItems")[0]["items"][0]["class"], "NetworkItem");
+    let send_print = of(&got, "PrintJSON").into_iter().find(|p| p["type"] == "ItemSend").unwrap();
+    assert_eq!(send_print["item"]["class"], "NetworkItem");
+    let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [100]}])).await;
+    assert_eq!(ps[0]["locations"][0]["class"], "NetworkItem");
 }

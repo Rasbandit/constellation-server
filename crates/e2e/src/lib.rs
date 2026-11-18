@@ -355,7 +355,7 @@ pub fn start_items(slot: u32) -> Res<Vec<Value>> {
     let s = b.slot(slot).ok_or_else(|| format!("no slot {slot}"))?;
     Ok(s.start_inventory
         .iter()
-        .map(|i| serde_json::json!({"item": i, "location": -2, "player": 0, "flags": 0}))
+        .map(|i| serde_json::json!({"class": "NetworkItem", "item": i, "location": -2, "player": 0, "flags": 0}))
         .collect())
 }
 

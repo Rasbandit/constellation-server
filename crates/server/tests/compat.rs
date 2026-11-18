@@ -102,7 +102,7 @@ mod scenarios {
         assert_eq!(
             got,
             json!({"cmd": "ReceivedItems", "index": start.len(),
-            "items": [{"item": item, "location": loc, "player": 1, "flags": flags}]})
+            "items": [{"class": "NetworkItem", "item": item, "location": loc, "player": 1, "flags": flags}]})
         );
         let (update, _) = alice.next_cmd("RoomUpdate").await.unwrap();
         assert_eq!(update["checked_locations"], json!([loc]));
@@ -118,7 +118,7 @@ mod scenarios {
         assert_eq!(got["index"], 0);
         assert_eq!(
             got["items"],
-            json!([{"item": item, "location": loc, "player": 1, "flags": flags}])
+            json!([{"class": "NetworkItem", "item": item, "location": loc, "player": 1, "flags": flags}])
         );
     }
 
