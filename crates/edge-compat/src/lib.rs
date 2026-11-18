@@ -11,6 +11,7 @@ mod presence;
 mod session;
 mod socket;
 mod storage;
+mod view;
 pub mod wire;
 
 use config::Limits;
@@ -59,6 +60,8 @@ pub struct CompatRoom {
     kv_bytes: RateTable<u32>,
     /// Who is connected to each slot, and the client statuses they set.
     presence: presence::Presence,
+    /// Game name to its item and location names by id, for the host's view.
+    names: BTreeMap<String, view::Names>,
 }
 
 impl std::fmt::Debug for CompatRoom {
@@ -102,6 +105,7 @@ impl CompatRoom {
             })
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
+        let names = bundle.games.iter().map(|(n, g)| (n.clone(), view::Names::of(g))).collect();
         let password = password.or_else(|| bundle.server_options.password.clone());
         let l = limits;
         let keys = l.rate_table_max_keys;
@@ -126,6 +130,7 @@ impl CompatRoom {
                 keys,
             ),
             presence: presence::Presence::default(),
+            names,
         })
     }
 

@@ -347,6 +347,12 @@ impl RoomState {
         self.kv.get(key)
     }
 
+    /// How many locations `slot` has checked.
+    #[must_use]
+    pub fn checked_count(&self, slot: SlotNo) -> usize {
+        self.checked.get(&slot).map_or(0, BTreeMap::len)
+    }
+
     /// Whether `slot` has reached its goal.
     #[must_use]
     pub fn has_goal(&self, slot: SlotNo) -> bool {

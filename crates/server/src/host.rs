@@ -310,12 +310,12 @@ impl RoomsFolder {
         &self.dir
     }
 
-    /// The key of the running room started from `file`, if any.
-    pub(crate) fn key_of(&self, file: &Path) -> Option<RoomKey> {
+    /// The running room started from `file` and its key, if any.
+    pub(crate) fn room_of(&self, file: &Path) -> Option<(RoomKey, Room)> {
         crate::read(&self.rooms)
             .iter()
             .find(|(_, r)| r.file.as_deref() == Some(file))
-            .map(|(k, _)| k.clone())
+            .map(|(k, r)| (k.clone(), r.clone()))
     }
 }
 
@@ -541,11 +541,18 @@ mod tests {
         let mut host = host(&dir, Limits { room_lifetime_secs: 0, ..Limits::DESIGN }).await;
         let folder = host.folder().unwrap();
         assert_eq!(folder.dir(), dir.0.as_path());
-        assert_eq!(folder.key_of(&dir.0.join("a.json")), Some(key_of(&host, "alpha")));
-        assert_eq!(folder.key_of(&dir.0.join("b.json")), Some(key_of(&host, "beta")));
-        assert_eq!(folder.key_of(&dir.0.join("c.json")), None, "no such file");
+        assert_eq!(
+            folder.room_of(&dir.0.join("a.json")).map(|r| r.0),
+            Some(key_of(&host, "alpha"))
+        );
+        assert_eq!(folder.room_of(&dir.0.join("b.json")).map(|r| r.0), Some(key_of(&host, "beta")));
+        assert_eq!(folder.room_of(&dir.0.join("c.json")).map(|r| r.0), None, "no such file");
         host.expire();
-        assert_eq!(folder.key_of(&dir.0.join("a.json")), None, "an expired room has no key");
+        assert_eq!(
+            folder.room_of(&dir.0.join("a.json")).map(|r| r.0),
+            None,
+            "an expired room has no key"
+        );
     }
 
     #[tokio::test]

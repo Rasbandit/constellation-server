@@ -12,6 +12,7 @@
 //! With `--data-dir` it also serves the admin API for uploads and seed generation
 //! ([`worlds`], run in [`sandbox`]).
 
+mod room_view;
 mod sandbox;
 mod worlds;
 
