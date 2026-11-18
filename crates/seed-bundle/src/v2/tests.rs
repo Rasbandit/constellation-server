@@ -173,13 +173,18 @@ fn rehash(bytes: &mut [u8]) {
 }
 
 fn reopen(bytes: Vec<u8>, text: &str) -> Result<Seed, BundleError> {
+    reopen_capped(bytes, text, 1 << 26)
+}
+
+/// Open `bytes` on `text`'s packages with `max_bytes` for its `slot_data`.
+fn reopen_capped(bytes: Vec<u8>, text: &str, max_bytes: u64) -> Result<Seed, BundleError> {
     let (_, e) = encoded(text);
     let games = e
         .packages
         .iter()
         .map(|f| Arc::new(GamePackage::from_file(package::key_of(f), f, 1 << 26).unwrap()))
         .collect();
-    Seed::open(bytes, games, 1 << 26)
+    Seed::open(bytes, games, max_bytes)
 }
 
 #[test]
@@ -550,4 +555,346 @@ fn seeds_with_different_entrances_share_one_package() {
     let (seed, data) = opened(&other.to_string());
     assert_eq!(seed.slot(2).unwrap().entrance(100), Some("Attic"));
     assert_eq!(seed.to_v1(&data).unwrap().slots[1].entrances[&100], "Attic");
+}
+
+fn get32(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize
+}
+
+fn put32(b: &mut [u8], at: usize, v: usize) {
+    b[at..at + 4].copy_from_slice(&u32::try_from(v).unwrap().to_le_bytes());
+}
+
+/// The slot table of a one-game seed.
+const SLOT0: usize = HEADER + ROOM + GAME;
+
+/// Why `text`'s seed, edited by `edit` (its body hash rewritten), does not open; "opened"
+/// when it does.
+fn refused(text: &str, edit: impl FnOnce(&mut Vec<u8>)) -> String {
+    let (_, e) = encoded(text);
+    let mut b = e.seed;
+    edit(&mut b);
+    rehash(&mut b);
+    reopen(b, text).map_or_else(|e| e.to_string(), |_| "opened".to_owned())
+}
+
+#[test]
+fn a_header_alone_is_read_and_anything_else_is_not_a_seed_file() {
+    let mut h = vec![0_u8; HEADER];
+    h[..4].copy_from_slice(&MAGIC);
+    h[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    put32(&mut h, 24, HEADER);
+    rehash(&mut h);
+    assert_eq!(bundle_hash_of(&h).unwrap(), [0; 32], "exactly a header");
+    let not_v2 = |b: &[u8]| matches!(bundle_hash_of(b), Err(BundleError::Parse(_)));
+    assert!(not_v2(&h[..HEADER - 1]), "one byte short");
+    assert!(not_v2(&MAGIC), "the magic alone");
+    let mut other = h;
+    other[0] = b'X';
+    assert!(not_v2(&other), "a whole header with another magic");
+}
+
+#[test]
+fn field_widths_fit_up_to_the_readers_limits() {
+    assert!(placement_fits((0, 0, 0)) && placement_fits((32, 16, 3)));
+    for w in [(33, 16, 3), (32, 17, 3), (32, 16, 4)] {
+        assert!(!placement_fits(w), "{w:?}");
+    }
+    assert!(hint_fits((0, 0, 0, 0)) && hint_fits((16, 32, 24, 16)));
+    for w in [(17, 32, 24, 16), (16, 33, 24, 16), (16, 32, 25, 16), (16, 32, 24, 17)] {
+        assert!(!hint_fits(w), "{w:?}");
+    }
+}
+
+#[test]
+fn every_mode_and_kind_byte_reads_back() {
+    for m in [Mode::Disabled, Mode::Enabled, Mode::Goal, Mode::Auto, Mode::AutoEnabled] {
+        assert_eq!(byte_mode(mode_byte(m)), Some(m));
+    }
+    for k in [SlotKind::Spectator, SlotKind::Player, SlotKind::Group] {
+        assert_eq!(byte_kind(kind_byte(k)), Some(k));
+    }
+    assert_eq!((byte_mode(5), byte_kind(3)), (None, None));
+}
+
+#[test]
+fn the_seed_is_sized_from_its_counts_before_it_is_built() {
+    let mut v = small();
+    v["server_options"]["password"] = json!("pwd");
+    v["slots"][0]["group_members"] = json!([1]);
+    let text = v.to_string();
+    let b = SeedBundle::from_json(&text).unwrap();
+    let h = hash_of(&text);
+    // Tables 96 + 36 + 32 + 2 * 72 + 3 * 16 = 356. Strings: "A" "B", "A" "B" "Bee", "s1",
+    // "pwd": 12. Slot 1: one presence word 8, one 5-bit record 1, slot_data {"k":[1,2]} 11.
+    // Slot 2: a word 8, two records 2, slot_data {} 2, one group member 4, three 1-bit start
+    // items 1.
+    let need: usize = 356 + 12 + (8 + 1 + 11) + (8 + 2 + 2 + 4 + 1);
+    let err = encode(&b, &h, 0).unwrap_err().to_string();
+    assert!(err.contains(&format!("would take {need} bytes")), "{err}");
+    let e = encode(&b, &h, need as u64).unwrap();
+    assert!(e.seed.len() <= need, "the bound holds: {}", e.seed.len());
+    assert!(encode(&b, &h, need as u64 - 1).is_err());
+}
+
+#[test]
+fn the_hint_block_size_is_its_byte_count() {
+    assert_eq!(HintData::default().size(), 0);
+    let h = HintData {
+        // Slot positions up to 1 (1 bit) and location indexes up to 3 (2 bits): 6-bit hints.
+        start: (0..8).map(|k| (k % 2, k / 2, k % 5)).collect(),
+        spheres: vec![(4, vec![(0, 2), (3, 0)]), (4, vec![])],
+        entrances: vec![vec![(1, 0), (2, 2)], vec![(3, 1)]],
+        names: ["A", "B", "C"].map(String::from).to_vec(),
+    };
+    // Fixed 20 + 2 * 12 + 3 * 8 = 68; eight hints 6 bytes; slot 0's four 2-bit spheres 1 and
+    // its two 4-bit entrances 1; slot 1's entrance 1.
+    assert_eq!(h.size(), 68 + 6 + 1 + 1 + 1);
+    assert_eq!(h.size(), h.bytes(0, &mut Strings::default()).unwrap().len());
+}
+
+/// Two team-1 slots of one game G (items and locations 1 to 4) that place every location, in
+/// groups, flags up to 7, spheres and entrances (slot 1 only), eight start hints and options
+/// at their edges: every field the reader decodes holds a value a wrong read would change.
+fn rich() -> Value {
+    let at = |l: i64, item: i64, to: u32, flags: u8| json!({"location": l, "item": item, "receiver": to, "flags": flags});
+    let mut p1 = vec![at(1, 2, 2, 7), at(2, 1, 1, 0), at(3, 4, 2, 5), at(4, 3, 1, 2)];
+    p1[2]["sphere"] = json!(1);
+    p1[3]["sphere"] = json!(0);
+    let p2 = vec![at(1, 4, 1, 1), at(2, 3, 2, 6), at(3, 2, 1, 3), at(4, 1, 2, 4)];
+    let slot = |id: u32, members: Vec<u32>, locations: Vec<Value>| {
+        json!({"id": id, "team": 1, "name": format!("P{id}"), "game": "G", "kind": "player",
+               "minimum_client_version": {"major": 0, "minor": 1, "build": 6},
+               "group_members": members, "locations": locations, "slot_data": {},
+               "start_inventory": [4, 1]})
+    };
+    let mut one = slot(1, vec![2], p1);
+    one["entrances"] = json!({"1": "Gate", "2": "Attic", "3": "Gate", "4": "Well"});
+    let start: Vec<Value> = RICH_START
+        .iter()
+        .map(|&(f, l, s)| json!({"finding": f.0, "location": l, "status": s}))
+        .collect();
+    json!({
+        "format": 1, "seed_name": "rich", "race_mode": 0,
+        "generator_version": {"major": 1, "minor": 2, "build": 3},
+        "server_options": {"password": null, "hint_cost": 100, "location_check_points": 2,
+            "release_mode": "disabled", "collect_mode": "enabled", "remaining_mode": "goal"},
+        "slots": [one, slot(2, vec![1, 2], p2)],
+        "connect_names": {"P1": [1, 1], "P2": [1, 2]},
+        "start_hints": start,
+        "games": {"G": {"item_name_to_id": {"I1": 1, "I2": 2, "I3": 3, "I4": 4},
+                        "location_name_to_id": {"L1": 1, "L2": 2, "L3": 3, "L4": 4},
+                        "checksum": "r", "item_name_groups": {}, "location_name_groups": {}}}
+    })
+}
+
+/// `rich`'s start hints: every (slot, location) once, statuses in no order.
+const RICH_START: [(SlotNo, i64, u8); 8] = [
+    (SlotNo(1), 1, 0),
+    (SlotNo(2), 1, 10),
+    (SlotNo(1), 2, 20),
+    (SlotNo(2), 2, 30),
+    (SlotNo(1), 3, 30),
+    (SlotNo(2), 3, 20),
+    (SlotNo(1), 4, 10),
+    (SlotNo(2), 4, 0),
+];
+
+#[test]
+fn every_field_of_a_rich_seed_reads_back() {
+    let text = rich().to_string();
+    let (seed, data) = opened(&text);
+    assert_eq!(seed.to_v1(&data).unwrap(), SeedBundle::from_json(&text).unwrap());
+    assert_eq!(seed.slot_nos().collect::<Vec<_>>(), [SlotNo(1), SlotNo(2)]);
+    let debug = format!("Seed {{ seed_name: \"rich\", bytes: {}, .. }}", seed.bytes().len());
+    assert_eq!(format!("{seed:?}"), debug);
+    assert_eq!(seed.start_hints().collect::<Vec<_>>(), RICH_START);
+    let (one, two) = (seed.slot(1).unwrap(), seed.slot(2).unwrap());
+    assert_eq!((one.team(), one.group_members(), two.group_members()), (1, vec![2], vec![1, 2]));
+    assert_eq!((one.sphere(1), one.sphere(3), one.sphere(4)), (None, Some(1), Some(0)));
+    assert!((1..=4).all(|l| two.sphere(l).is_none()), "slot 2 records no spheres");
+    let names: Vec<_> = (1..=4).map(|l| one.entrance(l)).collect();
+    assert_eq!(names, [Some("Gate"), Some("Attic"), Some("Gate"), Some("Well")]);
+    assert_eq!(two.entrance(1), None);
+    assert_eq!((one.flags(0), one.flags(3), one.flags(4)), (Some(7), Some(2), None));
+    assert_eq!(seed.ranks.len(), 2, "one rank entry per presence word");
+}
+
+#[test]
+fn one_entrance_name_takes_no_bits() {
+    let mut v = rich();
+    v["slots"][0]["entrances"] = json!({"2": "Gate", "4": "Gate"});
+    let text = v.to_string();
+    let (seed, data) = opened(&text);
+    assert_eq!(seed.hint_widths().2, 0);
+    let one = seed.slot(1).unwrap();
+    let names: Vec<_> = (1..=4).map(|l| one.entrance(l)).collect();
+    assert_eq!(names, [None, Some("Gate"), None, Some("Gate")]);
+    assert_eq!(seed.to_v1(&data).unwrap(), SeedBundle::from_json(&text).unwrap());
+}
+
+#[test]
+fn start_hints_fill_their_bytes_and_one_more_is_refused() {
+    // `rich` without spheres and entrances: the start hint bits end the data.
+    let mut v = rich();
+    for s in v["slots"].as_array_mut().unwrap() {
+        s.as_object_mut().unwrap().remove("entrances");
+        for p in s["locations"].as_array_mut().unwrap() {
+            p.as_object_mut().unwrap().remove("sphere");
+        }
+    }
+    let text = v.to_string();
+    let (seed, _) = opened(&text);
+    assert_eq!(seed.hint_widths(), (0, 2, 0, 1));
+    assert_eq!(seed.start_hints().collect::<Vec<_>>(), RICH_START);
+    // Eight 6-bit hints fill 6 bytes, right before the strings; a ninth needs a seventh.
+    let err = refused(&text, |b| {
+        let at = get32(b, 28);
+        put32(b, at + 4, 9);
+    });
+    assert!(err.contains("start hints out of range"), "{err}");
+}
+
+#[test]
+fn each_table_rule_refuses_with_its_own_reason() {
+    let text = small().to_string();
+    let (_, e) = encoded(&text);
+    let (len, strings) = (e.seed.len(), get32(&e.seed, 20));
+    let slot = |pos: usize| SLOT0 + SLOT * pos;
+    let connect = slot(2);
+    type Edit = Box<dyn Fn(&mut Vec<u8>)>;
+    let cases: [(&str, Edit, &str); 14] = [
+        ("strings past the end", Box::new(move |b| put32(b, 20, len + 1)), "overlap"),
+        ("connect table past the strings", Box::new(|b| put32(b, 16, 1000)), "overlap"),
+        ("strings at the very end", Box::new(move |b| put32(b, 20, len)), "room string"),
+        ("seed name with no string", Box::new(|b| put32(b, HEADER + 4, NONE as usize)), "room"),
+        ("seed name past the strings", Box::new(|b| put32(b, HEADER, 1 << 20)), "room string"),
+        ("password past the strings", Box::new(|b| put32(b, HEADER + 8, 1 << 20)), "room"),
+        ("no slots", Box::new(|b| b[10..12].copy_from_slice(&[0, 0])), "slots must be"),
+        ("a repeated slot id", Box::new(move |b| put32(b, slot(1), 1)), "slots must be"),
+        ("slot id 0", Box::new(move |b| put32(b, slot(0), 0)), "slots must be"),
+        (
+            "slot name with no string",
+            Box::new(move |b| put32(b, slot(0) + 12, NONE as usize)),
+            "slot 1 name",
+        ),
+        (
+            "presence past the data",
+            Box::new(move |b| put32(b, slot(0) + 32, NONE as usize)),
+            "slot 1 presence",
+        ),
+        (
+            "a location the game lacks",
+            Box::new(move |b| {
+                let p = get32(b, slot(0) + 32);
+                b[p] |= 1 << 5;
+            }),
+            "its game lacks",
+        ),
+        (
+            "records past the data",
+            Box::new(move |b| put32(b, slot(1) + 40, strings - 1)),
+            "slot 2 placements",
+        ),
+        (
+            "connect name past the strings",
+            Box::new(move |b| put32(b, connect + 4, 1000)),
+            "connect name",
+        ),
+    ];
+    for (name, edit, why) in cases {
+        let err = refused(&text, edit);
+        assert!(err.contains(why), "{name}: {err}");
+    }
+    // The strings may start right after the tables (an empty data area): not an overlap.
+    let tables = connect + 3 * CONNECT;
+    let err = refused(&text, move |b| put32(b, 20, tables));
+    assert!(!err.contains("overlap"), "{err}");
+}
+
+#[test]
+fn an_item_index_past_the_receivers_game_is_refused() {
+    let text = cross_games().to_string();
+    let (seed, _) = opened(&text);
+    assert_eq!(seed.bit_widths(), (2, 1, 3));
+    // Slot 1's second record (bits 6 to 11) sends A's a1 (index 0) to slot 1; A has 2 items,
+    // so index 3 is past them.
+    let err = refused(&text, |b| {
+        let records = get32(b, HEADER + ROOM + 2 * GAME + 40);
+        b[records] |= 0b1100_0000;
+    });
+    assert!(err.contains("slot 1 placement 1 is out of range"), "{err}");
+}
+
+#[test]
+fn slot_data_may_inflate_to_exactly_the_cap() {
+    let mut v = small();
+    v["slots"][1]["slot_data"] = json!({"text": "x".repeat(4000)});
+    let text = v.to_string();
+    let (_, e) = encoded(&text);
+    // {"text":"x...x"}: 4,011 bytes inflated.
+    assert!(reopen_capped(e.seed.clone(), &text, 4011).is_ok());
+    let err = reopen_capped(e.seed, &text, 4010).unwrap_err().to_string();
+    assert!(err.contains("slot 1 slot_data"), "{err}");
+}
+
+#[test]
+fn slot_data_that_deflate_does_not_shrink_is_kept_raw() {
+    // The first such object (short text deflates to about its own length).
+    let data = (0_u64..2000)
+        .map(|n| json!({"k": format!("{:x}", n.wrapping_mul(0x9e37_79b9_7f4a_7c15))}))
+        .find(|v| package::deflate(v.to_string().as_bytes()).unwrap().len() == v.to_string().len())
+        .unwrap();
+    let mut v = small();
+    v["slots"][1]["slot_data"] = data.clone();
+    let text = v.to_string();
+    let (seed, _) = opened(&text);
+    assert_eq!(get32(seed.bytes(), SLOT0 + 52), 0, "stored raw: no inflated length");
+    assert_eq!(seed.slot(1).unwrap().slot_data().unwrap(), data);
+}
+
+#[test]
+fn a_package_under_another_key_is_refused_even_with_the_right_data() {
+    let (b, e) = encoded(&small().to_string());
+    let other = Arc::new(GamePackage::new([3; 32], "G", &b.games["G"]));
+    let err = Seed::open(e.seed, vec![other], 1 << 26).unwrap_err().to_string();
+    assert!(err.contains("not the ones the seed names"), "{err}");
+}
+
+#[test]
+fn each_hint_rule_refuses_with_its_own_reason() {
+    let text = hinted().to_string();
+    let (_, e) = encoded(&text);
+    let strings = get32(&e.seed, 20);
+    // The block's fixed part and two slot entries take 20 + 2 * 12 = 44 bytes; 43 are left.
+    let err = refused(&text, |b| put32(b, 28, strings - 43));
+    assert!(err.contains("hint block out of range"), "{err}");
+    // Slot 1 places only location index 0. Its entrance list becomes one record read from
+    // slot 2's presence byte 0b11: location index 1 (bit 0), entrance 1 (bit 1).
+    let err = refused(&text, |b| {
+        let (at, presence) = (get32(b, 28), get32(b, SLOT0 + SLOT + 32));
+        put32(b, at + HINTS + 4, presence);
+        put32(b, at + HINTS + 8, 1);
+    });
+    assert!(err.contains("slot 1 entrance 0 is out of range"), "{err}");
+}
+
+#[test]
+fn a_group_member_that_is_no_slot_is_refused() {
+    let text = rich().to_string();
+    let err = refused(&text, |b| {
+        let members = get32(b, SLOT0 + 56);
+        put32(b, members, 9);
+    });
+    assert!(err.contains("slot 1 group members out of range"), "{err}");
+}
+
+/// Entrance names end at the table's count, even where the next bytes read as a name.
+#[test]
+fn no_entrance_name_past_the_table() {
+    let (mut seed, _) = opened(&rich().to_string());
+    let (count, table) = (seed.entrance_count(), get32(seed.bytes(), get32(seed.bytes(), 28) + 16));
+    assert_eq!((count, seed.entrance_name(0)), (3, Some("Attic")));
+    seed.bytes.copy_within(table..table + 8, table + 8 * count);
+    assert_eq!(seed.entrance_name(count), None);
 }

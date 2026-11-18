@@ -212,7 +212,8 @@ impl Packed {
 
     /// Append `v`; false (nothing appended) when it does not fit the width.
     pub fn push(&mut self, v: u32) -> bool {
-        if self.width < 32 && u64::from(v) >> self.width != 0 {
+        // `width` is at most 32 and `v` a u32, so the shift is in range and 0 at 32 bits.
+        if u64::from(v) >> self.width != 0 {
             return false;
         }
         self.bits.push(u64::from(v), self.width);
@@ -376,6 +377,7 @@ mod tests {
         let r = PackedRef::from_bytes(bytes, 5, 3).unwrap();
         assert_eq!(r.iter().collect::<Vec<_>>(), [31, 0, 17]);
         assert_eq!((r.get(3), r.len(), r.is_empty()), (None, 3, false));
+        assert!(PackedRef::from_bytes(bytes, 5, 0).unwrap().is_empty());
         assert_eq!(PackedRef::from_bytes(bytes, 5, 4), None, "20 bits need 3 bytes");
         assert_eq!(PackedRef::from_bytes(&[], 0, 1000).map(|r| r.get(999)), Some(Some(0)));
         assert_eq!(PackedRef::from_bytes(&[], 8, usize::MAX), None, "overflow");

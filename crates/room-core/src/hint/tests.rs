@@ -562,3 +562,13 @@ fn a_snapshot_takes_its_hint_rules_from_the_room_not_the_file() {
     let back = RoomState::from_snapshot(&s, &json).unwrap();
     assert_eq!(back.hint_rules(), PAID);
 }
+
+#[test]
+fn is_hinted_is_true_only_for_a_stored_hint() {
+    let mut s = room(FREE);
+    assert!(!s.is_hinted(SlotNo(1), 11));
+    apply(&mut s, &at(), scout(1, &[11])).unwrap();
+    assert!(s.is_hinted(SlotNo(1), 11));
+    assert!(!s.is_hinted(SlotNo(1), 12), "another location");
+    assert!(!s.is_hinted(SlotNo(2), 11), "another slot's world");
+}

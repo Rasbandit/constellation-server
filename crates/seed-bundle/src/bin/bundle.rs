@@ -141,6 +141,8 @@ mod tests {
         assert!(same_bundle(&cli(&[decode, &seed, flag, &moved]).unwrap()), "--packages");
         assert_eq!(cli(&[decode, &seed, Path::new("--pkgs"), &moved]), Err(USAGE.to_owned()));
         assert_eq!(cli(&[Path::new("v2-decod"), &seed]), Err(USAGE.to_owned()));
+        assert_eq!(cli(&[Path::new("v2-encod"), &input, &out]), Err(USAGE.to_owned()));
+        assert_eq!(cli(&[]), Err(USAGE.to_owned()));
     }
 
     #[test]
