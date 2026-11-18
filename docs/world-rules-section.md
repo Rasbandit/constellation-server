@@ -83,7 +83,7 @@ Item and location indexes are manifest order in this implementation, and the gam
 | 14 | names | string lists (`u16` count, then `u16` length and UTF-8 per key) of region, counter, def, option and roll keys. Needed to bind a seed given by key (options, rolls) and for reports; never read by a solve |
 | 15 | item groups | packed group starts, packed member items, packed caps (0 = no cap, else cap + 1): the item sets a `GROUP` sum reads |
 
-Rules for writers: every offset points inside the section; every index is below its count; defs form a DAG (no def reaches itself); every rule is monotone (below). `World::from_package` rejects a section that breaks any of these before a solve starts, in one pass (each def and each shared rule offset is checked once), and never panics on damaged bytes (tested by flipping every byte of a package).
+Rules for writers: every offset points inside the section; every index is below its count; defs form a DAG (no def reaches itself); no rule nests deeper than `config::RULES_MAX_DEPTH` (256) nodes, counting the defs it reaches through `ref`, so the recursive evaluators stay inside a thread stack (the compiler applies the same cap; the test world nests 16 deep); every rule is monotone (below). `World::from_package` rejects a section that breaks any of these before a solve starts, in one pass (each def and each shared rule offset is checked once), and never panics on damaged bytes (tested by flipping every byte of a package).
 
 ### Bytecode
 

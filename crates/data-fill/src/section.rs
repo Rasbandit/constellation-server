@@ -333,6 +333,8 @@ struct Compiler<'m> {
     def_at: Vec<Option<u32>>,
     def_busy: Vec<bool>,
     def_reads: Vec<Reads>,
+    /// Rule nodes open in the recursion, defs reached through `ref` included.
+    depth: u32,
     code: Vec<u8>,
     dedupe: HashMap<Vec<u8>, u32>,
     /// Item groups: (item, cap) members, `None` for an uncapped count.
@@ -448,6 +450,7 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         def_at: vec![None; raw_defs.len()],
         def_busy: vec![false; raw_defs.len()],
         def_reads: vec![Reads::default(); raw_defs.len()],
+        depth: 0,
         code: vec![op::TRUE, op::FALSE],
         dedupe: HashMap::new(),
         groups: Vec::new(),
@@ -720,7 +723,30 @@ impl<'m> Compiler<'m> {
         Ok(())
     }
 
+    /// One level deeper in the rule recursion; the loader enforces the same cap.
+    fn deeper(&mut self, path: &str) -> R<()> {
+        self.depth += 1;
+        if self.depth > config::RULES_MAX_DEPTH {
+            return Err(format!("{path}: rules nested more than {} deep", config::RULES_MAX_DEPTH));
+        }
+        Ok(())
+    }
+
     fn b(&mut self, v: &Value, path: &str, out: &mut Vec<u8>, r: &mut Reads, goal: bool) -> R<()> {
+        self.deeper(path)?;
+        let x = self.b_node(v, path, out, r, goal);
+        self.depth -= 1;
+        x
+    }
+
+    fn b_node(
+        &mut self,
+        v: &Value,
+        path: &str,
+        out: &mut Vec<u8>,
+        r: &mut Reads,
+        goal: bool,
+    ) -> R<()> {
         let o =
             v.as_object().ok_or_else(|| format!("{path}: a rule must be an object, got {v}"))?;
         let k = if o.contains_key("has") {
@@ -884,6 +910,13 @@ impl<'m> Compiler<'m> {
     }
 
     fn i(&mut self, v: &Value, path: &str, out: &mut Vec<u8>, r: &mut Reads) -> R<()> {
+        self.deeper(path)?;
+        let x = self.i_node(v, path, out, r);
+        self.depth -= 1;
+        x
+    }
+
+    fn i_node(&mut self, v: &Value, path: &str, out: &mut Vec<u8>, r: &mut Reads) -> R<()> {
         if let Some(n) = v.as_i64() {
             let n = i16::try_from(n).map_err(|_| format!("{path}: {n} does not fit 16 bits"))?;
             out.push(op::INT);

@@ -383,6 +383,54 @@ fn a_damaged_section_is_rejected_before_any_solve() {
     }
 }
 
+/// A rules section whose one def body (about 60 KB) is rewritten in place as a chain of
+/// `not` nodes ending in `true`: nesting far past the cap, which must be an error, not a
+/// stack overflow.
+#[test]
+fn a_deeply_nested_rule_is_rejected_not_a_stack_overflow() {
+    use data_fill::section::{op, sections};
+    let mut m = manifest();
+    let wide = json!({"has_any": vec!["lamp"; 255]});
+    m["defs"]["wide"] = json!({"all": vec![wide; 100]});
+    m["regions"][4]["checks"][0]["rule"] = json!({"ref": "wide"});
+    let (mut rules, game) = sections(&m).unwrap();
+    assert!(World::from_sections(rules.clone(), game.clone()).is_ok());
+    let at = rules
+        .windows(6)
+        .position(|x| x[0] == op::ALL && x[1] == 100 && x[4] == op::HAS_ANY && x[5] == 255)
+        .unwrap();
+    let len = 4 + usize::from(u16::from_le_bytes([rules[at + 2], rules[at + 3]]));
+    rules[at..at + len - 1].fill(op::NOT);
+    rules[at + len - 1] = op::TRUE;
+    let err = World::from_sections(rules, game).unwrap_err();
+    assert!(err.contains("nested"), "{err}");
+}
+
+/// A chain of defs nested past the cap fails to compile with a message, before the
+/// compiler's own recursion gets deep.
+#[test]
+fn a_def_chain_nested_too_deep_does_not_compile() {
+    let chain = |n: usize| {
+        let mut m = manifest();
+        for k in 0..n {
+            let next = json!({"ref": format!("d{}", k + 1)});
+            m["defs"][format!("d{k}")] = json!({"all": [next, {"has": "lamp"}]});
+        }
+        m["defs"][format!("d{n}")] = json!({"has": "rope"});
+        m["regions"][1]["checks"][0]["rule"] = json!({"ref": "d0"});
+        m
+    };
+    // Each def is two levels (`all`, then `ref`), so 120 defs fit the cap and 300 do not.
+    let w = World::load(&chain(120)).unwrap();
+    // Evaluating the whole chain (lamp and rope held) stays inside a test thread's stack.
+    let held = [w.item("lamp").unwrap(), w.item("rope").unwrap()];
+    let plan = Plan::new(&w, &instance(ALL)).unwrap();
+    let s = plan.solve(&w, &held);
+    assert!(s.reached(w.loc("well").unwrap()));
+    let err = data_fill::section::compile(&chain(300)).unwrap_err();
+    assert!(err.contains("nested"), "{err}");
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());

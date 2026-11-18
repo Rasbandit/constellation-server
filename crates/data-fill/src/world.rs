@@ -49,10 +49,25 @@ struct Hot {
 }
 
 /// What the loader has already checked: per def 0 unseen, 1 in progress, 2 checked and
-/// state-free, 3 checked and reading state; per rule offset whether it reads state.
+/// state-free, 3 checked and reading state; per rule offset whether it reads state and how
+/// deep it nests (defs it reaches included). `depth` is the node being checked, `peak` the
+/// deepest an evaluation from the current root goes so far.
 struct Memo {
     defs: Vec<u8>,
-    rules: HashMap<u32, bool>,
+    rules: HashMap<u32, (bool, u32)>,
+    depth: u32,
+    peak: u32,
+}
+
+impl Memo {
+    /// An evaluation from the current root goes `deep` nodes down.
+    fn reach(&mut self, deep: u32) -> R<()> {
+        self.peak = self.peak.max(deep);
+        if deep > config::RULES_MAX_DEPTH {
+            return Err(bad("a rule nested too deep"));
+        }
+        Ok(())
+    }
 }
 
 /// Clock ownership (clock shuffle), when the manifest models it.
@@ -430,7 +445,7 @@ impl World {
     /// Every layout rule a solve relies on (`docs/world-rules-section.md`, rules for writers).
     fn check(&mut self) -> R<Memo> {
         let c = self.counts;
-        let mut memo = Memo { defs: vec![0; c[DEFS]], rules: HashMap::new() };
+        let mut memo = Memo { defs: vec![0; c[DEFS]], rules: HashMap::new(), depth: 0, peak: 0 };
         let starts = self.region_starts;
         if starts.len != GROUPS * c[REGIONS] + 1
             || self.at(starts, 0) != 0
@@ -594,15 +609,19 @@ impl World {
     /// Check the rule at `at` once (shared offsets are remembered); true when it reads state
     /// (items, counters, time, regions).
     fn rule_ok(&self, at: u32, memo: &mut Memo) -> R<bool> {
-        if let Some(s) = memo.rules.get(&at) {
-            return Ok(*s);
+        if let Some((s, h)) = memo.rules.get(&at).copied() {
+            memo.reach(memo.depth + h)?;
+            return Ok(s);
         }
         let code = self.code();
+        let (base, outer) = (memo.depth, memo.peak);
+        memo.peak = base;
         let (end, state) = self.node_ok(code, at as usize, memo, true)?;
         if end > code.len() {
             return Err(bad("rule runs past the bytecode"));
         }
-        memo.rules.insert(at, state);
+        memo.rules.insert(at, (state, memo.peak - base));
+        memo.peak = memo.peak.max(outer);
         Ok(state)
     }
 
@@ -610,8 +629,8 @@ impl World {
     fn def_ok(&self, d: u16, memo: &mut Memo) -> R<bool> {
         match memo.defs[usize::from(d)] {
             1 => return Err(bad("a def reaches itself")),
-            2 => return Ok(false),
-            3 => return Ok(true),
+            // Checked: the rule memo answers, and counts its depth from here.
+            2 | 3 => return self.rule_ok(self.def(usize::from(d)), memo),
             _ => {}
         }
         memo.defs[usize::from(d)] = 1;
@@ -620,7 +639,23 @@ impl World {
         Ok(state)
     }
 
+    /// Check the node at `pc` and everything under it; returns the offset after it and whether
+    /// it reads state.
     fn node_ok(&self, code: &[u8], pc: usize, memo: &mut Memo, boolean: bool) -> R<(usize, bool)> {
+        memo.depth += 1;
+        memo.reach(memo.depth)?;
+        let out = self.node_body_ok(code, pc, memo, boolean)?;
+        memo.depth -= 1;
+        Ok(out)
+    }
+
+    fn node_body_ok(
+        &self,
+        code: &[u8],
+        pc: usize,
+        memo: &mut Memo,
+        boolean: bool,
+    ) -> R<(usize, bool)> {
         let (n, mut at) =
             node(code, pc, self.widths).ok_or_else(|| bad("bad opcode or truncated rule"))?;
         let c = self.counts;
