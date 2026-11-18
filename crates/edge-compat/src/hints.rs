@@ -14,9 +14,9 @@ use crate::CompatRoom;
 use crate::wire::{self, NetworkItem, PrintJson, TextPart};
 use proto::{HintAsk, SlotNo};
 use room_core::{Hint, Hinted, hint_status};
-use seed_bundle::SlotView;
+use seed_bundle::{SlotView, package::Names};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// A hint as the protocol sends it.
 pub(crate) fn record(room: &CompatRoom, h: &Hint) -> wire::Hint {
@@ -108,33 +108,29 @@ pub(crate) fn resolve(
     kind: Kind,
 ) -> Result<Vec<HintAsk>, String> {
     let (game, g) = (slot.game(), slot.package());
-    let (ids, names, groups) = match kind {
-        Kind::Item => (g.items(), g.item_names(), g.item_groups()),
-        Kind::Location => (g.locations(), g.location_names(), g.location_groups()),
+    let (ids, names) = match kind {
+        Kind::Item => (g.items(), g.item_names()),
+        Kind::Location => (g.locations(), g.location_names()),
     };
-    // shortcut: the groups are kept as JSON in the shared package and parsed per command
-    // (`!hint` is rate limited with chat); keep them parsed in the package if that shows up.
-    let groups: BTreeMap<String, Vec<String>> = serde_json::from_str(groups).unwrap_or_default();
-    let id_of = |name: &str| names.iter().position(|n| &**n == name).and_then(|i| ids.get(i));
     let wanted: BTreeSet<i64> = if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
         let id: i64 = arg.parse().map_err(|_| format!("{arg} is not an id"))?;
-        let name = ids.binary_search(&id).ok().and_then(|i| names.get(i));
+        let name = ids.binary_search(&id).ok().and_then(|i| names.name(i));
         if let Some(name) = name.filter(|n| g.hint_blacklisted(n)) {
             return Err(not_hintable(name));
         }
         BTreeSet::from([id])
     } else {
-        let all = names.iter().map(|n| &**n).chain(groups.keys().map(String::as_str));
-        let name = lookup(all, arg)
+        let name = lookup(names, arg)
             .ok_or_else(|| format!("No {0} or {0} group named '{arg}' in {game}.", kind.noun()))?;
         if g.hint_blacklisted(name) {
             return Err(not_hintable(name));
         }
         // A group name wins over an item of the same name, as in the reference.
-        groups.get(name).map_or_else(
-            || id_of(name).copied().into_iter().collect(),
-            |members| members.iter().filter_map(|m| id_of(m).copied()).collect(),
-        )
+        let members = names.group(name).map_or_else(
+            || names.index(name).into_iter().collect::<Vec<_>>(),
+            |m| m.iter().map(|&i| i as usize).collect(),
+        );
+        members.into_iter().filter_map(|i| ids.get(i).copied()).collect()
     };
     // (finding slot, location, flags, receiver) of every placement asked for.
     let at: Vec<(SlotView<'_>, i64, u8, u32)> = match kind {
@@ -173,13 +169,14 @@ pub(crate) fn resolve(
     Ok(asks.into_iter().map(|(a, _)| a).collect())
 }
 
-/// The name `arg` means: an exact match, else the only one equal ignoring case.
-fn lookup<'a>(names: impl Iterator<Item = &'a str> + Clone, arg: &str) -> Option<&'a str> {
-    if let Some(n) = names.clone().find(|n| *n == arg) {
+/// The name `arg` means: a group or name equal to it (a binary search), else the only one
+/// equal ignoring case (one pass over the names, nothing allocated per name).
+fn lookup<'a>(names: &'a Names, arg: &str) -> Option<&'a str> {
+    if let Some(n) = names.stored(arg) {
         return Some(n);
     }
     let lower = arg.to_lowercase();
-    let mut same = names.filter(|n| n.to_lowercase() == lower);
+    let mut same = names.all().filter(|n| n.chars().flat_map(char::to_lowercase).eq(lower.chars()));
     let first = same.next()?;
     same.next().is_none().then_some(first)
 }
@@ -224,11 +221,15 @@ pub(crate) fn summary(cost: u64, points: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::lookup;
+    use seed_bundle::{GameData, GamePackage};
+    use std::collections::BTreeMap;
 
     #[test]
     fn a_name_matches_exactly_else_the_only_one_equal_ignoring_case() {
-        let names = ["Bow", "bow", "Sword"];
-        let found = |arg| lookup(names.iter().copied(), arg);
+        let ids = BTreeMap::from([("Bow".into(), 1), ("bow".into(), 2), ("Sword".into(), 3)]);
+        let g = GameData { item_name_to_id: ids, ..GameData::default() };
+        let p = GamePackage::new([0; 32], "G", &g);
+        let found = |arg| lookup(p.item_names(), arg);
         assert_eq!(found("bow"), Some("bow"), "exact wins");
         assert_eq!(found("SWORD"), Some("Sword"));
         assert_eq!(found("BOW"), None, "two names equal ignoring case: ambiguous");

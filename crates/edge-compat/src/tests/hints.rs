@@ -533,3 +533,31 @@ fn every_hint_status_has_its_name() {
         ["(unspecified)", "(no priority)", "(avoid)", "(priority)", "(found)", "(unknown)"]
     );
 }
+
+/// Review finding: a group resolved each member by a scan of every name, so `!hint_location
+/// Everywhere` (Archipelago gives every world that group) cost names x members compares on the
+/// edge task. Now names and groups are indexed once per package; 40,000 members take
+/// milliseconds where the scan took far longer than this budget.
+#[tokio::test]
+async fn a_group_of_every_location_resolves_within_a_small_budget() {
+    let n = 40_000;
+    let mut v: Value = bundle_json(&Value::Null);
+    let locs: Vec<Value> = (1000..1000 + n)
+        .map(|l| json!({"location": l, "item": 7, "receiver": 2, "flags": 0}))
+        .collect();
+    v["slots"][0]["locations"] = json!(locs);
+    let names: Vec<String> = (1000..1000 + n).map(|l| format!("L{l}")).collect();
+    for (l, name) in (1000..1000 + n).zip(&names) {
+        v["games"][GAME]["location_name_to_id"][name] = json!(l);
+    }
+    v["games"][GAME]["location_name_groups"] = json!({"Everywhere": names});
+    let room = spawn_with(seed(&v), None, &Limits::DESIGN);
+    let mut a = joined(&room, "A").await;
+    pump(&mut a).await;
+    let started = std::time::Instant::now();
+    let ps = send(&mut a, &say("!hint_location Everywhere")).await;
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    // A hint costs 10 percent of 40,000 locations; nothing is checked yet.
+    assert_eq!(command_results(&ps), ["You have 0 points and need 4000 for a hint."]);
+}
