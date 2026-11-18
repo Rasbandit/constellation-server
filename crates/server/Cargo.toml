@@ -23,6 +23,14 @@ required-features = ["pg-tests"]
 name = "worlds"
 required-features = ["sandbox-tests"]
 
+[[test]]
+name = "memory"
+required-features = ["memory-harness"]
+
+[[example]]
+name = "measure"
+required-features = ["memory-harness"]
+
 [features]
 # The Postgres restart scenarios (`tests/restart.rs`). Need CONSTELLATION_DATABASE_URL and fail
 # loudly without it (docs/TESTING.md rule 5).
@@ -30,8 +38,12 @@ pg-tests = ["log/pg-tests"]
 # The upload and generation API through the real sandbox (`tests/worlds.rs`). Need `bwrap` and
 # `python3` and fail loudly without them (docs/TESTING.md rule 5).
 sandbox-tests = []
+# The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
+memory-harness = ["dep:allocation-counter"]
 
 [dependencies]
+# Counts allocations per thread for the memory harness only (feature `memory-harness`).
+allocation-counter = { version = "0.8", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
 edge-compat = { path = "../edge-compat" }

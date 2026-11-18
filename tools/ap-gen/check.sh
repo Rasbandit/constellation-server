@@ -8,7 +8,8 @@
 # The server also runs with --rooms (holding the e2e fixture, so there are two rooms and a
 # client must name its room key). With a command (`just e2e-full`): wait until the server hosts
 # the generated world as a room, then run the command with ROOM_URL (ws://<key>.localhost:<port>)
-# and ROOM_BUNDLE (the generated bundle file) set; the script exits with its status.
+# and ROOM_BUNDLE (the generated bundle as v1 JSON, from GET /api/worlds/<id>/bundle: the
+# server decodes the seed it keeps in its store) set; the script exits with its status.
 set -euo pipefail
 apworld=$1 yaml=$2 ap=$3 python=$4
 shift 4
@@ -73,6 +74,7 @@ address=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("addre
 [ -n "$address" ] || { echo "the world never became a room: $status"; tail -20 "$work/log"; exit 1; }
 echo "room address: $address"
 rc=0
-ROOM_URL="ws://$address" ROOM_BUNDLE="$work/rooms/$job.json" "$@" || rc=$?
+api "http://$addr/api/worlds/$job/bundle" >"$work/$job.json"
+ROOM_URL="ws://$address" ROOM_BUNDLE="$work/$job.json" "$@" || rc=$?
 [ "$rc" -eq 0 ] || { echo "client check failed ($rc); server log tail:"; tail -20 "$work/log"; }
 exit "$rc"

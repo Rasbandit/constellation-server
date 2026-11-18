@@ -287,6 +287,24 @@ mod scenarios {
         assert!(!plain.contains("sec-websocket-extensions"), "{plain}");
     }
 
+    /// RFC 7692 section 7.1.1.1: a server may answer `client_no_context_takeover` to an offer
+    /// without it, and a client must then reset its compressor per message. The server then
+    /// keeps no inflate state per connection between messages (it returns to the shared pool).
+    #[tokio::test]
+    async fn the_server_asks_clients_to_compress_each_message_alone() {
+        let server = start(&[]).unwrap();
+        for offer in ["permessage-deflate", "permessage-deflate; client_max_window_bits"] {
+            let head = handshake_headers(&server, Some(offer)).await;
+            let ext = head.lines().find(|l| l.starts_with("sec-websocket-extensions:"));
+            assert!(ext.unwrap_or("").contains("client_no_context_takeover"), "{offer}: {head}");
+        }
+        // And a compressing client (yawc, which honours it) still plays: connect and sync.
+        let (mut c, connected, _) = joined(&server, "Alice").await;
+        assert_eq!(connected["cmd"], "Connected");
+        c.send(&json!([{"cmd": "Sync"}, {"cmd": "Get", "keys": ["a"]}])).await.unwrap();
+        c.next_cmd("Retrieved").await.unwrap();
+    }
+
     #[tokio::test]
     async fn healthz_answers_ok() {
         let server = start(&[]).unwrap();

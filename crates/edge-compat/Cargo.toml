@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bits = { path = "../bits" }
 config = { path = "../config" }
 futures-util = { workspace = true }
 proto = { path = "../proto" }

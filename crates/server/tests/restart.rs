@@ -340,6 +340,66 @@ mod restart {
         assert_eq!(locations(&room_a["checked_locations"]), [loc]);
         let (_, room_b, _) = e2e::join_via(server.addr, &url(&server, &b), "Alice").await.unwrap();
         assert!(locations(&room_b["checked_locations"]).is_empty());
+        // Two rooms of one game: its packages once (the game and the generic one), a seed each.
+        assert_eq!(count(&db, "SELECT count(*) FROM game_packages").await, 2);
+        assert_eq!(count(&db, "SELECT count(*) FROM room_seeds").await, 2);
+        assert_eq!(count(&db, "SELECT count(*) FROM rooms WHERE bundle IS NOT NULL").await, 0);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    async fn count(db: &str, query: &'static str) -> i64 {
+        use sqlx::Connection;
+        let mut c = sqlx::PgConnection::connect(db).await.unwrap();
+        sqlx::query_scalar(query).fetch_one(&mut c).await.unwrap()
+    }
+
+    /// A package row whose bytes do not hash to its key is refused when the room loads after a
+    /// restart: the room does not open, nothing wrong is served.
+    #[tokio::test]
+    async fn a_tampered_package_row_is_refused_when_the_room_loads() {
+        let db = database().await;
+        let dir = rooms_dir("tampered", &["alpha"]);
+        let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        let a = key_of(&server, "alpha");
+        assert!(server.stop().unwrap().success());
+        std::fs::remove_file(dir.join("alpha.json")).unwrap();
+        sql(&db, "UPDATE game_packages SET bytes = 'tampered'").await;
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        let url = format!("ws://{a}.example:{}", server.addr.port());
+        assert!(e2e::join_via(server.addr, &url, "Alice").await.is_err());
+        server.wait_for_log("does not match its key").unwrap();
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A room stored before seeds were kept (its v1 file in rooms.bundle, no seed row) keeps
+    /// its own world when another bundle with its seed name comes in: the import is refused
+    /// and writes no seed for it.
+    #[tokio::test]
+    async fn a_legacy_room_keeps_its_world_when_another_bundle_takes_its_name() {
+        use sqlx::Connection;
+        let db = database().await;
+        let dir = rooms_dir("legacy", &["alpha"]);
+        let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        let a = key_of(&server, "alpha");
+        assert!(server.stop().unwrap().success());
+        let file = std::fs::read(dir.join("alpha.json")).unwrap();
+        let mut c = sqlx::PgConnection::connect(&db).await.unwrap();
+        sqlx::query("UPDATE rooms SET bundle = $1").bind(&file).execute(&mut c).await.unwrap();
+        sql(&db, "DELETE FROM room_seeds").await;
+        let mut other: Value = serde_json::from_slice(&file).unwrap();
+        for g in other["games"].as_object_mut().unwrap().values_mut() {
+            g["checksum"] = json!(format!("other-{}", g["checksum"]));
+        }
+        std::fs::write(dir.join("alpha.json"), other.to_string()).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
+        server.wait_for_log("different bundle").unwrap();
+        let seeds: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM room_seeds").fetch_one(&mut c).await.unwrap();
+        assert_eq!(seeds, 0, "no seed of the other bundle was written");
+        let url = format!("ws://{a}.example:{}", server.addr.port());
+        e2e::join_via(server.addr, &url, "Alice").await.unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -374,10 +434,12 @@ mod restart {
         assert!(server.stop().unwrap().success());
         std::fs::remove_file(dir.join("alpha.json")).unwrap();
 
+        // Nothing of the world is in a file now: the room wakes from its stored seed.
         let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         assert_eq!(key_of(&server, "alpha"), a);
         let (_, room, _) = e2e::join_via(server.addr, &url(&server), "Alice").await.unwrap();
         assert_eq!(locations(&room["checked_locations"]), [loc]);
+        assert_eq!(count(&db, "SELECT count(*) FROM room_seeds").await, 1);
         drop(std::fs::remove_dir_all(&dir));
     }
 

@@ -25,6 +25,8 @@ name = "throughput"
 required-features = ["pg-bench"]
 
 [dependencies]
+# Blob keys: the SHA-256 the blob seam checks every read against.
+sha2 = { version = "0.11", default-features = false }
 config = { path = "../config", optional = true }
 proto = { path = "../proto" }
 serde_json = { workspace = true, optional = true, features = ["std"] }

@@ -27,35 +27,23 @@ pub fn view_start(after: Seq, head: Seq, cap: u64) -> (Seq, bool) {
     }
 }
 
-/// Item and location names of one game, by id.
-#[derive(Debug, Default)]
-pub(crate) struct Names {
-    items: BTreeMap<i64, String>,
-    locations: BTreeMap<i64, String>,
-}
-
-impl Names {
-    pub(crate) fn of(g: &seed_bundle::GameData) -> Self {
-        let flip = |m: &BTreeMap<String, i64>| m.iter().map(|(n, id)| (*id, n.clone())).collect();
-        Self { items: flip(&g.item_name_to_id), locations: flip(&g.location_name_to_id) }
-    }
-}
-
 impl CompatRoom {
-    fn names(&self, slot: u32) -> Option<&Names> {
-        self.names.get(&self.bundle.slot(slot)?.game)
-    }
-
+    /// Names come from the slot's game package, shared by every room of that game.
     fn item_name(&self, slot: u32, item: i64) -> Option<&str> {
-        self.names(slot)?.items.get(&item).map(String::as_str)
+        self.bundle.slot(slot)?.package().item_name(item)
     }
 
     fn player(&self, slot: Option<u32>) -> Option<&str> {
-        Some(self.bundle.slot(slot?)?.name.as_str())
+        Some(self.bundle.slot(slot?)?.name())
     }
 
     fn location_name(&self, slot: u32, location: i64) -> Option<&str> {
-        self.names(slot)?.locations.get(&location).map(String::as_str)
+        self.bundle.slot(slot)?.package().location_name(location)
+    }
+
+    fn flags(&self, slot: u32, location: i64) -> u8 {
+        let s = self.bundle.slot(slot);
+        s.and_then(|s| s.flags(s.find(location)?)).unwrap_or(0)
     }
 
     /// The room now: its seed, and per slot its name, game, whether a session is on it, checked
@@ -64,7 +52,7 @@ impl CompatRoom {
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.
     pub async fn summary(&self) -> Result<Value, RoomError> {
-        let ids: Vec<u32> = self.bundle.slots.iter().map(|s| s.id).collect();
+        let ids: Vec<u32> = self.bundle.slots().map(|s| s.id()).collect();
         let progress = self
             .room
             .read(move |s| {
@@ -80,25 +68,25 @@ impl CompatRoom {
         let online = self.presence.connections().await;
         let slots: Vec<Value> = self
             .bundle
-            .slots
-            .iter()
+            .slots()
             .map(|s| {
-                let (checked, items, goal) = progress.get(&s.id).copied().unwrap_or_default();
+                let id = s.id();
+                let (checked, items, goal) = progress.get(&id).copied().unwrap_or_default();
                 json!({
-                    "slot": s.id,
-                    "team": s.team,
-                    "name": s.name,
-                    "game": s.game,
-                    "connected": online.contains_key(&s.id),
-                    "clients": online.get(&s.id).copied().unwrap_or(0),
+                    "slot": id,
+                    "team": s.team(),
+                    "name": s.name(),
+                    "game": s.game(),
+                    "connected": online.contains_key(&id),
+                    "clients": online.get(&id).copied().unwrap_or(0),
                     "checked": checked,
-                    "locations": s.locations.len(),
+                    "locations": s.placed(),
                     "items_received": items,
                     "goal": goal,
                 })
             })
             .collect();
-        let o = &self.bundle.server_options;
+        let o = self.bundle.server_options();
         let options = json!({
             // Whether one is set, never the password itself.
             "password": self.password.is_some(),
@@ -106,7 +94,7 @@ impl CompatRoom {
             "release_mode": o.release_mode,
             "collect_mode": o.collect_mode,
         });
-        Ok(json!({"seed": self.bundle.seed_name, "options": options, "slots": slots}))
+        Ok(json!({"seed": self.bundle.seed_name(), "options": options, "slots": slots}))
     }
 
     /// A host's view of the room's stream: the durable events from where [`view_start`] puts

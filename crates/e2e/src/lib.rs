@@ -5,6 +5,8 @@
 //! No sleeps: a server is ready when it logs its bound address, and every wait is on a frame
 //! or a process event, with a timeout only as a guard against a hang.
 
+pub mod synth;
+
 use futures_util::SinkExt;
 use seed_bundle::SeedBundle;
 use serde_json::Value;

@@ -15,6 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const BIN: &str = env!("CARGO_BIN_EXE_constellation-server");
 const TOKEN: &str = "test-admin-token-test-admin-token";
 
+/// The seed name of every world the fake sidecar generates.
+const GENERATED: &str = "generated-seed";
+
 /// A fresh folder with the data dir, a fake checkout and the fake sidecar's tools folder.
 struct Setup {
     root: PathBuf,
@@ -38,7 +41,12 @@ impl Setup {
         }
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         std::fs::copy(here.join("tests/fake_ap_gen.py"), tools.join("ap_gen.py")).unwrap();
-        std::fs::copy(e2e::fixture_path(), tools.join("bundle.json")).unwrap();
+        // Under its own seed name: the server also hosts the fixture (`--bundle`), and a world
+        // naming a hosted seed is refused.
+        let mut bundle: Value =
+            serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+        bundle["seed_name"] = json!(GENERATED);
+        std::fs::write(tools.join("bundle.json"), bundle.to_string()).unwrap();
         // What the fake sidecar must not see: the token (in the server's environment) and
         // host folders.
         let hidden: Vec<String> = ["data", "ap", "tools", ""]
@@ -161,21 +169,31 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(st, 200);
     assert_eq!(done["status"], "done", "{done}");
     let fixture = e2e::fixture().unwrap();
-    assert_eq!(done["seed_name"], fixture.seed_name);
+    assert_eq!(done["seed_name"], GENERATED);
     assert_eq!(done["slots"], fixture.slots.len());
-    // The server wrote the bundle from the sidecar's stdout; the symlink and FIFO the sidecar
-    // left in its scratch folder never reached the host.
-    let bundle = PathBuf::from(done["bundle"].as_str().unwrap());
-    assert!(std::fs::symlink_metadata(&bundle).unwrap().is_file());
-    let read = |p: &Path| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
-    assert_eq!(read(&bundle), read(&e2e::fixture_path()));
-    let world_dir = bundle.parent().unwrap();
-    let mut files: Vec<String> = std::fs::read_dir(world_dir)
+    // The seed went into the store, made from the sidecar's v1 bundle (its hash says which);
+    // no world data is left in the job folder, and the symlink and FIFO the sidecar left in
+    // its scratch folder never reached the host.
+    assert!(done.get("bundle").is_none(), "{done}");
+    let fixture_text = std::fs::read_to_string(setup.root.join("tools/fake/bundle.json")).unwrap();
+    let hash: String = seed_bundle::bundle_hash(&fixture_text)
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(done["bundle_hash"], hash);
+    // Decoded from the store, it is the sidecar's v1 bundle.
+    let (st, back) = http(&server, "GET", &format!("/api/worlds/{id}/bundle"), t, b"").await;
+    assert_eq!(st, 200, "{back}");
+    let fixture_json: Value = serde_json::from_str(&fixture_text).unwrap();
+    assert_eq!(back, fixture_json);
+    let world_dir = setup.root.join("data/worlds").join(&id);
+    let mut files: Vec<String> = std::fs::read_dir(&world_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     files.sort();
-    assert_eq!(files, ["apworlds", "bundle.json", "status.json", "yamls"]);
+    assert_eq!(files, ["status.json"], "the job's copies of its inputs are removed");
     // What the sandbox showed the sidecar, and what it let it do.
     let g = &done["generation"];
     assert_eq!(g["custom_worlds"], json!(["my_world.apworld"]), "only the chosen world, by module");
@@ -218,14 +236,11 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
 
     let id = generate_one(&server, b"Alice").await;
     server.wait_for_log("generation done").unwrap();
-    let published = rooms.join(format!("{id}.json"));
-    let read = |p: &Path| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
-    assert_eq!(read(&published), read(&e2e::fixture_path()), "the bundle is in the rooms folder");
+    // The world became a room through the store: nothing was written to the rooms folder.
     let left: Vec<_> = std::fs::read_dir(&rooms).unwrap().filter_map(Result::ok).collect();
-    assert_eq!(left.len(), 2, "no temporary file is left in the rooms folder");
+    assert_eq!(left.len(), 1, "only the other room's bundle");
 
-    let seed = e2e::fixture().unwrap().seed_name;
-    let ready = server.wait_for_log(&format!("seed=\"{seed}\"")).unwrap();
+    let ready = server.wait_for_log(&format!("seed=\"{GENERATED}\"")).unwrap();
     let key = ready.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned();
     let st = status(&server, &id).await;
     assert_eq!(st["status"], "done", "{st}");
@@ -249,7 +264,9 @@ async fn hosted_world(setup: &Setup) -> (Server, String, Value) {
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
     let id = generate_one(&server, b"Alice").await;
+    // The room is listed before the job writes its status, so wait for both signals.
     server.wait_for_log("room ready").unwrap();
+    server.wait_for_log("generation done").unwrap();
     let st = status(&server, &id).await;
     assert!(st["room_key"].is_string(), "{st}");
     (server, id, st)
@@ -307,7 +324,7 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     };
     let (code, room) = view(&server).await;
     assert_eq!(code, 200, "{room}");
-    assert_eq!((&room["seed"], &room["room_key"]), (&json!(fixture.seed_name), &st["room_key"]));
+    assert_eq!((&room["seed"], &room["room_key"]), (&json!(GENERATED), &st["room_key"]));
     assert_eq!(room["address"], st["address"]);
     let opts = &fixture.server_options;
     assert_eq!(room["options"]["password"], opts.password.is_some(), "a flag, never the password");
@@ -374,7 +391,7 @@ async fn a_second_world_with_a_hosted_seed_fails_instead_of_sharing_its_room() {
     assert!(st2["error"].as_str().unwrap().contains("already hosted"), "{st2}");
     assert!(st2.get("room_key").is_none(), "{st2}");
     let rooms = setup.root.join("rooms");
-    assert!(!rooms.join(format!("{second}.json")).exists(), "nothing reached the rooms folder");
+    assert_eq!(std::fs::read_dir(&rooms).unwrap().count(), 0, "nothing reached the rooms folder");
     assert_eq!(status(&server, &first).await["room_key"], st["room_key"], "the first is untouched");
 }
 
@@ -505,9 +522,11 @@ async fn generations_run_one_at_a_time() {
     assert_eq!(status(&server, &second).await["status"], "queued");
     assert_eq!(status(&server, &first).await["status"], "running");
     std::fs::write(setup.root.join("tools/fake/release"), "").unwrap();
-    server.wait_for_log(&format!("generation done world={second}")).unwrap();
+    // The fake prints one seed name, so the second ends refused (its name is the first's).
+    server.wait_for_log(&format!("generation failed world={second}")).unwrap();
     assert_eq!(status(&server, &first).await["status"], "done");
-    assert_eq!(status(&server, &second).await["status"], "done");
+    let st = status(&server, &second).await;
+    assert!(st["error"].as_str().unwrap_or_default().contains("already hosted"), "{st}");
 }
 
 #[tokio::test]

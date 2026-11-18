@@ -21,13 +21,13 @@
 //! accepts them; no real room gets near that.
 
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, CursorUpdate, LogStore, Snapshot, StoreError,
+    AppendBatch, AppendError, AppendReceipt, BlobKey, CursorUpdate, LogStore, Snapshot, StoreError,
 };
 use config::Limits;
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
-use sqlx::{PgPool, Postgres};
+use sqlx::{Connection as _, PgPool, Postgres};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -64,6 +64,15 @@ pub struct Opened {
     pub idle_secs: u64,
 }
 
+/// What a room's world is stored as when it first opens.
+#[derive(Debug, Clone, Copy)]
+pub enum World<'a> {
+    /// A v1 bundle file, kept in `rooms.bundle` (rooms from before seeds were kept, and tests).
+    V1(&'a [u8]),
+    /// A v2 seed, kept in `room_seeds`.
+    Seed(&'a [u8]),
+}
+
 /// A room the directory lists: stored, not finished, and loadable (it has its bundle).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
@@ -73,6 +82,8 @@ pub struct Listed {
     pub seed_name: String,
     /// Its room key.
     pub key: String,
+    /// The hash of the v1 bundle it was made from: a load refuses a seed of another.
+    pub bundle_hash: Vec<u8>,
     /// Seconds since it last had a connection.
     pub idle_secs: u64,
 }
@@ -202,10 +213,11 @@ impl PgLogStore {
 
     /// Record the room the first time it opens, and return its room key.
     ///
-    /// A new room is stored with `new_key` (a random key the caller drew) and its `bundle`
-    /// file; a room stored before keys or bundles were kept gets them now; a room that has a
-    /// key keeps it, so a restart serves it under the same key. A reopen must come from the
-    /// same bundle (by hash).
+    /// A new room is stored with `new_key` (a random key the caller drew) and its `world`; a
+    /// room stored before keys or bundles were kept gets them now; a room that has a key keeps
+    /// it, so a restart serves it under the same key. A reopen must come from the same bundle
+    /// (by hash). In one transaction, and only once the stored hash is this bundle's, so a
+    /// room never gets another bundle's world; a world it has already is kept.
     ///
     /// # Errors
     /// [`OpenError::OtherBundle`] when the room id is taken by another bundle,
@@ -219,13 +231,18 @@ impl PgLogStore {
         bundle_format: u32,
         bundle_hash: &[u8],
         new_key: &str,
-        bundle: &[u8],
+        world: World<'_>,
     ) -> Result<Opened, OpenError> {
         let (seed, hash, key) = (seed_name.to_owned(), bundle_hash.to_vec(), new_key.to_owned());
-        let file = bundle.to_vec();
+        let (file, seed_file) = match world {
+            World::V1(f) => (Some(f.to_vec()), None),
+            World::Seed(s) => (None, Some(s.to_vec())),
+        };
         let (stored_hash, stored_key, idle, finished) = self
             .isolated(move |c| {
                 Box::pin(async move {
+                    let mut tx = c.begin().await.map_err(|e| db::<StoreError>(&e))?;
+                    let c = &mut *tx;
                     sqlx::query(
                         "INSERT INTO rooms (room_id, seed_name, bundle_format, bundle_hash, \
                          room_key, bundle) VALUES ($1, $2, $3, $4, $5, $6) \
@@ -252,8 +269,20 @@ impl PgLogStore {
                     .execute(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))?;
+                    sqlx::query(
+                        "INSERT INTO room_seeds (room_id, seed) SELECT $1, $2 \
+                         WHERE $2::bytea IS NOT NULL AND EXISTS \
+                         (SELECT 1 FROM rooms WHERE room_id = $1 AND bundle_hash = $3) \
+                         ON CONFLICT (room_id) DO NOTHING",
+                    )
+                    .bind(room_key(room))
+                    .bind(&seed_file)
+                    .bind(&hash)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))?;
                     // The idle seconds since last_active, never negative.
-                    sqlx::query_as::<_, (Vec<u8>, Option<String>, i64, Option<String>)>(
+                    let row = sqlx::query_as::<_, (Vec<u8>, Option<String>, i64, Option<String>)>(
                         "SELECT bundle_hash, room_key, \
                          GREATEST(0, EXTRACT(EPOCH FROM now() - last_active))::bigint, \
                          CASE WHEN finished_at IS NULL THEN NULL \
@@ -263,7 +292,9 @@ impl PgLogStore {
                     .bind(room_key(room))
                     .fetch_one(&mut *c)
                     .await
-                    .map_err(|e| db::<StoreError>(&e))
+                    .map_err(|e| db::<StoreError>(&e))?;
+                    tx.commit().await.map_err(|e| db::<StoreError>(&e))?;
+                    Ok(row)
                 })
             })
             .await
@@ -288,11 +319,12 @@ impl PgLogStore {
         let rows = self
             .isolated(|c| {
                 Box::pin(async move {
-                    sqlx::query_as::<_, (i64, String, String, i64)>(
-                        "SELECT room_id, seed_name, room_key, \
+                    sqlx::query_as::<_, (i64, String, String, Vec<u8>, i64)>(
+                        "SELECT room_id, seed_name, room_key, bundle_hash, \
                          GREATEST(0, EXTRACT(EPOCH FROM now() - last_active))::bigint \
                          FROM rooms WHERE finished_at IS NULL AND room_key IS NOT NULL \
-                         AND bundle IS NOT NULL ORDER BY room_id",
+                         AND (bundle IS NOT NULL OR room_id IN (SELECT room_id FROM room_seeds)) \
+                         ORDER BY room_id",
                     )
                     .fetch_all(&mut *c)
                     .await
@@ -301,19 +333,21 @@ impl PgLogStore {
             })
             .await?;
         rows.into_iter()
-            .map(|(room, seed_name, key, idle)| {
+            .map(|(room, seed_name, key, bundle_hash, idle)| {
                 Ok(Listed {
                     room: RoomId(u64::from_be_bytes(room.to_be_bytes())),
                     seed_name,
                     key,
+                    bundle_hash,
                     idle_secs: stored(idle, "idle seconds")?,
                 })
             })
             .collect()
     }
 
-    /// The bundle file a room was made from, to load it (`None` for an unknown room or one
-    /// stored before bundles were kept).
+    /// The v1 bundle file a room stored before seeds were kept was made from (`None` for an
+    /// unknown room, one stored before bundles were kept, or one whose seed is in
+    /// `room_seeds`: read that with `seed_get`).
     ///
     /// # Errors
     /// When the database fails.
@@ -541,6 +575,44 @@ impl Job {
     }
 }
 
+/// Blobs in the `game_packages` table (migration 0003).
+impl crate::raw::RawBlobs for PgLogStore {
+    async fn put_raw(&self, key: &BlobKey, bytes: &[u8]) -> Result<(), StoreError> {
+        let (key, bytes) = (key.to_vec(), bytes.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    // Write once; a row whose bytes are not its key's (torn) is healed.
+                    "INSERT INTO game_packages (key, bytes) VALUES ($1, $2) \
+                     ON CONFLICT (key) DO UPDATE SET bytes = EXCLUDED.bytes \
+                     WHERE sha256(game_packages.bytes) <> game_packages.key",
+                )
+                .bind(&key)
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn get_raw(&self, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = key.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT bytes FROM game_packages WHERE key = $1")
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
 impl LogStore for PgLogStore {
     async fn append(&self, batch: AppendBatch<'_>) -> Result<AppendReceipt, AppendError> {
         let job = Job::new(&batch)?;
@@ -611,6 +683,47 @@ impl LogStore for PgLogStore {
                         })
                     })
                     .collect()
+            })
+        })
+        .await
+    }
+
+    /// A seed with no room yet (a world generated but not hosted): refused for a room that
+    /// is stored already, whose world only [`PgLogStore::open_room`] writes.
+    async fn seed_put(&self, room: RoomId, seed: &[u8]) -> Result<(), StoreError> {
+        let seed = seed.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                let (hosted, stored): (bool, Option<Vec<u8>>) = sqlx::query_as(
+                    "WITH hosted AS (SELECT 1 FROM rooms WHERE room_id = $1), \
+                     new AS (INSERT INTO room_seeds (room_id, seed) SELECT $1, $2 \
+                     WHERE NOT EXISTS (SELECT 1 FROM hosted) \
+                     ON CONFLICT (room_id) DO NOTHING RETURNING seed) \
+                     SELECT EXISTS (SELECT 1 FROM hosted), COALESCE((SELECT seed FROM new), \
+                     (SELECT seed FROM room_seeds WHERE room_id = $1))",
+                )
+                .bind(room_key(room))
+                .bind(&seed)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))?;
+                if hosted {
+                    return Err(StoreError::Corrupt("the room is stored already".to_owned()));
+                }
+                crate::mem::same_or_refused(&stored.unwrap_or_default(), &seed)
+            })
+        })
+        .await
+    }
+
+    async fn seed_get(&self, room: RoomId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT seed FROM room_seeds WHERE room_id = $1")
+                    .bind(room_key(room))
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
             })
         })
         .await
