@@ -1433,6 +1433,7 @@ dependencies = [
  "config",
  "e2e",
  "edge-compat",
+ "futures-util",
  "getrandom 0.4.3",
  "log 0.0.0",
  "proto",

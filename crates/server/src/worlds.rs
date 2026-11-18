@@ -14,6 +14,8 @@
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
+use crate::host::RoomsFolder;
+use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
 use crate::{hex, load_bundle};
 use axum::Router;
@@ -27,13 +29,13 @@ use config::{Generation, Limits};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
 /// The API's shared state.
-struct Worlds {
+pub(crate) struct Worlds {
     dir: PathBuf,
     /// SHA-256 of the admin token (compared in constant time, see [`authorized`]).
     token: [u8; 32],
@@ -41,8 +43,15 @@ struct Worlds {
     limits: Limits,
     /// One generation at a time.
     one_gen: Semaphore,
+    /// Room view streams open at once (`view_streams`).
+    view_streams: Arc<Semaphore>,
+    /// Seed names this process put in the rooms folder (the host may not have listed them yet).
+    published: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
+    /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
+    /// `<world id>.json`, and the public `host:port` its join address is under.
+    rooms: Option<(RoomsFolder, String)>,
 }
 
 /// The two kinds of upload.
@@ -86,17 +95,17 @@ fn json_reply(status: StatusCode, v: &Value) -> Response {
     r
 }
 
-/// The routes, rooted at `/api`. Makes the data folders and marks jobs a previous process left
-/// unfinished as failed.
+/// Make the data folders and mark jobs a previous process left unfinished as failed; the
+/// routes come from [`Worlds::router`].
 ///
 /// # Errors
 /// When the data folder cannot be made or read.
-pub fn router(
+pub(crate) fn open(
     dir: &Path,
     token: &str,
     paths: Generation,
     limits: Limits,
-) -> Result<Router, String> {
+) -> Result<Worlds, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
     // Uploads a previous process was inspecting when it stopped.
     if dir.join("tmp").exists() {
@@ -106,23 +115,61 @@ pub fn router(
         std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     recover(&dir.join("worlds"))?;
-    let state = Arc::new(Worlds {
+    Ok(Worlds {
         dir: dir.to_owned(),
         token: Sha256::digest(token.as_bytes()).into(),
         sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Semaphore::new(1),
+        view_streams: Arc::new(Semaphore::new(limits.view_streams)),
+        published: std::sync::Mutex::default(),
         seq: AtomicU64::new(0),
-    });
-    let body_cap = limits.apworld_max_bytes.max(limits.yaml_max_bytes);
-    Ok(Router::new()
+        rooms: None,
+    })
+}
+
+impl core::fmt::Debug for Worlds {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Worlds").field("dir", &self.dir).finish_non_exhaustive()
+    }
+}
+
+impl Worlds {
+    /// Reserve `seed` for a world about to enter the rooms folder. The host lists one room per
+    /// seed name, so a second world with a seed it already hosts would silently share the first
+    /// one's room: refused instead.
+    fn claim_seed(&self, seed: &str) -> Result<(), String> {
+        let mut published = self.published.lock().unwrap_or_else(PoisonError::into_inner);
+        let listed = self.rooms.as_ref().is_some_and(|(folder, _)| folder.key_of(seed).is_some());
+        if listed || !published.insert(seed.to_owned()) {
+            return Err(format!(
+                "seed {seed:?} is already hosted as a room on this server; generate again for a \
+                 new seed"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The routes, rooted at `/api`. With `rooms` (the host's rooms folder and the public
+    /// `host:port`), finished worlds are hosted as rooms.
+    pub(crate) fn router(mut self, rooms: Option<(RoomsFolder, String)>) -> Router {
+        self.rooms = rooms;
+        routes(Arc::new(self))
+    }
+}
+
+fn routes(state: Arc<Worlds>) -> Router {
+    let body_cap = state.limits.apworld_max_bytes.max(state.limits.yaml_max_bytes);
+    Router::new()
         .route("/api/apworlds", get(list_apworlds).put(put_apworld))
         .route("/api/yamls", get(list_yamls).put(put_yaml))
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
+        .route("/api/worlds/{id}/room", get(room_summary))
+        .route("/api/worlds/{id}/room/events", get(room_events))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
         .layer(DefaultBodyLimit::max(body_cap))
-        .with_state(state))
+        .with_state(state)
 }
 
 async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
@@ -445,10 +492,20 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
         Ok(stdout) => {
             let (bundle, limits) = (world.join("bundle.seed"), w.limits);
+            let room_file = room_file(&w, &id);
+            let worlds = Arc::clone(&w);
             tokio::task::spawn_blocking(move || {
                 let out = GenOut::parse(&stdout)?;
-                write_v2(&bundle, out.bundle.get(), &limits)?;
-                load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, out.report))
+                let text = out.bundle.get();
+                write_v2(&bundle, text, &limits)?;
+                let loaded = load_bundle(&bundle, &limits)?;
+                // Only a seed that loads reaches the rooms folder, its packages before it, and
+                // never half written.
+                if let Some(file) = room_file {
+                    worlds.claim_seed(loaded.bundle.seed_name())?;
+                    write_v2(&file, text, &limits).map_err(|e| format!("rooms folder: {e}"))?;
+                }
+                Ok((bundle, loaded, out.report))
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
@@ -481,13 +538,86 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     }
 }
 
+/// Where a world's seed goes in the rooms folder (`--rooms` only; its packages go in the
+/// folder's `packages/`). `id` is a checked world id.
+fn room_file(w: &Worlds, id: &str) -> Option<PathBuf> {
+    w.rooms.as_ref().map(|(folder, _)| folder.dir().join(format!("{id}.seed")))
+}
+
+/// The listed room of a finished world (`--rooms` only): its rooms folder, key and join address
+/// (`{key}.{host}:{port}`). Found by the seed name in the world's status; the host lists each
+/// seed once.
+fn hosted<'a>(w: &'a Worlds, status: &Value) -> Option<(&'a RoomsFolder, RoomKey, String)> {
+    let (folder, public) = w.rooms.as_ref()?;
+    let key = folder.key_of(status["seed_name"].as_str()?)?;
+    let address = format!("{key}.{public}");
+    Some((folder, key, address))
+}
+
+fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
+    if valid_id(id) { Ok(()) } else { Err((StatusCode::BAD_REQUEST, "bad id".to_owned())) }
+}
+
+fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCode, String)> {
+    checked_id(id)?;
+    read_json(&w.dir.join("worlds").join(id).join("status.json"))
+        .ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))
+}
+
+/// The status on disk, plus `room_key` and `address` once the host lists the world's room.
 async fn world_status(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    if !valid_id(&id) {
-        return Err((StatusCode::BAD_REQUEST, "bad id".to_owned()));
+    let mut status = read_status(&w, &id)?;
+    if let Some((_, key, address)) = hosted(&w, &status) {
+        status["room_key"] = json!(key.as_str());
+        status["address"] = json!(address);
     }
-    let status = read_json(&w.dir.join("worlds").join(&id).join("status.json"))
-        .ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))?;
     Ok(json_reply(StatusCode::OK, &status))
+}
+
+fn no_room() -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, "this world does not run as a room on this server".to_owned())
+}
+
+/// The room is listed but could not answer now (it failed to load, or stopped): try again.
+fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) {
+    tracing::warn!(%why, "room view unavailable");
+    (StatusCode::SERVICE_UNAVAILABLE, "the room is not available right now; try again".to_owned())
+}
+
+/// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
+/// cold room is loaded to answer, as a connection would load it.
+async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
+    let status = read_status(&w, &id)?;
+    let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;
+    let (room, _visit) = folder.enter(key.clone()).await.map_err(unavailable)?;
+    let mut summary = room.summary().await.map_err(|e| unavailable(format!("{e:?}")))?;
+    summary["room_key"] = json!(key.as_str());
+    summary["address"] = json!(address);
+    Ok(json_reply(StatusCode::OK, &summary))
+}
+
+/// The world's room events as server-sent events, resuming after `Last-Event-ID`
+/// ([`crate::room_view::events`]). The stream counts as a visit, so the room stays in memory
+/// while someone watches it; at most `view_streams` are open at once.
+async fn room_events(
+    State(w): State<Arc<Worlds>>,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Reply {
+    let status = read_status(&w, &id)?;
+    let (folder, key, _) = hosted(&w, &status).ok_or_else(no_room)?;
+    let permit = Arc::clone(&w.view_streams).try_acquire_owned().map_err(|_| {
+        (StatusCode::SERVICE_UNAVAILABLE, "too many room views are open; try again".to_owned())
+    })?;
+    let (room, visit) = folder.enter(key).await.map_err(unavailable)?;
+    let after = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .map_or(proto::Seq(0), proto::Seq);
+    let held = crate::room_view::Held { _visit: visit, _permit: permit };
+    crate::room_view::events(room, held, after, w.limits.view_history_events)
+        .await
+        .map_err(|e| unavailable(format!("{e:?}")))
 }
 
 /// A job a previous process left queued or running will never finish: mark it failed.

@@ -67,13 +67,18 @@ impl Server {
     }
 
     /// Like [`Server::start`], but with every seed bundle in the folder `rooms` (`--rooms`)
-    /// instead of the fixture.
+    /// instead of the fixture, then the `extra` arguments.
     ///
     /// # Errors
     /// When the binary cannot be started or never logs its address.
-    pub fn start_rooms(bin: &Path, rooms: &Path, env: &[(&str, &str)]) -> Res<Self> {
+    pub fn start_rooms(
+        bin: &Path,
+        rooms: &Path,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> Res<Self> {
         let mut c = base_command(bin, env);
-        c.arg("--rooms").arg(rooms).args(["--port", "0"]);
+        c.arg("--rooms").arg(rooms).args(["--port", "0"]).args(extra);
         Self::spawn(c)
     }
 

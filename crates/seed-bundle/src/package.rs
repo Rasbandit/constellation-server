@@ -210,6 +210,9 @@ pub struct GamePackage {
     locations: Box<[i64]>,
     /// Every item id, ascending.
     items: Box<[i64]>,
+    /// Names by index: what the host's room view shows, once per process, not per room.
+    location_names: Box<[Box<str>]>,
+    item_names: Box<[Box<str>]>,
     /// The package clients get in `DataPackage`: names to ids and the checksum, as JSON.
     data_package: Box<str>,
     item_groups: Box<str>,
@@ -231,11 +234,13 @@ pub fn canonical(mut v: serde_json::Value) -> Vec<u8> {
     v.to_string().into_bytes()
 }
 
-fn sorted(ids: impl Iterator<Item = i64>) -> Box<[i64]> {
-    let mut v: Vec<i64> = ids.collect();
-    v.sort_unstable();
-    v.dedup();
-    v.into_boxed_slice()
+/// Ids ascending (each once) and the name of each, in the same order. An id two names share
+/// keeps the first name in name order.
+fn sorted(names: &BTreeMap<String, i64>) -> (Box<[i64]>, Box<[Box<str>]>) {
+    let mut v: Vec<(i64, &str)> = names.iter().map(|(n, &id)| (id, n.as_str())).collect();
+    v.sort_by_key(|p| p.0);
+    v.dedup_by_key(|p| p.0);
+    (v.iter().map(|p| p.0).collect(), v.iter().map(|p| p.1.into()).collect())
 }
 
 impl GamePackage {
@@ -261,12 +266,16 @@ impl GamePackage {
             "location_name_to_id": g.location_name_to_id,
             "checksum": g.checksum,
         });
+        let (locations, location_names) = sorted(&g.location_name_to_id);
+        let (items, item_names) = sorted(&g.item_name_to_id);
         Self {
             key,
             name: name.into(),
             checksum: g.checksum.as_str().into(),
-            locations: sorted(g.location_name_to_id.values().copied()),
-            items: sorted(g.item_name_to_id.values().copied()),
+            locations,
+            items,
+            location_names,
+            item_names,
             data_package: reduced.to_string().into(),
             item_groups: serde_json::json!(g.item_name_groups).to_string().into(),
             location_groups: serde_json::json!(g.location_name_groups).to_string().into(),
@@ -330,6 +339,18 @@ impl GamePackage {
     #[must_use]
     pub fn item_index(&self, id: i64) -> Option<usize> {
         self.items.binary_search(&id).ok()
+    }
+
+    /// The name of location id `id`.
+    #[must_use]
+    pub fn location_name(&self, id: i64) -> Option<&str> {
+        self.location_names.get(self.location_index(id)?).map(|n| &**n)
+    }
+
+    /// The name of item id `id`.
+    #[must_use]
+    pub fn item_name(&self, id: i64) -> Option<&str> {
+        self.item_names.get(self.item_index(id)?).map(|n| &**n)
     }
 
     /// The JSON object clients get for this game in `DataPackage`.
@@ -483,6 +504,10 @@ mod tests {
         assert_eq!(p.items(), [-1, 9]);
         assert_eq!((p.location_index(5), p.location_index(3)), (Some(1), None));
         assert_eq!(p.item_index(-1), Some(0));
+        assert_eq!(
+            (p.item_name(9), p.location_name(2), p.item_name(3)),
+            (Some("b"), Some("y"), None)
+        );
         // Exactly what the edge sent before packages were shared (sorted keys, compact).
         assert_eq!(
             p.data_package(),

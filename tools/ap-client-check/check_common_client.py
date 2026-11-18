@@ -25,16 +25,12 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
-from typing import Any, Callable
+from typing import Any
 
-GUARD = 20.0  # seconds any single wait may take before the check fails instead of hanging
+from ap_client import GUARD, Failure, check, load_archipelago, make_probe
+
 GAME = "Archipela-Go 2: Electric Boogaloo"
-
-
-class Failure(Exception):
-    pass
 
 
 def start_server(binary: str, bundle: str) -> tuple[subprocess.Popen, str]:
@@ -60,53 +56,8 @@ def start_server(binary: str, bundle: str) -> tuple[subprocess.Popen, str]:
     return proc, f"ws://{found[0]}"
 
 
-def make_probe(base: type) -> type:
-    class Probe(base):  # type: ignore[misc, valid-type]
-        game = GAME
-        items_handling = 0b111  # every item, own world too, and the starting inventory
-
-        def __init__(self, address: str, name: str) -> None:
-            super().__init__(address, None)
-            self.username = name
-            self.packets: list[tuple[str, dict]] = []
-            self.changed = asyncio.Event()
-
-        async def server_auth(self, password_requested: bool = False) -> None:
-            await super().server_auth(password_requested)
-            await self.get_username()
-            await self.send_connect()
-
-        def on_package(self, cmd: str, args: dict) -> None:
-            self.packets.append((cmd, args))
-            self.changed.set()
-
-        async def until(self, what: str, done: Callable[[], bool]) -> None:
-            async def wait() -> None:
-                while not done():
-                    self.changed.clear()
-                    await self.changed.wait()
-
-            try:
-                await asyncio.wait_for(wait(), GUARD)
-            except asyncio.TimeoutError:
-                raise Failure(f"{self.username}: timed out waiting for {what}") from None
-
-        def invalid(self) -> list[dict]:
-            return [a for c, a in self.packets if c == "InvalidPacket"]
-
-    return Probe
-
-
-def check(cond: bool, what: str) -> None:
-    if not cond:
-        raise Failure(what)
-    print(f"ok: {what}")
-
-
-async def run(url: str, bundle: dict[str, Any]) -> None:
-    from CommonClient import CommonContext
-
-    Probe = make_probe(CommonContext)
+async def run(CommonContext: type, url: str, bundle: dict[str, Any]) -> None:
+    Probe = make_probe(CommonContext, GAME)
     game = bundle["games"][GAME]
     alice = Probe(url, "Alice")
     await alice.connect()
@@ -171,18 +122,10 @@ def main() -> int:
     args = parser.parse_args()
     with open(args.bundle) as f:
         bundle = json.load(f)
-    # Keep the client's cache out of the user's home; set before Archipelago is imported.
-    os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="ap-client-check-")
-    sys.path.insert(0, os.path.abspath(args.ap))
-    import ModuleUpdate  # Archipelago's dependency check; skip it, the venv is already set up
-
-    ModuleUpdate.update_ran = True
-    import Utils
-
-    Utils.persistent_store = lambda *a, **k: None  # never write into the checkout or home
+    CommonContext = load_archipelago(args.ap)
     proc, url = start_server(args.server, args.bundle)
     try:
-        asyncio.run(run(url, bundle))
+        asyncio.run(run(CommonContext, url, bundle))
     except Failure as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 1

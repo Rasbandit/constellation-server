@@ -370,7 +370,7 @@ mod scenarios {
         for seed in seeds {
             add_bundle(&dir, seed);
         }
-        (Server::start_rooms(Path::new(BIN), &dir, env).unwrap(), dir)
+        (Server::start_rooms(Path::new(BIN), &dir, &[], env).unwrap(), dir)
     }
 
     /// Put the fixture under `seed` into the folder the way an operator should: written under
@@ -413,7 +413,7 @@ mod scenarios {
         assert!(health.starts_with("HTTP/1.1 200"), "{health}");
         // In memory, a restart draws new keys (the rooms are lost anyway).
         drop(server);
-        let again = Server::start_rooms(Path::new(BIN), &dir, &[]).unwrap();
+        let again = Server::start_rooms(Path::new(BIN), &dir, &[], &[]).unwrap();
         assert_ne!(key_of(&again, "alpha"), a);
         drop(std::fs::remove_dir_all(&dir));
     }

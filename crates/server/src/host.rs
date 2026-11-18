@@ -219,6 +219,12 @@ impl Host {
         Arc::clone(&self.rooms)
     }
 
+    /// The rooms folder and a view of its rooms (`--rooms`); `None` for `--bundle`.
+    pub(crate) fn folder(&self) -> Option<RoomsFolder> {
+        let dir = self.folder.clone()?;
+        Some(RoomsFolder { dir, rooms: self.rooms(), wake: self.waker() })
+    }
+
     /// How many rooms are listed.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -653,6 +659,34 @@ impl Host {
     }
 }
 
+/// The rooms folder of a running host: where to put a bundle so the next scan lists it, which
+/// key a seed's room got, and how to reach that room.
+#[derive(Debug, Clone)]
+pub(crate) struct RoomsFolder {
+    dir: PathBuf,
+    rooms: Arc<RwLock<Rooms>>,
+    wake: Waker,
+}
+
+impl RoomsFolder {
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The key of the listed room made from seed `seed`, if any.
+    pub(crate) fn key_of(&self, seed: &str) -> Option<RoomKey> {
+        read(&self.rooms).key_of(crate::room_id(seed)).cloned()
+    }
+
+    /// The room `key`, woken first when it is cold, with a visit that keeps it in memory.
+    pub(crate) async fn enter(
+        &self,
+        key: RoomKey,
+    ) -> Result<(Arc<edge_compat::CompatRoom>, crate::rooms::Visit), String> {
+        crate::enter(&self.rooms, &self.wake, key).await
+    }
+}
+
 /// Every seed file in `folder` (`*.json` v1, `*.seed` v2), in name order, with what a scan
 /// compares.
 fn bundle_files(folder: &Path) -> Result<Vec<(PathBuf, Seen)>, String> {
@@ -734,6 +768,25 @@ mod tests {
 
     fn visit(host: &Host, key: &RoomKey) -> crate::rooms::Visit {
         read(&host.rooms).get(key).unwrap().activity.enter()
+    }
+
+    #[tokio::test]
+    async fn a_seeds_room_key_is_found_while_it_is_listed() {
+        let dir = TempDir::new("key-of");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let host = host(&dir, Limits::DESIGN).await;
+        let folder = host.folder().unwrap();
+        assert_eq!(folder.dir(), dir.0.as_path());
+        assert_eq!(folder.key_of("alpha"), Some(key_of(&host, "alpha")));
+        assert_eq!(folder.key_of("beta"), Some(key_of(&host, "beta")));
+        assert_eq!(folder.key_of("gamma"), None, "no such seed");
+    }
+
+    #[tokio::test]
+    async fn a_single_bundle_host_has_no_rooms_folder() {
+        let (_, host) = app(&Source::Bundle(fixture()), None, None, Limits::DESIGN).await.unwrap();
+        assert!(host.folder().is_none());
     }
 
     #[tokio::test]

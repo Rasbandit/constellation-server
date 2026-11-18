@@ -204,6 +204,218 @@ async fn upload_list_generate_poll_and_done() {
 }
 
 #[tokio::test]
+async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key() {
+    let setup = Setup::new("to-room");
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    // A second room, so a connection must name its key to reach the generated one.
+    let mut other: Value =
+        serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+    other["seed_name"] = json!("other-room");
+    std::fs::write(rooms.join("other.json"), other.to_string()).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let mut env = setup.env();
+    env.push(("CONSTELLATION_ROOMS_SCAN_MS".into(), "50".into()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("generation done").unwrap();
+    let published = rooms.join(format!("{id}.seed"));
+    let read = |p: &Path| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
+    let back = seed_bundle::v2::decode(
+        std::fs::read(&published).unwrap(),
+        &rooms.join("packages"),
+        1 << 26,
+    );
+    assert_eq!(
+        serde_json::to_value(back.unwrap()).unwrap(),
+        read(&e2e::fixture_path()),
+        "the seed is in the rooms folder"
+    );
+    let left: Vec<_> = std::fs::read_dir(&rooms).unwrap().filter_map(Result::ok).collect();
+    assert_eq!(left.len(), 3, "the other room, the seed, its packages; no temporary file");
+
+    let seed = e2e::fixture().unwrap().seed_name;
+    let ready = server.wait_for_log(&format!("seed=\"{seed}\"")).unwrap();
+    let key = ready.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "done", "{st}");
+    assert_eq!(st["room_key"], key.as_str(), "{st}");
+    let port = server.addr.port();
+    assert_eq!(st["address"], format!("{key}.localhost:{port}"), "{st}");
+
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (_, connected, _) = e2e::join_via(server.addr, &url, "Alice").await.unwrap();
+    assert_eq!(connected["cmd"], "Connected", "{connected}");
+}
+
+/// Start a server with a rooms folder and generate one world (the fixture); returns the server,
+/// the world id and its status once the server hosts it as a room.
+async fn hosted_world(setup: &Setup) -> (Server, String, Value) {
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let mut env = setup.env();
+    env.push(("CONSTELLATION_ROOMS_SCAN_MS".into(), "50".into()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("room ready").unwrap();
+    let st = status(&server, &id).await;
+    assert!(st["room_key"].is_string(), "{st}");
+    (server, id, st)
+}
+
+/// Read a streaming HTTP response until `want` appears in it; everything read so far.
+async fn read_until(s: &mut tokio::net::TcpStream, want: &str) -> String {
+    let mut got = Vec::new();
+    let read = async {
+        while !String::from_utf8_lossy(&got).contains(want) {
+            let mut buf = [0_u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "the stream ended before {want:?}: {}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&buf[..n]);
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .unwrap_or_else(|_| panic!("no {want:?} in {}", String::from_utf8_lossy(&got)));
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// Read SSE `data:` lines until one parses to an event `pick` accepts.
+async fn next_event(s: &mut tokio::net::TcpStream, pick: impl Fn(&Value) -> bool) -> Value {
+    let mut got = String::new();
+    let read = async {
+        loop {
+            let found = got
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l.strip_prefix("data: ")?).ok())
+                .find(|e| pick(e));
+            if let Some(e) = found {
+                return e;
+            }
+            let mut buf = [0_u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "the stream ended: {got}");
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .unwrap_or_else(|_| panic!("no such event in {got}"))
+}
+
+#[tokio::test]
+async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
+    let setup = Setup::new("room-view");
+    let (server, id, st) = hosted_world(&setup).await;
+    let fixture = e2e::fixture().unwrap();
+    let view = |server: &Server| {
+        let path = format!("/api/worlds/{id}/room");
+        let addr = admin_addr(server);
+        async move { request(&addr, "GET", &path, Some(TOKEN), b"").await }
+    };
+    let (code, room) = view(&server).await;
+    assert_eq!(code, 200, "{room}");
+    assert_eq!((&room["seed"], &room["room_key"]), (&json!(fixture.seed_name), &st["room_key"]));
+    assert_eq!(room["address"], st["address"]);
+    let opts = &fixture.server_options;
+    assert_eq!(room["options"]["password"], opts.password.is_some(), "a flag, never the password");
+    assert_eq!(room["options"]["hint_cost"], opts.hint_cost);
+    let slots = room["slots"].as_array().unwrap();
+    assert_eq!(slots.len(), fixture.slots.len());
+    let (alice, bob) = (&slots[0], &slots[1]);
+    assert_eq!(
+        (&alice["name"], &alice["connected"], &alice["checked"]),
+        (&json!("Alice"), &json!(false), &json!(0))
+    );
+    assert_eq!(alice["locations"], fixture.slots[0].locations.len());
+    assert_eq!((&bob["items_received"], &bob["goal"]), (&json!(0), &json!(false)));
+
+    // The event stream, on its own connection, before anything happens.
+    let addr = admin_addr(&server);
+    let mut sse = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "GET /api/worlds/{id}/room/events HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+    );
+    sse.write_all(head.as_bytes()).await.unwrap();
+    let opened = read_until(&mut sse, "\r\n\r\n").await;
+    assert!(opened.starts_with("HTTP/1.1 200"), "{opened}");
+    assert!(opened.contains("text/event-stream"), "{opened}");
+
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (mut alice_ws, _, _) = e2e::join_via(server.addr, &url, "Alice").await.unwrap();
+    next_event(&mut sse, |e| e["kind"] == "join" && e["slot"] == 1).await;
+    let (_, room) = view(&server).await;
+    assert_eq!(room["slots"][0]["connected"], true, "a real session: {room}");
+    assert_eq!(room["slots"][1]["connected"], false, "{room}");
+
+    let (loc, item, _) = e2e::locations_for(1, 2).unwrap()[0];
+    alice_ws.check(&[loc]).await.unwrap();
+    let ev = next_event(&mut sse, |e| e["kind"] == "item").await;
+    assert_eq!(
+        (&ev["from"], &ev["to"], &ev["location"], &ev["item"]),
+        (&json!(1), &json!(2), &json!(loc), &json!(item))
+    );
+    assert!(ev["item_name"].is_string() && ev["location_name"].is_string(), "{ev}");
+    assert_eq!((&ev["from_name"], &ev["to_name"]), (&json!("Alice"), &json!("Bob")));
+    let (_, room) = view(&server).await;
+    assert_eq!(
+        (&room["slots"][0]["checked"], &room["slots"][1]["items_received"]),
+        (&json!(1), &json!(1))
+    );
+
+    drop(alice_ws);
+    next_event(&mut sse, |e| e["kind"] == "leave" && e["slot"] == 1).await;
+    let (_, room) = view(&server).await;
+    assert_eq!(room["slots"][0]["connected"], false, "{room}");
+}
+
+#[tokio::test]
+async fn a_second_world_with_a_hosted_seed_fails_instead_of_sharing_its_room() {
+    let setup = Setup::new("same-seed");
+    let (server, first, st) = hosted_world(&setup).await;
+    // The fake sidecar always prints the fixture, so the second world has the same seed name.
+    let second = generate_one(&server, b"Bob").await;
+    server.wait_for_log(&format!("world={second}")).unwrap();
+    server.wait_for_log("generation failed").unwrap();
+    let st2 = status(&server, &second).await;
+    assert_eq!(st2["status"], "failed", "{st2}");
+    assert!(st2["error"].as_str().unwrap().contains("already hosted"), "{st2}");
+    assert!(st2.get("room_key").is_none(), "{st2}");
+    let rooms = setup.root.join("rooms");
+    assert!(!rooms.join(format!("{second}.seed")).exists(), "nothing reached the rooms folder");
+    assert_eq!(status(&server, &first).await["room_key"], st["room_key"], "the first is untouched");
+}
+
+#[tokio::test]
+async fn a_world_with_no_running_room_has_no_view() {
+    let setup = Setup::new("no-view");
+    let server = setup.start();
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("generation done").unwrap();
+    for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
+        let (code, body) = http(&server, "GET", &path, Some(TOKEN), b"").await;
+        assert_eq!(code, 404, "{path}: {body}");
+    }
+    let (code, _) = http(&server, "GET", &format!("/api/worlds/{id}/room"), None, b"").await;
+    assert_eq!(code, 401, "the view needs the admin token");
+}
+
+#[tokio::test]
+async fn without_a_rooms_folder_a_world_status_has_no_room() {
+    let setup = Setup::new("no-room");
+    let server = setup.start();
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("generation done").unwrap();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "done", "{st}");
+    assert!(st.get("room_key").is_none() && st.get("address").is_none(), "{st}");
+}
+
+#[tokio::test]
 async fn a_generation_past_its_time_limit_is_killed_and_reported_failed() {
     let setup = Setup::new("timeout");
     let server = setup.start_with(&[("CONSTELLATION_GEN_TIMEOUT_MS", "1000")]);

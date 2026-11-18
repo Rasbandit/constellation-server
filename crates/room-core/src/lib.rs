@@ -552,6 +552,14 @@ impl RoomState {
         self.kv.get(key)
     }
 
+    /// How many locations `slot` has checked.
+    #[must_use]
+    pub fn checked_count(&self, slot: SlotNo) -> usize {
+        let pos = self.world.0.slots().binary_search(&slot).ok();
+        let set = pos.and_then(|p| self.checked.get(p));
+        set.map_or(0, |w| w.iter().map(|x| x.count_ones() as usize).sum())
+    }
+
     /// Whether `slot` has reached its goal.
     #[must_use]
     pub fn has_goal(&self, slot: SlotNo) -> bool {
