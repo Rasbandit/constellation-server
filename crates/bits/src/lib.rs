@@ -136,6 +136,35 @@ impl BitSet {
     pub fn ones(&self) -> impl Iterator<Item = usize> + '_ {
         ones(&self.words)
     }
+
+    /// Add every index of `other` that is in this set's range.
+    pub fn union_with(&mut self, other: &Self) {
+        for (w, o) in self.words.iter_mut().zip(&other.words) {
+            *w |= o;
+        }
+        self.trim();
+    }
+
+    /// Whether the two sets share an index.
+    #[must_use]
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
+    }
+
+    /// Remove every index.
+    pub fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
+    /// Clear the bits past `len` in the last word (a union with a longer set can set them).
+    fn trim(&mut self) {
+        let tail = self.len % 64;
+        if tail != 0
+            && let Some(last) = self.words.last_mut()
+        {
+            *last &= (1 << tail) - 1;
+        }
+    }
 }
 
 /// Whether bit `i` of `words` is set (false past the end).
@@ -186,9 +215,7 @@ impl Packed {
     /// The value at `i`.
     #[must_use]
     pub fn get(&self, i: usize) -> Option<u32> {
-        // A width of at most 32 bits always fits a u32.
-        (i < self.len)
-            .then(|| read(&self.bits.bytes, i * usize::from(self.width), self.width) as u32)
+        self.view().get(i)
     }
 
     /// How many values.
@@ -205,7 +232,57 @@ impl Packed {
 
     /// Every value, in order.
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..self.len).filter_map(|i| self.get(i))
+        self.view().iter()
+    }
+
+    /// A read-only view of this list.
+    #[must_use]
+    pub fn view(&self) -> PackedRef<'_> {
+        PackedRef { bytes: &self.bits.bytes, width: self.width, len: self.len }
+    }
+}
+
+/// A read-only [`Packed`] list over borrowed bytes (for example a section of a file), read in
+/// place with no copy. Values past the bytes read as 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedRef<'a> {
+    bytes: &'a [u8],
+    width: u8,
+    len: usize,
+}
+
+impl<'a> PackedRef<'a> {
+    /// `len` values of `width` bits (at most 32) packed in `bytes` from bit 0; `None` when the
+    /// bytes are too short for them.
+    #[must_use]
+    pub fn from_bytes(bytes: &'a [u8], width: u8, len: usize) -> Option<Self> {
+        let width = width.min(32);
+        let need = len.checked_mul(usize::from(width))?.div_ceil(8);
+        (bytes.len() >= need).then_some(Self { bytes, width, len })
+    }
+
+    /// The value at `i`.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<u32> {
+        // A width of at most 32 bits always fits a u32.
+        (i < self.len).then(|| read(self.bytes, i * usize::from(self.width), self.width) as u32)
+    }
+
+    /// How many values.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the list is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every value, in order.
+    pub fn iter(self) -> impl Iterator<Item = u32> + 'a {
+        (0..self.len).filter_map(move |i| self.get(i))
     }
 }
 
@@ -260,6 +337,39 @@ mod tests {
         assert_eq!(BitSet::from_words(s.words().to_vec(), 129), None, "bit 129 is past 129");
         assert_eq!(BitSet::from_words(alloc::vec![0], 130), None, "too few words");
         assert_eq!(BitSet::new(0).words().len(), 0);
+    }
+
+    #[test]
+    fn union_intersection_and_clear_stay_in_range() {
+        let (mut a, mut b) = (BitSet::new(70), BitSet::new(130));
+        a.insert(3);
+        b.insert(69);
+        b.insert(100);
+        assert!(!a.intersects(&b));
+        a.union_with(&b);
+        assert_eq!(a.ones().collect::<Vec<_>>(), [3, 69], "100 is past a's range");
+        assert!(a.intersects(&b) && b.intersects(&a));
+        let mut short = BitSet::new(66);
+        short.union_with(&BitSet::from_words(alloc::vec![0, u64::MAX, 0], 192).unwrap());
+        assert_eq!(short.ones().collect::<Vec<_>>(), [64, 65], "bits past 66 are cleared");
+        a.clear();
+        assert_eq!((a.count(), a.len()), (0, 70));
+        assert!(!a.intersects(&b) && !BitSet::new(0).intersects(&b));
+    }
+
+    #[test]
+    fn a_borrowed_list_reads_in_place_and_checks_its_length() {
+        let mut p = Packed::new(5);
+        for v in [31, 0, 17] {
+            p.push(v);
+        }
+        let bytes = p.view().bytes;
+        let r = PackedRef::from_bytes(bytes, 5, 3).unwrap();
+        assert_eq!(r.iter().collect::<Vec<_>>(), [31, 0, 17]);
+        assert_eq!((r.get(3), r.len(), r.is_empty()), (None, 3, false));
+        assert_eq!(PackedRef::from_bytes(bytes, 5, 4), None, "20 bits need 3 bytes");
+        assert_eq!(PackedRef::from_bytes(&[], 0, 1000).map(|r| r.get(999)), Some(Some(0)));
+        assert_eq!(PackedRef::from_bytes(&[], 8, usize::MAX), None, "overflow");
     }
 
     #[test]

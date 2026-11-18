@@ -40,17 +40,22 @@ pub struct Section {
     pub id: u16,
     /// Its bytes, inflated.
     pub bytes: Vec<u8>,
+    /// Stored as raw deflate (smaller); otherwise stored as is, so [`stored`] can read it in
+    /// place.
+    pub deflate: bool,
 }
 
-/// A package file of these sections (each deflated, with the SHA-256 of its inflated bytes in
-/// the table of contents).
+/// A package file of these sections, with the SHA-256 of each one's inflated bytes in the
+/// table of contents.
 ///
 /// # Errors
 /// Never in practice (writes go to memory); a section over 4 GiB.
 pub fn file_bytes(sections: &[Section]) -> std::io::Result<Vec<u8>> {
     let big = || std::io::Error::other("a package section is too large");
-    let stored: Vec<Vec<u8>> =
-        sections.iter().map(|s| deflate(&s.bytes)).collect::<Result<_, _>>()?;
+    let stored: Vec<Vec<u8>> = sections
+        .iter()
+        .map(|s| if s.deflate { deflate(&s.bytes) } else { Ok(s.bytes.clone()) })
+        .collect::<Result<_, _>>()?;
     let count = u16::try_from(sections.len()).map_err(|_| big())?;
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
@@ -59,7 +64,7 @@ pub fn file_bytes(sections: &[Section]) -> std::io::Result<Vec<u8>> {
     let mut at = 8 + ENTRY * sections.len();
     for (s, b) in sections.iter().zip(&stored) {
         out.extend_from_slice(&s.id.to_le_bytes());
-        out.extend_from_slice(&DEFLATED.to_le_bytes());
+        out.extend_from_slice(&(if s.deflate { DEFLATED } else { 0 }).to_le_bytes());
         for n in [at, b.len(), s.bytes.len()] {
             out.extend_from_slice(&u32::try_from(n).map_err(|_| big())?.to_le_bytes());
         }
@@ -72,12 +77,16 @@ pub fn file_bytes(sections: &[Section]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Every section of a package file, each checked against its hash. Sections this crate does
-/// not know are returned too; a reader skips what it does not use.
-///
-/// # Errors
-/// A malformed file, a section over `max` bytes, or one that does not match its hash.
-pub fn sections(file: &[u8], max: u64) -> Result<Vec<Section>, BundleError> {
+/// One table of contents entry, its stored bytes borrowed from the file.
+struct Entry<'a> {
+    id: u16,
+    deflate: bool,
+    stored: &'a [u8],
+    raw: usize,
+    hash: &'a [u8],
+}
+
+fn toc(file: &[u8]) -> Result<Vec<Entry<'_>>, BundleError> {
     let bad = |why: &str| BundleError::Invalid(format!("package file: {why}"));
     let u16_at = |at: usize| file.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |at: usize| {
@@ -103,14 +112,64 @@ pub fn sections(file: &[u8], max: u64) -> Result<Vec<Section>, BundleError> {
             };
             let stored = at.checked_add(len).and_then(|end| file.get(at..end));
             let stored = stored.ok_or_else(|| bad("section past the end"))?;
-            let cap = max.min(raw as u64);
-            let bytes = if flags & DEFLATED != 0 { inflate(stored, cap)? } else { stored.to_vec() };
-            if bytes.len() != raw || Sha256::digest(&bytes)[..] != *hash {
-                return Err(bad("a section does not match its hash"));
-            }
-            Ok(Section { id, bytes })
+            Ok(Entry { id, deflate: flags & DEFLATED != 0, stored, raw, hash })
         })
         .collect()
+}
+
+fn checked(e: &Entry<'_>, bytes: &[u8]) -> Result<(), BundleError> {
+    if bytes.len() != e.raw || Sha256::digest(bytes)[..] != *e.hash {
+        return Err(BundleError::Invalid("package file: a section does not match its hash".into()));
+    }
+    Ok(())
+}
+
+/// Every section of a package file, each checked against its hash. Sections this crate does
+/// not know are returned too; a reader skips what it does not use.
+///
+/// # Errors
+/// A malformed file, a section over `max` bytes, or one that does not match its hash.
+pub fn sections(file: &[u8], max: u64) -> Result<Vec<Section>, BundleError> {
+    toc(file)?
+        .into_iter()
+        .map(|e| {
+            let cap = max.min(e.raw as u64);
+            if e.raw as u64 > max {
+                return Err(BundleError::Invalid(format!("package section over {max} bytes")));
+            }
+            let bytes = if e.deflate { inflate(e.stored, cap)? } else { e.stored.to_vec() };
+            checked(&e, &bytes)?;
+            Ok(Section { id: e.id, bytes, deflate: e.deflate })
+        })
+        .collect()
+}
+
+/// Section `id` of a package file, read in place (no copy), checked against its hash; `None`
+/// when the file has no such section.
+///
+/// # Errors
+/// A malformed file, a hash mismatch, or a section stored deflated (read it with
+/// [`sections`] or [`section`], which inflate).
+pub fn stored(file: &[u8], id: u16) -> Result<Option<&[u8]>, BundleError> {
+    let Some(e) = toc(file)?.into_iter().find(|e| e.id == id) else { return Ok(None) };
+    if e.deflate {
+        return Err(BundleError::Invalid(format!("package section {id} is deflated")));
+    }
+    checked(&e, e.stored)?;
+    Ok(Some(e.stored))
+}
+
+/// Section `id` of package `key` in `dir`, read from the file on request: a room keeps only
+/// [`GamePackage`]'s tables in memory, never other sections, so each call costs one file read
+/// (and an inflate for a deflated section) and holds nothing after.
+///
+/// # Errors
+/// As [`read`], plus a section over `max` bytes.
+pub fn section(dir: &Path, key: &Key, id: u16, max: u64) -> Result<Option<Vec<u8>>, BundleError> {
+    let path = file(dir, key);
+    let bytes =
+        std::fs::read(&path).map_err(|e| BundleError::Parse(format!("{}: {e}", path.display())))?;
+    Ok(sections(&bytes, max)?.into_iter().find(|s| s.id == id).map(|s| s.bytes))
 }
 
 /// One game's package as rooms use it.
@@ -313,7 +372,8 @@ pub fn write(dir: &Path, content: &[u8]) -> std::io::Result<Key> {
     if !path.exists() {
         std::fs::create_dir_all(dir)?;
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        let bytes = file_bytes(&[Section { id: SECTION_GAME, bytes: content.to_vec() }])?;
+        let bytes =
+            file_bytes(&[Section { id: SECTION_GAME, bytes: content.to_vec(), deflate: true }])?;
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)?;
     }
@@ -412,7 +472,9 @@ mod tests {
         assert_eq!(GamePackage::parse(&content).unwrap(), ("G".to_owned(), game()));
         // Over the cap: refused, not inflated without bound.
         assert!(read(&dir, &key, 10).is_err());
-        let other = file_bytes(&[Section { id: SECTION_GAME, bytes: b"{}".to_vec() }]).unwrap();
+        let other =
+            file_bytes(&[Section { id: SECTION_GAME, bytes: b"{}".to_vec(), deflate: true }])
+                .unwrap();
         std::fs::write(file(&dir, &key), other).unwrap();
         assert!(read(&dir, &key, 1 << 20).is_err(), "content that is not the key's");
         assert!(read(&dir, &[1; 32], 1 << 20).is_err(), "missing");
@@ -423,8 +485,8 @@ mod tests {
     #[test]
     fn sections_round_trip_and_unknown_or_broken_ones_are_handled() {
         let all = [
-            Section { id: SECTION_GAME, bytes: b"game".to_vec() },
-            Section { id: 99, bytes: vec![7; 300] },
+            Section { id: SECTION_GAME, bytes: b"game".to_vec(), deflate: true },
+            Section { id: 99, bytes: vec![7; 300], deflate: false },
         ];
         let f = file_bytes(&all).unwrap();
         assert_eq!(sections(&f, 1 << 20).unwrap(), all, "an unknown section is kept, not refused");
@@ -435,9 +497,42 @@ mod tests {
         let mut wrong = f.clone();
         wrong[8 + 16] ^= 1; // the first section's hash
         assert!(sections(&wrong, 1 << 20).is_err());
+        // A section stored as is reads in place; a deflated one says so.
+        assert_eq!(stored(&f, 99).unwrap(), Some(&[7_u8; 300][..]));
+        assert!(stored(&f, SECTION_GAME).is_err());
+        assert_eq!(stored(&f, SECTION_RULES).unwrap(), None);
+        let mut bent = f.clone();
+        let last = bent.len() - 1;
+        bent[last] ^= 1;
+        assert!(stored(&bent, 99).is_err(), "in place, still checked against its hash");
         let mut v2 = f;
         v2[4] = 2;
         assert!(sections(&v2, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_section_loads_on_request_from_the_package_file() {
+        let dir = std::env::temp_dir().join(format!("pkg-section-{}", std::process::id()));
+        let content = GamePackage::content("G", &game());
+        let key = write(&dir, &content).unwrap();
+        assert_eq!(section(&dir, &key, SECTION_GAME, 1 << 20).unwrap(), Some(content));
+        assert_eq!(section(&dir, &key, SECTION_RULES, 1 << 20).unwrap(), None);
+        assert!(section(&dir, &[9; 32], SECTION_GAME, 1 << 20).is_err());
+    }
+
+    /// Indexes are the position in the sorted ids of the game section, which the key hashes:
+    /// the same key always gives the same indexes, whatever order the names came in.
+    #[test]
+    fn indexes_are_fixed_by_the_package_key() {
+        let mut reversed = game();
+        reversed.item_name_to_id = game().item_name_to_id.into_iter().rev().collect();
+        let (a, b) = (GamePackage::content("G", &game()), GamePackage::content("G", &reversed));
+        assert_eq!(GamePackage::key_of(&a), GamePackage::key_of(&b));
+        let (name, parsed) = GamePackage::parse(&a).unwrap();
+        let (p, q) =
+            (GamePackage::new([0; 32], "G", &game()), GamePackage::new([0; 32], &name, &parsed));
+        assert_eq!((p.items(), p.locations()), (q.items(), q.locations()));
+        assert_eq!(p.items(), [-1, 9], "ascending ids");
     }
 
     #[test]

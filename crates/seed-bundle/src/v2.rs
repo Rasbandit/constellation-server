@@ -893,9 +893,9 @@ impl<'a> SlotView<'a> {
 
     fn start_indexes(&self) -> impl Iterator<Item = usize> + use<'a> {
         let (at, n) = (self.field(64) as usize, self.field(68) as usize);
-        let w = self.seed.widths().0;
         let bytes = self.seed.bytes.get(at..).unwrap_or_default();
-        (0..n).map(move |k| bits::read(bytes, k * usize::from(w), w) as usize)
+        let list = bits::PackedRef::from_bytes(bytes, self.seed.widths().0, n);
+        list.into_iter().flat_map(bits::PackedRef::iter).map(|v| v as usize)
     }
 
     /// Starting inventory: item ids of this slot's game, in order.

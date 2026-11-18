@@ -67,7 +67,9 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 | 6 | 2 | section count `s` |
 | 8 | `s` × 48 | table of contents: id `u16`, flags `u16` (bit 0: deflated), offset `u32`, stored length `u32`, inflated length `u32`, SHA-256 of the inflated bytes |
 
-Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. 2 is reserved for rules and regions. A reader skips sections it does not know.
+Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
+
+**Index stability.** A game's location and item indexes are the positions of its ids, sorted ascending, in section 1. That section is exactly what the key hashes, so for a given package key the indexes never change, whatever order the names were listed in. Other sections, and seeds, may refer to them by index (test: `indexes_are_fixed_by_the_package_key`).
 
 ## Decoding by hand
 
