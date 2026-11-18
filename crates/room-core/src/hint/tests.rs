@@ -253,9 +253,10 @@ fn only_the_receiver_may_change_a_status_and_never_to_found() {
         EventKind::HintStatus { finding: SlotNo(1), location: 11, status: status::AVOID }
     );
     assert_eq!(s.hints_of(SlotNo(1))[0].status, status::AVOID);
-    // The same status again writes nothing.
+    // The same status again writes nothing, and its answer waits for the change it rests on.
     let again = apply(&mut s, &at(), update(2, 1, 11, status::AVOID)).unwrap();
     assert_eq!((again.reply, again.events.len()), (Reply::HintStatus { changed: false }, 0));
+    assert_eq!(again.depends_on, Some(a.events[0].seq));
 }
 
 #[test]
@@ -511,6 +512,9 @@ mod properties {
                         let locs: Vec<_> = locs.into_iter().filter(|&l| slot == 1 || l == 10).collect();
                         let before = m.points(rules, slot);
                         let a = apply(&mut s, &at(), scout(slot, &locs)).unwrap();
+                        let new: std::collections::BTreeSet<_> =
+                            locs.iter().filter(|&&l| !m.hinted.contains(&(slot, l))).collect();
+                        prop_assert_eq!(a.events.len(), new.len(), "a scout creates every new hint");
                         for e in &a.events {
                             if let EventKind::HintAdded { finding, location, paid, .. } = e.kind {
                                 prop_assert!(!paid);

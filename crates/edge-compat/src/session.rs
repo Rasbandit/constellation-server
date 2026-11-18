@@ -994,6 +994,22 @@ fn hint_points(room: &CompatRoom, j: &Joined) -> i64 {
     room.hint_rules.points(size, j.checked.len(), j.used)
 }
 
+/// The slots whose list holds `finder`'s `location` as not yet found: a check of it changes
+/// them.
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "rustc's unreachable_pub (denied) needs crate visibility in this private module"
+)]
+pub(crate) fn lists_finding(
+    lists: &BTreeMap<u32, Vec<Hint>>,
+    finder: u32,
+    location: i64,
+) -> Vec<u32> {
+    let holds =
+        |l: &[Hint]| l.iter().any(|h| h.finding.0 == finder && h.location == location && !h.found);
+    lists.iter().filter(|(_, l)| holds(l)).map(|(&n, _)| n).collect()
+}
+
 /// The current hint list of each slot, from the room.
 async fn read_hint_lists(
     room: &CompatRoom,
@@ -1069,11 +1085,7 @@ fn events_packets(
                 if j.checked.len() != was {
                     checked.push(location);
                 }
-                // A watched list holding this location unfound now reads it as found.
-                let touched = j.hint_lists.iter().filter(|(_, l)| {
-                    l.iter().any(|h| h.finding.0 == slot && h.location == location && !h.found)
-                });
-                let touched: Vec<u32> = touched.map(|(&n, _)| n).collect();
+                let touched = lists_finding(&j.hint_lists, slot, location);
                 j.stale_hints.extend(touched);
             }
             (

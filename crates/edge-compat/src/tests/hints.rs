@@ -101,9 +101,13 @@ async fn a_scout_with_create_as_hint_two_announces_only_new_hints() {
     // With 1 (or true, read as 1 like the reference's int()), known hints are announced again.
     send(&mut a, &scout(&[100], &json!(true))).await;
     assert_eq!(hint_prints(&pump(&mut a).await), [(1, 100, 0, false)]);
-    // With 0, nothing is created or announced.
+    // With 0, or without the field, nothing is created or announced.
     send(&mut a, &scout(&[100], &json!(0))).await;
     assert_eq!(hint_prints(&pump(&mut a).await), []);
+    let mut b = joined(&room, "B").await;
+    send(&mut b, &json!([{"cmd": "LocationScouts", "locations": [100]}])).await;
+    assert_eq!(hint_prints(&pump(&mut b).await), []);
+    assert_eq!(read_hints(&mut b, 2).await.as_array().unwrap().len(), 1, "only A's hint");
 }
 
 #[tokio::test]
@@ -176,10 +180,13 @@ async fn hint_points_grow_with_checks_and_drop_by_the_cost_per_paid_hint() {
     let got = pump(&mut b).await;
     assert_eq!(hint_prints(&got), [(1, 100, 30, false)], "priority: not a trap");
     assert_eq!(points(&got), Some(1), "one paid hint costs 1");
-    // The points survive a reconnect.
+    // The points survive a reconnect, and only the payer's points dropped.
     let mut again = Session::new(Arc::clone(&room));
     let ps = send(&mut again, &connect_packet("B", &json!(7))).await;
     assert_eq!(ps[0]["hint_points"], 1);
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(7))).await;
+    assert_eq!(ps[0]["hint_points"], 0);
 }
 
 /// A's world gets a second copy of B's item 7, at location 102 in sphere 0 (100 is in 1).
@@ -263,7 +270,10 @@ async fn bang_hint_with_an_unknown_name_says_so_and_costs_nothing() {
     let mut b = joined(&room, "B").await;
     let ps = send(&mut b, &say("!hint Sevn")).await;
     let text = command_results(&ps).join(" ");
-    assert!(text.contains("Sevn"), "{text}");
+    assert!(text.contains("Sevn") && text.contains("item group"), "{text}");
+    let ps = send(&mut b, &say("!hint_location L999")).await;
+    let text = command_results(&ps).join(" ");
+    assert!(text.contains("location group named 'L999'"), "{text}");
     assert_eq!(hint_prints(&pump(&mut b).await), []);
 }
 
@@ -273,6 +283,8 @@ async fn bang_hint_on_a_blacklisted_item_says_it_is_not_hintable() {
     let mut b = joined(&room, "B").await;
     let ps = send(&mut b, &say("!hint Seven")).await;
     assert!(command_results(&ps).join(" ").contains("cannot be hinted"), "{ps:?}");
+    let ps = send(&mut b, &say("!hint 7")).await;
+    assert!(command_results(&ps).join(" ").contains("'Seven' cannot be hinted"), "by id: {ps:?}");
     assert_eq!(hint_prints(&pump(&mut b).await), []);
 }
 
@@ -355,6 +367,17 @@ async fn start_hints_from_the_seed_are_readable_on_first_connect() {
         json!([{"class": "Hint", "receiving_player": 1, "finding_player": 2, "location": 100,
             "item": 7, "found": false, "entrance": "Cave", "item_flags": 4, "status": 30}])
     );
+    // The print names the entrance.
+    send(&mut a, &say("!hint")).await;
+    let got = pump(&mut a).await;
+    let print = of(&got, "PrintJSON").into_iter().find(|p| p["type"] == "Hint").unwrap().clone();
+    let data = print["data"].as_array().unwrap();
+    let at = data.iter().position(|p| p["type"] == "entrance_name").unwrap();
+    assert_eq!(
+        (data[at - 1]["text"].clone(), data[at]["text"].clone()),
+        (json!(" at "), json!("Cave"))
+    );
+    assert_eq!(data[at + 2]["text"], "(priority)");
 }
 
 #[tokio::test]
@@ -423,4 +446,81 @@ async fn hint_creating_packets_are_rate_limited_per_slot() {
 /// The base bundle (no edits) with the given limits.
 fn room_with_limits(limits: &Limits) -> Arc<CompatRoom> {
     spawn_with(bundle(&Value::Null), None, limits)
+}
+
+#[tokio::test]
+async fn hint_prints_put_the_slots_own_finds_first_and_found_ones_first_within() {
+    // B's world gets its own item 7 at 101 too.
+    let room = hint_room(|v| {
+        v["slots"][1]["locations"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"location": 101, "item": 7, "receiver": 2, "flags": 0}));
+    });
+    let mut a = joined(&room, "A").await;
+    let mut b = joined(&room, "B").await;
+    send(&mut a, &scout(&[100], &json!(1))).await;
+    send(&mut b, &scout(&[100, 101], &json!(1))).await;
+    check(&mut b, &[101]).await;
+    pump(&mut b).await;
+    send(&mut b, &say("!hint")).await;
+    assert_eq!(
+        hint_prints(&pump(&mut b).await),
+        [(2, 101, 40, true), (2, 100, 0, false), (1, 100, 0, false)]
+    );
+}
+
+#[tokio::test]
+async fn bang_hint_says_when_nothing_matches_and_when_more_cost_too_much() {
+    let room = hint_room(|v| {
+        two_sevens(v);
+        v["server_options"]["location_check_points"] = json!(1);
+    });
+    let mut b = joined(&room, "B").await;
+    // Only A receives Eight: with too few points B hears what a hint costs, with enough that
+    // nothing matches.
+    let ps = send(&mut b, &say("!hint Eight")).await;
+    assert!(command_results(&ps)[0].contains("need 1"), "{ps:?}");
+    check(&mut b, &[100]).await;
+    pump(&mut b).await;
+    let ps = send(&mut b, &say("!hint Eight")).await;
+    assert!(
+        command_results(&ps)[0].contains("Nothing in this multiworld matches 'Eight'"),
+        "{ps:?}"
+    );
+    // One point buys one of the two sevens; the other is left for lack of points.
+    let ps = send(&mut b, &say("!hint Seven")).await;
+    let text = command_results(&ps).join(" ");
+    assert!(text.contains("There may be more, but you have 0 points and need 1"), "{text}");
+}
+
+#[test]
+fn a_check_changes_only_the_lists_holding_that_location_unfound() {
+    let h = |finding: u32, location: i64, found: bool| room_core::Hint {
+        finding: proto::SlotNo(finding),
+        location,
+        receiver: proto::SlotNo(2),
+        item: 7,
+        status: if found { 40 } else { 0 },
+        found,
+    };
+    let lists = BTreeMap::from([
+        (1, vec![h(1, 100, false)]),
+        (2, vec![h(1, 101, true), h(2, 100, false)]),
+        (3, vec![h(1, 100, false), h(1, 101, false)]),
+    ]);
+    assert_eq!(session::lists_finding(&lists, 1, 100), [1, 3]);
+    assert_eq!(session::lists_finding(&lists, 1, 101), [3], "found already: no change for 2");
+    assert_eq!(session::lists_finding(&lists, 2, 101), Vec::<u32>::new());
+    assert_eq!(session::lists_finding(&lists, 2, 100), [2]);
+}
+
+#[test]
+fn every_hint_status_has_its_name() {
+    let names: Vec<String> =
+        [0, 10, 20, 30, 40, 7].into_iter().map(|s| wire::TextPart::hint_status(s).text).collect();
+    assert_eq!(
+        names,
+        ["(unspecified)", "(no priority)", "(avoid)", "(priority)", "(found)", "(unknown)"]
+    );
 }

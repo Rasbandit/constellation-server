@@ -210,3 +210,19 @@ pub(crate) fn outcome(h: &Hinted, asked_for: &str) -> Option<String> {
 pub(crate) fn summary(cost: u64, points: i64) -> String {
     format!("A hint costs {cost} points; you have {points}.")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::lookup;
+
+    #[test]
+    fn a_name_matches_exactly_else_the_only_one_equal_ignoring_case() {
+        let names = ["Bow".to_owned(), "bow".to_owned(), "Sword".to_owned()];
+        let found = |arg| lookup(names.iter(), arg).map(String::as_str);
+        assert_eq!(found("bow"), Some("bow"), "exact wins");
+        assert_eq!(found("SWORD"), Some("Sword"));
+        assert_eq!(found("BOW"), None, "two names equal ignoring case: ambiguous");
+        assert_eq!(found("Swor"), None);
+        assert_eq!(found(""), None);
+    }
+}
