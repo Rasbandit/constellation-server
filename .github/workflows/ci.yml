@@ -1,6 +1,7 @@
 name: ci
-# POC mode: fmt and the unit tests only. Docs-only PRs still run `check` (it is a required
-# check) but skip every step after the scope test. No database, no end-to-end.
+# POC mode: fmt, the unit tests and the data-fill integration tests. Docs-only PRs still run
+# `check` (it is a required check) but skip every step after the scope test. No database, no
+# end-to-end.
 # The full suite with Postgres is the manual `properties` job in nightly.yml; locally `just check`.
 # The push to main keeps the build cache warm; PRs only restore it.
 on:
@@ -43,6 +44,9 @@ jobs:
         run: cargo fmt --all --check
       - if: steps.scope.outputs.code != 'false'
         run: cargo test --workspace --lib --locked
+      # The data-only fill engine's integration tests (damaged sections, fixtures, fairness).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p data-fill --tests --locked
       # The generation sidecar's checks (zip traversal, bombs, yaml) and the bundle converter.
       - if: steps.scope.outputs.code != 'false'
         uses: actions/setup-python@v5

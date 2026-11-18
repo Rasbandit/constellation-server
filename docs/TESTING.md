@@ -62,4 +62,4 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 
 ## Hooks
 
-Run `just setup` once. Pre-commit: fmt check. Commit-msg: conventional commit, subject at most 50 characters. CI runs fmt and the unit tests (`--lib`); the full suite with Postgres is manual (`nightly.yml`, or `just test-pg`). Never use `--no-verify`; fix the finding.
+Run `just setup` once. Pre-commit: fmt check. Commit-msg: conventional commit, subject at most 50 characters. CI runs fmt, the unit tests (`--lib`) and the `data-fill` integration tests; the full suite with Postgres is manual (`nightly.yml`, or `just test-pg`). Never use `--no-verify`; fix the finding.
