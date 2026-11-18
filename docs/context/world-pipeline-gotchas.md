@@ -5,6 +5,8 @@ _Last verified: 2026-11-18_
 ## Status
 Working on main.
 
+Generation builds on Archipelago's own generator and world format (https://archipelago.gg); credit for both goes to the Archipelago project and its world authors.
+
 ## What This Is
 How a world goes from uploaded files to a room, plus the non-obvious traps found while building and running it.
 
