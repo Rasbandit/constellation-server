@@ -338,16 +338,32 @@ mod scenarios {
 
     /// A rooms folder with the fixture under each seed name, and the server on it.
     fn rooms_server(name: &str, seeds: &[&str]) -> (Server, std::path::PathBuf) {
+        rooms_server_env(name, seeds, &[])
+    }
+
+    fn rooms_server_env(
+        name: &str,
+        seeds: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Server, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("e2e-rooms-{name}-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).unwrap();
-        let text = std::fs::read_to_string(e2e::fixture_path()).unwrap();
         for seed in seeds {
-            let mut v: Value = serde_json::from_str(&text).unwrap();
-            v["seed_name"] = json!(seed);
-            std::fs::write(dir.join(format!("{seed}.json")), v.to_string()).unwrap();
+            add_bundle(&dir, seed);
         }
-        (Server::start_rooms(Path::new(BIN), &dir, &[]).unwrap(), dir)
+        (Server::start_rooms(Path::new(BIN), &dir, env).unwrap(), dir)
+    }
+
+    /// Put the fixture under `seed` into the folder the way an operator should: written under
+    /// another name, then renamed into place, so a scan never reads half a file.
+    fn add_bundle(dir: &Path, seed: &str) {
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+        v["seed_name"] = json!(seed);
+        let part = dir.join(format!("{seed}.json.part"));
+        std::fs::write(&part, v.to_string()).unwrap();
+        std::fs::rename(part, dir.join(format!("{seed}.json"))).unwrap();
     }
 
     /// The room key the server logged for `seed`.
@@ -421,6 +437,41 @@ mod scenarios {
         assert!(none.unwrap_err().contains("404"));
         let ws = http_get(&server, "/", true).await;
         assert!(ws.contains("this server runs 2 rooms"), "{ws}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_added_to_the_folder_becomes_a_room_while_the_server_runs() {
+        let fast = [("CONSTELLATION_ROOMS_SCAN_MS", "100")];
+        let (server, dir) = rooms_server_env("live-add", &["alpha"], &fast);
+        let alpha = key_of(&server, "alpha");
+        let (mut alice_a, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
+        add_bundle(&dir, "beta");
+        server.wait_for_log("seed=\"beta\"").unwrap();
+        let beta = key_of(&server, "beta");
+        assert_ne!(alpha, beta);
+        e2e::join_via(server.addr, &room_url(&server, &beta), "Alice").await.unwrap();
+        // The open connection to alpha did not notice.
+        alice_a.send(&json!([{"cmd": "Get", "keys": []}])).await.unwrap();
+        assert_eq!(alice_a.next_cmd("Retrieved").await.unwrap().0["keys"], json!({}));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[tokio::test]
+    async fn a_room_past_its_lifetime_closes_its_clients_and_refuses_new_ones() {
+        let env =
+            [("CONSTELLATION_ROOMS_SCAN_MS", "100"), ("CONSTELLATION_ROOM_LIFETIME_SECS", "1")];
+        let (server, dir) = rooms_server_env("expire", &["alpha"], &env);
+        let alpha = key_of(&server, "alpha");
+        let (mut alice, _, _) =
+            e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
+        server.wait_for_log("room expired").unwrap();
+        let end = alice.next_cmd("Retrieved").await.unwrap_err();
+        assert!(end.contains("closed") || end.contains("socket"), "{end}");
+        let again = e2e::Client::connect_via(server.addr, &room_url(&server, &alpha)).await;
+        assert!(again.unwrap_err().contains("404"));
+        assert!(dir.join("alpha.json.expired").exists() && !dir.join("alpha.json").exists());
         drop(std::fs::remove_dir_all(&dir));
     }
 

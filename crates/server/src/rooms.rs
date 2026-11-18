@@ -108,6 +108,11 @@ impl Rooms {
         Ok(())
     }
 
+    /// Take the room with this key out, so no new connection reaches it.
+    pub fn remove(&mut self, key: &RoomKey) -> Option<Room> {
+        self.by_key.remove(key)
+    }
+
     /// The room with this key.
     #[must_use]
     pub fn get(&self, key: &RoomKey) -> Option<&Room> {
