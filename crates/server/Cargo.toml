@@ -35,7 +35,7 @@ runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { version = "0.11", default-features = false }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "process", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 yawc.workspace = true
