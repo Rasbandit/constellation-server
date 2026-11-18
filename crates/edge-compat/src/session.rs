@@ -822,7 +822,10 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
             None
         }
         // The goal and stored values are read from the room when asked for.
-        EventKind::Goal | EventKind::KvSet { .. } => None,
+        EventKind::Goal
+        | EventKind::KvSet { .. }
+        | EventKind::HintAdded { .. }
+        | EventKind::HintStatus { .. } => None,
         EventKind::Item { from, location, item, .. } => {
             let it =
                 NetworkItem { item, location, player: from.0, flags: room.flags(from.0, location) };

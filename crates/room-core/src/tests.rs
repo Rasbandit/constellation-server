@@ -439,7 +439,9 @@ mod properties {
                     EventKind::Checked { location, .. } => (e.slot, location, 0),
                     EventKind::Item { from, location, .. } => (Some(from), location, 1),
                     EventKind::Goal => (e.slot, 0, 2),
-                    EventKind::KvSet { .. } => continue,
+                    EventKind::KvSet { .. }
+                    | EventKind::HintAdded { .. }
+                    | EventKind::HintStatus { .. } => continue,
                 };
                 prop_assert!(seen.insert(key));
             }
@@ -762,7 +764,7 @@ mod hostile_logs_and_snapshots {
             (
                 "head that matches no checks",
                 json!({"checked": {"1": {}}}),
-                "head is not two events per check, one per goal and one per key write",
+                "head is not two events per check, one per goal, key write and hint event",
             ),
         ];
         for (name, patch, why) in cases {

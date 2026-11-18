@@ -16,17 +16,22 @@
 //! The room also holds a key-value store written by `KvSet` (data storage, docs/protocol-plan.md
 //! section 1). `apply` evaluates the operations (the `kv` module); the event carries the resulting value,
 //! so `fold` never evaluates them again.
+//!
+//! Hints and hint points live in the `hint` module (docs/protocol-plan.md section 2).
 #![no_std]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod hint;
 mod kv;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 use config::Limits;
 use core::fmt;
+pub use hint::{Hint, valid as valid_hint_status};
+pub use hint::{HintRefusal, HintRules, HintShown, Hinted, status as hint_status};
 pub use kv::KvRefusal;
 use proto::{Cid, Command, Event, EventKind, ItemSeq, KvWrite, Seq, SlotNo, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -96,6 +101,18 @@ pub struct RoomState {
     /// `Limits::kv_max_room_log_bytes`: the log keeps each write in full.
     #[serde(default)]
     kv_log_bytes: u64,
+    /// The hint economy, from the seed.
+    #[serde(default)]
+    hint_rules: HintRules,
+    /// Hints by the slot whose world holds the location, then the location.
+    #[serde(default)]
+    hints: BTreeMap<SlotNo, BTreeMap<i64, hint::HintRec>>,
+    /// Paid hints per asking slot.
+    #[serde(default)]
+    hints_used: BTreeMap<SlotNo, u64>,
+    /// Hint events folded so far (one per event, so the head can be checked).
+    #[serde(default)]
+    hint_writes: u64,
 }
 
 /// The reply to the caller (a `result` frame), sent only after the events commit.
@@ -120,6 +137,14 @@ pub enum Reply {
     },
     /// The key was written (boxed: much larger than the other replies).
     KvSet(Box<KvDone>),
+    /// A hint request was answered (boxed: a list).
+    Hinted(Box<Hinted>),
+    /// A status change was applied, or changed nothing (an unknown or found hint, or the same
+    /// status).
+    HintStatus {
+        /// A `HintStatus` event was written.
+        changed: bool,
+    },
 }
 
 /// A key write that was applied.
@@ -197,6 +222,8 @@ pub enum CoreError {
     },
     /// A key write was refused; nothing was stored.
     Kv(KvRefusal),
+    /// A hint command was refused; nothing changed.
+    Hint(HintRefusal),
 }
 
 impl fmt::Display for CoreError {
@@ -254,6 +281,10 @@ impl RoomState {
             kv_bytes: 0,
             kv_writes: 0,
             kv_log_bytes: 0,
+            hint_rules: HintRules::default(),
+            hints: BTreeMap::new(),
+            hints_used: BTreeMap::new(),
+            hint_writes: 0,
         })
     }
 
@@ -299,11 +330,16 @@ impl RoomState {
         }
         let checks = u64::try_from(self.checked_pairs().count()).unwrap_or(u64::MAX);
         let goals = u64::try_from(self.goals.len()).unwrap_or(u64::MAX);
-        // One event per kind's unit: two per check, one per goal, one per key write.
-        let events = checks.saturating_mul(2).saturating_add(goals).saturating_add(self.kv_writes);
+        // One event per kind's unit: two per check, one per goal, key write and hint event.
+        let events = checks
+            .saturating_mul(2)
+            .saturating_add(goals)
+            .saturating_add(self.kv_writes)
+            .saturating_add(self.hint_writes);
         if self.head.0 != events {
-            return bad("head is not two events per check, one per goal and one per key write");
+            return bad("head is not two events per check, one per goal, key write and hint event");
         }
+        self.validate_hints().or_else(bad)?;
         if usize::try_from(self.kv_writes).is_ok_and(|w| w < self.kv.len()) {
             return bad("more keys than key writes");
         }
@@ -443,6 +479,9 @@ impl RoomState {
                 self.kv.insert(key.clone(), (**value).clone());
                 self.kv_writes = writes;
             }
+            EventKind::HintAdded { .. } | EventKind::HintStatus { .. } => {
+                self.record_hint(slot, ev)?;
+            }
             EventKind::Goal => {
                 if self.awaiting.is_some() {
                     return Err(CoreError::PlacementMismatch);
@@ -535,6 +574,10 @@ fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<KvWritten, 
 /// See [`CoreError`]: unknown slot or location, ack ahead of head, counter overflow.
 pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Applied, CoreError> {
     match cmd {
+        Command::Hint(req) => hint::request(state, ctx.limits, *req),
+        Command::HintStatus { slot, finding, location, status } => {
+            hint::set_status(state, ctx.limits, slot, finding, location, status)
+        }
         Command::KvSet(w) => {
             if !state.slots.contains_key(&w.slot) {
                 return Err(CoreError::UnknownSlot(w.slot));
