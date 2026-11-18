@@ -493,11 +493,24 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn one_room_takes_every_host() {
-        let (server, dir) = rooms_server("one", &["alpha"]);
-        // A host whose first label only looks like a key still reaches the only room.
+    async fn one_bundle_takes_every_host() {
+        let server = start(&[]).unwrap();
+        // A host whose first label only looks like a key still reaches the one room.
         e2e::join_via(server.addr, &room_url(&server, "playground"), "Alice").await.unwrap();
         e2e::join(&server.url(), "Bob").await.unwrap();
+    }
+
+    /// The number of listed rooms changes while a rooms folder runs (a scan adds one, D-30
+    /// ends one), so routing never depends on it: an old link to another room must not land
+    /// in the only room left.
+    #[tokio::test]
+    async fn a_rooms_folder_with_one_room_refuses_another_key_and_no_key() {
+        let (server, dir) = rooms_server("one", &["alpha"]);
+        let alpha = key_of(&server, "alpha");
+        let other = e2e::Client::connect_via(server.addr, &room_url(&server, "zzzzzzzzzz")).await;
+        assert!(other.unwrap_err().contains("404"));
+        assert!(e2e::Client::connect(&server.url()).await.unwrap_err().contains("404"));
+        e2e::join_via(server.addr, &room_url(&server, &alpha), "Alice").await.unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
 

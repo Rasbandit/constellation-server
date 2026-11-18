@@ -165,6 +165,8 @@ struct AppState {
     rooms: Arc<RwLock<Rooms>>,
     /// Asks the host to load a cold room.
     wake: host::Waker,
+    /// `--bundle`: the one room takes every host (see [`route`]).
+    any_host: bool,
     options: Options,
     /// One permit per open WebSocket (`Limits::max_connections`).
     slots: Arc<Semaphore>,
@@ -337,6 +339,7 @@ pub async fn app(
     let state = AppState {
         rooms: host.rooms(),
         wake,
+        any_host: matches!(source, Source::Bundle(_)),
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
@@ -409,12 +412,14 @@ pub fn key_from_host(host: &str) -> Option<RoomKey> {
 
 /// The room a connection with this `Host` header joins.
 ///
-/// One room takes every connection, whatever the host, so `--bundle` and old addresses keep
-/// working (a host whose first label only looks like a key, such as `playground.example`, is
-/// not refused). With several rooms the first label must be the key of one of them, so once a
-/// second room joins a rooms folder, new connections must name their room (open ones stay).
-fn route(rooms: &Rooms, host: Option<&str>) -> Result<Route, String> {
-    let key = match rooms.only_with_key() {
+/// With `--bundle` (`any_host`) the one room takes every connection, whatever the host, so old
+/// addresses keep working (a host whose first label only looks like a key, such as
+/// `playground.example`, is not refused). With `--rooms` the first label must be the key of a
+/// listed room, however many there are: the count changes at runtime, so an old link to a
+/// room that ended must never land in another one.
+fn route(rooms: &Rooms, host: Option<&str>, any_host: bool) -> Result<Route, String> {
+    let only = if any_host { rooms.only_with_key() } else { None };
+    let key = match only {
         Some((key, _)) => key.clone(),
         None => match host.and_then(key_from_host) {
             Some(key) => key,
@@ -453,7 +458,7 @@ async fn find(
     // Twice at most: a room can go cold again between its wake and the second lookup only if
     // it idled for the whole idle time in between.
     for _ in 0..2 {
-        let found = route(&read(&s.rooms), host)?;
+        let found = route(&read(&s.rooms), host, s.any_host)?;
         match found {
             Route::Ready(key, room, visit) => return Ok((key, room, visit)),
             Route::Cold(key) => s.wake.wake(key).await?,
