@@ -340,8 +340,8 @@ fn hints_fold_back_to_the_same_state_and_validate() {
     s.mark_durable(s.head()).unwrap();
     assert_eq!(folded, s);
     folded.validate(folded.head()).unwrap();
-    let json = serde_json::to_string(&folded).unwrap();
-    let back: RoomState = serde_json::from_str(&json).unwrap();
+    let json = serde_json::to_vec(&folded).unwrap();
+    let back = RoomState::from_snapshot(folded.world(), &json).unwrap();
     assert_eq!(back, folded);
     assert_eq!(back.hint_points(SlotNo(2)), 0, "1 check earned 1, one paid hint cost 1");
 }
@@ -383,14 +383,23 @@ fn a_snapshot_whose_hints_disagree_with_its_counters_is_refused() {
     let tamper = |edit: &dyn Fn(&mut serde_json::Value)| {
         let mut v = serde_json::to_value(&s).unwrap();
         edit(&mut v);
-        serde_json::from_value::<RoomState>(v).unwrap().validate(s.head())
+        let json = serde_json::to_vec(&v).unwrap();
+        RoomState::from_snapshot(s.world(), &json).unwrap().validate(s.head())
     };
     let bad =
         |e: &dyn Fn(&mut serde_json::Value)| matches!(tamper(e), Err(CoreError::BadSnapshot(_)));
     assert!(bad(&|v| v["hint_writes"] = 2.into()), "head count");
-    assert!(bad(&|v| v["hints"]["1"]["99"] = serde_json::json!({"status": 0, "seq": 0})));
-    assert!(bad(&|v| v["hints"]["1"]["11"]["status"] = 5.into()));
-    assert!(bad(&|v| v["hints"]["1"]["11"]["seq"] = 9.into()));
+    // Slot 1 is position 0; its location 11 is index 1 of 3.
+    assert!(bad(&|v| v["hints"][0][1] = 3.into()), "an index outside the world");
+    assert!(bad(&|v| v["hints"][0][2]["status"] = 5.into()));
+    assert!(bad(&|v| v["hints"][0][2]["seq"] = 9.into()));
+    assert!(
+        bad(&|v| {
+            let rec = serde_json::json!({"status": 0, "seq": 0});
+            v["hints"].as_array_mut().unwrap().push(serde_json::json!([0, 0, rec]));
+        }),
+        "out of order"
+    );
     assert!(bad(&|v| v["hints_used"]["9"] = 1.into()));
     assert!(bad(&|v| v["hints_used"]["2"] = 2.into()));
 }

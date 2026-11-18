@@ -289,6 +289,12 @@ impl LogStore for GatedStore {
     ) -> Result<(), AppendError> {
         self.inner.snapshot_put(room, snap, epoch).await
     }
+    async fn seed_put(&self, room: RoomId, seed: &[u8]) -> Result<(), StoreError> {
+        self.inner.seed_put(room, seed).await
+    }
+    async fn seed_get(&self, room: RoomId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.seed_get(room).await
+    }
 }
 
 fn gated(fail: bool) -> (RoomHandle, Arc<GatedStore>, JoinHandle<Stopped>) {

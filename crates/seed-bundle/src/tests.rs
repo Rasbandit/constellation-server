@@ -182,8 +182,8 @@ fn start_hints_and_the_hint_economy_reach_the_fresh_room() {
     let mut v = good();
     // B's location 101 holds A's item 7; A asked for it at generation (a start hint).
     v["start_hints"] = json!([{"finding": 2, "location": 101, "status": 30}]);
-    let b = parse(&v).unwrap();
-    let s = b.room_state().unwrap();
+    let (seed, _) = import_v1(v.to_string().as_bytes(), 1 << 26).unwrap();
+    let s = room_state(&Arc::new(seed)).unwrap();
     let hints = s.hints_of(SlotNo(1));
     assert_eq!(hints.len(), 1);
     assert_eq!((hints[0].finding, hints[0].location, hints[0].status), (SlotNo(2), 101, 30));
@@ -196,6 +196,7 @@ fn start_hints_and_the_hint_economy_reach_the_fresh_room() {
 fn entrances_spheres_and_hint_blacklists_are_kept_and_default_to_empty() {
     let mut v = good();
     v["slots"][1]["entrances"] = json!({"101": "Cave"});
+    v["games"]["G"]["entrance_names"] = json!(["Cave"]);
     v["slots"][1]["locations"][1]["sphere"] = json!(2);
     v["games"]["G"]["hint_blacklist"] = json!(["Eight"]);
     let b = parse(&v).unwrap();
@@ -216,6 +217,11 @@ fn hint_data_outside_a_world_or_with_a_bad_status_is_refused() {
     assert!(m.contains("start hint"), "{m}");
     let m = refused(|v| v["start_hints"] = json!([{"finding": 2, "location": 101, "status": 5}]));
     assert!(m.contains("status 5"), "{m}");
-    let m = refused(|v| v["slots"][0]["entrances"] = json!({"101": "Cave"}));
+    let m = refused(|v| {
+        v["slots"][0]["entrances"] = json!({"101": "Cave"});
+        v["games"]["G"]["entrance_names"] = json!(["Cave"]);
+    });
     assert!(m.contains("entrance"), "{m}");
+    let m = refused(|v| v["slots"][1]["entrances"] = json!({"101": "Cave"}));
+    assert!(m.contains("entrance_names"), "{m}");
 }

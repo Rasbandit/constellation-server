@@ -372,7 +372,21 @@ fn a_state_survives_a_json_snapshot_round_trip() {
     apply(&mut s, &at(3), check(1, 1, 11)).unwrap();
     apply(&mut s, &at(3), ack(2, 1)).unwrap();
     let j = serde_json::to_string(&s).unwrap();
-    assert_eq!(serde_json::from_str::<RoomState>(&j).unwrap(), s);
+    let back = RoomState::from_snapshot(s.world(), j.as_bytes()).unwrap();
+    assert_eq!(back, s);
+    assert_eq!(
+        apply(&mut back.clone(), &at(3), check(1, 2, 12)),
+        apply(&mut s, &at(3), check(1, 2, 12))
+    );
+    assert!(RoomState::from_snapshot(s.world(), b"{").is_err());
+    // A snapshot of the shape before versions (or any other version) is refused as such.
+    let mut old: serde_json::Value = serde_json::from_str(&j).unwrap();
+    old.as_object_mut().unwrap().remove("v");
+    let old = serde_json::to_vec(&old).unwrap();
+    assert_eq!(
+        RoomState::from_snapshot(s.world(), &old),
+        Err(CoreError::BadSnapshot(super::UNKNOWN_SNAPSHOT))
+    );
 }
 
 mod properties {
@@ -674,9 +688,10 @@ mod hostile_logs_and_snapshots {
     }
 
     fn tampered(edit: impl FnOnce(&mut Value)) -> RoomState {
-        let mut v = serde_json::to_value(live()).unwrap();
+        let s = live();
+        let mut v = serde_json::to_value(&s).unwrap();
         edit(&mut v);
-        serde_json::from_value(v).unwrap()
+        RoomState::from_snapshot(s.world(), &serde_json::to_vec(&v).unwrap()).unwrap()
     }
 
     #[test]
@@ -703,7 +718,6 @@ mod hostile_logs_and_snapshots {
     /// never sit at the head of a valid snapshot; a goal can.
     #[test]
     fn inconsistent_snapshots_are_errors_not_panics() {
-        const BEYOND: &str = "checked location outside the placement or at or beyond the head";
         let cases: [(&str, Value, &str); 13] = [
             (
                 "applied above item_head",
@@ -727,19 +741,23 @@ mod hostile_logs_and_snapshots {
             ),
             (
                 "checked location outside the placement",
-                json!({"checked": {"1": {"99": 1}}}),
-                BEYOND,
-            ),
-            ("check at the head, its item missing", json!({"checked": {"1": {"11": 2}}}), BEYOND),
-            (
-                "placement from a slot that does not exist",
-                json!({"placement": {"9": {"13": [2, 503]}}}),
-                "placement names a missing slot",
+                json!({"checked": [[10], [0]]}),
+                "checked location outside the placement",
             ),
             (
-                "placement to a slot that does not exist",
-                json!({"placement": {"1": {"11": [9, 501]}}}),
-                "placement names a missing slot",
+                "checks for a slot the world lacks",
+                json!({"checked": [[2], [0], [0]]}),
+                "checked location outside the placement",
+            ),
+            (
+                "a check whose events were not durable",
+                json!({"pending": [[0, 1, 1]]}),
+                "a check in the snapshot is not durable",
+            ),
+            (
+                "a slot the world lacks",
+                json!({"slots": {"9": {"item_head": 0, "applied": 0}}}),
+                "snapshot slots are not the world's",
             ),
             (
                 "goal for a slot that does not exist",
@@ -763,7 +781,7 @@ mod hostile_logs_and_snapshots {
             ),
             (
                 "head that matches no checks",
-                json!({"checked": {"1": {}}}),
+                json!({"checked": [[0], [0]]}),
                 "head is not two events per check, one per goal, key write and hint event",
             ),
         ];
@@ -964,8 +982,8 @@ mod key_value {
         assert_eq!(folded.kv_get("a"), Some(&json!(2)));
         assert_eq!(folded.validate(Seq(5)), Ok(()));
         // Through a JSON snapshot too, as a store would keep it.
-        let snap: RoomState =
-            serde_json::from_str(&serde_json::to_string(&folded).unwrap()).unwrap();
+        let json = serde_json::to_string(&folded).unwrap();
+        let snap = RoomState::from_snapshot(folded.world(), json.as_bytes()).unwrap();
         assert_eq!(snap, folded);
         // A fold re-uses the recorded value; it never evaluates operations again.
         let tampered: Vec<Event> = events
@@ -1004,7 +1022,8 @@ mod key_value {
         let edit = |f: &dyn Fn(&mut Value)| {
             let mut v = serde_json::to_value(&s).unwrap();
             f(&mut v);
-            serde_json::from_value::<RoomState>(v).unwrap().validate(Seq(1)).unwrap_err()
+            let json = serde_json::to_vec(&v).unwrap();
+            RoomState::from_snapshot(s.world(), &json).unwrap().validate(Seq(1)).unwrap_err()
         };
         let cases: [(SnapshotEdit<'_>, &str); 4] = [
             (&|v| v["kv_bytes"] = json!(99), "kv_bytes"),

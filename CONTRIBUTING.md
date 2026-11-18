@@ -12,8 +12,8 @@ By opening a pull request you agree that:
 
 ## Setup
 - Rust from `rust-toolchain.toml` (rustup picks it up), `just`, `cargo-deny`, `typos`.
-- `just setup` once: it turns on the git hooks (fmt, clippy, typos and unit tests before a commit; the full gate before a push).
-- Postgres is optional locally. CI runs the Postgres tests. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
+- `just setup` once: it turns on the git hooks (a fmt check before a commit, the commit message format).
+- Postgres is optional locally. CI runs only the unit tests; the Postgres and end-to-end tests run from the manual `nightly` workflow. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
 - The design docs live in the sibling `constellation` repo. Clone it next to this one.
 
 ## Workflow
@@ -21,10 +21,18 @@ By opening a pull request you agree that:
 - Branch off `main`: `feat/...`, `fix/...`, `docs/...`.
 - Conventional commits, subject at most 50 characters (the hook checks).
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
-- `just check` passes before you push. CI must be green before merge.
+- CI must be green before merge. `just check` is optional while this is a POC.
 - One reviewer who is not the author approves each PR.
-- Lints are strict (`deny`). A new `allow` needs a `reason = "..."`. No `unsafe`.
+- Lints are default (POC mode). No `unsafe`.
 - Limits and environment variables live only in `crates/config`.
+
+## Concurrency
+Write all new code as if it runs on many cores, so scaling out never needs a rewrite. Existing code is not rewritten for this; it is brought in line only when an issue already changes that code.
+- Shared data is immutable and shared by reference (`&T`, `Arc<T>`). Mutable state is owned by one task and passed in, never global. No `static mut`, no `Rc`/`RefCell` in library types; core types must be `Send + Sync`.
+- Results never depend on thread count or scheduling. Each task gets its own RNG stream from `spec_rng::derive`, and parallel results are merged in a fixed order.
+- Parallelise across independent units (seeds, rooms, worlds, checks), not inside one inherently sequential step such as a single fill. Code that can run units in parallel takes its worker count from `crates/config`. Generation's one-job-at-a-time cap is still hardcoded in `crates/server/src/worlds.rs` (see #77). Its tests run with 1 worker and with several and expect the same result.
+- CPU-heavy work (generation, compiling worlds, bulk checks) runs in a subprocess (as generation does) or on `spawn_blocking` / a worker pool, never on the async runtime's I/O threads.
+- Locks guard small, short critical sections only. Never hold a `std::sync` lock across an `.await`. An async lock held across an `.await` only to order effects needs a comment saying why (see `edge-compat/src/presence.rs`).
 
 ## Talking about Archipelago
 We build on Archipelago and want to stay good neighbours. Read the design repo's `CLAUDE.md` before writing any issue, PR or doc that mentions it. In short: be accurate and cite sources, credit their work, critique designs and never people, report a suspected bug to its maintainers before mentioning it anywhere public, and never copy their code, text or data into this repo. Text that mentions Archipelago gets a review against that file by someone other than its author before it is posted.

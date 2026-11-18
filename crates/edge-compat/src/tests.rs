@@ -11,8 +11,22 @@ const GAME: &str = "G";
 
 /// Slot 1 (A): location 100 -> B's item 7 (progression), 101 -> A's own item 8.
 /// Slot 2 (B): location 100 -> A's item 7 (trap).
-fn bundle(password: &Value) -> Arc<SeedBundle> {
-    let v = json!({
+/// A v1 bundle as the room runs it (encoded to v2 in memory, the server's load path).
+fn seed(v: &Value) -> Arc<Seed> {
+    Arc::new(seed_bundle::import_v1(v.to_string().as_bytes(), 1 << 26).unwrap().0)
+}
+
+fn state_of(b: &Arc<Seed>) -> room_core::RoomState {
+    seed_bundle::room_state(b).unwrap()
+}
+
+fn bundle(password: &Value) -> Arc<Seed> {
+    seed(&bundle_json(password))
+}
+
+/// The bundle above as v1 JSON.
+fn bundle_json(password: &Value) -> Value {
+    json!({
         "format": 1, "seed_name": "seed-1",
         "generator_version": {"major": 0, "minor": 6, "build": 8},
         "server_options": {"password": password, "hint_cost": 10, "location_check_points": 2,
@@ -31,8 +45,7 @@ fn bundle(password: &Value) -> Arc<SeedBundle> {
         "connect_names": {"A": [0, 1], "B": [0, 2]},
         "games": {GAME: {"item_name_to_id": {"Seven": 7, "Eight": 8},
                          "location_name_to_id": {"L100": 100, "L101": 101}, "checksum": "ck"}}
-    });
-    Arc::new(SeedBundle::from_json(&v.to_string()).unwrap())
+    })
 }
 
 fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
@@ -41,10 +54,10 @@ fn room_with(password: &Value, override_pw: Option<&str>) -> Arc<CompatRoom> {
 }
 
 /// A room task for `b` on an in-memory log, and its compatible edge.
-fn spawn_with(b: Arc<SeedBundle>, password: Option<&str>, limits: &Limits) -> Arc<CompatRoom> {
+fn spawn_with(b: Arc<Seed>, password: Option<&str>, limits: &Limits) -> Arc<CompatRoom> {
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));
-    let state = b.room_state().unwrap();
+    let state = state_of(&b);
     let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state, store, *limits);
     Arc::new(CompatRoom::new(b, h, password.map(str::to_owned), *limits).unwrap())
 }
@@ -460,7 +473,7 @@ fn big_room(end: i64, limits: &Limits) -> Arc<CompatRoom> {
 
 /// As [`big_room`], every item going to `receiver`.
 fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     let locs: Vec<Value> = (1000..end)
         .map(|l| json!({"location": l, "item": 7, "receiver": receiver, "flags": 0}))
         .collect();
@@ -468,8 +481,7 @@ fn big_room_to(end: i64, receiver: u32, limits: &Limits) -> Arc<CompatRoom> {
     for l in 1000..end {
         v["games"][GAME]["location_name_to_id"][format!("L{l}")] = json!(l);
     }
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
-    spawn_with(b, None, limits)
+    spawn_with(seed(&v), None, limits)
 }
 
 fn indexes(ps: &[Value]) -> Vec<u64> {
@@ -612,10 +624,9 @@ fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
 
 /// The test bundle with an edit applied.
 fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
-    let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
+    let mut v: Value = bundle_json(&Value::Null);
     edit(&mut v);
-    let b = Arc::new(SeedBundle::from_json(&v.to_string()).unwrap());
-    spawn_with(b, None, &Limits::DESIGN)
+    spawn_with(seed(&v), None, &Limits::DESIGN)
 }
 
 fn tracker_packet(name: &str, version: (u32, u32, u32)) -> Value {
@@ -709,6 +720,59 @@ async fn a_self_found_item_reads_found_their() {
     let texts: Vec<&str> =
         print["data"].as_array().unwrap().iter().filter_map(|p| p["text"].as_str()).collect();
     assert_eq!(texts, ["1", " found their ", "8", " (", "101", ")"]);
+}
+
+/// Two games with disjoint item ids (`crates/e2e/fixtures/cross-games.json`): P1 plays A and
+/// finds B's item 202 for P2; P2 plays B and finds A's item 2 (a trap) for P1; P3 places
+/// nothing. Ids at the wire come from the receiver's game.
+#[tokio::test]
+async fn items_across_games_carry_the_receivers_ids_at_the_wire() {
+    let v: Value =
+        serde_json::from_str(include_str!("../../e2e/fixtures/cross-games.json")).unwrap();
+    let b = seed(&v);
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state_of(&b), store, Limits::DESIGN);
+    let room = Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap());
+    let join = async |name: &str, game: &str| {
+        let mut s = Session::new(Arc::clone(&room));
+        let mut c = connect_packet(name, &json!(7));
+        c[0]["game"] = json!(game);
+        let ps = send(&mut s, &c).await;
+        assert_eq!(ps[0]["cmd"], "Connected", "{ps:?}");
+        pump(&mut s).await;
+        s
+    };
+    let (mut p1, mut p2, mut p3) =
+        (join("P1", "A").await, join("P2", "B").await, join("P3", "A").await);
+    let ps = send(&mut p1, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(
+        ps[0]["locations"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 2, "flags": 1}])
+    );
+    check(&mut p1, &[11]).await;
+    check(&mut p2, &[21]).await;
+    let to_p2 = pump(&mut p2).await;
+    assert_eq!(
+        of(&to_p2, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 1, "flags": 1}])
+    );
+    let to_p1 = pump(&mut p1).await;
+    assert_eq!(
+        of(&to_p1, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 2, "location": 21, "player": 2, "flags": 4}])
+    );
+    // A reconnect rebuilds the same inventory from the log and the seed.
+    let again = send(&mut Session::new(Arc::clone(&room)), &{
+        let mut c = connect_packet("P2", &json!(7));
+        c[0]["game"] = json!("B");
+        c
+    })
+    .await;
+    assert_eq!(of(&again, "ReceivedItems")[0]["items"][0]["item"], 202);
+    let ps = send(&mut p3, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(ps[0]["cmd"], "InvalidPacket", "P3 places nothing: {ps:?}");
+    assert_eq!(pump(&mut p3).await.iter().filter(|p| p["cmd"] == "ReceivedItems").count(), 0);
 }
 
 #[tokio::test]
@@ -1663,3 +1727,117 @@ async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
 }
 
 mod hints;
+// The host's room view (view.rs): numbers from the room and its sessions, events as shown.
+
+fn slot(summary: &Value, id: u64) -> &Value {
+    summary["slots"].as_array().unwrap().iter().find(|s| s["slot"] == id).unwrap()
+}
+
+#[tokio::test]
+async fn the_summary_counts_real_sessions_checks_and_items() {
+    let room = room();
+    let fresh = room.summary().await.unwrap();
+    assert_eq!(fresh["seed"], "seed-1");
+    assert_eq!(
+        fresh["options"],
+        json!({"password": false, "hint_cost": 10,
+        "release_mode": "auto", "collect_mode": "auto"})
+    );
+    assert_eq!(
+        *slot(&fresh, 1),
+        json!({"slot": 1, "team": 0, "name": "A", "game": GAME, "connected": false, "clients": 0,
+               "checked": 0, "locations": 2, "items_received": 0, "goal": false})
+    );
+    let mut a = joined(&room, "A").await;
+    let mut a2 = joined(&room, "A").await;
+    let now = room.summary().await.unwrap();
+    assert_eq!((&slot(&now, 1)["connected"], &slot(&now, 1)["clients"]), (&json!(true), &json!(2)));
+    assert_eq!(slot(&now, 2)["connected"], false, "B has no session");
+    check(&mut a, &[100]).await;
+    let now = room.summary().await.unwrap();
+    assert_eq!(
+        (&slot(&now, 1)["checked"], &slot(&now, 2)["items_received"]),
+        (&json!(1), &json!(1))
+    );
+    assert_eq!(slot(&now, 1)["items_received"], 0, "the item went to B");
+    a.leave().await;
+    assert_eq!(slot(&room.summary().await.unwrap(), 1)["clients"], 1);
+    a2.leave().await;
+    assert_eq!(slot(&room.summary().await.unwrap(), 1)["connected"], false);
+}
+
+#[tokio::test]
+async fn the_summary_says_only_whether_a_password_is_set() {
+    let s = room_with(&json!("hunter2"), None).summary().await.unwrap();
+    assert_eq!(s["options"]["password"], true);
+    assert!(!s.to_string().contains("hunter2"));
+}
+
+#[tokio::test]
+async fn durable_events_are_described_with_names_and_data_writes_are_hidden() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    check(&mut a, &[100, 101]).await;
+    send(&mut a, &json!([{"cmd": "Set", "key": "k", "default": 0, "operations": []}])).await;
+    let history = room.watch(proto::Seq(0), 400).await.unwrap().0.history;
+    let shown: Vec<Value> = history.iter().filter_map(|e| room.describe_event(e)).collect();
+    assert_eq!(history.len(), 5, "two checks, two items, one write: {history:?}");
+    assert_eq!(
+        shown,
+        [
+            json!({"kind": "checked", "seq": 1, "slot": 1, "name": "A", "location": 100,
+                   "location_name": "L100"}),
+            json!({"kind": "item", "seq": 2, "from": 1, "from_name": "A", "to": 2, "to_name": "B",
+                   "item": 7, "item_name": "Seven", "location": 100, "location_name": "L100",
+                   "flags": 1}),
+            json!({"kind": "checked", "seq": 3, "slot": 1, "name": "A", "location": 101,
+                   "location_name": "L101"}),
+            json!({"kind": "item", "seq": 4, "from": 1, "from_name": "A", "to": 1, "to_name": "A",
+                   "item": 8, "item_name": "Eight", "location": 101, "location_name": "L101",
+                   "flags": 0}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn joins_chat_and_leaves_are_described_from_the_live_stream() {
+    let room = room();
+    let (sub, _, _) = room.watch(proto::Seq(0), 400).await.unwrap();
+    let mut live = sub.live;
+    let mut a = joined(&room, "A").await;
+    send(&mut a, &json!([{"cmd": "Say", "text": "hello"}])).await;
+    a.leave().await;
+    let mut seen = Vec::new();
+    while let Ok(p) = live.try_recv() {
+        seen.extend(room.describe(&p));
+    }
+    let kinds: Vec<(&str, &Value)> =
+        seen.iter().map(|e| (e["kind"].as_str().unwrap(), &e["text"])).collect();
+    assert_eq!(
+        kinds,
+        [("join", &Value::Null), ("chat", &json!("hello")), ("leave", &Value::Null)],
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|e| e["slot"] == 1 && e["name"] == "A"), "{seen:?}");
+}
+
+#[test]
+fn a_view_starts_after_its_cursor_unless_it_is_past_the_head_or_too_far_behind() {
+    use proto::Seq;
+    // (after, head, cap) -> (start, reset)
+    for ((after, head, cap), want) in [
+        ((0, 0, 400), (0, false)),
+        ((0, 50, 400), (0, false)),
+        ((0, 1000, 400), (600, false)),
+        ((40, 50, 400), (40, false)),
+        ((50, 50, 400), (50, false)),
+        ((57, 50, 400), (0, true)),
+        ((1057, 1000, 400), (600, true)),
+        ((100, 1000, 400), (600, true)),
+        ((600, 1000, 400), (600, false)),
+        ((5, 9, 0), (9, true)),
+    ] {
+        let got = crate::view::view_start(Seq(after), Seq(head), cap);
+        assert_eq!((got.0.0, got.1), want, "after {after}, head {head}, cap {cap}");
+    }
+}

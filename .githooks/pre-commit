@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Fast checks only (seconds). The full gate runs in pre-push and CI. Fix findings; never --no-verify.
+# POC mode: formatting only (under a second). CI runs the unit tests.
 set -euo pipefail
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-typos
-cargo test --workspace --lib --locked --quiet

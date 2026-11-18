@@ -4,12 +4,25 @@
 //!
 //! The per-game data package, `slot_data` and the server options are kept because a client
 //! compatible with Archipelago asks for them; only `edge-compat` interprets them.
+//!
+//! [`SeedBundle`] is the v1 schema (JSON, what `tools/ap-import` writes). Rooms run on the v2
+//! form, [`Seed`]: a compact binary file read in place ([`v2`]), with each game's data package
+//! stored once per content hash and shared across rooms ([`package`]). [`import_v1`] turns a
+//! v1 file into both. No IO here: the server keeps seeds and packages in its store.
+
+pub mod package;
+pub mod v2;
+
+pub use package::GamePackage;
+pub use v2::{Seed, SlotView};
 
 use proto::SlotNo;
 use room_core::{CoreError, HintRules, Placement, RoomState};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 /// The bundle format this crate reads.
 pub const FORMAT: u32 = 1;
@@ -40,7 +53,7 @@ pub struct SeedBundle {
     pub race_mode: u8,
     /// Hints every room of this seed starts with (the generator's start hints and start
     /// location hints), once each.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start_hints: Vec<StartHint>,
 }
 
@@ -142,8 +155,9 @@ pub struct Slot {
     /// received item, as from location -2 and player 0 (protocol doc, "Data Package Contents").
     #[serde(default)]
     pub start_inventory: Vec<i64>,
-    /// Location id to the entrance a hint names for it (worlds with shuffled entrances).
-    #[serde(default)]
+    /// Location id to the entrance a hint names for it (worlds with shuffled entrances); each
+    /// name is one of its game's [`GameData::entrance_names`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entrances: BTreeMap<i64, String>,
 }
 
@@ -161,12 +175,12 @@ pub struct Placed {
     pub flags: u8,
     /// The generator's sphere of this location, from 0 (`!hint` prefers early ones); `None`
     /// when the seed records none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sphere: Option<u32>,
 }
 
 /// One game's names and ids.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GameData {
     /// Item name to id.
@@ -182,9 +196,15 @@ pub struct GameData {
     /// Location group name to location names (`_read_location_name_groups_<game>`).
     #[serde(default)]
     pub location_name_groups: BTreeMap<String, Vec<String>>,
-    /// Item and location names the world forbids hinting.
-    #[serde(default)]
+    /// Item and location names the world forbids hinting (the same for every seed of the
+    /// game, so it lives in the package).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hint_blacklist: BTreeSet<String>,
+    /// Every entrance name a slot of this game names ([`Slot::entrances`]); a seed refers to
+    /// them by index. Empty, and left out of the package, for a game without shuffled
+    /// entrances.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub entrance_names: BTreeSet<String>,
 }
 
 /// Why a bundle was refused. Names the first rule that failed.
@@ -213,6 +233,45 @@ macro_rules! ensure {
             return Err(BundleError::Invalid(format!($($arg)+)));
         }
     };
+}
+
+/// SHA-256 of a bundle file's canonical JSON.
+///
+/// Canonical: parsed as plain JSON, every object's keys sorted, no whitespace. It depends on the
+/// file's content only, never on the `SeedBundle` type, so a new defaulted field in the type
+/// does not change a stored room's hash. A v2 seed carries the hash of the v1 file it was made
+/// from.
+///
+/// # Errors
+/// When the text is not JSON.
+pub fn bundle_hash(text: &str) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    Ok(Sha256::digest(package::canonical(v)).to_vec())
+}
+
+/// Import a v1 bundle file (JSON): validate it and encode it to v2, on this process's shared
+/// packages. Returns the seed (its hash is the v1 file's [`bundle_hash`]) and its package
+/// files, for the caller to store. `max_bytes` caps the seed.
+///
+/// # Errors
+/// A message naming the first problem.
+pub fn import_v1(bytes: &[u8], max_bytes: u64) -> Result<(Seed, Vec<Vec<u8>>), String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("seed bundle is not UTF-8: {e}"))?;
+    let bundle = SeedBundle::from_json(text).map_err(|e| e.to_string())?;
+    let hash: [u8; 32] = bundle_hash(text)?.try_into().map_err(|_| "hash length")?;
+    Seed::from_v1(&bundle, &hash, max_bytes).map_err(|e| e.to_string())
+}
+
+/// A room's state before any event, on its seed: the placement, the hint economy and the
+/// start hints. The one place a room is built from a seed.
+///
+/// # Errors
+/// What room-core refuses (`Seed::open` rules most of it out).
+pub fn room_state(seed: &Arc<Seed>) -> Result<RoomState, CoreError> {
+    let rules =
+        HintRules { cost_pct: seed.hint_cost(), check_points: seed.location_check_points() };
+    let world: Arc<dyn room_core::World> = Arc::clone(seed) as _;
+    RoomState::from_world(world)?.with_hints(rules, seed.start_hints())
 }
 
 fn id_ok(id: i64) -> bool {
@@ -250,17 +309,6 @@ impl SeedBundle {
                 (SlotNo(s.id), world)
             })
             .collect()
-    }
-
-    /// The room's state before any event: the placement, the hint economy and the start hints.
-    ///
-    /// # Errors
-    /// What room-core refuses (the bundle's own validation rules most of it out).
-    pub fn room_state(&self) -> Result<RoomState, CoreError> {
-        let o = &self.server_options;
-        let rules = HintRules { cost_pct: o.hint_cost, check_points: o.location_check_points };
-        let start = self.start_hints.iter().map(|h| (SlotNo(h.finding), h.location, h.status));
-        RoomState::new(self.slot_nos(), self.placement())?.with_hints(rules, start)
     }
 
     /// Every slot number.
@@ -351,10 +399,16 @@ impl SeedBundle {
         let none = BTreeSet::new();
         let own = locations.get(s.game.as_str()).unwrap_or(&none);
         let mut seen = BTreeSet::new();
-        for l in s.entrances.keys() {
+        let names = self.games.get(&s.game).map(|g| &g.entrance_names);
+        for (l, name) in &s.entrances {
             ensure!(
                 s.locations.iter().any(|p| p.location == *l),
                 "slot {} entrance for location {l}, which its world lacks",
+                s.id
+            );
+            ensure!(
+                names.is_some_and(|n| n.contains(name)),
+                "slot {} entrance {name:?} is not in its game's entrance_names",
                 s.id
             );
         }

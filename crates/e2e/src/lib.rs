@@ -5,6 +5,8 @@
 //! No sleeps: a server is ready when it logs its bound address, and every wait is on a frame
 //! or a process event, with a timeout only as a guard against a hang.
 
+pub mod synth;
+
 use futures_util::SinkExt;
 use seed_bundle::SeedBundle;
 use serde_json::Value;
@@ -61,8 +63,27 @@ impl Server {
     /// # Errors
     /// When the binary cannot be started or never logs its address.
     pub fn start(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
-        let mut child =
-            command(bin, extra, env).spawn().map_err(|e| format!("spawn server: {e}"))?;
+        Self::spawn(command(bin, extra, env))
+    }
+
+    /// Like [`Server::start`], but with every seed bundle in the folder `rooms` (`--rooms`)
+    /// instead of the fixture, then the `extra` arguments.
+    ///
+    /// # Errors
+    /// When the binary cannot be started or never logs its address.
+    pub fn start_rooms(
+        bin: &Path,
+        rooms: &Path,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> Res<Self> {
+        let mut c = base_command(bin, env);
+        c.arg("--rooms").arg(rooms).args(["--port", "0"]).args(extra);
+        Self::spawn(c)
+    }
+
+    fn spawn(mut command: Command) -> Res<Self> {
+        let mut child = command.spawn().map_err(|e| format!("spawn server: {e}"))?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
         let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
@@ -171,14 +192,18 @@ impl Drop for Server {
 /// not wait for the server to listen.
 #[must_use]
 pub fn command(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Command {
+    let mut c = base_command(bin, env);
+    c.arg("--bundle").arg(fixture_path()).args(["--port", "0"]).args(extra);
+    c
+}
+
+/// The server binary with only the database variables in `env` and stderr piped, no
+/// arguments yet.
+fn base_command(bin: &Path, env: &[(&str, &str)]) -> Command {
     let mut c = Command::new(bin);
-    c.arg("--bundle")
-        .arg(fixture_path())
-        .args(["--port", "0"])
-        .args(extra)
-        // A scenario says which database it uses; it never inherits one (CI sets the URL
-        // for the Postgres tests, and parallel servers must not share a room).
-        .env_remove("CONSTELLATION_DATABASE_URL")
+    // A scenario says which database it uses; it never inherits one (CI sets the URL
+    // for the Postgres tests, and parallel servers must not share a room).
+    c.env_remove("CONSTELLATION_DATABASE_URL")
         .env_remove("CONSTELLATION_DATABASE_URL_FILE")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
@@ -228,6 +253,26 @@ impl Client {
             .await
             .map_err(|_| "connect timed out".to_owned())?
             .map_err(|e| format!("connect: {e}"))?;
+        Ok(Self { ws, queue: VecDeque::new() })
+    }
+
+    /// Open TCP to `addr` and do the WebSocket handshake for `url`, so the request's `Host`
+    /// header is `url`'s host (`{room_key}.example:port`) without that name resolving anywhere.
+    ///
+    /// # Errors
+    /// When the connection or the handshake fails.
+    pub async fn connect_via(addr: SocketAddr, url: &str) -> Res<Self> {
+        let url = url.parse().map_err(|e| format!("{url}: {e}"))?;
+        let opts = Options::default().with_low_latency_compression();
+        let handshake = async {
+            let tcp = TcpStream::connect(addr).await.map_err(|e| format!("tcp: {e}"))?;
+            WebSocket::handshake(url, MaybeTlsStream::Plain(tcp), opts)
+                .await
+                .map_err(|e| format!("handshake: {e}"))
+        };
+        let ws = tokio::time::timeout(GUARD, handshake)
+            .await
+            .map_err(|_| "connect timed out".to_owned())??;
         Ok(Self { ws, queue: VecDeque::new() })
     }
 
@@ -365,7 +410,18 @@ pub fn start_items(slot: u32) -> Res<Vec<Value>> {
 /// # Errors
 /// When the socket fails or the first packet is not `RoomInfo`.
 pub async fn join(url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
-    let mut c = Client::connect(url).await?;
+    join_client(Client::connect(url).await?, name).await
+}
+
+/// [`join`] through [`Client::connect_via`]: TCP to `addr`, handshake for `url`.
+///
+/// # Errors
+/// As [`join`].
+pub async fn join_via(addr: SocketAddr, url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
+    join_client(Client::connect_via(addr, url).await?, name).await
+}
+
+async fn join_client(mut c: Client, name: &str) -> Res<(Client, Value, Vec<Value>)> {
     let info = c.next().await?;
     if info.get("cmd").and_then(Value::as_str) != Some("RoomInfo") {
         return Err(format!("first packet is not RoomInfo: {info}"));

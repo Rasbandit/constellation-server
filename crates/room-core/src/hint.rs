@@ -1,8 +1,9 @@
 //! Hints (docs/protocol-plan.md section 2): which locations a slot knows the item of, their
 //! status, and the points that buy them.
 //!
-//! A hint is keyed by the slot whose world holds the location and the location id, so the
-//! same hint asked for twice is one hint. The item and receiver come from the placement, and
+//! A hint is keyed by the slot whose world holds the location and the location, as the
+//! room's dense indexes (slot position, location index), so the same hint asked for twice is
+//! one hint; ids appear only in commands, events and the [`Hint`] view. The item and receiver come from the placement, and
 //! whether it is found from the checks, so neither is stored. Points follow the reference
 //! server's rule (`MultiServer.py:816-819, 1929-1936`): each checked location of a slot's own
 //! world earns the room's points per check, and each paid hint costs a share of that world's
@@ -17,7 +18,7 @@
 )]
 
 use crate::{Applied, CoreError, Reply, RoomState, next_seq};
-use alloc::{boxed::Box, collections::BTreeMap, collections::BTreeSet, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeSet, vec::Vec};
 use proto::{Event, EventKind, HintAsk, HintRequest, Seq, SlotNo};
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +150,39 @@ pub enum HintRefusal {
     NoPermission,
 }
 
+/// Every stored hint by (finding slot position, location index), sorted: 24 bytes a hint. A
+/// snapshot keeps it as that list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HintTable(Vec<(u32, u32, HintRec)>);
+
+impl HintTable {
+    fn find(&self, pos: usize, i: usize) -> Result<usize, usize> {
+        let key = (u32::try_from(pos).unwrap_or(u32::MAX), u32::try_from(i).unwrap_or(u32::MAX));
+        self.0.binary_search_by_key(&key, |e| (e.0, e.1))
+    }
+
+    fn get(&self, pos: usize, i: usize) -> Option<HintRec> {
+        self.find(pos, i).ok().and_then(|k| self.0.get(k)).map(|e| e.2)
+    }
+
+    /// Store `rec` unless a hint is there already; whether it was stored.
+    fn add(&mut self, pos: usize, i: usize, rec: HintRec) -> bool {
+        let Err(k) = self.find(pos, i) else { return false };
+        let key = (u32::try_from(pos).unwrap_or(u32::MAX), u32::try_from(i).unwrap_or(u32::MAX));
+        self.0.insert(k, (key.0, key.1, rec));
+        true
+    }
+
+    fn get_mut(&mut self, pos: usize, i: usize) -> Option<&mut HintRec> {
+        let k = self.find(pos, i).ok()?;
+        self.0.get_mut(k).map(|e| &mut e.2)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, usize, HintRec)> + '_ {
+        self.0.iter().map(|&(p, i, r)| (p as usize, i as usize, r))
+    }
+}
+
 impl RoomState {
     /// The room's hint economy and the hints the seed starts with, each `(finding slot,
     /// location, status)`; a hint named twice is kept once, the first time.
@@ -163,12 +197,12 @@ impl RoomState {
     ) -> Result<Self, CoreError> {
         self.hint_rules = rules;
         for (finding, location, s) in start {
-            self.place(finding, location).ok_or(CoreError::UnknownLocation(location))?;
+            let (pos, i, ..) =
+                self.place(finding, location).ok_or(CoreError::UnknownLocation(location))?;
             if !valid(s) {
                 return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
             }
-            let world = self.hints.entry(finding).or_default();
-            world.entry(location).or_insert(HintRec { status: s, seq: Seq(0) });
+            self.hints.add(pos, i, HintRec { status: s, seq: Seq(0) });
         }
         Ok(self)
     }
@@ -181,7 +215,8 @@ impl RoomState {
 
     /// Locations in `slot`'s world.
     fn world_size(&self, slot: SlotNo) -> usize {
-        self.placement.get(&slot).map_or(0, BTreeMap::len)
+        let w = &self.world.0;
+        w.slots().binary_search(&slot).map_or(0, |pos| w.placed(pos))
     }
 
     /// What one hint costs `slot`.
@@ -193,16 +228,18 @@ impl RoomState {
     /// `slot`'s hint points now.
     #[must_use]
     pub fn hint_points(&self, slot: SlotNo) -> i64 {
-        let checked = self.checked.get(&slot).map_or(0, BTreeMap::len);
         let used = self.hints_used.get(&slot).copied().unwrap_or(0);
-        self.hint_rules.points(self.world_size(slot), checked, used)
+        self.hint_rules.points(self.world_size(slot), self.checked_count(slot), used)
     }
 
-    fn hint_view(&self, finding: SlotNo, location: i64, stored: u8) -> Option<Hint> {
-        let (receiver, item) = self.place(finding, location)?;
-        let found = self.checked_at(finding, location).is_some();
+    /// The hint at location `i` of slot position `pos` in ids, as clients see it.
+    fn hint_view(&self, pos: usize, i: usize, stored: u8) -> Option<Hint> {
+        let w = &self.world.0;
+        let (to, item) = w.target(pos, i)?;
+        let found = self.is_checked(pos, i);
         let status = if found { status::FOUND } else { stored };
-        Some(Hint { finding, location, receiver, item, status, found })
+        let (finding, receiver) = (*w.slots().get(pos)?, *w.slots().get(to)?);
+        Some(Hint { finding, location: w.location(pos, i)?, receiver, item, status, found })
     }
 
     /// Every hint `slot` finds or receives, in (finding slot, location) order: the value of
@@ -211,14 +248,9 @@ impl RoomState {
     pub fn hints_of(&self, slot: SlotNo) -> Vec<Hint> {
         self.hints
             .iter()
-            .flat_map(|(&f, m)| m.iter().filter_map(move |(&l, r)| self.hint_view(f, l, r.status)))
+            .filter_map(|(pos, i, r)| self.hint_view(pos, i, r.status))
             .filter(|h| h.finding == slot || h.receiver == slot)
             .collect()
-    }
-
-    /// The stored hint at `(finding, location)`.
-    fn hint_at(&self, finding: SlotNo, location: i64) -> Option<HintRec> {
-        self.hints.get(&finding).and_then(|m| m.get(&location)).copied()
     }
 
     /// The one place a hint event changes state (called from `record`).
@@ -229,29 +261,26 @@ impl RoomState {
         let writes = self.hint_writes.checked_add(1).ok_or(CoreError::SeqOverflow)?;
         match ev.kind {
             EventKind::HintAdded { finding, location, status: s, paid } => {
-                self.place(finding, location).ok_or(CoreError::UnknownLocation(location))?;
+                let (pos, i, ..) =
+                    self.place(finding, location).ok_or(CoreError::UnknownLocation(location))?;
                 if !valid(s) {
                     return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
                 }
-                if self.hint_at(finding, location).is_some() {
+                if self.hints.get(pos, i).is_some() {
                     return Err(CoreError::BadEvent);
                 }
                 if paid {
                     let used = self.hints_used.entry(slot).or_insert(0);
                     *used = used.checked_add(1).ok_or(CoreError::SeqOverflow)?;
                 }
-                let rec = HintRec { status: s, seq: ev.seq };
-                self.hints.entry(finding).or_default().insert(location, rec);
+                self.hints.add(pos, i, HintRec { status: s, seq: ev.seq });
             }
             EventKind::HintStatus { finding, location, status: s } => {
                 if !valid(s) || s == status::FOUND {
                     return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
                 }
-                let rec = self
-                    .hints
-                    .get_mut(&finding)
-                    .and_then(|m| m.get_mut(&location))
-                    .ok_or(CoreError::BadEvent)?;
+                let (pos, i, ..) = self.place(finding, location).ok_or(CoreError::BadEvent)?;
+                let rec = self.hints.get_mut(pos, i).ok_or(CoreError::BadEvent)?;
                 *rec = HintRec { status: s, seq: ev.seq };
             }
             _ => return Err(CoreError::BadEvent),
@@ -262,11 +291,12 @@ impl RoomState {
 
     /// Snapshot rules for the hint table (part of [`RoomState::validate`]).
     pub(crate) fn validate_hints(&self) -> Result<(), &'static str> {
-        let bad_rec = |(&f, m): (&SlotNo, &BTreeMap<i64, HintRec>)| {
-            m.iter()
-                .any(|(&l, r)| self.place(f, l).is_none() || !valid(r.status) || r.seq > self.head)
+        let w = &self.world.0;
+        let sorted = self.hints.0.windows(2).all(|p| (p[0].0, p[0].1) < (p[1].0, p[1].1));
+        let bad_rec = |(pos, i, r): (usize, usize, HintRec)| {
+            i >= w.placed(pos) || !valid(r.status) || r.seq > self.head
         };
-        if self.hints.iter().any(bad_rec) {
+        if !sorted || self.hints.iter().any(bad_rec) {
             return Err("hint outside the placement, with a bad status or beyond the head");
         }
         if self.hints_used.keys().any(|s| !self.slots.contains_key(s)) {
@@ -279,9 +309,10 @@ impl RoomState {
     }
 }
 
-/// One asked hint: the ask, the `(status, paid)` of the event that creates it (none for a known
-/// one or a found one that is not kept), and the seq it rests on.
-type Planned = (HintAsk, Option<(u8, bool)>, Seq);
+/// One asked hint: the ask, where it is (slot position, location index), the `(status, paid)`
+/// of the event that creates it (none for a known one or a found one that is not kept), and
+/// the seq it rests on.
+type Planned = (HintAsk, (usize, usize), Option<(u8, bool)>, Seq);
 
 /// Apply a hint request: see [`Hinted`] for the reply. Known hints are shown and never
 /// changed; a new found hint is kept only with `keep_found`; new unfound hints are all created
@@ -296,24 +327,22 @@ pub(crate) fn request(
         return Err(CoreError::UnknownSlot(slot));
     }
     let mut seen = BTreeSet::new();
-    let mut asked: Vec<HintAsk> = Vec::new();
+    let mut asked: Vec<(HintAsk, (usize, usize))> = Vec::new();
     for a in asks {
-        state.place(a.finding, a.location).ok_or(CoreError::UnknownLocation(a.location))?;
+        let (pos, i, ..) =
+            state.place(a.finding, a.location).ok_or(CoreError::UnknownLocation(a.location))?;
         if !valid(a.status) || a.status == status::FOUND {
             return Err(CoreError::Hint(HintRefusal::BadStatus(a.status)));
         }
-        if seen.insert((a.finding, a.location)) {
-            asked.push(a);
+        if seen.insert((pos, i)) {
+            asked.push((a, (pos, i)));
         }
     }
     let cost = state.hint_cost(slot);
     let points = state.hint_points(slot);
     let unfound = asked
         .iter()
-        .filter(|a| {
-            state.hint_at(a.finding, a.location).is_none()
-                && state.checked_at(a.finding, a.location).is_none()
-        })
+        .filter(|(_, (p, i))| state.hints.get(*p, *i).is_none() && !state.is_checked(*p, *i))
         .count();
     let affordable = if !pay || cost == 0 {
         unfound
@@ -325,27 +354,27 @@ pub(crate) fn request(
     let mut head = state.head;
     let mut wait = Seq(0);
     let mut paid = 0;
-    for a in asked {
-        if let Some(rec) = state.hint_at(a.finding, a.location) {
+    for (a, (p, i)) in asked {
+        if let Some(rec) = state.hints.get(p, i) {
             wait = wait.max(rec.seq);
-            plan.push((a, None, rec.seq));
-        } else if state.checked_at(a.finding, a.location).is_some() {
+            plan.push((a, (p, i), None, rec.seq));
+        } else if state.is_checked(p, i) {
             if keep_found {
                 head = next_seq(head)?;
-                plan.push((a, Some((status::FOUND, false)), head));
+                plan.push((a, (p, i), Some((status::FOUND, false)), head));
             } else {
-                plan.push((a, None, Seq(0)));
+                plan.push((a, (p, i), None, Seq(0)));
             }
         } else if paid < affordable {
             paid = paid.saturating_add(1);
             head = next_seq(head)?;
-            plan.push((a, Some((a.status, pay)), head));
+            plan.push((a, (p, i), Some((a.status, pay)), head));
         }
     }
     let mut events = Vec::new();
     let mut shown = Vec::with_capacity(plan.len());
-    for (a, create, seq) in plan {
-        let known = state.hint_at(a.finding, a.location);
+    for (a, (p, i), create, seq) in plan {
+        let known = state.hints.get(p, i);
         if let Some((s, paid)) = create {
             let kind =
                 EventKind::HintAdded { finding: a.finding, location: a.location, status: s, paid };
@@ -353,9 +382,8 @@ pub(crate) fn request(
             state.record(&ev, limits)?;
             events.push(ev);
         }
-        let stored =
-            known.or_else(|| state.hint_at(a.finding, a.location)).map_or(a.status, |r| r.status);
-        if let Some(hint) = state.hint_view(a.finding, a.location, stored) {
+        let stored = known.or_else(|| state.hints.get(p, i)).map_or(a.status, |r| r.status);
+        if let Some(hint) = state.hint_view(p, i, stored) {
             shown.push(HintShown { hint, new: known.is_none() });
         }
     }
@@ -384,17 +412,20 @@ pub(crate) fn set_status(
         reply: Reply::HintStatus { changed: false },
         depends_on: state.wait_for(seq.0),
     };
-    let Some(rec) = state.hint_at(finding, location) else {
+    let Some((pos, i, receiver, _)) = state.place(finding, location) else {
+        return Ok(unchanged(state, Seq(0)));
+    };
+    let Some(rec) = state.hints.get(pos, i) else {
         return Ok(unchanged(state, Seq(0)));
     };
     // The reference checks who asks before it reads the status.
-    if state.place(finding, location).map(|(r, _)| r) != Some(slot) {
+    if receiver != slot {
         return Err(CoreError::Hint(HintRefusal::NoPermission));
     }
     if !valid(s) || s == status::FOUND {
         return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
     }
-    if state.checked_at(finding, location).is_some() || rec.status == s {
+    if state.is_checked(pos, i) || rec.status == s {
         return Ok(unchanged(state, rec.seq));
     }
     let seq = next_seq(state.head)?;

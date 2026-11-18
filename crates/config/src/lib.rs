@@ -35,6 +35,27 @@ pub struct Limits {
     pub session_queue: usize,
     /// Largest seed bundle file the server will read.
     pub bundle_max_bytes: u64,
+    /// Most rooms one process lists (in memory or not); further bundles are skipped with a
+    /// warning.
+    pub max_rooms: usize,
+    /// How often the server looks in the rooms folder for new seed bundles and checks for idle
+    /// and abandoned rooms (`CONSTELLATION_ROOMS_SCAN_MS`).
+    pub rooms_scan_ms: u64,
+    /// A room with no connection for this long leaves memory, and its next connect loads it
+    /// again (doc 02 section 4.3: Resident to Draining after idle 15 min, a design value;
+    /// `CONSTELLATION_ROOM_IDLE_SECS`).
+    pub room_idle_secs: u64,
+    /// A room with no connection for this long ends as abandoned and is never served again
+    /// (D-30: 30 days, a design value; `CONSTELLATION_ROOM_ABANDON_SECS`).
+    pub room_abandon_secs: u64,
+    /// A room in use has the time it was last used written to the database at most this
+    /// often, so a crash loses at most this much of it (a cost trade, not a design value;
+    /// `CONSTELLATION_ROOM_TOUCH_SECS`). A room leaving memory, and a clean stop, write it
+    /// at once.
+    pub room_touch_secs: u64,
+    /// Draws of a new room key before a new room gives up until the next scan; each draw
+    /// collides with an existing key only with odds of about one in 2^50 per stored room.
+    pub room_key_draws: usize,
     /// Chat and bounce messages a session may send in a burst (one shared token bucket).
     pub fanout_burst: u32,
     /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
@@ -56,6 +77,12 @@ pub struct Limits {
     pub rate_table_max_keys: usize,
     /// Open WebSocket connections per process; more get HTTP 503 (`CONSTELLATION_MAX_CONNECTIONS`).
     pub max_connections: usize,
+    /// Durable events a host's room view stream replays at most when it opens or resumes; an
+    /// older start gets the newest ones and a reset (the web UI keeps 400 lines).
+    pub view_history_events: u64,
+    /// Room view streams (admin API, server-sent events) open at once per process; more get
+    /// HTTP 503.
+    pub view_streams: usize,
     /// A socket that has not connected to a slot within this long is closed
     /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
     pub connect_timeout_ms: u64,
@@ -110,7 +137,51 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
+    /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
+    /// ones are tens of MB).
+    pub apworld_max_bytes: usize,
+    /// Most bytes an `.apworld` may unpack to; more is refused as a zip bomb (design value).
+    pub apworld_max_unpacked_bytes: u64,
+    /// Most entries in an `.apworld` zip (design value).
+    pub apworld_max_entries: u64,
+    /// Largest player `.yaml` upload, bytes (design value: real ones are a few KB).
+    pub yaml_max_bytes: usize,
+    /// Wall-clock limit of one sandboxed inspect call, after which it is killed (design value).
+    pub inspect_timeout_ms: u64,
+    /// Wall-clock limit of one sandboxed generation, after which it is killed
+    /// (`CONSTELLATION_GEN_TIMEOUT_MS`; design value: one real world took about 22 s here).
+    pub gen_timeout_ms: u64,
+    /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
+    /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
+    pub gen_memory_bytes: u64,
+    /// Most bytes of the sidecar's error output kept in a failed job's status; the rest is
+    /// read and dropped, never held (design value).
+    pub gen_error_max_bytes: usize,
+    /// Most bytes the sidecar may print as its result (the bundle travels this way); more
+    /// fails the call (design value: the bundle cap plus room for the report).
+    pub gen_stdout_max_bytes: usize,
+    /// Size of each writable tmpfs in the sandbox (`/tmp`, the generator's scratch output),
+    /// bytes (design value).
+    pub gen_tmpfs_bytes: u64,
+    /// Largest file the sandboxed process may write (`prlimit --fsize`), bytes (design value).
+    pub gen_file_max_bytes: u64,
+    /// Most processes and threads in the sandbox (`prlimit --nproc`, counted per sandbox
+    /// because each has its own user namespace; design value).
+    pub gen_max_processes: u64,
+    /// Most open files in the sandbox (`prlimit --nofile`; bounds memfd use; design value).
+    pub gen_max_open_files: u64,
+    /// Memory cap of each sandbox's own cgroup (`systemd-run --user --scope -p MemoryMax`),
+    /// bytes. It counts what the address space cap misses: tmpfs, memfd and shared memory
+    /// pages, and all processes together (`CONSTELLATION_GEN_CGROUP_MEMORY_BYTES`; design value).
+    pub gen_cgroup_memory_bytes: u64,
+    /// Task cap of each sandbox's cgroup (`TasksMax`; bwrap's own processes included; design
+    /// value).
+    pub gen_cgroup_tasks: u64,
 }
+
+/// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
+/// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
+pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
 
 impl Limits {
     /// The design values (see each field).
@@ -127,6 +198,12 @@ impl Limits {
         room_mailbox: 1024,
         session_queue: 256,
         bundle_max_bytes: 64 * 1024 * 1024,
+        max_rooms: 1000,
+        rooms_scan_ms: 2_000,
+        room_idle_secs: 15 * 60,
+        room_abandon_secs: 30 * 24 * 60 * 60,
+        room_touch_secs: 60,
+        room_key_draws: 3,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
         chat_max_bytes: 2048,
@@ -137,6 +214,8 @@ impl Limits {
         connect_refill_milli_per_sec: 1000,
         rate_table_max_keys: 100_000,
         max_connections: 10_000,
+        view_history_events: 400,
+        view_streams: 64,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
@@ -158,6 +237,21 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
+        apworld_max_bytes: 64 * 1024 * 1024,
+        apworld_max_unpacked_bytes: 256 * 1024 * 1024,
+        apworld_max_entries: 20_000,
+        yaml_max_bytes: 1024 * 1024,
+        inspect_timeout_ms: 30_000,
+        gen_timeout_ms: 15 * 60 * 1000,
+        gen_memory_bytes: 4 * 1024 * 1024 * 1024,
+        gen_error_max_bytes: 16 * 1024,
+        gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
+        gen_tmpfs_bytes: 256 * 1024 * 1024,
+        gen_file_max_bytes: 256 * 1024 * 1024,
+        gen_max_processes: 64,
+        gen_max_open_files: 256,
+        gen_cgroup_memory_bytes: 4 * 1024 * 1024 * 1024,
+        gen_cgroup_tasks: 80,
     };
 }
 
@@ -189,6 +283,13 @@ pub fn load() -> Limits {
         ("CONSTELLATION_CONNECT_TIMEOUT_MS", &mut l.connect_timeout_ms),
         ("CONSTELLATION_IDLE_TIMEOUT_MS", &mut l.idle_timeout_ms),
         ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
+        ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
+        ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
+        ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
+        ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
+        ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
+        ("CONSTELLATION_ROOM_ABANDON_SECS", &mut l.room_abandon_secs),
+        ("CONSTELLATION_ROOM_TOUCH_SECS", &mut l.room_touch_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -208,6 +309,9 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
+    /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
+    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. That API is refused without it.
+    pub admin_token: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -215,7 +319,12 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Secrets").field("room_password", &pw).field("database_url", &db).finish()
+        let admin = self.admin_token.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Secrets")
+            .field("room_password", &pw)
+            .field("database_url", &db)
+            .field("admin_token", &admin)
+            .finish()
     }
 }
 
@@ -262,7 +371,80 @@ fn secrets_from(
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
+        admin_token: admin_token(var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?)?,
     })
+}
+
+#[cfg(feature = "std")]
+fn admin_token(token: Option<String>) -> Result<Option<String>, String> {
+    match token {
+        Some(t) if t.len() < ADMIN_TOKEN_MIN_BYTES => Err(format!(
+            "CONSTELLATION_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_BYTES} bytes (not shown)"
+        )),
+        t => Ok(t),
+    }
+}
+
+/// Where seed generation finds Archipelago and our sidecar. All three are needed for the
+/// upload and generation API (`--data-dir`).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    /// An Archipelago checkout (`Generate.py`, `custom_worlds/`): `CONSTELLATION_AP_DIR`.
+    pub ap_dir: std::path::PathBuf,
+    /// A Python with Archipelago's dependencies installed: `CONSTELLATION_AP_PYTHON`.
+    pub python: std::path::PathBuf,
+    /// The sidecar script, normally `tools/ap-gen/ap_gen.py`: `CONSTELLATION_AP_GEN_SCRIPT`.
+    pub sidecar: std::path::PathBuf,
+    /// Host paths no sandbox mount may contain: the server user's home (`HOME`) and the secret
+    /// files (`CONSTELLATION_*_FILE`).
+    pub private: Vec<std::path::PathBuf>,
+}
+
+/// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
+#[cfg(feature = "std")]
+const SECRET_FILE_VARS: [&str; 3] = [
+    "CONSTELLATION_ROOM_PASSWORD_FILE",
+    "CONSTELLATION_DATABASE_URL_FILE",
+    "CONSTELLATION_ADMIN_TOKEN_FILE",
+];
+
+/// Read [`Generation`] from the environment: `None` when none of its variables is set.
+///
+/// # Errors
+/// Some but not all set, or a path that is not absolute (the sandbox mounts them by path).
+#[cfg(feature = "std")]
+pub fn load_generation() -> Result<Option<Generation>, String> {
+    generation_from(|k| std::env::var(k).ok())
+}
+
+#[cfg(feature = "std")]
+fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Generation>, String> {
+    const KEYS: [&str; 3] =
+        ["CONSTELLATION_AP_DIR", "CONSTELLATION_AP_PYTHON", "CONSTELLATION_AP_GEN_SCRIPT"];
+    let [ap, py, side] = KEYS.map(|k| var(k).filter(|v| !v.is_empty()));
+    let (Some(ap), Some(py), Some(side)) = (&ap, &py, &side) else {
+        if ap.is_none() && py.is_none() && side.is_none() {
+            return Ok(None);
+        }
+        return Err(format!("set all of {} or none", KEYS.join(", ")));
+    };
+    let path = |v: &str, k: &str| {
+        let p = std::path::PathBuf::from(v);
+        if p.is_absolute() { Ok(p) } else { Err(format!("{k} must be an absolute path")) }
+    };
+    let private = ["HOME"]
+        .iter()
+        .chain(SECRET_FILE_VARS.iter())
+        .filter_map(|k| var(k).filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from)
+        .collect();
+    Ok(Some(Generation {
+        ap_dir: path(ap, KEYS[0])?,
+        python: path(py, KEYS[1])?,
+        sidecar: path(side, KEYS[2])?,
+        private,
+    }))
 }
 
 /// URL parameters sqlx 0.9.0 understands (`sqlx-postgres` `options/parse.rs`), plus
@@ -334,6 +516,10 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
+        assert_eq!(l.max_rooms, 1000);
+        assert_eq!(l.rooms_scan_ms, 2_000);
+        assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
+        assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
     }
 
     #[test]
@@ -381,8 +567,8 @@ mod tests {
         assert!(empty.unwrap_err().contains("empty"));
         assert_eq!(secrets_from(env(&[]), file).unwrap().database_url, None);
         let s = Secrets {
-            room_password: None,
             database_url: Some("postgres://u:hunter2@h".to_owned()),
+            ..Secrets::default()
         };
         assert!(!format!("{s:?}").contains("hunter2"), "the URL can hold a password");
     }
@@ -435,7 +621,12 @@ mod tests {
             .env("CONSTELLATION_CONNECT_TIMEOUT_MS", "11")
             .env("CONSTELLATION_IDLE_TIMEOUT_MS", "not-a-number")
             .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
+            .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
+            .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
+            .env("CONSTELLATION_AP_DIR", "/probe/ap")
+            .env("CONSTELLATION_AP_PYTHON", "/probe/python")
+            .env("CONSTELLATION_AP_GEN_SCRIPT", "/probe/ap_gen.py")
             .env("CONSTELLATION_DATABASE_URL_FILE", &url_file)
             .env_remove("CONSTELLATION_ROOM_PASSWORD_FILE")
             .env_remove("CONSTELLATION_DATABASE_URL")
@@ -445,11 +636,17 @@ mod tests {
         assert!(out.status.success(), "{text}");
         let d = Limits::DESIGN;
         // Bad numbers keep the design value.
-        let want =
-            format!("probe limits 77 5 Some(9) 3 11 {} {}", d.idle_timeout_ms, d.ping_interval_ms);
+        let want = format!(
+            "probe limits 77 5 Some(9) 3 11 {} {} 1234 5678",
+            d.idle_timeout_ms, d.ping_interval_ms
+        );
         assert!(text.contains(&want), "want {want:?} in {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
+            "{text}"
+        );
+        assert!(
+            text.contains("probe generation /probe/ap /probe/python /probe/ap_gen.py"),
             "{text}"
         );
     }
@@ -462,22 +659,31 @@ mod tests {
         }
         let l = load();
         println!(
-            "probe limits {} {} {:?} {} {} {} {}",
+            "probe limits {} {} {:?} {} {} {} {} {} {}",
             l.dedupe_window_secs,
             l.sim_seeds,
             l.sim_replay_seed,
             l.max_connections,
             l.connect_timeout_ms,
             l.idle_timeout_ms,
-            l.ping_interval_ms
+            l.ping_interval_ms,
+            l.gen_timeout_ms,
+            l.gen_memory_bytes
         );
         let s = load_secrets().unwrap();
         println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
+        let g = load_generation().unwrap().expect("the paths are set");
+        println!(
+            "probe generation {} {} {}",
+            g.ap_dir.display(),
+            g.python.display(),
+            g.sidecar.display()
+        );
     }
 
     #[test]
     fn secrets_print_redacted() {
-        let s = Secrets { room_password: Some("hunter2".to_owned()), database_url: None };
+        let s = Secrets { room_password: Some("hunter2".to_owned()), ..Secrets::default() };
         let text = format!("{s:?}");
         assert!(!text.contains("hunter2") && text.contains("redacted"), "{text}");
     }
@@ -486,6 +692,7 @@ mod tests {
     fn connection_limits_are_design_values_and_the_ping_beats_the_idle_timeout() {
         let l = Limits::DESIGN;
         assert_eq!(l.max_connections, 10_000);
+        assert_eq!((l.view_history_events, l.view_streams), (400, 64), "the room view caps");
         assert_eq!(
             (l.connect_timeout_ms, l.idle_timeout_ms, l.ping_interval_ms),
             (30_000, 60_000, 20_000)
@@ -506,6 +713,89 @@ mod tests {
             (262_144, 4_096_000)
         );
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn upload_and_generation_limits_are_design_values() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
+        assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
+        assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
+        assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
+        assert_eq!(l.gen_stdout_max_bytes, (64 << 20) + (1 << 20));
+        assert!(l.gen_stdout_max_bytes as u64 > l.bundle_max_bytes, "a full bundle fits");
+        assert_eq!(
+            (l.gen_tmpfs_bytes, l.gen_file_max_bytes, l.gen_max_processes),
+            (256 << 20, 256 << 20, 64)
+        );
+        assert_eq!(
+            (l.gen_max_open_files, l.gen_cgroup_memory_bytes, l.gen_cgroup_tasks),
+            (256, 4 << 30, 80)
+        );
+        assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
+    }
+
+    #[test]
+    fn the_admin_token_comes_from_the_variable_or_a_file_and_prints_redacted() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        const T32: &str = "t0ken-t0ken-t0ken-t0ken-t0ken-32";
+        let file = |_: &std::path::Path| Ok("t0ken-from-file-t0ken-from-file-\n".to_owned());
+        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", T32)]), file).unwrap();
+        assert_eq!(direct.admin_token.as_deref(), Some(T32));
+        assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
+        let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
+        assert_eq!(
+            from_file.unwrap().admin_token.as_deref(),
+            Some("t0ken-from-file-t0ken-from-file-")
+        );
+        const T31: &[(&str, &str)] = &[("CONSTELLATION_ADMIN_TOKEN", T32.split_at(1).1)];
+        let short = secrets_from(env(T31), file);
+        let e = short.unwrap_err();
+        assert!(e.contains("shorter than 32") && !e.contains("t0ken"), "{e}");
+        let both: &'static [(&str, &str)] =
+            &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
+        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
+        assert_eq!(secrets_from(env(&[]), file).unwrap().admin_token, None);
+    }
+
+    #[test]
+    fn generation_paths_come_from_the_environment_and_are_all_or_nothing() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        assert_eq!(generation_from(env(&[])), Ok(None));
+        let all: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "/ap"),
+            ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
+        ];
+        let g = generation_from(env(all)).unwrap().unwrap();
+        assert_eq!(g.ap_dir, std::path::PathBuf::from("/ap"));
+        assert_eq!(g.python, std::path::PathBuf::from("/venv/bin/python"));
+        assert_eq!(g.sidecar, std::path::PathBuf::from("/tools/ap-gen/ap_gen.py"));
+        assert!(g.private.is_empty());
+        let with_private: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "/ap"),
+            ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
+            ("HOME", "/home/u"),
+            ("CONSTELLATION_ADMIN_TOKEN_FILE", "/etc/c/token"),
+            ("CONSTELLATION_DATABASE_URL_FILE", "/etc/c/db"),
+        ];
+        let g = generation_from(env(with_private)).unwrap().unwrap();
+        let want: Vec<std::path::PathBuf> =
+            ["/home/u", "/etc/c/db", "/etc/c/token"].iter().map(Into::into).collect();
+        assert_eq!(g.private, want);
+        let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
+        assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");
+        let rel: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "ap"),
+            ("CONSTELLATION_AP_PYTHON", "/p"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/s"),
+        ];
+        assert!(generation_from(env(rel)).unwrap_err().contains("absolute"));
     }
 
     #[test]

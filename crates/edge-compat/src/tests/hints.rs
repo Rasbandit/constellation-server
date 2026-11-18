@@ -3,6 +3,7 @@
 // B's item 7 (progression), A's 101 holds A's own item 8, B's 100 holds A's item 7 (a trap).
 // A hint costs each slot 1 point (10 percent of a world of 1 or 2, at least 1); a check earns 2.
 use super::*;
+use std::collections::BTreeMap;
 
 fn hint_room(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
     room_edit(|v| {
@@ -367,6 +368,7 @@ async fn start_hints_from_the_seed_are_readable_on_first_connect() {
     let room = hint_room(|v| {
         v["start_hints"] = json!([{"finding": 2, "location": 100, "status": 30}]);
         v["slots"][1]["entrances"] = json!({"100": "Cave"});
+        v["games"][GAME]["entrance_names"] = json!(["Cave"]);
     });
     let mut a = joined(&room, "A").await;
     let got = read_hints(&mut a, 1).await;

@@ -1,0 +1,12 @@
+{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_spectator","client":{"kind":"spectator"}}}
+{"dir":"s2c","frame":{"op":"welcome","proto":{"major":1,"minor":0},"session":"s_golden_4","caller":{"kind":"spectator","scopes":["observe"],"roles":[]},"limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":5,"max_watches":16,"max_paths_per_watch":16},"epoch":1,"head":7,"replay":{"from":1,"to":7},"resume":{"status":"ok"},"server_time_ms":1790000003000}}
+{"dir":"s2c","frame":{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":104}}}
+{"dir":"s2c","frame":{"op":"event","seq":7,"type":"slot.goal","slot":1,"data":{}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"c-1","type":"check","data":{"location":1}}}
+{"dir":"s2c","frame":{"op":"result","cid":"c-1","upto":7,"error":{"code":2021,"key":"auth.scope_insufficient","retry":"never"}}}
+{"dir":"c2s","frame":{"op":"get","cid":"g-1","path":"room/slots"}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-1","upto":7,"ok":{"path":"room/slots","value":[{"index":1,"name":"Rowan","game":"dev.example.mosscave"}],"ver":0}}}
+{"dir":"c2s","frame":{"op":"get","cid":"g-2","path":"slot/1/inventory"}}
+{"dir":"s2c","frame":{"op":"result","cid":"g-2","upto":7,"error":{"code":2022,"key":"path.forbidden","retry":"never"}}}
+{"dir":"c2s","frame":{"op":"ack","applied":1}}
+{"dir":"s2c","frame":{"op":"error","code":3051,"key":"ack.invalid","retry":"never","ref":"ack"}}

@@ -14,8 +14,9 @@ use crate::CompatRoom;
 use crate::wire::{self, NetworkItem, PrintJson, TextPart};
 use proto::{HintAsk, SlotNo};
 use room_core::{Hint, Hinted, hint_status};
-use seed_bundle::Slot;
+use seed_bundle::SlotView;
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A hint as the protocol sends it.
 pub(crate) fn record(room: &CompatRoom, h: &Hint) -> wire::Hint {
@@ -32,8 +33,7 @@ pub(crate) fn record(room: &CompatRoom, h: &Hint) -> wire::Hint {
 }
 
 fn entrance<'a>(room: &'a CompatRoom, h: &Hint) -> Option<&'a str> {
-    let slot = room.bundle.slot(h.finding.0)?;
-    slot.entrances.get(&h.location).map(String::as_str)
+    room.bundle.slot(h.finding.0)?.entrance(h.location)
 }
 
 /// The value of a `_read_hints_` key.
@@ -103,68 +103,78 @@ impl Kind {
 /// text to answer with.
 pub(crate) fn resolve(
     room: &CompatRoom,
-    slot: &Slot,
+    slot: &SlotView<'_>,
     arg: &str,
     kind: Kind,
 ) -> Result<Vec<HintAsk>, String> {
-    let game = &slot.game;
-    let g = room.bundle.games.get(game).ok_or("this slot's game has no data package")?;
-    let (ids, groups) = match kind {
-        Kind::Item => (&g.item_name_to_id, &g.item_name_groups),
-        Kind::Location => (&g.location_name_to_id, &g.location_name_groups),
+    let (game, g) = (slot.game(), slot.package());
+    let (ids, names, groups) = match kind {
+        Kind::Item => (g.items(), g.item_names(), g.item_groups()),
+        Kind::Location => (g.locations(), g.location_names(), g.location_groups()),
     };
-    let wanted: Vec<i64> = if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
+    // shortcut: the groups are kept as JSON in the shared package and parsed per command
+    // (`!hint` is rate limited with chat); keep them parsed in the package if that shows up.
+    let groups: BTreeMap<String, Vec<String>> = serde_json::from_str(groups).unwrap_or_default();
+    let id_of = |name: &str| names.iter().position(|n| &**n == name).and_then(|i| ids.get(i));
+    let wanted: BTreeSet<i64> = if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
         let id: i64 = arg.parse().map_err(|_| format!("{arg} is not an id"))?;
-        if let Some(name) = ids.iter().find(|(_, v)| **v == id).map(|(n, _)| n)
-            && g.hint_blacklist.contains(name)
-        {
+        let name = ids.binary_search(&id).ok().and_then(|i| names.get(i));
+        if let Some(name) = name.filter(|n| g.hint_blacklisted(n)) {
             return Err(not_hintable(name));
         }
-        vec![id]
+        BTreeSet::from([id])
     } else {
-        let name = lookup(ids.keys().chain(groups.keys()), arg)
+        let all = names.iter().map(|n| &**n).chain(groups.keys().map(String::as_str));
+        let name = lookup(all, arg)
             .ok_or_else(|| format!("No {0} or {0} group named '{arg}' in {game}.", kind.noun()))?;
-        if g.hint_blacklist.contains(name) {
+        if g.hint_blacklisted(name) {
             return Err(not_hintable(name));
         }
         // A group name wins over an item of the same name, as in the reference.
         groups.get(name).map_or_else(
-            || ids.get(name).copied().into_iter().collect(),
-            |members| members.iter().filter_map(|m| ids.get(m).copied()).collect(),
+            || id_of(name).copied().into_iter().collect(),
+            |members| members.iter().filter_map(|m| id_of(m).copied()).collect(),
         )
     };
-    let mut asks: Vec<(HintAsk, (u32, bool))> = Vec::new();
-    for id in wanted {
-        let at: Vec<(u32, i64)> = match kind {
-            Kind::Item => room.by_item.get(&(slot.id, id)).cloned().unwrap_or_default(),
-            Kind::Location => {
-                if room.placed.contains_key(&(slot.id, id)) {
-                    vec![(slot.id, id)]
-                } else {
-                    vec![]
-                }
-            }
-        };
-        for (finder, location) in at {
-            let Some(p) = room.placed.get(&(finder, location)) else { continue };
+    // (finding slot, location, flags, receiver) of every placement asked for.
+    let at: Vec<(SlotView<'_>, i64, u8, u32)> = match kind {
+        // shortcut: scans every placement of the room per `!hint` rather than keep an item
+        // index per room (memory every room would pay); index it if big rooms make it slow.
+        Kind::Item => room
+            .bundle
+            .slots()
+            .flat_map(|f| f.placements().map(move |p| (f, p)))
+            .filter(|(_, p)| p.receiver == slot.id() && wanted.contains(&p.item))
+            .map(|(f, p)| (f, p.location, p.flags, p.receiver))
+            .collect(),
+        Kind::Location => wanted
+            .iter()
+            .filter_map(|&l| slot.placement(slot.find(l)?))
+            .map(|p| (*slot, p.location, p.flags, p.receiver))
+            .collect(),
+    };
+    let mut asks: Vec<(HintAsk, (u32, bool))> = at
+        .into_iter()
+        .map(|(finder, location, flags, receiver)| {
             // Item hints start as priority, or avoid for a trap; location hints as unspecified
             // (`MultiServer.py:1289-1296, 1306`).
             let status = match kind {
-                Kind::Item if p.flags & 4 != 0 => hint_status::AVOID,
+                Kind::Item if flags & 4 != 0 => hint_status::AVOID,
                 Kind::Item => hint_status::PRIORITY,
                 Kind::Location => hint_status::UNSPECIFIED,
             };
-            let ask = HintAsk { finding: SlotNo(finder), location, status };
-            asks.push((ask, (p.sphere.unwrap_or(u32::MAX), p.receiver == finder)));
-        }
-    }
+            let ask = HintAsk { finding: SlotNo(finder.id()), location, status };
+            let sphere = finder.sphere(location).unwrap_or(u32::MAX);
+            (ask, (sphere, receiver == finder.id()))
+        })
+        .collect();
     // Earliest sphere first, then another player's world (`MultiServer.py:1858-1871`).
     asks.sort_by_key(|(a, (sphere, local))| (*sphere, *local, a.finding, a.location));
     Ok(asks.into_iter().map(|(a, _)| a).collect())
 }
 
 /// The name `arg` means: an exact match, else the only one equal ignoring case.
-fn lookup<'a>(names: impl Iterator<Item = &'a String> + Clone, arg: &str) -> Option<&'a String> {
+fn lookup<'a>(names: impl Iterator<Item = &'a str> + Clone, arg: &str) -> Option<&'a str> {
     if let Some(n) = names.clone().find(|n| *n == arg) {
         return Some(n);
     }
@@ -217,8 +227,8 @@ mod tests {
 
     #[test]
     fn a_name_matches_exactly_else_the_only_one_equal_ignoring_case() {
-        let names = ["Bow".to_owned(), "bow".to_owned(), "Sword".to_owned()];
-        let found = |arg| lookup(names.iter(), arg).map(String::as_str);
+        let names = ["Bow", "bow", "Sword"];
+        let found = |arg| lookup(names.iter().copied(), arg);
         assert_eq!(found("bow"), Some("bow"), "exact wins");
         assert_eq!(found("SWORD"), Some("Sword"));
         assert_eq!(found("BOW"), None, "two names equal ignoring case: ambiguous");

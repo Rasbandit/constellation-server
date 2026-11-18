@@ -449,13 +449,14 @@ impl World {
     /// as a zombie holding a stale epoch.
     fn rehydrate(&mut self, race: bool) -> Res {
         let epoch = self.store.claim(ROOM);
+        let fresh = RoomState::new(slot_ids(), self.placement.clone()).map_err(dbg)?;
         let base = match block_on(self.store.snapshot_get(ROOM)).map_err(dbg)? {
             Some(s) => {
-                let state = serde_json::from_slice::<RoomState>(&s.data).map_err(dbg)?;
+                let state = RoomState::from_snapshot(fresh.world(), &s.data).map_err(dbg)?;
                 state.validate(s.seq).map_err(|e| format!("stored snapshot rejected: {e}"))?;
                 state
             }
-            None => RoomState::new(slot_ids(), self.placement.clone()).map_err(dbg)?,
+            None => fresh,
         };
         let tail = block_on(self.store.read_tail(ROOM, base.head(), usize::MAX)).map_err(dbg)?;
         let mut state = fold(base, &self.limits, tail).map_err(dbg)?;

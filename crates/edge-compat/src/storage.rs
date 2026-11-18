@@ -11,7 +11,7 @@ use crate::CompatRoom;
 use crate::wire::CLIENT_GOAL;
 use proto::{ErrorCode, KvOp, KvWrite, SlotNo};
 use room_core::{KvRefusal, RESERVED_KEY_PREFIX};
-use seed_bundle::{Slot, SlotKind};
+use seed_bundle::{GamePackage, SlotKind, SlotView};
 use serde_json::{Map, Value, json};
 
 /// The wire name of each operation (protocol doc, "`DataStorageOperation`").
@@ -155,26 +155,26 @@ pub(crate) fn status_key(team: u32, slot: u32) -> String {
 
 /// The slot a `<team>_<slot>` key suffix names, written exactly as the reference forms it (so
 /// `0_01` names nothing).
-fn slot_of<'a>(room: &'a CompatRoom, rest: &str) -> Option<&'a Slot> {
+fn slot_of<'a>(room: &'a CompatRoom, rest: &str) -> Option<SlotView<'a>> {
     let (team, slot) = rest.split_once('_')?;
     let s = room.bundle.slot(slot.parse().ok()?)?;
-    (team == s.team.to_string() && slot == s.id.to_string()).then_some(s)
+    (team == s.team().to_string() && slot == s.id().to_string()).then_some(s)
 }
 
 /// Whether a slot's client status is final (30): its goal is reached, or it is not a player.
 /// The reference sets spectators and groups to the goal at load (`MultiServer.py:594-598`) and
 /// never changes a goal (`update_client_status`, `MultiServer.py:2316-2317`).
-pub(crate) fn done(s: &Slot, goal: bool) -> bool {
-    goal || s.kind != SlotKind::Player
+pub(crate) fn done(s: &SlotView<'_>, goal: bool) -> bool {
+    goal || s.kind() != SlotKind::Player
 }
 
 /// A slot's client status: 30 when [`done`], else what its connections set.
-pub(crate) fn status_value(s: &Slot, goal: bool, presence: i64) -> i64 {
+pub(crate) fn status_value(s: &SlotView<'_>, goal: bool, presence: i64) -> i64 {
     if done(s, goal) { CLIENT_GOAL } else { presence }
 }
 
 /// What a `_read_` key needs from outside the bundle: the slot whose client status it names.
-pub(crate) fn status_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<&'a Slot> {
+pub(crate) fn status_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<SlotView<'a>> {
     slot_of(room, key.strip_prefix(RESERVED_KEY_PREFIX)?.strip_prefix("client_status_")?)
 }
 
@@ -184,7 +184,7 @@ pub(crate) fn hints_key(team: u32, slot: u32) -> String {
 }
 
 /// The slot whose hints a `_read_hints_` key names (the room holds them).
-pub(crate) fn hints_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<&'a Slot> {
+pub(crate) fn hints_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<SlotView<'a>> {
     slot_of(room, key.strip_prefix(RESERVED_KEY_PREFIX)?.strip_prefix("hints_")?)
 }
 
@@ -193,21 +193,33 @@ pub(crate) fn hints_slot<'a>(room: &'a CompatRoom, key: &str) -> Option<&'a Slot
 pub(crate) fn read_only(room: &CompatRoom, key: &str) -> Option<Value> {
     let b = &room.bundle;
     let rest = key.strip_prefix(RESERVED_KEY_PREFIX).unwrap_or_default();
-    let group = |games: &str, pick: fn(&seed_bundle::GameData) -> Value| {
-        b.games.get(games).map_or(Value::Null, pick)
+    // Kept as JSON text in the shared package; parsed only for the `Get` that asks.
+    let group = |game: &str, pick: fn(&GamePackage) -> &str| {
+        b.game(game).and_then(|g| serde_json::from_str(pick(g)).ok()).unwrap_or(Value::Null)
     };
     Some(if let Some(r) = rest.strip_prefix("slot_data_") {
-        let slot = r.parse::<u32>().ok().and_then(|s| b.slot(s)).filter(|s| r == s.id.to_string());
-        slot.map_or(Value::Null, |s| s.slot_data.clone())
+        let slot =
+            r.parse::<u32>().ok().and_then(|s| b.slot(s)).filter(|s| r == s.id().to_string());
+        slot.map_or(Value::Null, |s| slot_data(&s))
     } else if let Some(game) = rest.strip_prefix("item_name_groups_") {
-        group(game, |g| json!(g.item_name_groups))
+        group(game, GamePackage::item_groups)
     } else if let Some(game) = rest.strip_prefix("location_name_groups_") {
-        group(game, |g| json!(g.location_name_groups))
+        group(game, GamePackage::location_groups)
     } else if rest == "race_mode" {
-        json!(b.race_mode)
+        json!(b.race_mode())
     } else if status_slot(room, key).is_some() || hints_slot(room, key).is_some() {
         return None;
     } else {
+        Value::Null
+    })
+}
+
+/// A slot's `slot_data`, inflated from the seed; `null` (logged) if the stored bytes do not
+/// decode. `Seed::open` checks its range and inflate cap, not its content (that waits for the
+/// first `Connect`); the file hash makes a bad one corruption or tampering.
+pub(crate) fn slot_data(s: &SlotView<'_>) -> Value {
+    s.slot_data().unwrap_or_else(|e| {
+        tracing::error!(slot = s.id(), error = %e, "slot_data does not decode");
         Value::Null
     })
 }
