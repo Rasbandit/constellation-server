@@ -333,19 +333,24 @@ impl PgLogStore {
         .await
     }
 
-    /// Record that the room had a connection `idle_secs` ago (D-30 counts from here).
+    /// Record, for each `(room, idle_secs)`, that the room was last used `idle_secs` ago
+    /// (D-30 counts from here). One statement for all of them; an unknown room is ignored.
     ///
     /// # Errors
     /// When the database fails.
-    pub async fn touch(&self, room: RoomId, idle_secs: u64) -> Result<(), StoreError> {
-        let idle = bound(idle_secs);
+    pub async fn touch(&self, rooms: &[(RoomId, u64)]) -> Result<(), StoreError> {
+        if rooms.is_empty() {
+            return Ok(());
+        }
+        let (ids, idle): (Vec<i64>, Vec<i64>) =
+            rooms.iter().map(|&(room, idle)| (room_key(room), bound(idle))).unzip();
         self.isolated(move |c| {
             Box::pin(async move {
                 sqlx::query(
-                    "UPDATE rooms SET last_active = now() - make_interval(secs => $2::bigint::double precision) \
-                     WHERE room_id = $1",
+                    "UPDATE rooms SET last_active = now() - make_interval(secs => t.idle::double precision) \
+                     FROM unnest($1::bigint[], $2::bigint[]) AS t(id, idle) WHERE room_id = t.id",
                 )
-                .bind(room_key(room))
+                .bind(ids)
                 .bind(idle)
                 .execute(&mut *c)
                 .await
@@ -356,24 +361,33 @@ impl PgLogStore {
         .await
     }
 
-    /// End the room for `reason` (doc 02 section 4.3, Finished). Its rows are kept; it is never
-    /// listed or opened again. Ending a finished room changes nothing.
+    /// End the room for `reason` (doc 02 section 4.3, Finished) if the database says it was
+    /// last used at least `min_idle_secs` ago, so a stale clock in the caller never ends a
+    /// room in use. Its rows are kept; it is never listed or opened again. Returns whether it
+    /// ended now (`false` for a room used since, an unknown room or one already finished).
     ///
     /// # Errors
     /// When the database fails.
-    pub async fn finish(&self, room: RoomId, reason: &str) -> Result<(), StoreError> {
-        let reason = reason.to_owned();
+    pub async fn finish(
+        &self,
+        room: RoomId,
+        reason: &str,
+        min_idle_secs: u64,
+    ) -> Result<bool, StoreError> {
+        let (reason, idle) = (reason.to_owned(), bound(min_idle_secs));
         self.isolated(move |c| {
             Box::pin(async move {
                 sqlx::query(
                     "UPDATE rooms SET finished_at = now(), finished_reason = $2 \
-                     WHERE room_id = $1 AND finished_at IS NULL",
+                     WHERE room_id = $1 AND finished_at IS NULL \
+                     AND last_active <= now() - make_interval(secs => $3::bigint::double precision)",
                 )
                 .bind(room_key(room))
                 .bind(reason)
+                .bind(idle)
                 .execute(&mut *c)
                 .await
-                .map(drop)
+                .map(|done| done.rows_affected() == 1)
                 .map_err(|e| db::<StoreError>(&e))
             })
         })

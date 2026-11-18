@@ -14,7 +14,7 @@ use proto::RoomId;
 use runtime::RoomHandle;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Characters in a room key.
@@ -104,33 +104,62 @@ pub struct Listing {
     pub activity: Arc<Activity>,
 }
 
+/// A moment on this process's monotonic clock, in milliseconds since its first use. Earlier
+/// moments are negative, so a room idle for longer than the machine has been up keeps its
+/// idle time (an [`Instant`] cannot go back past boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Moment(i64);
+
+impl Moment {
+    /// Now.
+    #[must_use]
+    pub fn now() -> Self {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        Self(millis(ORIGIN.get_or_init(Instant::now).elapsed()))
+    }
+
+    /// The moment `by` before this one.
+    #[must_use]
+    pub fn minus(self, by: Duration) -> Self {
+        Self(self.0.saturating_sub(millis(by)))
+    }
+
+    /// How long after `earlier` this is; zero when it is not after it.
+    #[must_use]
+    pub fn since(self, earlier: Self) -> Duration {
+        Duration::from_millis(u64::try_from(self.0.saturating_sub(earlier.0)).unwrap_or(0))
+    }
+}
+
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// How many connections a room has open, and since when it has had none.
 #[derive(Debug)]
 pub struct Activity {
     open: AtomicUsize,
-    last: Mutex<Instant>,
+    last: Mutex<Moment>,
 }
 
 impl Activity {
     /// A room whose last connection was `idle` ago.
     #[must_use]
     pub fn new(idle: Duration) -> Arc<Self> {
-        let now = Instant::now();
-        let last = now.checked_sub(idle).unwrap_or(now);
-        Arc::new(Self { open: AtomicUsize::new(0), last: Mutex::new(last) })
+        Arc::new(Self { open: AtomicUsize::new(0), last: Mutex::new(Moment::now().minus(idle)) })
     }
 
     /// A connection begins; it counts until the returned [`Visit`] is dropped.
     #[must_use]
     pub fn enter(self: &Arc<Self>) -> Visit {
         self.open.fetch_add(1, Ordering::SeqCst);
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        self.touch();
         Visit(Arc::clone(self))
     }
 
     /// Restart the idle clock: a connection is about to enter (it woke the room).
     pub fn touch(&self) {
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Moment::now();
     }
 
     /// How long the room has had no connection; `None` while one is open.
@@ -139,7 +168,24 @@ impl Activity {
         if self.open.load(Ordering::SeqCst) > 0 {
             return None;
         }
-        Some(self.last.lock().unwrap_or_else(PoisonError::into_inner).elapsed())
+        Some(Moment::now().since(*self.last.lock().unwrap_or_else(PoisonError::into_inner)))
+    }
+
+    /// When the room was last used: `now` while a connection is open.
+    #[must_use]
+    pub fn last_used(&self, now: Moment) -> Moment {
+        if self.open.load(Ordering::SeqCst) > 0 {
+            return now;
+        }
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Move the idle clock back by `by`, as if that much time had passed (tests only, so no
+    /// test sleeps; docs/TESTING.md rule 5).
+    #[cfg(test)]
+    pub fn age(&self, by: Duration) {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        *last = last.minus(by);
     }
 }
 
@@ -150,7 +196,7 @@ pub struct Visit(Arc<Activity>);
 impl Drop for Visit {
     fn drop(&mut self) {
         // The time first, so a reader that sees no open connection never sees an old time.
-        *self.0.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        self.0.touch();
         self.0.open.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -274,6 +320,18 @@ mod tests {
         assert_eq!(a.idle_for(), None, "one is still open");
         drop(two);
         assert!(a.idle_for().unwrap() < Duration::from_secs(60), "the clock restarts on close");
+    }
+
+    /// A room idle for longer than the machine has been up (a restart after a reboot) keeps
+    /// its idle time; an `Instant` would have clamped it to zero.
+    #[test]
+    fn an_idle_time_longer_than_the_uptime_is_kept() {
+        let years = Duration::from_secs(100 * 365 * 86_400);
+        let idle = Activity::new(years).idle_for().unwrap();
+        assert!(idle >= years && idle < years + Duration::from_secs(60), "{idle:?}");
+        let now = Moment::now();
+        assert_eq!(now.since(now.minus(years)), Duration::from_secs(100 * 365 * 86_400));
+        assert_eq!(now.minus(years).since(now), Duration::ZERO, "never negative");
     }
 
     #[test]

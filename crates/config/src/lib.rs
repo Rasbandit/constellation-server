@@ -48,6 +48,14 @@ pub struct Limits {
     /// A room with no connection for this long ends as abandoned and is never served again
     /// (D-30: 30 days, a design value; `CONSTELLATION_ROOM_ABANDON_SECS`).
     pub room_abandon_secs: u64,
+    /// A room in use has the time it was last used written to the database at most this
+    /// often, so a crash loses at most this much of it (a cost trade, not a design value;
+    /// `CONSTELLATION_ROOM_TOUCH_SECS`). A room leaving memory, and a clean stop, write it
+    /// at once.
+    pub room_touch_secs: u64,
+    /// Draws of a new room key before a new room gives up until the next scan; each draw
+    /// collides with an existing key only with odds of about one in 2^50 per stored room.
+    pub room_key_draws: usize,
     /// Chat and bounce messages a session may send in a burst (one shared token bucket).
     pub fanout_burst: u32,
     /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
@@ -182,6 +190,8 @@ impl Limits {
         rooms_scan_ms: 2_000,
         room_idle_secs: 15 * 60,
         room_abandon_secs: 30 * 24 * 60 * 60,
+        room_touch_secs: 60,
+        room_key_draws: 3,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
         chat_max_bytes: 2048,
@@ -263,6 +273,7 @@ pub fn load() -> Limits {
         ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
         ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
         ("CONSTELLATION_ROOM_ABANDON_SECS", &mut l.room_abandon_secs),
+        ("CONSTELLATION_ROOM_TOUCH_SECS", &mut l.room_touch_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -492,6 +503,7 @@ mod tests {
         assert_eq!(l.max_rooms, 1000);
         assert_eq!(l.rooms_scan_ms, 2_000);
         assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
+        assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
     }
 
     #[test]

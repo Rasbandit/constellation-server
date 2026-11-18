@@ -650,6 +650,7 @@ pub async fn run(
         r = admin => return Err(RunError::Failed(format!("the admin API stopped: {r:?}"))),
         fatal = host.supervise() => return Err(fatal),
     }
+    host.stop().await;
     tracing::info!("stopped");
     Ok(())
 }

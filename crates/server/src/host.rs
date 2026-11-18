@@ -16,13 +16,13 @@
 //! No room ever runs without a connection (there are no room timers yet), so "no connection"
 //! here is also "no event", as D-30 asks.
 //!
-//! With `--bundle` the one room is loaded at startup and is never abandoned, and its end is
-//! the process's end, as before. With `--rooms`, one room's trouble never stops the others: a
+//! With `--bundle` the one room is loaded at startup, never leaves memory and is never
+//! abandoned, and its end is the process's end, as before. With `--rooms`, one room's trouble never stops the others: a
 //! bad bundle is skipped with a warning, and a room whose task fails goes cold, so its next
 //! connect loads it again from its log. Only a fence ends the process, because then another
 //! process owns the database.
 
-use crate::rooms::{Activity, Listing, RoomKey, Rooms};
+use crate::rooms::{Activity, Listing, Moment, RoomKey, Rooms};
 use crate::{
     Loaded, RunError, load_bundle, open_with_key, parse_bundle, prepare, room_ended, start,
 };
@@ -57,6 +57,12 @@ struct Running {
 
 /// What a room task's end is reported with: its key, which load it was, and why it ended.
 type Ended = (RoomKey, u64, Result<Stopped, JoinError>);
+
+/// The reason a room left alone for `room_abandon_secs` ends with (D-30).
+const ABANDONED: &str = "abandoned";
+
+/// Seconds in a day, for the log line of an abandoned room.
+const DAY_SECS: u64 = 24 * 60 * 60;
 
 /// A file's length and modification time: a scan rereads a file only when they change.
 type Seen = (u64, Option<SystemTime>);
@@ -94,6 +100,8 @@ pub struct Host {
     tasks: JoinSet<Ended>,
     running: BTreeMap<RoomKey, Running>,
     runs: u64,
+    /// For each listed room, the time of last use the database holds (`rooms.last_active`).
+    recorded: BTreeMap<RoomKey, Moment>,
     /// Every bundle file as the last scan saw it, whatever came of it.
     seen: BTreeMap<PathBuf, Seen>,
     // Unbounded, but every request holds a connection permit (`max_connections`).
@@ -145,6 +153,7 @@ impl Host {
             tasks: JoinSet::new(),
             running: BTreeMap::new(),
             runs: 0,
+            recorded: BTreeMap::new(),
             seen: BTreeMap::new(),
             wakes,
         };
@@ -186,10 +195,19 @@ impl Host {
         Ok(())
     }
 
-    fn list(&self, key: RoomKey, id: RoomId, seed: String, idle: Duration) -> Result<(), String> {
+    fn list(
+        &mut self,
+        key: RoomKey,
+        id: RoomId,
+        seed: String,
+        idle: Duration,
+    ) -> Result<(), String> {
         tracing::info!(%key, seed, "room ready");
-        let listing = Listing { id, seed, room: None, activity: Activity::new(idle) };
-        write(&self.rooms).insert(key, listing)
+        let activity = Activity::new(idle);
+        let used = activity.last_used(Moment::now());
+        write(&self.rooms).insert(key.clone(), Listing { id, seed, room: None, activity })?;
+        self.recorded.insert(key, used);
+        Ok(())
     }
 
     /// Add a room to the directory (cold) from its bundle and return its key. A seed that is
@@ -299,12 +317,55 @@ impl Host {
                     }
                     drop(done.send(woke));
                 }
-                _ = tick.tick() => {
-                    self.unload_idle().await;
-                    self.end_abandoned().await;
-                    self.scan().await;
-                }
+                _ = tick.tick() => self.tick().await,
             }
+        }
+    }
+
+    /// One supervisor tick: unload idle rooms, record when rooms were last used, end
+    /// abandoned ones and rescan the rooms folder.
+    async fn tick(&mut self) {
+        self.unload_idle();
+        self.record_use(false).await;
+        self.end_abandoned().await;
+        self.scan().await;
+    }
+
+    /// Before a clean stop: record when every room was last used.
+    pub(crate) async fn stop(&mut self) {
+        self.record_use(true).await;
+    }
+
+    /// Write when rooms were last used to the database (`last_active`, what D-30 and a
+    /// restart count from), in one statement: a cold room (it just left memory) as soon as it
+    /// was used since the last write, a room in memory at most every `room_touch_secs`, and
+    /// with `all` (a clean stop) every room used since. A failed write is tried again on the
+    /// next tick.
+    async fn record_use(&mut self, all: bool) {
+        let Store::Pg(store) = &self.store else { return };
+        let every = Duration::from_secs(self.limits.room_touch_secs);
+        let now = Moment::now();
+        let due: Vec<(RoomKey, RoomId, Moment)> = read(&self.rooms)
+            .iter()
+            .filter_map(|(key, l)| {
+                let used = l.activity.last_used(now);
+                let since = used.since(*self.recorded.get(key)?);
+                let due = since > Duration::ZERO && (all || l.room.is_none() || since >= every);
+                due.then(|| (key.clone(), l.id, used))
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let rows: Vec<(RoomId, u64)> =
+            due.iter().map(|(_, id, used)| (*id, now.since(*used).as_secs())).collect();
+        match store.touch(&rows).await {
+            Ok(()) => self.recorded.extend(due.into_iter().map(|(key, _, used)| (key, used))),
+            Err(e) => tracing::warn!(
+                rooms = rows.len(),
+                error = ?e,
+                "could not record when rooms were last used; trying again next tick"
+            ),
         }
     }
 
@@ -327,8 +388,12 @@ impl Host {
 
     /// Unload every room in memory with no connection for `room_idle_secs`. Dropping the room
     /// ends its task once it has handled every message already sent (no reply is lost), and
-    /// its log is durable up to its last reply. Writing a snapshot first is #47.
-    async fn unload_idle(&mut self) {
+    /// its log is durable up to its last reply. Writing a snapshot first is #47. The one room
+    /// of `--bundle` stays in memory: its end is the process's end.
+    fn unload_idle(&mut self) {
+        if self.folder.is_none() {
+            return;
+        }
         let limit = Duration::from_secs(self.limits.room_idle_secs);
         let mut gone = Vec::new();
         {
@@ -340,17 +405,12 @@ impl Host {
                     && idle >= limit
                 {
                     listing.room = None;
-                    gone.push((key.clone(), listing.id, idle));
+                    gone.push((key.clone(), idle));
                 }
             }
         }
-        for (key, id, idle) in gone {
+        for (key, idle) in gone {
             self.running.remove(&key);
-            if let Store::Pg(store) = &self.store
-                && let Err(e) = store.touch(id, idle.as_secs()).await
-            {
-                tracing::warn!(%key, error = ?e, "could not record when the room was last used");
-            }
             tracing::info!(%key, idle_secs = idle.as_secs(), "room idle; left memory");
         }
     }
@@ -369,23 +429,37 @@ impl Host {
         for (key, id) in old {
             let finished = match &mut self.store {
                 Store::Pg(store) => {
-                    store.finish(id, "abandoned").await.map_err(|e| format!("{e:?}"))
+                    store.finish(id, ABANDONED, limit.as_secs()).await.map_err(|e| format!("{e:?}"))
                 }
                 Store::Mem { bundles, finished, .. } => {
                     bundles.remove(&id);
                     finished.insert(id);
-                    Ok(())
+                    Ok(true)
                 }
             };
-            if let Err(e) = finished {
-                tracing::warn!(%key, "room not ended yet, the database failed: {e}");
-                continue;
+            match finished {
+                Ok(true) => {}
+                Ok(false) => {
+                    // The database saw the room used more recently than this clock did; trust
+                    // it and start the clock again rather than ask on every tick.
+                    if let Some(l) = read(&self.rooms).get(&key) {
+                        l.activity.touch();
+                        self.recorded.insert(key.clone(), l.activity.last_used(Moment::now()));
+                    }
+                    tracing::warn!(%key, "room not abandoned: the database says it was used since");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%key, "room not ended yet, the database failed: {e}");
+                    continue;
+                }
             }
             write(&self.rooms).remove(&key);
+            self.recorded.remove(&key);
             if let Some(r) = self.running.remove(&key) {
                 r.task.abort();
             }
-            let days = limit.as_secs() / 86_400;
+            let days = limit.as_secs() / DAY_SECS;
             tracing::info!(%key, days, "room abandoned; it has ended (D-30)");
         }
     }
@@ -585,7 +659,7 @@ mod tests {
         let mut host = host(&dir, Limits { room_idle_secs: 0, ..Limits::DESIGN }).await;
         let key = key_of(&host, "alpha");
         host.wake(&key).await.unwrap();
-        host.unload_idle().await;
+        host.unload_idle();
         assert!(!in_memory(&host, &key) && host.resident() == 0);
         assert_eq!(seeds(&host), ["alpha"], "still listed");
         host.wake(&key).await.unwrap();
@@ -600,11 +674,11 @@ mod tests {
         let key = key_of(&host, "alpha");
         host.wake(&key).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        host.unload_idle().await;
+        host.unload_idle();
         assert!(!in_memory(&host, &key), "idle for longer than the idle time");
         // Woken after a long sleep: the clock starts at the wake, not at the last connection.
         host.wake(&key).await.unwrap();
-        host.unload_idle().await;
+        host.unload_idle();
         assert!(in_memory(&host, &key));
     }
 
@@ -616,10 +690,10 @@ mod tests {
         let key = key_of(&host, "alpha");
         host.wake(&key).await.unwrap();
         let open = visit(&host, &key);
-        host.unload_idle().await;
+        host.unload_idle();
         assert!(in_memory(&host, &key));
         drop(open);
-        host.unload_idle().await;
+        host.unload_idle();
         assert!(!in_memory(&host, &key));
     }
 
@@ -649,7 +723,7 @@ mod tests {
         let mut host = host(&dir, Limits::DESIGN).await;
         let key = key_of(&host, "alpha");
         host.wake(&key).await.unwrap();
-        host.unload_idle().await;
+        host.unload_idle();
         host.end_abandoned().await;
         assert!(in_memory(&host, &key));
     }
@@ -694,5 +768,110 @@ mod tests {
         assert_eq!(host.len(), 1);
         let (key, run) = host.running.iter().map(|(k, r)| (k.clone(), r.run)).next().unwrap();
         assert_eq!(host.ended((key, run, Ok(Stopped::Failed))).map(|e| e.exit_code()), Some(1));
+    }
+
+    /// The directory in Postgres (feature `pg-tests`, docs/TESTING.md): each test on its own
+    /// schema.
+    #[cfg(feature = "pg-tests")]
+    mod pg {
+        use super::*;
+        use sqlx::Connection;
+
+        async fn database() -> String {
+            let url = config::load_secrets().unwrap().database_url.expect(
+                "pg-tests needs CONSTELLATION_DATABASE_URL (docs/TESTING.md rule 5: no silent skip)",
+            );
+            log::testing::fresh_schema(&url).await.unwrap()
+        }
+
+        async fn pg_host(dir: &TempDir, db: &str, limits: Limits) -> Host {
+            app(&Source::Rooms(dir.0.clone()), None, Some(db), limits).await.unwrap().1
+        }
+
+        async fn sql(db: &str, q: &'static str) {
+            let mut c = sqlx::PgConnection::connect(db).await.unwrap();
+            sqlx::raw_sql(q).execute(&mut c).await.unwrap();
+        }
+
+        /// How long ago the database says the only room was last used.
+        async fn stored_idle_secs(db: &str) -> i64 {
+            let mut c = sqlx::PgConnection::connect(db).await.unwrap();
+            sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now() - last_active)::bigint FROM rooms")
+                .fetch_one(&mut c)
+                .await
+                .unwrap()
+        }
+
+        const FORTY_DAYS: &str = "UPDATE rooms SET last_active = now() - interval '40 days'";
+
+        /// Review of #55, H1: a connection open longer than the abandon time kept
+        /// `last_active` at its old value, so a restart ended a room in use.
+        #[tokio::test]
+        async fn a_room_in_use_for_longer_than_the_abandon_time_survives_a_restart() {
+            let (db, dir) = (database().await, TempDir::new("pg-in-use"));
+            dir.bundle("a.json", "alpha");
+            let limits = Limits { room_touch_secs: 0, ..Limits::DESIGN };
+            let mut host = pg_host(&dir, &db, limits).await;
+            let key = key_of(&host, "alpha");
+            host.wake(&key).await.unwrap();
+            let open = visit(&host, &key);
+            // One connection open for 40 days: the database last heard of the room then.
+            sql(&db, FORTY_DAYS).await;
+            host.tick().await;
+            assert!(stored_idle_secs(&db).await < 60, "a room in use is recorded as used");
+            drop((open, host));
+            let mut again = pg_host(&dir, &db, Limits::DESIGN).await;
+            again.tick().await;
+            assert_eq!(seeds(&again), ["alpha"], "still served after the restart");
+        }
+
+        #[tokio::test]
+        async fn a_clean_stop_records_when_each_room_was_last_used() {
+            let (db, dir) = (database().await, TempDir::new("pg-stop"));
+            dir.bundle("a.json", "alpha");
+            let mut host = pg_host(&dir, &db, Limits::DESIGN).await;
+            let key = key_of(&host, "alpha");
+            host.wake(&key).await.unwrap();
+            drop(visit(&host, &key));
+            sql(&db, FORTY_DAYS).await;
+            host.tick().await;
+            // In memory and written less than room_touch_secs ago: not written on a tick.
+            assert!(stored_idle_secs(&db).await > 39 * 86_400);
+            host.stop().await;
+            assert!(stored_idle_secs(&db).await < 60);
+        }
+
+        #[tokio::test]
+        async fn a_room_that_left_memory_has_its_idle_time_read_back_after_a_restart() {
+            let (db, dir) = (database().await, TempDir::new("pg-unload"));
+            dir.bundle("a.json", "alpha");
+            let limits = Limits { room_idle_secs: 60, room_touch_secs: 3_600, ..Limits::DESIGN };
+            let mut host = pg_host(&dir, &db, limits).await;
+            let key = key_of(&host, "alpha");
+            host.wake(&key).await.unwrap();
+            read(&host.rooms).get(&key).unwrap().activity.age(Duration::from_secs(120));
+            host.tick().await;
+            assert!(!in_memory(&host, &key));
+            assert!((120..180).contains(&stored_idle_secs(&db).await));
+            drop(host);
+            let again = pg_host(&dir, &db, Limits::DESIGN).await;
+            let idle = read(&again.rooms).get(&key).unwrap().activity.idle_for().unwrap();
+            assert!((120..180).contains(&idle.as_secs()), "{idle:?}");
+        }
+
+        #[tokio::test]
+        async fn a_room_the_database_saw_recently_is_not_abandoned_on_a_stale_clock() {
+            let (db, dir) = (database().await, TempDir::new("pg-stale"));
+            dir.bundle("a.json", "alpha");
+            let limits =
+                Limits { room_abandon_secs: 100, room_touch_secs: 3_600, ..Limits::DESIGN };
+            let mut host = pg_host(&dir, &db, limits).await;
+            let key = key_of(&host, "alpha");
+            read(&host.rooms).get(&key).unwrap().activity.age(Duration::from_secs(200));
+            host.end_abandoned().await;
+            assert_eq!(seeds(&host), ["alpha"], "the database says it was used just now");
+            let idle = read(&host.rooms).get(&key).unwrap().activity.idle_for().unwrap();
+            assert!(idle < Duration::from_secs(100), "the clock starts again: {idle:?}");
+        }
     }
 }
