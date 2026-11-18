@@ -2,14 +2,11 @@
 //!
 //! A room key is the room's public address (doc 01 D1.1, D-12): 10 characters of lowercase
 //! base32 (`a` to `z`, `2` to `7`), so it is also a valid DNS label for the hostname form
-//! `{room_key}.{host}` (doc 01 section 3.8.1). It is not a secret.
-//!
-//! Deviation from D-12: the key is derived from the room id (the top 50 bits of the seed
-//! name's SHA-256, see [`crate::room_id`]) instead of drawn at random, so a restart finds the
-//! same key without a stored mapping. A random key needs a key table in the log store first.
+//! `{room_key}.{host}` (doc 01 section 3.8.1). It is not a secret. A new room draws its key at
+//! random (50 bits from the OS); with Postgres the key is stored with the room, so a restart
+//! serves the room under the same key.
 
 use edge_compat::CompatRoom;
-use proto::RoomId;
 use runtime::RoomHandle;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,10 +22,20 @@ const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 pub struct RoomKey(String);
 
 impl RoomKey {
-    /// The key for a room id: its top 50 bits, 5 bits per character, most significant first.
+    /// A new random key: 50 bits from the operating system's random source.
+    ///
+    /// # Errors
+    /// When the operating system has no random source.
+    pub fn random() -> Result<Self, String> {
+        let mut bytes = [0_u8; 8];
+        getrandom::fill(&mut bytes).map_err(|e| format!("room key: no random source: {e}"))?;
+        Ok(Self::from_bits(u64::from_be_bytes(bytes)))
+    }
+
+    /// The key for 64 bits: the top 50, 5 bits per character, most significant first.
     #[must_use]
-    pub fn for_room(room: RoomId) -> Self {
-        let bits = room.0 >> (64 - 5 * ROOM_KEY_LEN);
+    pub fn from_bits(bits: u64) -> Self {
+        let bits = bits >> (64 - 5 * ROOM_KEY_LEN);
         let key = (0..ROOM_KEY_LEN)
             .rev()
             .map(|i| {
@@ -107,10 +114,10 @@ impl Rooms {
         self.by_key.get(key)
     }
 
-    /// The only room, when there is exactly one.
+    /// The only room and its key, when there is exactly one.
     #[must_use]
-    pub fn only(&self) -> Option<&Room> {
-        let mut all = self.by_key.values();
+    pub fn only_with_key(&self) -> Option<(&RoomKey, &Room)> {
+        let mut all = self.by_key.iter();
         match (all.next(), all.next()) {
             (Some(room), None) => Some(room),
             _ => None,
@@ -147,21 +154,28 @@ mod tests {
 
     #[test]
     fn a_key_is_ten_lowercase_base32_characters_from_the_top_50_bits() {
-        assert_eq!(RoomKey::for_room(RoomId(0)).as_str(), "aaaaaaaaaa");
-        assert_eq!(RoomKey::for_room(RoomId(u64::MAX)).as_str(), "7777777777");
+        assert_eq!(RoomKey::from_bits(0).as_str(), "aaaaaaaaaa");
+        assert_eq!(RoomKey::from_bits(u64::MAX).as_str(), "7777777777");
         // Only the top 50 bits count: the low 14 bits never change the key.
-        assert_eq!(RoomKey::for_room(RoomId(0x3fff)).as_str(), "aaaaaaaaaa");
+        assert_eq!(RoomKey::from_bits(0x3fff).as_str(), "aaaaaaaaaa");
         // The lowest of the 50 bits is the last character.
-        assert_eq!(RoomKey::for_room(RoomId(1 << 14)).as_str(), "aaaaaaaaab");
+        assert_eq!(RoomKey::from_bits(1 << 14).as_str(), "aaaaaaaaab");
         // The highest 5 bits are the first character.
-        assert_eq!(RoomKey::for_room(RoomId(0b11111 << 59)).as_str(), "7aaaaaaaaa");
+        assert_eq!(RoomKey::from_bits(0b11111 << 59).as_str(), "7aaaaaaaaa");
     }
 
     #[test]
-    fn a_derived_key_parses_back_and_case_is_ignored() {
-        let key = RoomKey::for_room(crate::room_id("abc"));
+    fn a_random_key_parses_back_and_case_is_ignored() {
+        let key = RoomKey::random().unwrap();
         assert_eq!(RoomKey::parse(key.as_str()).unwrap(), key);
         assert_eq!(RoomKey::parse(&key.as_str().to_ascii_uppercase()).unwrap(), key);
+    }
+
+    #[test]
+    fn random_keys_differ() {
+        let keys: std::collections::BTreeSet<_> =
+            (0..100).map(|_| RoomKey::random().unwrap()).collect();
+        assert_eq!(keys.len(), 100, "50 random bits: 100 draws never repeat in practice");
     }
 
     #[test]

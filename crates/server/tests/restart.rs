@@ -299,4 +299,47 @@ mod restart {
         .unwrap_err();
         assert!(err.contains("different bundle"), "{err}");
     }
+
+    /// The key `room ready` logged for `seed`.
+    fn key_of(server: &Server, seed: &str) -> String {
+        let line = server
+            .log()
+            .into_iter()
+            .find(|l| l.contains("room ready") && l.contains(&format!("seed=\"{seed}\"")))
+            .unwrap_or_else(|| panic!("no room ready line for {seed}: {:?}", server.log()));
+        line.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn rooms_keep_their_random_keys_and_their_items_across_kill_9() {
+        let db = database().await;
+        let dir = std::env::temp_dir().join(format!("e2e-pg-rooms-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = std::fs::read_to_string(e2e::fixture_path()).unwrap();
+        for seed in ["alpha", "beta"] {
+            let mut v: Value = serde_json::from_str(&text).unwrap();
+            v["seed_name"] = json!(seed);
+            std::fs::write(dir.join(format!("{seed}.json")), v.to_string()).unwrap();
+        }
+        let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
+        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
+        assert_ne!(a, b);
+        let url = |s: &Server, key: &str| format!("ws://{key}.example:{}", s.addr.port());
+        let loc = locations_for(1, 2).unwrap()[0].0;
+        let (mut alice, _, _) =
+            e2e::join_via(server.addr, &url(&server, &a), "Alice").await.unwrap();
+        alice.check(&[loc]).await.unwrap();
+        alice.next_cmd("RoomUpdate").await.unwrap();
+        assert!(!server.kill().unwrap().success());
+
+        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        assert_eq!((key_of(&server, "alpha"), key_of(&server, "beta")), (a.clone(), b.clone()));
+        let (_, room_a, _) = e2e::join_via(server.addr, &url(&server, &a), "Alice").await.unwrap();
+        assert_eq!(locations(&room_a["checked_locations"]), [loc]);
+        let (_, room_b, _) = e2e::join_via(server.addr, &url(&server, &b), "Alice").await.unwrap();
+        assert!(locations(&room_b["checked_locations"]).is_empty());
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }

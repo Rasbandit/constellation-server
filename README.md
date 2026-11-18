@@ -30,7 +30,11 @@ cargo run -p server --bin constellation-server -- --bundle crates/e2e/fixtures/t
 Then point a client compatible with Archipelago at `ws://localhost:38281` with slot `Alice` or `Bob` and game `Archipela-Go 2: Electric Boogaloo`. Flags: `--host <ip>` (default 127.0.0.1).
 
 ### Several rooms
-`--rooms <folder>` in place of `--bundle` starts one room per `*.json` seed bundle in the folder (at most `max_rooms`, 1 000, in `crates/config`). Each room logs its room key: `room ready key=<10 characters> seed=<seed name>`. Two bundles with the same seed name are refused before any room starts. Connections are not routed to a room by its key yet, so with more than one room a WebSocket connection gets HTTP 404; with exactly one room, `--rooms` behaves like `--bundle`. `CONSTELLATION_ROOM_PASSWORD` applies to every room. `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. SIGTERM or Ctrl-C stops it.
+`--rooms <folder>` in place of `--bundle` starts one room per `*.json` seed bundle in the folder (at most `max_rooms`, 1 000, in `crates/config`). Each room gets a random room key (D-12: 10 characters, `a` to `z` and `2` to `7`) and logs it: `room ready key=<key> seed=<seed name>`. With Postgres the key is stored with the room (`migrations/0002_room_key.sql`), so a restart keeps it; in memory a restart draws new keys. Two bundles with the same seed name are refused before any room starts. `CONSTELLATION_ROOM_PASSWORD` applies to every room.
+
+A client reaches a room through a hostname whose first label is its key (doc 01 section 3.8.1, hostname form): `ws://<key>.<host>:<port>`. The server reads the `Host` header of the WebSocket request; case does not matter and the port is ignored. With one room, every host reaches it (so `--bundle` and `ws://localhost:38281` keep working). With several, a host that names no room, or an unknown key, gets HTTP 404.
+
+To try it on one machine without DNS, `sslip.io` names resolve to the IP inside them: `ws://<key>.127.0.0.1.sslip.io:38281` reaches a local server. A real deployment needs a wildcard DNS record (`*.<host>`) and a wildcard TLS certificate in front. `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. SIGTERM or Ctrl-C stops it.
 The room password is never a flag (it would show in `ps`): set `CONSTELLATION_ROOM_PASSWORD`, or `CONSTELLATION_ROOM_PASSWORD_FILE` to a file whose first line is the password; it overrides the seed's. Limits come from `crates/config` (design values), some overridable by environment: `CONSTELLATION_MAX_CONNECTIONS` (10 000; over it, HTTP 503), `CONSTELLATION_CONNECT_TIMEOUT_MS` (30 000: a socket with no slot connected by then is closed), `CONSTELLATION_IDLE_TIMEOUT_MS` (60 000) and `CONSTELLATION_PING_INTERVAL_MS` (20 000).
 
 ### With Postgres (the room survives restarts)
@@ -62,12 +66,11 @@ This repo is source-available, not open source: [PolyForm Strict 1.0.0](LICENSE.
 
 We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo dependencies; none of their source is in this repo. `THIRD_PARTY_NOTICES.md` is not written yet: it becomes required when we distribute a binary (it must then carry the notices of every bundled crate), and is created then.
 
-## Known deviations from doc 05 7.1 and 7.2, and from D-12
+## Known deviations from doc 05 7.1 and 7.2
 - `Item` events carry `from` (the checking slot) and no `item_uid`, and events have no ULID id (`seq` is the id). Location and item ids are `i64`, and a location id is only unique within its slot's world, so the placement table is keyed by (slot, location).
 - `Command::Goal` and `EventKind::Goal` record a slot's goal (D-100 needs it); not in the doc 05 sketch.
 - `fold(snapshot, limits, tail)` takes the limits and returns `Result`; `Ctx::limits` is a borrow.
 - `Applied` has one `reply` plus `depends_on` (the hold rule: do not release a reply until that `seq` is durable), and no `effects`.
-- The room key (D-12) is derived from the room id (the top 50 bits of the seed name's SHA-256, in lowercase base32) instead of drawn at random, so a restart finds the same key without a stored key table.
 - `LogStore` has `read_cursors` and no outbox rows yet. `Cid` and `RoomId` are integers.
 - The Postgres schema (`migrations/0001_log.sql`) is doc 02 section 5.5 cut down: no foreign keys, unencrypted event bodies, the latest snapshot only, cursors in `slot_cursors`. `seq`, `item_seq` and epochs above `i64::MAX` are refused by `PgLogStore` (Postgres has no unsigned 64-bit type).
 

@@ -249,6 +249,26 @@ impl Client {
         Ok(Self { ws, queue: VecDeque::new() })
     }
 
+    /// Open TCP to `addr` and do the WebSocket handshake for `url`, so the request's `Host`
+    /// header is `url`'s host (`{room_key}.example:port`) without that name resolving anywhere.
+    ///
+    /// # Errors
+    /// When the connection or the handshake fails.
+    pub async fn connect_via(addr: SocketAddr, url: &str) -> Res<Self> {
+        let url = url.parse().map_err(|e| format!("{url}: {e}"))?;
+        let opts = Options::default().with_low_latency_compression();
+        let handshake = async {
+            let tcp = TcpStream::connect(addr).await.map_err(|e| format!("tcp: {e}"))?;
+            WebSocket::handshake(url, MaybeTlsStream::Plain(tcp), opts)
+                .await
+                .map_err(|e| format!("handshake: {e}"))
+        };
+        let ws = tokio::time::timeout(GUARD, handshake)
+            .await
+            .map_err(|_| "connect timed out".to_owned())??;
+        Ok(Self { ws, queue: VecDeque::new() })
+    }
+
     /// Send one frame holding these packets.
     ///
     /// # Errors
@@ -383,7 +403,18 @@ pub fn start_items(slot: u32) -> Res<Vec<Value>> {
 /// # Errors
 /// When the socket fails or the first packet is not `RoomInfo`.
 pub async fn join(url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
-    let mut c = Client::connect(url).await?;
+    join_client(Client::connect(url).await?, name).await
+}
+
+/// [`join`] through [`Client::connect_via`]: TCP to `addr`, handshake for `url`.
+///
+/// # Errors
+/// As [`join`].
+pub async fn join_via(addr: SocketAddr, url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
+    join_client(Client::connect_via(addr, url).await?, name).await
+}
+
+async fn join_client(mut c: Client, name: &str) -> Res<(Client, Value, Vec<Value>)> {
     let info = c.next().await?;
     if info.get("cmd").and_then(Value::as_str) != Some("RoomInfo") {
         return Err(format!("first packet is not RoomInfo: {info}"));

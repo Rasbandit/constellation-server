@@ -69,11 +69,9 @@ impl Args {
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
+                // As with every flag, the last one given wins (a test appends `--bundle`).
                 "--bundle" | "--rooms" => {
                     let path = PathBuf::from(value()?);
-                    if source.is_some() {
-                        return Err("use one of --bundle and --rooms, once".to_owned());
-                    }
                     source = Some(if flag == "--bundle" {
                         Source::Bundle(path)
                     } else {
@@ -258,9 +256,8 @@ impl RoomTasks {
     }
 }
 
-/// A room built from its bundle, not yet claimed or started.
+/// A room built from its bundle, not yet claimed or started, and without its key.
 struct Prepared {
-    key: RoomKey,
     id: RoomId,
     hash: Vec<u8>,
     format: u32,
@@ -278,27 +275,24 @@ fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<
     let (seed, format) = (bundle.seed_name.clone(), bundle.format);
     let compat =
         Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password.cloned(), limits)?);
-    Ok(Prepared {
-        key: RoomKey::for_room(id),
-        id,
-        hash,
-        format,
-        fresh,
-        room: Room { seed, compat, live },
-        mailbox,
-    })
+    Ok(Prepared { id, hash, format, fresh, room: Room { seed, compat, live }, mailbox })
 }
+
+/// Draws of a new room key before giving up; each draw collides with an existing key only
+/// with odds of about one in 2^50 per stored room.
+const KEY_DRAWS: usize = 3;
 
 /// Start a room for each of `loaded` and build the router.
 ///
 /// Also returns the room tasks, whose first end says why the process stops (see [`run`]).
-/// With `database_url` the log is in Postgres and each room is rebuilt from it; without, it is
-/// in memory and a restart loses the rooms. `password` overrides every room's. Everything that
-/// can fail on the bundles alone (an invalid bundle, two bundles with one room key) runs before
-/// any room is claimed, so a bad bundle never fences a live room.
+/// With `database_url` the log is in Postgres and each room is rebuilt from it and keeps its
+/// stored room key; without, the log is in memory, keys are drawn fresh, and a restart loses
+/// the rooms. `password` overrides every room's. Everything that can fail on the bundles alone
+/// (an invalid bundle, two bundles with one seed name) runs before any room is claimed, so a
+/// bad bundle never fences a live room.
 ///
 /// # Errors
-/// A message when a bundle does not make a valid room, two bundles share a room key, the
+/// A message when a bundle does not make a valid room, two bundles share a seed name, the
 /// database fails, or a stored room was made from a different bundle.
 pub async fn app(
     loaded: Vec<Loaded>,
@@ -310,10 +304,16 @@ pub async fn app(
         .into_iter()
         .map(|l| prepare(l, password.as_ref(), limits))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut rooms = Rooms::default();
+    let mut seeds = std::collections::BTreeMap::new();
     for p in &prepared {
-        rooms.insert(p.key.clone(), p.room.clone())?;
+        if let Some(other) = seeds.insert(p.id, &p.room.seed) {
+            return Err(format!(
+                "two bundles make one room: seed {other:?} and seed {:?}",
+                p.room.seed
+            ));
+        }
     }
+    let mut rooms = Rooms::default();
     let mut handles = Vec::with_capacity(prepared.len());
     if let Some(url) = database_url {
         let store = Arc::new(
@@ -323,28 +323,22 @@ pub async fn app(
         );
         tracing::info!("log store: postgres");
         for p in prepared {
-            match store.open_room(p.id, &p.room.seed, p.format, &p.hash).await {
-                Ok(()) => {}
-                Err(OpenError::OtherBundle) => {
-                    return Err(format!(
-                        "the database holds room {:?} made from a different bundle with \
-                         this seed name; refusing to start",
-                        p.room.seed
-                    ));
-                }
-                Err(OpenError::Store(e)) => return Err(format!("postgres: {e:?}")),
-            }
+            let key = open_with_key(&store, &p).await?;
             let epoch = store.claim(p.id).await.map_err(|e| format!("postgres: {e:?}"))?;
-            handles.push(start(p, epoch, Arc::clone(&store), &limits).await?);
+            rooms.insert(key.clone(), p.room.clone())?;
+            handles.push(start(p, key, epoch, Arc::clone(&store), &limits).await?);
         }
     } else {
         tracing::warn!(
-            "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the rooms"
+            "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the rooms \
+             and draws new room keys"
         );
         let store = Arc::new(MemLogStore::new());
         for p in prepared {
+            let key = RoomKey::random()?;
             let epoch = store.claim(p.id);
-            handles.push(start(p, epoch, Arc::clone(&store), &limits).await?);
+            rooms.insert(key.clone(), p.room.clone())?;
+            handles.push(start(p, key, epoch, Arc::clone(&store), &limits).await?);
         }
     }
     let options = edge_compat::ws_options(&limits, DeflatePool::new(limits.ws_deflate_pool));
@@ -358,42 +352,100 @@ pub async fn app(
     Ok((router, RoomTasks::new(handles)))
 }
 
+/// Record the room in Postgres and return its key: the stored one, or a new random one for a
+/// new room (drawn again when it collides with another room's).
+async fn open_with_key(store: &PgLogStore, p: &Prepared) -> Result<RoomKey, String> {
+    let mut last = String::new();
+    for _ in 0..KEY_DRAWS {
+        let new_key = RoomKey::random()?;
+        match store.open_room(p.id, &p.room.seed, p.format, &p.hash, new_key.as_str()).await {
+            Ok(stored) => return RoomKey::parse(&stored).map_err(|e| format!("stored {e}")),
+            Err(OpenError::OtherBundle) => {
+                return Err(format!(
+                    "the database holds room {:?} made from a different bundle with this seed \
+                     name; refusing to start",
+                    p.room.seed
+                ));
+            }
+            Err(OpenError::Store(e)) => last = format!("postgres: {e:?}"),
+        }
+    }
+    Err(last)
+}
+
 /// Rebuild and start one prepared room, and log its key.
 async fn start<S: LogStore>(
     p: Prepared,
+    key: RoomKey,
     epoch: Epoch,
     store: Arc<S>,
     limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let handle = start_room(p.mailbox, p.id, epoch, p.fresh, store, limits).await?;
-    tracing::info!(key = %p.key, seed = p.room.seed, "room ready");
+    tracing::info!(%key, seed = p.room.seed, "room ready");
     Ok(handle)
+}
+
+/// The room key a `Host` header names: its first DNS label, when that is a room key
+/// (`{room_key}.{host}`, doc 01 section 3.8.1). The port, if any, is ignored; an IP address
+/// names no key.
+#[must_use]
+pub fn key_from_host(host: &str) -> Option<RoomKey> {
+    if host.starts_with('[') {
+        return None;
+    }
+    let name = host.split(':').next()?;
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return None;
+    }
+    RoomKey::parse(name.split('.').next()?).ok()
+}
+
+/// The room a connection with this `Host` header joins.
+///
+/// One room takes every connection, whatever the host, so `--bundle` and old addresses keep
+/// working (a host whose first label only looks like a key, such as `playground.example`, is
+/// not refused). With several rooms the first label must be the key of one of them.
+fn route(rooms: &Rooms, host: Option<&str>) -> Result<(RoomKey, Arc<CompatRoom>), String> {
+    if let Some((key, room)) = rooms.only_with_key() {
+        return Ok((key.clone(), Arc::clone(&room.compat)));
+    }
+    match host.and_then(key_from_host) {
+        Some(key) => match rooms.get(&key) {
+            Some(room) => Ok((key, Arc::clone(&room.compat))),
+            None => Err(format!("no room with key {key} on this server")),
+        },
+        None => Err(format!(
+            "this server runs {} rooms; connect through {{room_key}}.<this host>",
+            rooms.len()
+        )),
+    }
 }
 
 async fn upgrade(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     ws: IncomingUpgrade,
 ) -> Response {
     let Ok(permit) = Arc::clone(&s.slots).try_acquire_owned() else {
         tracing::warn!("connection cap reached");
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     };
-    // One room takes every connection. With several, a connection must name its room;
-    // routing by room key is the next step.
-    let Some(room) = s.rooms.only().map(|r| Arc::clone(&r.compat)) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("this server runs {} rooms; connect to one by its room key", s.rooms.len()),
-        )
-            .into_response();
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let (key, room) = match route(&s.rooms, host) {
+        Ok(found) => found,
+        Err(why) => {
+            tracing::info!(host, "{why}");
+            return (StatusCode::NOT_FOUND, why).into_response();
+        }
     };
     let (response, fut) = match ws.upgrade(s.options) {
         Ok(pair) => pair,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let deflate = response.headers().contains_key(header::SEC_WEBSOCKET_EXTENSIONS);
-    tracing::info!(deflate, "websocket accepted");
+    tracing::info!(%key, deflate, "websocket accepted");
     tokio::spawn(async move {
         match fut.await {
             Ok(socket) => edge_compat::serve(socket, room, peer.ip()).await,
@@ -576,6 +628,8 @@ mod tests {
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         let a = parse("--rooms seeds --port 1").unwrap();
         assert_eq!(a.source, Source::Rooms(PathBuf::from("seeds")));
+        let a = parse("--bundle b --port 1 --rooms r --bundle c").unwrap();
+        assert_eq!(a.source, Source::Bundle(PathBuf::from("c")), "the last source wins");
     }
 
     #[test]
@@ -583,8 +637,6 @@ mod tests {
         for (args, want) in [
             ("", "--bundle or --rooms is required"),
             ("--port 1", "--bundle or --rooms is required"),
-            ("--bundle b --rooms r --port 1", "use one of --bundle and --rooms, once"),
-            ("--bundle b --bundle c --port 1", "use one of --bundle and --rooms, once"),
             ("--bundle b", "--port is required"),
             ("--bundle b --port", "--port needs a value"),
             ("--bundle b --port 70000", "--port needs a number"),
@@ -737,14 +789,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_bundles_start_two_rooms_with_their_own_keys() {
+    async fn two_bundles_start_two_rooms() {
         let dir = TempDir::new("two");
         dir.bundle("a.json", "alpha");
         dir.bundle("b.json", "beta");
         let loaded = load_rooms(&dir.0, &Limits::DESIGN).unwrap();
-        let (_router, _tasks) = app(loaded, None, None, Limits::DESIGN).await.unwrap();
-        let (a, b) = (RoomKey::for_room(room_id("alpha")), RoomKey::for_room(room_id("beta")));
-        assert_ne!(a, b);
+        let (_router, tasks) = app(loaded, None, None, Limits::DESIGN).await.unwrap();
+        assert_eq!(tasks.0.len(), 2);
+    }
+
+    #[test]
+    fn the_key_is_the_hosts_first_label_without_the_port() {
+        let key = |h: &str| key_from_host(h).map(|k| k.as_str().to_owned());
+        assert_eq!(key("abcdefgh23.example.gg"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("abcdefgh23.example.gg:38281"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("ABCDEFGH23.127.0.0.1.sslip.io:38281"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("abcdefgh23"), Some("abcdefgh23".to_owned()));
+        for none in
+            ["example.gg", "localhost:38281", "127.0.0.1:38281", "[::1]:38281", "", "abcdefgh1.x"]
+        {
+            assert_eq!(key(none), None, "{none:?}");
+        }
     }
 
     #[tokio::test]
@@ -754,7 +819,7 @@ mod tests {
         dir.bundle("b.json", "twin");
         let loaded = load_rooms(&dir.0, &Limits::DESIGN).unwrap();
         let e = app(loaded, None, None, Limits::DESIGN).await.unwrap_err();
-        assert!(e.contains("is taken by seed \"twin\""), "{e}");
+        assert!(e.contains("two bundles make one room: seed \"twin\""), "{e}");
     }
 
     #[test]
