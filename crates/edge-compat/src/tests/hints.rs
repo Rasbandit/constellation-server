@@ -442,8 +442,14 @@ async fn hint_creating_packets_are_rate_limited_per_slot() {
         room_with_limits(&Limits { hint_burst: 1, hint_refill_milli_per_sec: 0, ..Limits::DESIGN });
     let mut a = joined(&room, "A").await;
     send(&mut a, &scout(&[100], &json!(1))).await;
+    // Review finding: a limited scout lost its LocationInfo, which shop clients wait for. Now
+    // it is answered, and only the hint is refused.
     let ps = send(&mut a, &scout(&[101], &json!(2))).await;
-    assert_eq!(ps[0]["cmd"], "InvalidPacket");
+    assert_eq!(ps[0]["cmd"], "LocationInfo");
+    assert_eq!(ps[0]["locations"][0]["location"], 101);
+    assert_eq!(ps[1]["cmd"], "InvalidPacket");
+    assert_eq!(ps.len(), 2);
+    assert_eq!(read_hints(&mut a, 1).await.as_array().unwrap().len(), 1, "no hint for 101");
     // A plain scout is not limited.
     assert_eq!(send(&mut a, &scout(&[101], &json!(0))).await[0]["cmd"], "LocationInfo");
     let up = json!([{"cmd": "UpdateHint", "player": 1, "location": 100, "status": 30}]);

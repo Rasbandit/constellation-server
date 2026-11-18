@@ -577,7 +577,8 @@ impl Session {
     /// One answer per requested id, in request order; an id outside the slot's world refuses
     /// the whole packet. With `create_as_hint`, each location also becomes a free hint, kept
     /// even when found, announced to its finder and receiver (only the new ones with 2;
-    /// reference `MultiServer.py:2086-2105`).
+    /// reference `MultiServer.py:2086-2105`). Over the hint rate the locations are still
+    /// answered, with an `InvalidPacket` for the hints not made.
     async fn scout(&self, req: &Locations) -> Result<Vec<String>, Step> {
         let j = self.joined.as_ref().ok_or(Step::Closed)?;
         let slot = self.room.bundle.slot(j.slot).ok_or(Step::Closed)?;
@@ -600,8 +601,14 @@ impl Session {
                 })
             })
             .collect::<Result<_, Step>>()?;
+        let info = ServerPacket::LocationInfo { locations };
         if create != 0 {
-            Self::rate(&self.room.hint_writes, j.slot, "LocationScouts")?;
+            // The answer is sent even when the hints are limited: clients wait for it.
+            if let Err(Step::Reply(refused)) =
+                Self::rate(&self.room.hint_writes, j.slot, "LocationScouts")
+            {
+                return Ok(vec![wire::frame(&[info, *refused])]);
+            }
             let asks = req
                 .locations
                 .iter()
@@ -615,7 +622,7 @@ impl Session {
             let hints = h.shown.iter().filter(|s| create != 2 || s.new).map(|s| s.hint).collect();
             self.fan_hints(j.slot, hints, None).await?;
         }
-        Ok(vec![wire::frame(&[ServerPacket::LocationInfo { locations }])])
+        Ok(vec![wire::frame(&[info])])
     }
 
     /// Ask the room for hints; `pay` for the chat commands.
