@@ -504,6 +504,24 @@ fn a_rule_that_folds_past_the_length_field_keeps_its_bytes() {
     assert!(!reached.contains(&"well".to_owned()), "{reached:?}");
 }
 
+/// With several unknown keys the error names the first in key order, whatever the order of
+/// the instance's maps.
+#[test]
+fn unknown_key_errors_do_not_depend_on_map_order() {
+    let w = world(&manifest());
+    for _ in 0..32 {
+        let mut inst = instance(ALL);
+        let keys = ["zz", "aa", "mm", "qq", "bb", "yy"];
+        inst.logic_start = keys.iter().map(|k| ((*k).to_owned(), 1)).collect();
+        inst.locked = keys.iter().map(|k| ((*k).to_owned(), "lamp".to_owned())).collect();
+        let err = Plan::new(&w, &inst).unwrap_err();
+        assert!(format!("{err:?}").contains("\\\"aa\\\""), "{err:?}");
+        inst.logic_start.clear();
+        let err = Plan::new(&w, &inst).unwrap_err();
+        assert!(format!("{err:?}").contains("\\\"aa\\\""), "{err:?}");
+    }
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());

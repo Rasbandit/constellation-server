@@ -79,6 +79,14 @@ pub struct Plan {
     copies: Vec<i64>,
 }
 
+/// A map's entries in key order, so the first bad key an error names does not depend on the
+/// map's hash order.
+fn by_key<V>(m: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_unstable_by_key(|x| x.0);
+    v
+}
+
 /// Why a fill failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FillError {
@@ -132,7 +140,7 @@ impl Plan {
         let mut start = Vec::new();
         // Solves allocate and loop by held counts, so bound them by what a seed can place.
         let most = i64::try_from(w.locations()).unwrap_or(i64::MAX);
-        for (k, n) in &inst.logic_start {
+        for (k, n) in by_key(&inst.logic_start) {
             if !(0..=most).contains(n) {
                 return Err(e(format!("logic_start {k:?}: {n} is not in 0 to {most} (locations)")));
             }
@@ -154,7 +162,7 @@ impl Plan {
             excluded[loc(k)? as usize] = true;
         }
         let mut locked = Vec::new();
-        for (l, i) in &inst.locked {
+        for (l, i) in by_key(&inst.locked) {
             locked.push((loc(l)?, item(i)?));
         }
         locked.sort_unstable();
@@ -175,11 +183,11 @@ impl Plan {
             u32::try_from(groups.iter().position(|x| *x == g).unwrap_or(0)).unwrap_or(0)
         };
         let mut item_group = HashMap::new();
-        for (k, g) in &inst.item_groups {
+        for (k, g) in by_key(&inst.item_groups) {
             item_group.insert(item(k)?, gid(g));
         }
         let mut loc_group = vec![None; w.locations()];
-        for (k, g) in &inst.location_groups {
+        for (k, g) in by_key(&inst.location_groups) {
             loc_group[loc(k)? as usize] = Some(gid(g));
         }
         let folded = fold(w, &opts, &rolls);
