@@ -1,4 +1,4 @@
-# One entry point for local checks. CI runs fmt and the tests (see .github/workflows/ci.yml).
+# One entry point for local checks. CI runs fmt and the unit tests (see .github/workflows/ci.yml).
 default: check
 
 setup:
@@ -23,7 +23,7 @@ test:
 
 # The Postgres tests too: the log store contract suite, the G-DB race tests and the restart
 # scenarios. Needs CONSTELLATION_DATABASE_URL (a database you may create schemas in; each test
-# makes its own). Fails, never skips, without it. CI runs this in the `check` job.
+# makes its own). Fails, never skips, without it. The manual nightly `properties` job runs this.
 test-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --workspace --locked --features log/pg-tests,server/pg-tests

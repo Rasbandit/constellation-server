@@ -67,4 +67,4 @@ A finding is anything that surprised us: a client that expects something the pro
 ## Rules that apply to every lane
 
 - The design repo's `CLAUDE.md` is binding for anything that mentions Archipelago: be accurate, credit them, critique design and never people, report bugs upstream before mentioning them anywhere, no copied code, text or data. This repo is public, so issues and PR text count as external: text that mentions Archipelago gets a review against that file by someone other than its author before it is posted.
-- CI (fmt and the tests, with Postgres) gates merge. No em dashes in docs.
+- CI (fmt and the unit tests) gates merge. Run the manual `nightly` workflow after touching the log store or the server. No em dashes in docs.
