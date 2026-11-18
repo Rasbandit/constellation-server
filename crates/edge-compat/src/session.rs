@@ -2,6 +2,8 @@
 //! publishes. Output: text frames to send. The socket loop (`socket.rs`) owns the IO.
 
 use crate::limit::RateTable;
+use crate::presence::{Changed, Who};
+use crate::storage;
 use crate::wire::{
     self, Bounce, CLIENT_GOAL, Connect, ConnectUpdate, Get, GetDataPackage, Locations, NetVersion,
     NetworkItem, NetworkPlayer, NetworkSlot, Permissions, PrintJson, Say, ServerPacket,
@@ -9,7 +11,8 @@ use crate::wire::{
 };
 use crate::{CompatRoom, NO_GAME_MIN_VERSION, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
 use proto::{Command, Event, EventKind, Seq, SlotNo};
-use runtime::{Published, Subscription};
+use room_core::{CoreError, RESERVED_KEY_PREFIX, Reply};
+use runtime::{Note, Published, Subscription};
 use seed_bundle::{Slot, SlotKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -32,6 +35,8 @@ enum Fanout {
     Print { print: PrintJson },
     /// A `Bounced` for the clients that match the targets.
     Bounce { team: u32, targets: Bounce, packet: Map<String, Value> },
+    /// A read-only key changed: a `SetReply` for the clients watching it.
+    KeyChanged { key: String, value: Value },
 }
 
 /// Which items a client wants (section `items_handling flags`).
@@ -88,6 +93,12 @@ struct Joined {
     live: mpsc::Receiver<Arc<Published>>,
     /// The last room `seq` folded into this view: where a resync resumes.
     cursor: Seq,
+    /// Keys this connection asked to be told about (`SetNotify`). Not durable; kept across a
+    /// re-`Connect` on the same socket, lost with the socket.
+    watch: BTreeSet<String>,
+    /// This connection's own key writes not yet seen in the stream: already answered from the
+    /// room's reply, so the published copy is skipped (exactly one `SetReply` per write).
+    own_writes: BTreeSet<Seq>,
 }
 
 impl Joined {
@@ -239,9 +250,11 @@ impl Session {
             "StatusUpdate" => self.status(&parse(cmd, p)?).await,
             "Say" => self.say(parse(cmd, p)?).await,
             "Bounce" => self.bounce(p).await,
-            "Get" => self.get(p),
+            "Get" => self.get(p).await,
+            "Set" => self.set(p).await,
+            "SetNotify" => self.set_notify(&p),
             "ConnectUpdate" => self.connect_update(parse(cmd, p)?),
-            "Set" | "SetNotify" | "CreateHints" | "UpdateHint" => Err(Step::from(invalid(
+            "CreateHints" | "UpdateHint" => Err(Step::from(invalid(
                 "cmd",
                 Some(cmd),
                 format!("{cmd} is not supported by this server yet"),
@@ -258,7 +271,10 @@ impl Session {
             return Ok(vec![wire::frame(&[ServerPacket::ConnectionRefused { errors }])]);
         };
         // Leave the old subscription first, so the room can prune its queue.
-        let previous = self.joined.take().map(|j| (j.team, j.slot));
+        let (previous, watch) = match self.joined.take() {
+            Some(j) => (Some((j.team, j.slot)), j.watch),
+            None => (None, BTreeSet::new()),
+        };
         let Subscription { history, live } =
             self.room.room.subscribe(Seq(0)).await.map_err(|_| Step::Closed)?;
         let mut j = Joined {
@@ -277,6 +293,8 @@ impl Session {
             goals: BTreeSet::new(),
             live,
             cursor: Seq(0),
+            watch,
+            own_writes: BTreeSet::new(),
         };
         for e in &history {
             fold(&self.room, &mut j, e);
@@ -292,8 +310,12 @@ impl Session {
         // A re-Connect to the same slot announces nothing; to another slot it leaves the old one.
         if previous.is_none_or(|(_, old)| old != slot.id) {
             if let Some((old_team, old)) = previous {
+                self.presence_part(old_team, old).await?;
                 self.fan(old, &Fanout::Print { print: part_print(old_team, old) }).await?;
             }
+            let goal = self.goal(slot.id).await?;
+            let who = Who { team, slot: slot.id, goal };
+            self.room.presence.join(who, async |c| self.publish_change(slot.id, c).await).await;
             let print = PrintJson {
                 kind: "Join".to_owned(),
                 data: json!([TextPart::player(slot.id), TextPart::text(" joined the room.")]),
@@ -361,7 +383,7 @@ impl Session {
         let room = Arc::clone(&self.room);
         let Some(j) = self.joined.as_mut() else { return Ok(Vec::new()) };
         let packets = match p {
-            Published::Events(evs) => events_packets(&room, j, evs),
+            Published::Events { events, notes } => events_packets(&room, j, events, notes),
             Published::Ext { body, .. } => {
                 match serde_json::from_value::<Fanout>((**body).clone()) {
                     Ok(Fanout::Print { print }) if !j.no_text() => {
@@ -373,7 +395,10 @@ impl Session {
                         }
                         Vec::new()
                     }
-                    Ok(Fanout::Print { .. }) => Vec::new(),
+                    Ok(Fanout::KeyChanged { key, value }) if j.watch.contains(&key) => {
+                        vec![ServerPacket::SetReply(storage::read_only_reply(&key, value))]
+                    }
+                    Ok(Fanout::Print { .. } | Fanout::KeyChanged { .. }) => Vec::new(),
                     Err(e) => {
                         tracing::error!(error = %e, "unreadable fan-out body");
                         Vec::new()
@@ -395,17 +420,39 @@ impl Session {
         let Subscription { history, live } =
             room.room.subscribe(j.cursor).await.map_err(|_| Closed)?;
         j.live = live;
-        let packets = events_packets(&room, j, &history);
+        // The log has no notes: watchers get `null` for `original_value` and no pass-through
+        // fields for the writes they missed (docs/protocol-plan.md 1.4).
+        let packets = events_packets(&room, j, &history, &[]);
         Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })
     }
 
     /// The client is gone: tell the others.
     pub async fn leave(&mut self) {
         let Some(j) = self.joined.take() else { return };
+        // The room may already be gone; nobody is left to tell then.
+        drop(self.presence_part(j.team, j.slot).await);
         let print = part_print(j.team, j.slot);
         let body = serde_json::to_value(Fanout::Print { print }).unwrap_or(Value::Null);
         // The room may already be gone; nobody is left to tell then.
         drop(self.room.room.ext(SlotNo(j.slot), Arc::new(body)).await);
+    }
+
+    /// Whether `slot` reached its goal, from the room.
+    async fn goal(&self, slot: u32) -> Result<bool, Step> {
+        self.room.room.read(move |s| s.has_goal(SlotNo(slot))).await.map_err(|_| Step::Closed)
+    }
+
+    async fn presence_part(&self, team: u32, slot: u32) -> Result<(), Step> {
+        let who = Who { team, slot, goal: self.goal(slot).await? };
+        self.room.presence.part(who, async |c| self.publish_change(slot, c).await).await;
+        Ok(())
+    }
+
+    /// Tell the watchers of a read-only key its new value. The room may be gone; then nobody
+    /// is left to tell.
+    async fn publish_change(&self, slot: u32, c: Changed) {
+        let f = Fanout::KeyChanged { key: c.key, value: Value::from(c.value) };
+        drop(self.fan(slot, &f).await);
     }
 
     async fn fan(&self, from: u32, f: &Fanout) -> Result<(), Step> {
@@ -492,8 +539,14 @@ impl Session {
         if req.status == CLIENT_GOAL {
             let out = self.room.room.command(Command::Goal { slot: SlotNo(slot) });
             out.await.map_err(|_| Step::Closed)?.map_err(|_| Step::Closed)?;
+            // Watchers learn it from the durable `Goal` event.
+            return Ok(Vec::new());
         }
-        // Other statuses are accepted and not stored yet (docs/compat-status.md).
+        // Any other value is kept as the slot's status until the goal, like the reference
+        // (`MultiServer.py:2203-2210`); not durable.
+        let who = Who { team: j.team, slot, goal: self.goal(slot).await? };
+        let status = req.status;
+        self.room.presence.set(who, status, async |c| self.publish_change(slot, c).await).await;
         Ok(Vec::new())
     }
 
@@ -550,41 +603,113 @@ impl Session {
         Ok(Vec::new())
     }
 
-    fn get(&self, p: Value) -> Result<Vec<String>, Step> {
+    async fn get(&self, p: Value) -> Result<Vec<String>, Step> {
         let Value::Object(mut extra) = p else {
             return Err(Step::from(invalid("arguments", Some("Get"), "Get: not an object")));
         };
         let req: Get = parse("Get", Value::Object(extra.clone()))?;
+        self.key_count("Get", req.keys.len())?;
         extra.remove("cmd");
         extra.remove("keys");
-        let keys = req.keys.into_iter().map(|k| {
-            let v = self.read_key(&k);
-            (k, v)
-        });
-        let packet = ServerPacket::Retrieved { keys: keys.collect(), extra };
-        Ok(vec![wire::frame(&[packet])])
+        let room = &self.room;
+        // One read of the room for the stored keys and the goals of the status keys asked for.
+        let stored: Vec<String> =
+            req.keys.iter().filter(|k| !k.starts_with(RESERVED_KEY_PREFIX)).cloned().collect();
+        let status: Vec<u32> =
+            req.keys.iter().filter_map(|k| storage::status_slot(room, k)).map(|s| s.id).collect();
+        let (values, goals) = room
+            .room
+            .read(move |s| {
+                let values: BTreeMap<String, Value> = stored
+                    .into_iter()
+                    .map(|k| {
+                        let v = s.kv_get(&k).cloned().unwrap_or(Value::Null);
+                        (k, v)
+                    })
+                    .collect();
+                let goals: BTreeSet<u32> =
+                    status.into_iter().filter(|&n| s.has_goal(SlotNo(n))).collect();
+                (values, goals)
+            })
+            .await
+            .map_err(|_| Step::Closed)?;
+        let mut keys = Map::new();
+        for k in req.keys {
+            let v = if let Some(v) = values.get(&k) {
+                v.clone()
+            } else if let Some(v) = storage::read_only(room, &k) {
+                v
+            } else if let Some(slot) = storage::status_slot(room, &k) {
+                let presence = room.presence.status(slot.id).await;
+                Value::from(storage::status_value(slot, goals.contains(&slot.id), presence))
+            } else {
+                Value::Null
+            };
+            keys.insert(k, v);
+        }
+        Ok(vec![wire::frame(&[ServerPacket::Retrieved { keys, extra }])])
     }
 
-    /// The read-only special keys we can answer; everything else is `null` (no data storage).
-    fn read_key(&self, key: &str) -> Value {
-        let j = self.joined.as_ref();
-        let b = &self.room.bundle;
-        if let Some(rest) = key.strip_prefix("_read_client_status_") {
-            let slot = rest.split_once('_').and_then(|(_, s)| s.parse::<u32>().ok());
-            let goal = slot.is_some_and(|s| j.is_some_and(|j| j.goals.contains(&s)));
-            return if goal { json!(CLIENT_GOAL) } else { json!(0) };
+    /// Refuse a `Get` or `SetNotify` with more keys than `Limits::kv_max_keys_per_request`.
+    fn key_count(&self, cmd: &str, n: usize) -> Result<(), Step> {
+        if n > self.room.limits.kv_max_keys_per_request {
+            return Err(Step::from(invalid(
+                "arguments",
+                Some(cmd),
+                format!("{cmd}: too many keys"),
+            )));
         }
-        if key.starts_with("_read_hints_") {
-            return json!([]); // no hints yet
+        Ok(())
+    }
+
+    async fn set(&mut self, p: Value) -> Result<Vec<String>, Step> {
+        let Value::Object(packet) = p else {
+            return Err(Step::from(invalid("arguments", Some("Set"), "Set: not an object")));
+        };
+        let j = self.joined.as_ref().ok_or(Step::Closed)?;
+        let slot = j.slot;
+        let req = storage::parse_set(slot, &packet)
+            .map_err(|text| Step::from(invalid("arguments", Some("Set"), text)))?;
+        Self::rate(&self.room.kv_sets, slot, "Set")?;
+        let key = req.write.key.clone();
+        let packet = Arc::new(Value::Object(packet));
+        let cmd = Command::KvSet(Box::new(req.write));
+        let out = self.room.room.noted_commands(vec![(cmd, Some(Arc::clone(&packet)))]);
+        let out = out.await.map_err(|_| Step::Closed)?.pop().ok_or(Step::Closed)?;
+        let (seq, original, value) = match out {
+            Ok(Reply::KvSet { seq, original, value }) => (seq, original, value),
+            Err(CoreError::Kv(r)) => {
+                return Err(Step::from(invalid(
+                    "arguments",
+                    Some("Set"),
+                    storage::refusal_text(r),
+                )));
+            }
+            Ok(_) | Err(_) => return Err(Step::Closed),
+        };
+        let j = self.joined.as_mut().ok_or(Step::Closed)?;
+        // The published copy of this write reaches this session later; it is skipped then.
+        j.own_writes.insert(seq);
+        if !(req.want_reply || j.watch.contains(&key)) {
+            return Ok(Vec::new());
         }
-        if key == "_read_race_mode" {
-            return json!(b.race_mode);
+        let reply = storage::set_reply(Some(&packet), &key, &value, Some(&original), slot);
+        Ok(vec![wire::frame(&[ServerPacket::SetReply(reply)])])
+    }
+
+    /// Watch keys for this connection; nothing is sent back (reference `MultiServer.py:2306-2312`).
+    fn set_notify(&mut self, p: &Value) -> Result<Vec<String>, Step> {
+        let req: Get = parse("SetNotify", p.clone())?;
+        self.key_count("SetNotify", req.keys.len())?;
+        let max = self.room.limits.kv_max_watched_keys;
+        let j = self.joined.as_mut().ok_or(Step::Closed)?;
+        let new = req.keys.iter().filter(|k| !j.watch.contains(*k)).collect::<BTreeSet<_>>().len();
+        if j.watch.len().saturating_add(new) > max {
+            let text = "SetNotify: too many watched keys on this connection";
+            return Err(Step::from(invalid("arguments", Some("SetNotify"), text)));
         }
-        if let Some(rest) = key.strip_prefix("_read_slot_data_") {
-            let slot = rest.parse::<u32>().ok().and_then(|s| b.slot(s));
-            return slot.map_or(Value::Null, |s| s.slot_data.clone());
-        }
-        Value::Null
+        j.watch.extend(req.keys);
+        Ok(Vec::new())
     }
 
     fn connect_update(&mut self, req: ConnectUpdate) -> Result<Vec<String>, Step> {
@@ -677,6 +802,7 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
     j.cursor = j.cursor.max(e.seq);
     let slot = e.slot?.0;
     match e.kind {
+        EventKind::KvSet { .. } => None,
         EventKind::Checked { location, .. } => {
             if slot == j.slot {
                 j.checked.insert(location);
@@ -699,18 +825,37 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
 }
 
 /// What one batch of durable events means for this client: one `RoomUpdate` for its new
-/// checks, one `ReceivedItems` for its new items (continuing its index), and the prints.
-fn events_packets(room: &CompatRoom, j: &mut Joined, evs: &[Event]) -> Vec<ServerPacket> {
+/// checks, one `ReceivedItems` for its new items (continuing its index), the prints, and a
+/// `SetReply` for each watched key written (with the write's pass-through fields from `notes`).
+fn events_packets(
+    room: &CompatRoom,
+    j: &mut Joined,
+    evs: &[Event],
+    notes: &[Note],
+) -> Vec<ServerPacket> {
     let (mut checked, mut items, mut prints) = (Vec::new(), Vec::new(), Vec::new());
+    let mut replies = Vec::new();
     for e in evs {
         let slot = e.slot.map_or(0, |s| s.0);
         let was = j.checked.len();
         let item = fold(room, j, e);
-        match (e.kind, item) {
-            (EventKind::Checked { location, .. }, _) if j.checked.len() != was => {
+        match (&e.kind, item) {
+            (EventKind::KvSet { key, value }, _) => {
+                if !j.own_writes.remove(&e.seq) && j.watch.contains(key) {
+                    let note = notes.iter().find(|n| n.seq == e.seq);
+                    let original = note.and_then(|n| match &n.reply {
+                        Reply::KvSet { original, .. } => Some(&**original),
+                        _ => None,
+                    });
+                    let request = note.map(|n| &*n.extra);
+                    let reply = storage::set_reply(request, key, value, original, slot);
+                    replies.push(ServerPacket::SetReply(reply));
+                }
+            }
+            (&EventKind::Checked { location, .. }, _) if j.checked.len() != was => {
                 checked.push(location);
             }
-            (EventKind::Item { .. }, Some(it)) => {
+            (&EventKind::Item { .. }, Some(it)) => {
                 if slot == j.slot && j.handling.wants(j.slot, &it) {
                     items.push(it);
                 }
@@ -718,7 +863,17 @@ fn events_packets(room: &CompatRoom, j: &mut Joined, evs: &[Event]) -> Vec<Serve
                     prints.push(item_send(slot, it));
                 }
             }
-            (EventKind::Goal, _) if !j.no_text() => prints.push(goal_print(j.team, slot)),
+            (EventKind::Goal, _) => {
+                if !j.no_text() {
+                    prints.push(goal_print(j.team, slot));
+                }
+                let team = room.bundle.slot(slot).map_or(0, |s| s.team);
+                let key = storage::status_key(team, slot);
+                if j.watch.contains(&key) {
+                    let reply = storage::read_only_reply(&key, Value::from(CLIENT_GOAL));
+                    replies.push(ServerPacket::SetReply(reply));
+                }
+            }
             _ => {}
         }
     }
@@ -733,6 +888,7 @@ fn events_packets(room: &CompatRoom, j: &mut Joined, evs: &[Event]) -> Vec<Serve
         packets.push(ServerPacket::ReceivedItems { index, items });
     }
     packets.extend(prints);
+    packets.extend(replies);
     packets
 }
 

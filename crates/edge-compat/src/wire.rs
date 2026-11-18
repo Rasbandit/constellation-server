@@ -259,6 +259,8 @@ pub enum ServerPacket {
         /// What was wrong.
         text: String,
     },
+    /// `SetReply`: the body is built by the storage module (it passes request fields through).
+    SetReply(Map<String, Value>),
     /// `Retrieved`, with the `Get` packet's extra fields passed through.
     Retrieved {
         /// Requested key to value (`null` when absent).

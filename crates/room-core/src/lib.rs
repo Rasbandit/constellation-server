@@ -12,17 +12,28 @@
 //!
 //! Applied cursors (`Ack`) are not log events (D-02): `fold` does not restore them, the caller
 //! reads them from the store and calls [`RoomState::restore_applied`].
+//!
+//! The room also holds a key-value store written by `KvSet` (data storage, docs/protocol-plan.md
+//! section 1). `apply` evaluates the operations ([`kv`]); the event carries the resulting value,
+//! so `fold` never evaluates them again.
 #![no_std]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::{collections::BTreeMap, vec, vec::Vec};
+mod kv;
+
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 use config::Limits;
 use core::fmt;
-use proto::{Cid, Command, Event, EventKind, ItemSeq, Seq, SlotNo, Timestamp};
+pub use kv::KvRefusal;
+use proto::{Cid, Command, Event, EventKind, ItemSeq, KvWrite, Seq, SlotNo, Timestamp};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Keys with this prefix are read only (protocol doc, "Set"; reference `MultiServer.py:2286`).
+pub const RESERVED_KEY_PREFIX: &str = "_read_";
 
 /// Checking slot, then location id in that slot's world, to (receiving slot, item id). Fixed for
 /// the life of the room. Nested rather than keyed by a pair so a snapshot encodes as JSON.
@@ -35,6 +46,10 @@ pub struct Ctx<'a> {
     pub now: Timestamp,
     /// The one source of limits (the `config` crate).
     pub limits: &'a Limits,
+    /// Float power for the `pow` operation: `core` has no float math library, so the host
+    /// supplies it like the clock (the result is recorded in the event, so replay never needs
+    /// it).
+    pub powf: fn(f64, f64) -> f64,
 }
 
 /// Per-slot delivery cursors.
@@ -68,10 +83,19 @@ pub struct RoomState {
     slots: BTreeMap<SlotNo, SlotCursor>,
     /// `(slot, cid)` index, expiring after `dedupe_window_secs` (D-13).
     dedupe: BTreeMap<SlotNo, BTreeMap<Cid, Dedupe>>,
+    /// The key-value store.
+    #[serde(default)]
+    kv: BTreeMap<String, Value>,
+    /// Bytes the store holds: every key plus its value as compact JSON.
+    #[serde(default)]
+    kv_bytes: u64,
+    /// `KvSet` events folded so far (one per write, so the head can be checked).
+    #[serde(default)]
+    kv_writes: u64,
 }
 
 /// The reply to the caller (a `result` frame), sent only after the events commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// The check was applied (or is a repeat of the cid that was); `seq` is its `Checked` event.
     Checked {
@@ -89,6 +113,15 @@ pub enum Reply {
     Acked {
         /// The slot's applied cursor after the ack.
         applied: ItemSeq,
+    },
+    /// The key was written; `seq` is its `KvSet` event.
+    KvSet {
+        /// Seq of the `KvSet` event.
+        seq: Seq,
+        /// The value before the write: the stored one, else the default, else 0.
+        original: Box<Value>,
+        /// The value after.
+        value: Box<Value>,
     },
 }
 
@@ -151,6 +184,8 @@ pub enum CoreError {
         /// The current head.
         head: Seq,
     },
+    /// A key write was refused; nothing was stored.
+    Kv(KvRefusal),
 }
 
 impl fmt::Display for CoreError {
@@ -204,6 +239,9 @@ impl RoomState {
             goals: BTreeMap::new(),
             slots,
             dedupe: BTreeMap::new(),
+            kv: BTreeMap::new(),
+            kv_bytes: 0,
+            kv_writes: 0,
         })
     }
 
@@ -249,8 +287,21 @@ impl RoomState {
         }
         let checks = u64::try_from(self.checked_pairs().count()).unwrap_or(u64::MAX);
         let goals = u64::try_from(self.goals.len()).unwrap_or(u64::MAX);
-        if self.head.0 != checks.saturating_mul(2).saturating_add(goals) {
-            return bad("head is not two events per check plus one per goal");
+        // One event per kind's unit: two per check, one per goal, one per key write.
+        let events = checks.saturating_mul(2).saturating_add(goals).saturating_add(self.kv_writes);
+        if self.head.0 != events {
+            return bad("head is not two events per check, one per goal and one per key write");
+        }
+        if usize::try_from(self.kv_writes).is_ok_and(|w| w < self.kv.len()) {
+            return bad("more keys than key writes");
+        }
+        if self.kv.keys().any(|k| k.starts_with(RESERVED_KEY_PREFIX)) {
+            return bad("a reserved key is stored");
+        }
+        if self.kv.iter().map(|(k, v)| entry_bytes(k, v)).fold(0, u64::saturating_add)
+            != self.kv_bytes
+        {
+            return bad("kv_bytes does not match the stored keys");
         }
         for (slot, c) in &self.slots {
             let items = self
@@ -276,6 +327,12 @@ impl RoomState {
 
     fn checked_at(&self, from: SlotNo, location: i64) -> Option<Seq> {
         self.checked.get(&from).and_then(|m| m.get(&location)).copied()
+    }
+
+    /// The stored value of `key`, if any.
+    #[must_use]
+    pub fn kv_get(&self, key: &str) -> Option<&Value> {
+        self.kv.get(key)
     }
 
     /// Whether `slot` has reached its goal.
@@ -361,7 +418,18 @@ impl RoomState {
         }
         // Every check is validated against the placement table before anything changes, so a
         // hostile or corrupt log is an error and never a half-applied state.
-        match ev.kind {
+        match &ev.kind {
+            EventKind::KvSet { key, value } => {
+                if self.awaiting.is_some() {
+                    return Err(CoreError::PlacementMismatch);
+                }
+                let writes = self.kv_writes.checked_add(1).ok_or(CoreError::SeqOverflow)?;
+                let old = self.kv.get(key).map_or(0, |v| entry_bytes(key, v));
+                self.kv_bytes =
+                    self.kv_bytes.saturating_sub(old).saturating_add(entry_bytes(key, value));
+                self.kv.insert(key.clone(), (**value).clone());
+                self.kv_writes = writes;
+            }
             EventKind::Goal => {
                 if self.awaiting.is_some() {
                     return Err(CoreError::PlacementMismatch);
@@ -371,7 +439,7 @@ impl RoomState {
                 }
                 self.goals.insert(slot, ev.seq);
             }
-            EventKind::Item { from, location, item, item_seq } => {
+            &EventKind::Item { from, location, item, item_seq } => {
                 if self.awaiting != Some((from, location))
                     || self.place(from, location) != Some((slot, item))
                 {
@@ -385,7 +453,7 @@ impl RoomState {
                 cursor.item_head = item_seq;
                 self.awaiting = None;
             }
-            EventKind::Checked { cid, location, at } => {
+            &EventKind::Checked { cid, location, at } => {
                 if self.place(slot, location).is_none() {
                     return Err(CoreError::UnknownLocation(location));
                 }
@@ -406,12 +474,67 @@ impl RoomState {
     }
 }
 
+/// Bytes one store entry counts for: the key plus the value as compact JSON.
+fn entry_bytes(key: &str, value: &Value) -> u64 {
+    u64::try_from(key.len().saturating_add(kv::size(value))).unwrap_or(u64::MAX)
+}
+
+/// Evaluate a key write against the limits, without changing the state: the value before and
+/// after.
+fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<(Value, Value), KvRefusal> {
+    let l = ctx.limits;
+    if w.key.starts_with(RESERVED_KEY_PREFIX) {
+        return Err(KvRefusal::ReservedKey);
+    }
+    if w.key.len() > l.kv_max_key_bytes {
+        return Err(KvRefusal::KeyTooLong);
+    }
+    if w.ops.len() > l.kv_max_ops {
+        return Err(KvRefusal::TooManyOps);
+    }
+    if w.default.iter().chain(w.ops.iter().map(|(_, v)| v)).any(|v| kv::depth(v) > l.kv_max_depth) {
+        return Err(KvRefusal::TooDeep);
+    }
+    // The reference starts from 0 when the packet has no default (`MultiServer.py:2292`).
+    let original =
+        state.kv.get(&w.key).or(w.default.as_ref()).cloned().unwrap_or_else(|| Value::from(0));
+    let value = kv::evaluate(original.clone(), &w.ops, l.kv_max_value_bytes, ctx.powf)?;
+    if kv::size(&value) > l.kv_max_value_bytes {
+        return Err(KvRefusal::ValueTooLarge);
+    }
+    let old = state.kv.get(&w.key).map_or(0, |v| entry_bytes(&w.key, v));
+    let total = state.kv_bytes.saturating_sub(old).saturating_add(entry_bytes(&w.key, &value));
+    if total > l.kv_max_room_bytes {
+        return Err(KvRefusal::RoomFull);
+    }
+    Ok((original, value))
+}
+
 /// Apply one command. On `Err` the state is unchanged.
 ///
 /// # Errors
 /// See [`CoreError`]: unknown slot or location, ack ahead of head, counter overflow.
 pub fn apply(state: &mut RoomState, ctx: &Ctx<'_>, cmd: Command) -> Result<Applied, CoreError> {
     match cmd {
+        Command::KvSet(w) => {
+            if !state.slots.contains_key(&w.slot) {
+                return Err(CoreError::UnknownSlot(w.slot));
+            }
+            let (original, value) = kv_write(state, ctx, &w).map_err(CoreError::Kv)?;
+            let seq = next_seq(state.head)?;
+            let KvWrite { slot, key, .. } = *w;
+            let value = Box::new(value);
+            let events = vec![Event {
+                seq,
+                slot: Some(slot),
+                kind: EventKind::KvSet { key, value: value.clone() },
+            }];
+            for e in &events {
+                state.record(e, ctx.limits)?;
+            }
+            let reply = Reply::KvSet { seq, original: Box::new(original), value };
+            Ok(Applied { events, reply, depends_on: Some(seq) })
+        }
         Command::Ack { slot, applied } => {
             let applied = state.restore_applied(slot, applied)?;
             Ok(Applied { events: Vec::new(), reply: Reply::Acked { applied }, depends_on: None })

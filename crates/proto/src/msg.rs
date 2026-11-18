@@ -1,13 +1,72 @@
-//! Commands in, events out (doc 05 7.1). Minimal: `Check`, `Ack` and `Goal`; `Ext` and `Host` come later.
+//! Commands in, events out (doc 05 7.1). Minimal: `Check`, `Ack`, `Goal` and `KvSet`; `Ext` and
+//! `Host` come later.
 //!
 //! Location and item ids are `i64`: worlds made by other generators use ids up to 2^53 - 1 and
 //! reserve negative ids, and a location id is only unique within the world of the slot that
 //! checks it (two slots of the same game share ids).
 use crate::{Cid, ItemSeq, Seq, SlotNo, Timestamp};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// One operation on a stored value. Our own names for the operations a client compatible with
+/// Archipelago may send (protocol doc, "`DataStorageOperation`"); `room_core` defines what each
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KvOp {
+    /// The operand becomes the value.
+    Replace,
+    /// Keep the value (the start value already applied the default).
+    Default,
+    /// Sum, or concatenation of strings and of lists.
+    Add,
+    /// Product, or repetition of a string or a list.
+    Mul,
+    /// Power.
+    Pow,
+    /// Floor modulo (the result takes the divisor's sign).
+    Mod,
+    /// Round down to an integer.
+    Floor,
+    /// Round up to an integer.
+    Ceil,
+    /// The larger; a tie keeps the current value.
+    Max,
+    /// The smaller; a tie keeps the current value.
+    Min,
+    /// Bitwise and.
+    And,
+    /// Bitwise or, or a merge of two objects.
+    Or,
+    /// Bitwise exclusive or.
+    Xor,
+    /// Shift left.
+    LeftShift,
+    /// Arithmetic shift right.
+    RightShift,
+    /// Remove the first equal element of a list.
+    Remove,
+    /// Remove a list index or an object key.
+    Pop,
+    /// Add missing elements to a list, or merge into an object.
+    Update,
+}
+
+/// A write to the room's key-value store: the start value, then each operation in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvWrite {
+    /// The writing slot.
+    pub slot: SlotNo,
+    /// The key.
+    pub key: String,
+    /// The start value when the key has none; `None` means the integer 0.
+    pub default: Option<Value>,
+    /// Operations with their operands, applied in order.
+    pub ops: Vec<(KvOp, Value)>,
+}
 
 /// A client command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Check a location. `(slot, cid)` is the idempotency key (doc 02 D3).
     Check {
@@ -30,6 +89,8 @@ pub enum Command {
         /// Highest `item_seq` the client has applied.
         applied: ItemSeq,
     },
+    /// Write one key of the room's key-value store (boxed: much larger than the others).
+    KvSet(Box<KvWrite>),
 }
 
 /// One log entry.
@@ -37,7 +98,7 @@ pub enum Command {
 /// Deviations from doc 05 7.1, both out of scope for now: no ULID event id (the room-wide `seq`
 /// is the id), and `Item` carries no `item_uid` (`H(room, location_id)`, doc 02 D3); the
 /// `location` field identifies the item until the hash exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     /// Room-wide, gapless, starts at 1.
     pub seq: Seq,
@@ -48,7 +109,7 @@ pub struct Event {
 }
 
 /// Event payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A location was checked. Carries the cid and time so a fold can rebuild the dedupe index.
     Checked {
@@ -72,6 +133,14 @@ pub enum EventKind {
     },
     /// The event's slot reached its goal.
     Goal,
+    /// The event's slot wrote a key. Carries the resulting value, so a fold never evaluates
+    /// operations again.
+    KvSet {
+        /// The key.
+        key: String,
+        /// Its value after the write.
+        value: Box<Value>,
+    },
 }
 
 #[cfg(test)]
@@ -96,6 +165,25 @@ mod tests {
                 item: i64::MAX,
                 item_seq: ItemSeq(0),
             },
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+    }
+
+    #[test]
+    fn a_key_write_and_its_event_survive_a_json_round_trip() {
+        let c = Command::KvSet(Box::new(KvWrite {
+            slot: SlotNo(3),
+            key: "k".into(),
+            default: Some(serde_json::json!({"a": [1.5, null]})),
+            ops: alloc::vec![(KvOp::Add, serde_json::json!(u64::MAX)), (KvOp::Floor, Value::Null)],
+        }));
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&s).unwrap(), c);
+        let e = Event {
+            seq: Seq(1),
+            slot: Some(SlotNo(3)),
+            kind: EventKind::KvSet { key: "k".into(), value: Box::new(serde_json::json!(-0.0)) },
         };
         let s = serde_json::to_string(&e).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);

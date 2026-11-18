@@ -193,9 +193,10 @@ mod scenarios {
             .await
             .unwrap();
         let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        // Bob is connected (5) and has not reached his goal.
         assert_eq!(
             got["keys"],
-            json!({"_read_client_status_0_1": 30, "_read_client_status_0_2": 0})
+            json!({"_read_client_status_0_1": 30, "_read_client_status_0_2": 5})
         );
     }
 
@@ -401,5 +402,54 @@ mod scenarios {
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{}; log:\n{log}", out.status);
         assert!(log.contains("SIGTERM"), "{log}");
+    }
+
+    /// Data storage over real sockets (protocol doc, "Get", "Set", "`SetNotify`", "`SetReply`"):
+    /// a watcher hears a write with the writer's extra fields, the writer gets its one reply,
+    /// and `Get` reads the stored value and the fixture's name groups.
+    #[tokio::test]
+    async fn data_storage_round_trips_between_two_real_clients() {
+        let server = start(&[]).unwrap();
+        let (mut alice, _, _) = joined(&server, "Alice").await;
+        let (mut bob, _, _) = joined(&server, "Bob").await;
+        bob.send(&json!([{"cmd": "SetNotify", "keys": ["shared"]}])).await.unwrap();
+        // SetNotify answers nothing; this Get is the signal that it was handled.
+        bob.send(&json!([{"cmd": "Get", "keys": ["shared"]}])).await.unwrap();
+        let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(got["keys"], json!({"shared": null}));
+        let set = json!([{"cmd": "Set", "key": "shared", "default": [], "want_reply": true,
+            "operations": [{"operation": "update", "value": ["a", "b"]},
+                           {"operation": "remove", "value": "a"}], "tag": "e2e"}]);
+        alice.send(&set).await.unwrap();
+        let want = json!({"cmd": "SetReply", "key": "shared", "value": ["b"], "original_value": [],
+            "slot": 1, "default": [], "want_reply": true, "tag": "e2e",
+            "operations": [{"operation": "update", "value": ["a", "b"]},
+                           {"operation": "remove", "value": "a"}]});
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, want);
+        assert_eq!(bob.next_cmd("SetReply").await.unwrap().0, want);
+        let b = fixture().unwrap();
+        let groups = format!("_read_item_name_groups_{GAME}");
+        bob.send(&json!([{"cmd": "Get", "keys": ["shared", groups]}])).await.unwrap();
+        let (got, _) = bob.next_cmd("Retrieved").await.unwrap();
+        assert_eq!(got["keys"]["shared"], json!(["b"]));
+        assert_eq!(got["keys"][&groups], json!(b.games[GAME].item_name_groups));
+        assert!(!b.games[GAME].item_name_groups.is_empty(), "the fixture has item groups");
+    }
+
+    /// A watcher of a slot's client status hears it connect (5) and its last connection leave
+    /// (0) (reference `MultiServer.py:1043-1046, 1071-1074`).
+    #[tokio::test]
+    async fn a_slots_client_status_follows_its_connections() {
+        let server = start(&[]).unwrap();
+        let (mut alice, _, _) = joined(&server, "Alice").await;
+        let key = "_read_client_status_0_2";
+        alice.send(&json!([{"cmd": "SetNotify", "keys": [key]}])).await.unwrap();
+        alice.send(&json!([{"cmd": "Get", "keys": [key]}])).await.unwrap();
+        assert_eq!(alice.next_cmd("Retrieved").await.unwrap().0["keys"][key], 0);
+        let (bob, _, _) = joined(&server, "Bob").await;
+        let reply = |v: i64| json!({"cmd": "SetReply", "key": key, "value": v});
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, reply(5));
+        bob.close().await.unwrap();
+        assert_eq!(alice.next_cmd("SetReply").await.unwrap().0, reply(0));
     }
 }

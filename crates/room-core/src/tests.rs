@@ -27,7 +27,7 @@ fn room() -> RoomState {
 }
 
 fn at(t: u64) -> Ctx<'static> {
-    Ctx { now: Timestamp(t), limits: &LIM }
+    Ctx { now: Timestamp(t), limits: &LIM, powf: f64::powf }
 }
 
 fn check(slot: u32, cid: u64, location: i64) -> Command {
@@ -217,7 +217,7 @@ fn an_expired_cid_on_a_checked_location_still_emits_nothing() {
 #[test]
 fn a_zero_window_disables_dedupe_but_never_double_checks() {
     let lim = Limits { dedupe_window_secs: 0, ..LIM };
-    let ctx = Ctx { now: Timestamp(0), limits: &lim };
+    let ctx = Ctx { now: Timestamp(0), limits: &lim, powf: f64::powf };
     let mut s = room();
     apply(&mut s, &ctx, check(1, 1, 10)).unwrap();
     let r = apply(&mut s, &ctx, check(1, 1, 10)).unwrap();
@@ -317,8 +317,8 @@ fn fold_rebuilds_the_state_from_a_snapshot_and_a_tail() {
     }
     let (head, tail) = events.split_at(2);
     let mut snap = room();
-    snap = fold(snap, &LIM, head.iter().copied()).unwrap();
-    let rebuilt = fold(snap, &LIM, tail.iter().copied()).unwrap();
+    snap = fold(snap, &LIM, head.iter().cloned()).unwrap();
+    let rebuilt = fold(snap, &LIM, tail.iter().cloned()).unwrap();
     // The live state learns its events are durable from the caller; fold knows by definition.
     live.mark_durable(live.head()).unwrap();
     assert_eq!(rebuilt, live);
@@ -334,14 +334,14 @@ fn fold_refuses_a_gap_a_replay_and_a_slotless_event() {
     let mut live = room();
     let ev = apply(&mut live, &at(0), check(1, 1, 10)).unwrap().events;
     assert_eq!(
-        fold(room(), &LIM, ev.iter().skip(1).copied()),
+        fold(room(), &LIM, ev.iter().skip(1).cloned()),
         Err(CoreError::LogGap { expected: Seq(1), got: Seq(2) })
     );
     assert_eq!(
-        fold(live.clone(), &LIM, ev.iter().copied()),
+        fold(live.clone(), &LIM, ev.iter().cloned()),
         Err(CoreError::LogGap { expected: Seq(3), got: Seq(1) })
     );
-    let mut bad = ev[0];
+    let mut bad = ev[0].clone();
     bad.slot = None;
     assert_eq!(fold(room(), &LIM, [bad]), Err(CoreError::BadEvent));
 }
@@ -401,7 +401,7 @@ mod properties {
         let (mut now, mut events, mut replies) = (0_u64, Vec::new(), Vec::new());
         for (dt, c) in cmds {
             now = now.saturating_add(*dt);
-            match apply(&mut s, &at(now), *c) {
+            match apply(&mut s, &at(now), c.clone()) {
                 Ok(a) => {
                     events.extend(a.events);
                     replies.push(Ok(a.reply));
@@ -439,6 +439,7 @@ mod properties {
                     EventKind::Checked { location, .. } => (e.slot, location, 0),
                     EventKind::Item { from, location, .. } => (Some(from), location, 1),
                     EventKind::Goal => (e.slot, 0, 2),
+                    EventKind::KvSet { .. } => continue,
                 };
                 prop_assert!(seen.insert(key));
             }
@@ -451,9 +452,9 @@ mod properties {
         ) {
             let (mut state, ..) = run(&cmds);
             let now = 400_u64.saturating_mul(30);
-            let Ok(first) = apply(&mut state, &at(now), again.1) else { return Ok(()) };
+            let Ok(first) = apply(&mut state, &at(now), again.1.clone()) else { return Ok(()) };
             let after_first = state.clone();
-            let second = apply(&mut state, &at(now), again.1).unwrap();
+            let second = apply(&mut state, &at(now), again.1.clone()).unwrap();
             prop_assert_eq!(second.events, NO_EVENTS);
             prop_assert_eq!(&state, &after_first);
             if matches!(again.1, Command::Check { .. }) && !first.events.is_empty() {
@@ -471,7 +472,7 @@ mod properties {
             let mut s = room();
             let mut last: BTreeMap<SlotNo, ItemSeq> = BTreeMap::new();
             for (_, c) in &cmds {
-                drop(apply(&mut s, &at(0), *c));
+                drop(apply(&mut s, &at(0), c.clone()));
                 for slot in [SlotNo(1), SlotNo(2)] {
                     let cur = s.cursor(slot).unwrap();
                     prop_assert!(cur.applied <= cur.item_head);
@@ -490,8 +491,8 @@ mod properties {
             // Snapshot at an arbitrary event boundary, then fold the tail onto it.
             let cut = cut.min(events.len());
             let (head, tail) = events.split_at(cut);
-            let snap = fold(room(), &LIM, head.iter().copied()).unwrap();
-            let mut rebuilt = fold(snap, &LIM, tail.iter().copied()).unwrap();
+            let snap = fold(room(), &LIM, head.iter().cloned()).unwrap();
+            let mut rebuilt = fold(snap, &LIM, tail.iter().cloned()).unwrap();
             // Cursors are not in the log (D-02); rehydration restores them from the store.
             for slot in [SlotNo(1), SlotNo(2)] {
                 rebuilt.restore_applied(slot, live.cursor(slot).unwrap().applied).unwrap();
@@ -573,7 +574,7 @@ fn expired_dedupe_entries_are_pruned() {
     apply(&mut s, &at(120), check(1, 3, 12)).unwrap();
     assert_eq!(s.dedupe_len(), 2, "the entry from t=0 expired, the one from t=50 did not");
     let lim = Limits { dedupe_window_secs: 0, ..LIM };
-    let ctx = Ctx { now: Timestamp(0), limits: &lim };
+    let ctx = Ctx { now: Timestamp(0), limits: &lim, powf: f64::powf };
     let mut z = room();
     apply(&mut z, &ctx, check(1, 1, 10)).unwrap();
     apply(&mut z, &ctx, check(1, 2, 11)).unwrap();
@@ -623,7 +624,7 @@ mod hostile_logs_and_snapshots {
     fn fold_refuses_an_item_that_disagrees_with_the_placement() {
         for bad in [item(2, 2, 10, 500, 1), item(2, 1, 10, 777, 1), item(2, 1, 11, 500, 1)] {
             assert_eq!(
-                fold(room(), &LIM, [checked(1, 1, 10), bad]),
+                fold(room(), &LIM, [checked(1, 1, 10), bad.clone()]),
                 Err(CoreError::PlacementMismatch),
                 "{bad:?}"
             );
@@ -761,7 +762,7 @@ mod hostile_logs_and_snapshots {
             (
                 "head that matches no checks",
                 json!({"checked": {"1": {}}}),
-                "head is not two events per check plus one per goal",
+                "head is not two events per check, one per goal and one per key write",
             ),
         ];
         for (name, patch, why) in cases {
@@ -796,5 +797,216 @@ mod hostile_logs_and_snapshots {
     fn a_head_that_does_not_match_the_checks_is_refused() {
         let s = tampered(|v| v["head"] = json!(7));
         assert!(matches!(s.validate(Seq(7)), Err(CoreError::BadSnapshot(_))));
+    }
+}
+
+mod key_value {
+    use super::*;
+    use crate::KvRefusal;
+    use proto::{KvOp, KvWrite};
+    use serde_json::{Value, json};
+    use std::boxed::Box;
+
+    fn set(slot: u32, key: &str, default: Option<Value>, ops: Vec<(KvOp, Value)>) -> Command {
+        Command::KvSet(Box::new(KvWrite { slot: SlotNo(slot), key: key.into(), default, ops }))
+    }
+
+    fn add(key: &str, n: i64) -> Command {
+        set(1, key, None, vec![(KvOp::Add, json!(n))])
+    }
+
+    #[test]
+    fn a_write_is_one_event_carrying_the_result_and_replies_with_before_and_after() {
+        let mut s = room();
+        let a = apply(&mut s, &at(0), add("k", 5)).unwrap();
+        let five = Box::new(json!(5));
+        assert_eq!(
+            a.events,
+            vec![Event {
+                seq: Seq(1),
+                slot: Some(SlotNo(1)),
+                kind: EventKind::KvSet { key: "k".into(), value: five.clone() },
+            }]
+        );
+        assert_eq!(
+            (a.reply, a.depends_on),
+            (Reply::KvSet { seq: Seq(1), original: Box::new(json!(0)), value: five }, Some(Seq(1)))
+        );
+        let b = apply(&mut s, &at(0), add("k", 2)).unwrap();
+        assert!(matches!(b.reply, Reply::KvSet { ref original, .. } if **original == json!(5)));
+        assert_eq!(s.kv_get("k"), Some(&json!(7)));
+        assert_eq!(s.kv_get("other"), None);
+    }
+
+    /// Reference `MultiServer.py:2292`: the start value is the stored one, else the packet's
+    /// default (even an explicit `null`), else 0; the key is stored even with no operations.
+    #[test]
+    fn a_missing_key_starts_from_the_default_and_without_one_from_zero() {
+        let mut s = room();
+        apply(&mut s, &at(0), set(1, "d", Some(json!([1])), vec![])).unwrap();
+        assert_eq!(s.kv_get("d"), Some(&json!([1])));
+        apply(&mut s, &at(0), set(1, "d", Some(json!([9])), vec![(KvOp::Add, json!([2]))]))
+            .unwrap();
+        assert_eq!(s.kv_get("d"), Some(&json!([1, 2])), "a stored value beats the default");
+        apply(&mut s, &at(0), set(1, "n", Some(Value::Null), vec![])).unwrap();
+        assert_eq!(s.kv_get("n"), Some(&Value::Null));
+        apply(&mut s, &at(0), set(1, "z", None, vec![])).unwrap();
+        assert_eq!(s.kv_get("z"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn every_limit_refuses_the_write_and_changes_nothing() {
+        let lim = Limits {
+            kv_max_key_bytes: 4,
+            kv_max_ops: 2,
+            kv_max_depth: 2,
+            kv_max_value_bytes: 10,
+            kv_max_room_bytes: 20,
+            ..LIM
+        };
+        let ctx = Ctx { now: Timestamp(0), limits: &lim, powf: f64::powf };
+        let mut s = room();
+        // "abcd" + "12345678" = 12 bytes stored; the room may hold 20.
+        apply(&mut s, &ctx, set(1, "abcd", Some(json!("123456")), vec![])).unwrap();
+        let before = s.clone();
+        let replace = |key: &str, v: Value| set(1, key, None, vec![(KvOp::Replace, v)]);
+        let cases = [
+            (replace("_read_x", json!(1)), KvRefusal::ReservedKey),
+            (replace("abcde", json!(1)), KvRefusal::KeyTooLong),
+            (set(1, "k", None, vec![(KvOp::Add, json!(1)); 3]), KvRefusal::TooManyOps),
+            (replace("k", json!([[[1]]])), KvRefusal::TooDeep),
+            (set(1, "k", Some(json!([[[1]]])), vec![]), KvRefusal::TooDeep),
+            (replace("k", json!("123456789")), KvRefusal::ValueTooLarge),
+            // 12 stored + "k" and "12345" (7 bytes) + ... = 20 fits; one more byte does not.
+            (replace("kk", json!("123456")), KvRefusal::RoomFull),
+            (
+                set(1, "k", None, vec![(KvOp::Add, json!(1)), (KvOp::Mod, json!(0))]),
+                KvRefusal::ZeroDivision(KvOp::Mod),
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(apply(&mut s, &ctx, cmd.clone()), Err(CoreError::Kv(want)), "{cmd:?}");
+            assert_eq!(s, before, "{cmd:?} changed the state");
+        }
+        // Exactly at the room cap is fine: "k" and "12345" with its quotes are 8 bytes.
+        apply(&mut s, &ctx, replace("k", json!("12345"))).unwrap();
+        // Growing a stored key counts only the growth: 13 instead of 12 passes the cap.
+        let grow = apply(&mut s, &ctx, replace("abcd", json!("1234567")));
+        assert_eq!(grow, Err(CoreError::Kv(KvRefusal::RoomFull)));
+        apply(&mut s, &ctx, replace("abcd", json!("12345"))).unwrap();
+        // A key at the length cap, a value at the depth and size caps: all accepted.
+        apply(&mut room(), &ctx, replace("_rea", json!([[1]]))).unwrap();
+        apply(&mut room(), &ctx, replace("abcd", json!("12345678"))).unwrap();
+        // The reserved prefix is exactly `_read_`; `_readme` is an ordinary key (reference
+        // `MultiServer.py:2286`).
+        let lim = Limits { kv_max_key_bytes: 16, ..lim };
+        let ctx = Ctx { now: Timestamp(0), limits: &lim, powf: f64::powf };
+        apply(&mut room(), &ctx, replace("_readme", json!(1))).unwrap();
+    }
+
+    #[test]
+    fn a_key_write_for_an_unknown_slot_is_refused() {
+        let mut s = room();
+        assert_eq!(
+            apply(&mut s, &at(0), set(9, "k", None, vec![])),
+            Err(CoreError::UnknownSlot(SlotNo(9)))
+        );
+        assert_eq!(s, room());
+    }
+
+    #[test]
+    fn writes_fold_back_to_the_same_store_and_validate() {
+        let mut live = room();
+        let mut events = Vec::new();
+        events.extend(apply(&mut live, &at(0), add("a", 1)).unwrap().events);
+        events.extend(apply(&mut live, &at(0), check(1, 1, 11)).unwrap().events);
+        events.extend(apply(&mut live, &at(0), add("a", 1)).unwrap().events);
+        events.extend(
+            apply(&mut live, &at(0), set(2, "b", None, vec![(KvOp::Replace, json!({"x": [1.5]}))]))
+                .unwrap()
+                .events,
+        );
+        live.mark_durable(live.head()).unwrap();
+        let folded = fold(room(), &LIM, events.clone()).unwrap();
+        assert_eq!(folded, live);
+        assert_eq!(folded.kv_get("a"), Some(&json!(2)));
+        assert_eq!(folded.validate(Seq(5)), Ok(()));
+        // Through a JSON snapshot too, as a store would keep it.
+        let snap: RoomState =
+            serde_json::from_str(&serde_json::to_string(&folded).unwrap()).unwrap();
+        assert_eq!(snap, folded);
+        // A fold re-uses the recorded value; it never evaluates operations again.
+        let tampered: Vec<Event> = events
+            .into_iter()
+            .map(|mut e| {
+                if let EventKind::KvSet { value, .. } = &mut e.kind {
+                    **value = json!("recorded");
+                }
+                e
+            })
+            .collect();
+        assert_eq!(fold(room(), &LIM, tampered).unwrap().kv_get("a"), Some(&json!("recorded")));
+    }
+
+    #[test]
+    fn fold_refuses_a_key_write_between_a_check_and_its_item() {
+        let ev = [
+            hostile_logs_and_snapshots_events::checked(1, 1, 10),
+            Event {
+                seq: Seq(2),
+                slot: Some(SlotNo(1)),
+                kind: EventKind::KvSet { key: "k".into(), value: Box::new(json!(1)) },
+            },
+        ];
+        assert_eq!(fold(room(), &LIM, ev), Err(CoreError::PlacementMismatch));
+    }
+
+    type SnapshotEdit<'a> = &'a dyn Fn(&mut Value);
+
+    #[test]
+    fn a_snapshot_whose_store_disagrees_with_its_counters_is_refused() {
+        let mut s = room();
+        apply(&mut s, &at(0), add("a", 1)).unwrap();
+        s.mark_durable(s.head()).unwrap();
+        assert_eq!(s.validate(Seq(1)), Ok(()));
+        let edit = |f: &dyn Fn(&mut Value)| {
+            let mut v = serde_json::to_value(&s).unwrap();
+            f(&mut v);
+            serde_json::from_value::<RoomState>(v).unwrap().validate(Seq(1)).unwrap_err()
+        };
+        let cases: [(SnapshotEdit<'_>, &str); 4] = [
+            (&|v| v["kv_bytes"] = json!(99), "kv_bytes"),
+            (&|v| v["kv_writes"] = json!(0), "head"),
+            (
+                &|v| {
+                    v["kv"] = json!({"_read_x": 1});
+                    v["kv_bytes"] = json!(8);
+                },
+                "reserved",
+            ),
+            (
+                &|v| {
+                    v["kv"]["b"] = json!(1);
+                    v["kv_bytes"] = json!(4);
+                },
+                "more keys",
+            ),
+        ];
+        for (f, want) in cases {
+            let CoreError::BadSnapshot(why) = edit(f) else { panic!("not a snapshot error") };
+            assert!(why.contains(want), "{why} lacks {want}");
+        }
+    }
+}
+
+mod hostile_logs_and_snapshots_events {
+    use super::*;
+
+    pub(super) fn checked(seq: u64, slot: u32, location: i64) -> Event {
+        Event {
+            seq: Seq(seq),
+            slot: Some(SlotNo(slot)),
+            kind: EventKind::Checked { cid: Cid(seq), location, at: Timestamp(0) },
+        }
     }
 }

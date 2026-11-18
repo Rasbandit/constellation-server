@@ -24,8 +24,15 @@ use tokio::task::JoinHandle;
 /// What the room publishes to every subscriber, in log order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Published {
-    /// One batch's durable log events, in order (one queue entry however large the batch).
-    Events(Arc<[Event]>),
+    /// One batch's durable log events, in order (one queue entry however large the batch),
+    /// with the notes the edges attached to the batch's commands.
+    Events {
+        /// The events.
+        events: Arc<[Event]>,
+        /// Non-durable notes about some of these events (docs/protocol-plan.md section 0.5).
+        /// A subscriber that resyncs from the log gets the events without them.
+        notes: Arc<[Note]>,
+    },
     /// A message one session asked to fan out (chat, bounce). Not durable; each edge decides who
     /// gets it. The body is opaque to the room.
     Ext {
@@ -34,6 +41,29 @@ pub enum Published {
         /// Edge-defined payload.
         body: Arc<serde_json::Value>,
     },
+}
+
+/// What an edge attached to one command, published with the command's events.
+///
+/// Facts that are not state ([`RoomHandle::noted_commands`]): a request's pass-through fields,
+/// and the command's reply (for example a key's value before a write).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// The command's last event.
+    pub seq: Seq,
+    /// The command's reply.
+    pub reply: Reply,
+    /// What the edge attached, opaque to the room.
+    pub extra: Arc<serde_json::Value>,
+}
+
+/// A read-only query, run on the room task against its state ([`RoomHandle::read`]).
+struct ReadFn(Box<dyn FnOnce(&RoomState) + Send>);
+
+impl core::fmt::Debug for ReadFn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ReadFn")
+    }
 }
 
 /// A subscriber's view: the durable events after its cursor, then the live stream from right
@@ -70,9 +100,13 @@ impl std::error::Error for RoomError {}
 /// One command's outcome inside a batch.
 pub type Outcome = Result<Reply, CoreError>;
 
+/// A command and the note to publish with its events, if any.
+pub type Noted = (Command, Option<Arc<serde_json::Value>>);
+
 #[derive(Debug)]
 enum RoomMsg {
-    Commands { cmds: Vec<Command>, reply: oneshot::Sender<Vec<Outcome>> },
+    Commands { cmds: Vec<Noted>, reply: oneshot::Sender<Vec<Outcome>> },
+    Read(ReadFn),
     Subscribe { after: Seq, reply: oneshot::Sender<Result<Subscription, RoomError>> },
     Ext { from: SlotNo, body: Arc<serde_json::Value>, done: oneshot::Sender<()> },
     Subscribers { reply: oneshot::Sender<usize> },
@@ -150,8 +184,34 @@ impl RoomHandle {
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.
     pub async fn commands(&self, cmds: Vec<Command>) -> Result<Vec<Outcome>, RoomError> {
+        self.noted_commands(cmds.into_iter().map(|c| (c, None)).collect()).await
+    }
+
+    /// As [`RoomHandle::commands`], each command with an optional note that is published with
+    /// its events when it succeeds and emits any ([`Note`]).
+    ///
+    /// # Errors
+    /// [`RoomError::Unavailable`] when the room task has stopped.
+    pub async fn noted_commands(&self, cmds: Vec<Noted>) -> Result<Vec<Outcome>, RoomError> {
         let (reply, rx) = oneshot::channel();
         self.send(RoomMsg::Commands { cmds, reply }).await?;
+        rx.await.map_err(|_| RoomError::Unavailable)
+    }
+
+    /// Run a read-only query on the room state, after every message sent before it. Nothing is
+    /// written. The answer can reach the caller before events published earlier have left its
+    /// queue (docs/protocol-plan.md section 0.4).
+    ///
+    /// # Errors
+    /// [`RoomError::Unavailable`] when the room task has stopped.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&RoomState) -> T + Send + 'static,
+    ) -> Result<T, RoomError> {
+        let (tx, rx) = oneshot::channel();
+        // A caller that went away does not stop the room.
+        let run = move |s: &RoomState| drop(tx.send(query(s)));
+        self.send(RoomMsg::Read(ReadFn(Box::new(run)))).await?;
         rx.await.map_err(|_| RoomError::Unavailable)
     }
 
@@ -249,6 +309,10 @@ impl<S: LogStore> Actor<S> {
                     drop(reply.send(sub));
                     ok
                 }
+                RoomMsg::Read(ReadFn(run)) => {
+                    run(&self.state);
+                    Ok(())
+                }
                 RoomMsg::Subscribers { reply } => {
                     let _ = reply.send(self.subs.len());
                     Ok(())
@@ -278,15 +342,19 @@ impl<S: LogStore> Actor<S> {
     }
 
     /// Apply, append once, mark durable, publish, then reply. `Err` means the room must stop.
-    async fn batch(&mut self, cmds: Vec<Command>) -> Result<Vec<Outcome>, Stopped> {
-        let ctx = Ctx { now: now(), limits: &self.limits };
+    async fn batch(&mut self, cmds: Vec<Noted>) -> Result<Vec<Outcome>, Stopped> {
+        let ctx = Ctx { now: now(), limits: &self.limits, powf: f64::powf };
         let mut events = Vec::new();
+        let mut notes = Vec::new();
         let mut outcomes = Vec::with_capacity(cmds.len());
         let mut wait = Seq(0);
-        for cmd in cmds {
+        for (cmd, extra) in cmds {
             match apply(&mut self.state, &ctx, cmd) {
                 Ok(a) => {
                     wait = wait.max(a.depends_on.unwrap_or_default());
+                    if let (Some(extra), Some(last)) = (extra, a.events.last()) {
+                        notes.push(Note { seq: last.seq, reply: a.reply.clone(), extra });
+                    }
                     events.extend(a.events);
                     outcomes.push(Ok(a.reply));
                 }
@@ -313,7 +381,10 @@ impl<S: LogStore> Actor<S> {
             return Err(Stopped::Failed);
         }
         if !events.is_empty() {
-            self.publish(&Arc::new(Published::Events(events.into())));
+            self.publish(&Arc::new(Published::Events {
+                events: events.into(),
+                notes: notes.into(),
+            }));
         }
         Ok(outcomes)
     }

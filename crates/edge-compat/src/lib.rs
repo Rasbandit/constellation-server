@@ -7,8 +7,10 @@
 //! state machine; [`serve`] runs a session over a `yawc` WebSocket.
 
 mod limit;
+mod presence;
 mod session;
 mod socket;
+mod storage;
 pub mod wire;
 
 use config::Limits;
@@ -51,6 +53,10 @@ pub struct CompatRoom {
     datapackage: RateTable<IpAddr>,
     /// `Connect` packets, per client address.
     connects: RateTable<IpAddr>,
+    /// `Set` packets, per slot (their own bucket, so shared-value writes never use up chat).
+    kv_sets: RateTable<u32>,
+    /// Who is connected to each slot, and the client statuses they set.
+    presence: presence::Presence,
 }
 
 impl std::fmt::Debug for CompatRoom {
@@ -111,6 +117,8 @@ impl CompatRoom {
                 keys,
             ),
             connects: RateTable::new(l.connect_burst, l.connect_refill_milli_per_sec, keys),
+            kv_sets: RateTable::new(l.kv_set_burst, l.kv_set_refill_milli_per_sec, keys),
+            presence: presence::Presence::default(),
         })
     }
 
