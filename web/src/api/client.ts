@@ -84,6 +84,9 @@ export async function generateWorld(
   req: CreateRoomRequest,
   wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<GeneratedWorld> {
+  if (req.rules.password) {
+    throw new Error('A room password cannot be set from this page yet; the server sets it (CONSTELLATION_ROOM_PASSWORD)');
+  }
   if (req.players.length === 0 || req.players.some((p) => !p.yamlId)) {
     throw new Error('Every player needs an uploaded YAML to generate on the server');
   }

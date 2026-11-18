@@ -5,7 +5,7 @@ import type { LinkState } from '../lib/live';
 import { Empty, FlagTag, HintTag, Progress, StatusPill } from './ui';
 
 export function LinkBadge({ link }: { link: LinkState }) {
-  const text = { connecting: 'Connecting', live: 'Live', retrying: 'Reconnecting' }[link];
+  const text = { connecting: 'Connecting', live: 'Live', retrying: 'Reconnecting', closed: 'Disconnected: reload the page' }[link];
   return <span className={`link link-${link}`}>{text}</span>;
 }
 

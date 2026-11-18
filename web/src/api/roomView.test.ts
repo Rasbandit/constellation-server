@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { toFeed, toRoom, type RoomEvent, type RoomView } from './roomView';
+import { applyEvent, toFeed, toRoom, type RoomEvent, type RoomView } from './roomView';
 
 const W = 'c'.repeat(64);
 
@@ -79,5 +79,34 @@ describe('toFeed', () => {
   it('shows nothing for a check alone (its item event says it) or an unknown kind', () => {
     expect(toFeed({ kind: 'checked', seq: 6, slot: 1, location: 1 }, 1)).toBeNull();
     expect(toFeed({ kind: 'later' } as unknown as RoomEvent, 1)).toBeNull();
+  });
+});
+
+describe('applyEvent', () => {
+  const join: RoomEvent = { kind: 'join', slot: 1, name: 'Alice' };
+  const leave: RoomEvent = { kind: 'leave', slot: 1, name: 'Alice' };
+
+  it('appends each shown event numbered in stream order and skips the rest', () => {
+    let feed = applyEvent([], join);
+    feed = applyEvent(feed, { kind: 'checked', seq: 1, slot: 1, location: 1 });
+    feed = applyEvent(feed, leave);
+    expect(feed.map((f) => [f.seq, f.text])).toEqual([
+      [1, 'Alice connected'],
+      [2, 'Alice disconnected'],
+    ]);
+  });
+
+  it('drops everything shown on a reset (the room restarted), then starts again', () => {
+    const before = applyEvent(applyEvent([], join), leave);
+    const after = applyEvent(before, { kind: 'reset' });
+    expect(after).toEqual([]);
+    expect(applyEvent(after, join).map((f) => f.seq)).toEqual([1]);
+  });
+
+  it('keeps the newest 400 lines', () => {
+    let feed: ReturnType<typeof applyEvent> = [];
+    for (let i = 0; i < 405; i++) feed = applyEvent(feed, join);
+    expect(feed.length).toBe(400);
+    expect(feed[399].seq).toBe(405);
   });
 });

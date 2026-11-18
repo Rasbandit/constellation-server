@@ -42,7 +42,12 @@ export type RoomEvent =
       flags: number;
     }
   | { kind: 'goal'; seq: number; slot: number; name: string | null }
-  | { kind: 'join' | 'leave' | 'chat'; slot: number; name: string | null; text?: string | null };
+  | { kind: 'join' | 'leave' | 'chat'; slot: number; name: string | null; text?: string | null }
+  /** The room restarted (or the viewer fell too far behind): drop what was shown. */
+  | { kind: 'reset' };
+
+/** Feed lines a page keeps. */
+export const FEED_LINES = 400;
 
 /** Archipelago item flags: bit 0 progression, bit 1 useful, bit 2 trap. */
 function flagOf(flags: number): ItemFlag {
@@ -119,4 +124,11 @@ export function toFeed(e: RoomEvent, n: number): FeedItem | null {
     default:
       return null;
   }
+}
+
+/** The feed after one stream event: a reset empties it, a shown event is appended. */
+export function applyEvent(feed: FeedItem[], e: RoomEvent): FeedItem[] {
+  if (e.kind === 'reset') return [];
+  const item = toFeed(e, (feed.at(-1)?.seq ?? 0) + 1);
+  return item ? [...feed, item].slice(-FEED_LINES) : feed;
 }

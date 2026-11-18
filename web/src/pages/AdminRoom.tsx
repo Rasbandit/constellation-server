@@ -142,8 +142,8 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
 
       {params.get('created') && (
         <div className="callout ok">
-          <strong>Your room is set up.</strong> Send players the room code or link; it shows them the server address and their slot
-          name.
+          <strong>Your room is set up.</strong> Send players the {r.code ? 'room code or link' : 'player link'}; it shows them the server
+          address and their slot name.
           <div className="share-line">
             {r.code ? (
               <>

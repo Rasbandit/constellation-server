@@ -51,6 +51,13 @@ describe('generateWorld', () => {
     await expect(generateWorld(req([player('a', Y)]), noWait)).rejects.toThrow(/--rooms/);
   });
 
+  it('refuses a room password it cannot pass to the server, before calling it', async () => {
+    const calls = server([]);
+    const r = { ...req([player('a', Y)]), rules: { password: 'hunter2' } as CreateRoomRequest['rules'] };
+    await expect(generateWorld(r, noWait)).rejects.toThrow(/password/);
+    expect(calls).toEqual([]);
+  });
+
   it('refuses players without an uploaded yaml before calling the server', async () => {
     const calls = server([]);
     await expect(generateWorld(req([player('a', Y), player('d')]), noWait)).rejects.toThrow(/YAML/);

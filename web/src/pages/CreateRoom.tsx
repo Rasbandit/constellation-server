@@ -38,7 +38,8 @@ export function CreateRoom() {
   }, []);
 
   const readiness = useMemo(
-    () => checkReadiness({ roomName: name, apworlds: worlds, players, builtinGames: builtin }),
+    // A live room is named by its key; the name field is not shown then.
+    () => checkReadiness({ roomName: liveRooms ? 'live' : name, apworlds: worlds, players, builtinGames: builtin }),
     [name, worlds, players, builtin],
   );
   const neededGames = useMemo(() => [...new Set(players.flatMap((p) => gamesOf(p.game)))].sort(), [players]);
@@ -117,15 +118,25 @@ export function CreateRoom() {
       <div className="create-grid">
         <div className="create-main">
           <Card title={<StepTitle n={1} text="Room" />}>
-            <label className="field">
-              <span>Room name</span>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Friday Night Multiworld" maxLength={60} />
-            </label>
-            <button type="button" className="disclosure" aria-expanded={showRules} onClick={() => setShowRules((s) => !s)}>
-              {showRules ? '▾' : '▸'} Rules: hint cost {rules.hintCostPct}%, release {rules.releaseMode}, collect {rules.collectMode}
-              {rules.password ? ', password set' : ''}
-            </button>
-            {showRules && <RulesForm rules={rules} onChange={setRules} />}
+            {liveRooms ? (
+              // The server cannot take a name, password or rules from this page yet, so none are asked for.
+              <p className="muted">
+                Not available yet: room name, password and rules. The room gets a key as its name; hint cost, release and collect
+                come from the generated world, and a password from the server (CONSTELLATION_ROOM_PASSWORD).
+              </p>
+            ) : (
+              <>
+                <label className="field">
+                  <span>Room name</span>
+                  <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Friday Night Multiworld" maxLength={60} />
+                </label>
+                <button type="button" className="disclosure" aria-expanded={showRules} onClick={() => setShowRules((s) => !s)}>
+                  {showRules ? '▾' : '▸'} Rules: hint cost {rules.hintCostPct}%, release {rules.releaseMode}, collect {rules.collectMode}
+                  {rules.password ? ', password set' : ''}
+                </button>
+                {showRules && <RulesForm rules={rules} onChange={setRules} />}
+              </>
+            )}
           </Card>
 
           <Card

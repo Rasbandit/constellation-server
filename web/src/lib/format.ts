@@ -57,12 +57,12 @@ export function pct(done: number, total: number): number {
 }
 
 /** The text a player pastes into most clients' connect box. */
+export function address(host: string, port: number): string {
+  return `${host}:${port}`;
+}
+
 /** `{key}.{host}:{port}` from the server, split into what `address` joins. */
 export function hostPort(address: string): { host: string; port: number } {
   const at = address.lastIndexOf(':');
   return { host: address.slice(0, at), port: Number(address.slice(at + 1)) };
-}
-
-export function address(host: string, port: number): string {
-  return `${host}:${port}`;
 }
