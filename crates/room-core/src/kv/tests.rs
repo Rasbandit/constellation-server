@@ -150,6 +150,7 @@ fn ordering_and_bit_operations_match_the_reference_on_their_table() {
         (json!(-8), RightShift, json!(1), ok(json!(-4))),
         (json!(-1), RightShift, json!(100), ok(json!(-1))),
         (json!(5), RightShift, json!(100), ok(json!(0))),
+        (json!(0), RightShift, json!(100), ok(json!(0))),
         (json!(1), LeftShift, json!(63), Err(Overflow(LeftShift))),
         (json!(1), LeftShift, json!(64), Err(Overflow(LeftShift))),
         (json!(5), LeftShift, json!(0), ok(json!(5))),
