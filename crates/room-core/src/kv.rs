@@ -175,8 +175,6 @@ fn cmp_num(a: Num, b: Num) -> Option<Ordering> {
 /// Python's `==` on JSON values: `1 == 1.0 == true`, lists and objects compared deeply.
 pub(crate) fn py_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Null, Value::Null) => true,
-        (Value::String(x), Value::String(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
         }
@@ -185,7 +183,7 @@ pub(crate) fn py_eq(a: &Value, b: &Value) -> bool {
         }
         _ => match (num(a, KvOp::Max), num(b, KvOp::Max)) {
             (Ok(Some(x)), Ok(Some(y))) => cmp_num(x, y) == Some(Ordering::Equal),
-            // Integers above i64::MAX only equal themselves.
+            // Null, strings, mixed types, and integers above i64::MAX: plain equality.
             _ => a == b,
         },
     }
@@ -323,11 +321,11 @@ fn pow(cur: &Value, operand: &Value, powf: fn(f64, f64) -> f64) -> Result<Value,
     }
     // Python turns an integer to a negative power, and any float power, into float math.
     let (x, y) = (float(base), float(exp));
-    if y == 0.0 {
-        return from_float(1.0, op);
-    }
     if x == 0.0 && y < 0.0 {
         return Err(KvRefusal::ZeroDivision(op));
+    }
+    if y == 0.0 {
+        return from_float(1.0, op);
     }
     if x < 0.0 && floor(y) != y {
         // A complex number in Python, which JSON cannot hold.
@@ -344,7 +342,7 @@ fn modulo(cur: &Value, v: &Value) -> Result<Value, KvRefusal> {
             // `checked_rem` fails only for i64::MIN % -1, which is 0.
             let r = a.checked_rem(b).unwrap_or(0);
             // Python's result takes the divisor's sign; |r| < |b|, so the sum cannot overflow.
-            Ok(Value::from(if r != 0 && (r < 0) != (b < 0) { r.wrapping_add(b) } else { r }))
+            Ok(Value::from(if r != 0 && r.signum() != b.signum() { r.wrapping_add(b) } else { r }))
         }
         (Some(a), Some(b)) => {
             let (a, b) = (float(a), float(b));
@@ -354,7 +352,7 @@ fn modulo(cur: &Value, v: &Value) -> Result<Value, KvRefusal> {
             let m = a % b;
             let m = if m == 0.0 {
                 0.0_f64.copysign(b)
-            } else if (b < 0.0) != (m < 0.0) {
+            } else if b.is_sign_negative() != m.is_sign_negative() {
                 m + b
             } else {
                 m

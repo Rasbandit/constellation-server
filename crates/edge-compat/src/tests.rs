@@ -1518,3 +1518,58 @@ async fn network_items_players_and_slots_carry_their_class() {
     let ps = send(&mut a, &json!([{"cmd": "LocationScouts", "locations": [100]}])).await;
     assert_eq!(ps[0]["locations"][0]["class"], "NetworkItem");
 }
+
+/// Every operation name of the protocol document ("`DataStorageOperation`") reaches its own
+/// operation; results are hand calculations.
+#[tokio::test]
+async fn every_operation_name_maps_to_its_operation() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    let cases = [
+        ("replace", json!(1), json!(9), json!(9)),
+        ("default", json!(1), json!(9), json!(1)),
+        ("add", json!(1), json!(2), json!(3)),
+        ("mul", json!(3), json!(2), json!(6)),
+        ("pow", json!(2), json!(3), json!(8)),
+        ("mod", json!(7), json!(4), json!(3)),
+        ("floor", json!(2.5), json!(0), json!(2)),
+        ("ceil", json!(2.5), json!(0), json!(3)),
+        ("max", json!(1), json!(5), json!(5)),
+        ("min", json!(5), json!(1), json!(1)),
+        ("and", json!(12), json!(10), json!(8)),
+        ("or", json!(12), json!(10), json!(14)),
+        ("xor", json!(12), json!(10), json!(6)),
+        ("left_shift", json!(1), json!(2), json!(4)),
+        ("right_shift", json!(8), json!(1), json!(4)),
+        ("remove", json!([1, 2]), json!(1), json!([2])),
+        ("pop", json!([1, 2]), json!(0), json!([2])),
+        ("update", json!([1]), json!([2]), json!([1, 2])),
+    ];
+    for (name, default, value, want) in cases {
+        let p = json!([{"cmd": "Set", "key": name, "default": default, "want_reply": true,
+                        "operations": [{"operation": name, "value": value}]}]);
+        let ps = send(&mut a, &p).await;
+        assert_eq!(ps[0]["value"], want, "{name}: {ps:?}");
+    }
+}
+
+/// `want_reply` is read with Python truthiness: empty strings, lists and objects are false.
+#[tokio::test]
+async fn want_reply_is_read_with_python_truthiness() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    for (flag, replies) in [
+        (json!(""), 0),
+        (json!("x"), 1),
+        (json!([]), 0),
+        (json!([0]), 1),
+        (json!({}), 0),
+        (json!({"a": 0}), 1),
+        (json!(0.0), 0),
+        (json!(0.5), 1),
+    ] {
+        let mut p = set("k", &json!([{"operation": "replace", "value": 1}]));
+        p[0]["want_reply"] = flag.clone();
+        assert_eq!(set_reply_of(&send(&mut a, &p).await).len(), replies, "{flag}");
+    }
+}

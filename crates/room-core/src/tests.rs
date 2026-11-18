@@ -875,6 +875,7 @@ mod key_value {
             (replace("abcde", json!(1)), KvRefusal::KeyTooLong),
             (set(1, "k", None, vec![(KvOp::Add, json!(1)); 3]), KvRefusal::TooManyOps),
             (replace("k", json!([[[1]]])), KvRefusal::TooDeep),
+            (replace("k", json!({"a": {"b": {"c": 1}}})), KvRefusal::TooDeep),
             (set(1, "k", Some(json!([[[1]]])), vec![]), KvRefusal::TooDeep),
             (replace("k", json!("123456789")), KvRefusal::ValueTooLarge),
             // 12 stored + "k" and "12345" (7 bytes) + ... = 20 fits; one more byte does not.

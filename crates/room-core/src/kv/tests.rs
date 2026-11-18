@@ -61,17 +61,28 @@ fn arithmetic_matches_the_reference_on_its_table() {
         (json!("a"), Mul, json!(true), ok(json!("a"))),
         (json!("a"), Mul, json!(2.0), Err(Type(Mul))),
         (json!("a"), Mul, json!("b"), Err(Type(Mul))),
-        (json!([1]), Mul, json!(1_000_000_000), Err(KvRefusal::ValueTooLarge)),
+        // Small enough to build at once if the check before building were gone.
+        (json!([1]), Mul, json!(100_000), Err(KvRefusal::ValueTooLarge)),
+        (json!("x"), Mul, json!(100_000), Err(KvRefusal::ValueTooLarge)),
         // pow: an int to a negative int is a float; 0 to a negative power divides by zero
         (json!(2), Pow, json!(10), ok(json!(1024))),
         (json!(2), Pow, json!(62), ok(json!(4_611_686_018_427_387_904_i64))),
         (json!(2), Pow, json!(63), Err(Overflow(Pow))),
         (json!(2), Pow, json!(-1), ok(json!(0.5))),
         (json!(-1), Pow, json!(4_294_967_297_i64), ok(json!(-1))),
+        // Found by the nightly property run (PROPTEST_CASES=50000): an even exponent above
+        // u32::MAX; the oracle, not the code, had it wrong. Kept as a regression vector.
+        (json!(-1), Pow, json!(49_673_055_972_i64), ok(json!(1))),
+        (json!(0), Pow, json!(49_673_055_972_i64), ok(json!(0))),
+        (json!(2), Pow, json!(49_673_055_972_i64), Err(Overflow(Pow))),
         (json!(1), Pow, json!(i64::MAX), ok(json!(1))),
         (json!(0), Pow, json!(-1), Err(ZeroDivision(Pow))),
         (json!(0.0), Pow, json!(-2.5), Err(ZeroDivision(Pow))),
         (json!(4.0), Pow, json!(0.5), ok(json!(2.0))),
+        (json!(0.0), Pow, json!(0.5), ok(json!(0.0))),
+        (json!(0.0), Pow, json!(0), ok(json!(1.0))),
+        (json!(0), Pow, json!(0.0), ok(json!(1.0))),
+        (json!(0), Pow, json!(0), ok(json!(1))),
         (json!(5.5), Pow, json!(0), ok(json!(1.0))),
         (json!(-8), Pow, json!(0.5), Err(Type(Pow))),
         (json!(-8.0), Pow, json!(3), ok(json!(-512.0))),
@@ -140,6 +151,12 @@ fn ordering_and_bit_operations_match_the_reference_on_their_table() {
         (json!(-1), RightShift, json!(100), ok(json!(-1))),
         (json!(5), RightShift, json!(100), ok(json!(0))),
         (json!(1), LeftShift, json!(63), Err(Overflow(LeftShift))),
+        (json!(1), LeftShift, json!(64), Err(Overflow(LeftShift))),
+        (json!(5), LeftShift, json!(0), ok(json!(5))),
+        (json!(5), RightShift, json!(0), ok(json!(5))),
+        (json!(5), RightShift, json!(64), ok(json!(0))),
+        (json!(-8), RightShift, json!(64), ok(json!(-1))),
+        (json!(-8), RightShift, json!(63), ok(json!(-1))),
         (json!(-1), LeftShift, json!(63), ok(json!(i64::MIN))),
         (json!(0), LeftShift, json!(1000), ok(json!(0))),
         (json!(1), LeftShift, json!(-1), Err(Range(LeftShift))),
@@ -157,6 +174,17 @@ fn list_and_object_operations_match_the_reference_on_their_table() {
         (json!([1.0, 2]), Remove, json!(true), ok(json!([2]))),
         (json!([[1], [1.0]]), Remove, json!([1.0]), ok(json!([[1.0]]))),
         (json!([1]), Remove, json!(5), ok(json!([1]))),
+        // Lists and objects are equal only with equal lengths and equal members.
+        (json!([[1, 2], [1]]), Remove, json!([1]), ok(json!([[1, 2]]))),
+        (
+            json!([{"a": 1, "b": 2}, {"a": 1.0}]),
+            Remove,
+            json!({"a": 1}),
+            ok(json!([{"a": 1, "b": 2}])),
+        ),
+        (json!([{"a": 1}]), Remove, json!({"b": 1}), ok(json!([{"a": 1}]))),
+        (json!([null, "s"]), Remove, json!("s"), ok(json!([null]))),
+        (json!([null, "s"]), Remove, json!(null), ok(json!(["s"]))),
         (json!("abc"), Remove, json!("a"), Err(Type(Remove))),
         (json!({"a": 1}), Remove, json!("a"), Err(Type(Remove))),
         // pop: list index (negative from the end, past the end a no-op) or object key
@@ -208,6 +236,9 @@ fn ints_compare_exactly_with_floats_beyond_two_to_the_53() {
     );
     assert_eq!(run(&json!(i64::MAX), Max, &json!(9.3e18)), Ok(json!(9.3e18)));
     assert_eq!(run(&json!(i64::MIN), Min, &json!(-9.3e18)), Ok(json!(-9.3e18)));
+    // -2^63 is exactly i64::MIN: a tie, so the current value stays either way.
+    assert_eq!(run(&json!(i64::MIN), Min, &json!(-(2.0_f64.powi(63)))), Ok(json!(i64::MIN)));
+    assert_eq!(run(&json!(i64::MIN), Max, &json!(-(2.0_f64.powi(63)))), Ok(json!(i64::MIN)));
     assert_eq!(run(&json!(3), Max, &json!(3.5)), Ok(json!(3.5)));
     assert_eq!(run(&json!(-3), Min, &json!(-3.5)), Ok(json!(-3.5)));
     assert_eq!(run(&json!([1]), Remove, &json!(1.5)), Ok(json!([1])));
@@ -226,6 +257,7 @@ fn ints_compare_exactly_with_floats_beyond_two_to_the_53() {
     clippy::manual_range_contains,
     clippy::unreachable,
     clippy::type_complexity,
+    clippy::option_if_let_else,
     reason = "a test oracle: Python's math restated plainly on small generated ranges"
 )]
 mod oracle {
@@ -313,9 +345,15 @@ mod oracle {
                     Err(KvRefusal::Overflow(op))
                 }
             }
-            (Pow, N::I(p), N::I(q)) if q >= 0 => p
-                .checked_pow(u32::try_from(q).unwrap_or(u32::MAX))
-                .map_or(Err(KvRefusal::Overflow(op)), |r| int_out(r, op)),
+            (Pow, N::I(p), N::I(q)) if q >= 0 => match u32::try_from(q) {
+                Ok(e) => p.checked_pow(e).map_or(Err(KvRefusal::Overflow(op)), |r| int_out(r, op)),
+                // A huge exponent: only 0, 1 and -1 stay finite (-1 by the exponent's parity).
+                Err(_) => match p {
+                    0 | 1 => int_out(p, op),
+                    -1 => int_out(if q % 2 == 0 { 1 } else { -1 }, op),
+                    _ => Err(KvRefusal::Overflow(op)),
+                },
+            },
             (Pow, ..) if f(y) == 0.0 => Ok(json!(1.0)),
             (Pow, ..) if f(x) == 0.0 && f(y) < 0.0 => Err(KvRefusal::ZeroDivision(op)),
             (Pow, ..) if f(x) < 0.0 && f(y).fract() != 0.0 => Err(KvRefusal::Type(op)),
@@ -450,4 +488,16 @@ mod properties {
             prop_assert_eq!(evaluate(start, &ops, CAP, f64::powf), want);
         }
     }
+}
+
+#[test]
+fn a_repetition_is_measured_before_it_is_built() {
+    // A string counts its bytes; a list counts its JSON size per copy (`[1]` is 3 bytes).
+    let rep = |v: Value, n: i64, max: usize| evaluate(v, &[(Mul, json!(n))], max, f64::powf);
+    assert_eq!(rep(json!("ab"), 3, 6), Ok(json!("ababab")));
+    assert_eq!(rep(json!("ab"), 4, 6), Err(KvRefusal::ValueTooLarge));
+    assert_eq!(rep(json!([1]), 3, 9), Ok(json!([1, 1, 1])));
+    assert_eq!(rep(json!([1]), 4, 9), Err(KvRefusal::ValueTooLarge));
+    // A count whose byte total overflows is refused, whatever the cap.
+    assert_eq!(rep(json!("abc"), i64::MAX, usize::MAX), Err(KvRefusal::ValueTooLarge));
 }
