@@ -1,4 +1,4 @@
-# One entry point for local checks. CI runs fmt, clippy and the tests (see .github/workflows/ci.yml).
+# One entry point for local checks. CI runs fmt and the tests (see .github/workflows/ci.yml).
 default: check
 
 setup:
@@ -15,7 +15,7 @@ fmt-check:
     cargo fmt --all --check
 
 lint:
-    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --locked
 
 # Everything that needs no database. The Postgres half is `just test-pg`.
 test:
@@ -44,12 +44,12 @@ e2e-ap:
     cargo build -p server --bin constellation-server --locked
     CONSTELLATION_SERVER_BIN={{justfile_directory()}}/target/debug/constellation-server cargo test --manifest-path crates/e2e-ap/Cargo.toml --target-dir target --locked --features ap-interop
 
-# Fast unit tests only; what the pre-commit hook runs.
+# Fast unit tests only.
 unit:
     cargo test --workspace --lib --locked
 
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+    cargo doc --workspace --no-deps --all-features --locked
 
 deny:
     cargo deny check

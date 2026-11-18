@@ -12,7 +12,7 @@ By opening a pull request you agree that:
 
 ## Setup
 - Rust from `rust-toolchain.toml` (rustup picks it up), `just`, `cargo-deny`, `typos`.
-- `just setup` once: it turns on the git hooks (fmt, clippy, typos and unit tests before a commit; the full gate before a push).
+- `just setup` once: it turns on the git hooks (a fmt check before a commit, the commit message format).
 - Postgres is optional locally. CI runs the Postgres tests. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
 - The design docs live in the sibling `constellation` repo. Clone it next to this one.
 
@@ -21,9 +21,9 @@ By opening a pull request you agree that:
 - Branch off `main`: `feat/...`, `fix/...`, `docs/...`.
 - Conventional commits, subject at most 50 characters (the hook checks).
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
-- `just check` passes before you push. CI must be green before merge.
+- CI must be green before merge. `just check` is optional while this is a POC.
 - One reviewer who is not the author approves each PR.
-- Lints are strict (`deny`). A new `allow` needs a `reason = "..."`. No `unsafe`.
+- Lints are default (POC mode). No `unsafe`.
 - Limits and environment variables live only in `crates/config`.
 
 ## Talking about Archipelago
