@@ -1,0 +1,30 @@
+{
+ "connect_names": {"P1": [0, 1], "P2": [0, 2], "P3": [0, 3]},
+ "format": 1,
+ "games": {
+  "A": {"checksum": "x", "item_name_groups": {}, "item_name_to_id": {"a1": 1, "a2": 2},
+        "location_name_groups": {}, "location_name_to_id": {"l11": 11, "l12": 12}},
+  "B": {"checksum": "y", "item_name_groups": {},
+        "item_name_to_id": {"b0": 200, "b1": 201, "b2": 202, "b3": 203},
+        "location_name_groups": {}, "location_name_to_id": {"l21": 21}}
+ },
+ "generator_version": {"build": 8, "major": 0, "minor": 6},
+ "race_mode": 0,
+ "seed_name": "cross",
+ "server_options": {"collect_mode": "auto", "hint_cost": 10, "location_check_points": 1,
+                    "password": null, "release_mode": "auto", "remaining_mode": "goal"},
+ "slots": [
+  {"game": "A", "group_members": [], "id": 1, "kind": "player",
+   "locations": [{"flags": 1, "item": 202, "location": 11, "receiver": 2},
+                 {"flags": 0, "item": 1, "location": 12, "receiver": 1}],
+   "minimum_client_version": {"build": 6, "major": 0, "minor": 1}, "name": "P1",
+   "slot_data": {}, "start_inventory": [], "team": 0},
+  {"game": "B", "group_members": [], "id": 2, "kind": "player",
+   "locations": [{"flags": 4, "item": 2, "location": 21, "receiver": 1}],
+   "minimum_client_version": {"build": 6, "major": 0, "minor": 1}, "name": "P2",
+   "slot_data": {}, "start_inventory": [], "team": 0},
+  {"game": "A", "group_members": [], "id": 3, "kind": "player", "locations": [],
+   "minimum_client_version": {"build": 6, "major": 0, "minor": 1}, "name": "P3",
+   "slot_data": {}, "start_inventory": [], "team": 0}
+ ]
+}

@@ -77,6 +77,12 @@ const fn byte_kind(b: u8) -> Option<SlotKind> {
     })
 }
 
+/// Bits per start inventory entry: the item width, but at least 1, so every entry costs file
+/// bytes and a hostile count is bounded by the file's length.
+const fn start_width(w_item: u8) -> u8 {
+    if w_item == 0 { 1 } else { w_item }
+}
+
 fn u32_of(n: usize) -> Result<u32, BundleError> {
     u32::try_from(n).map_err(|_| bad("too large for a v2 seed file"))
 }
@@ -149,9 +155,13 @@ struct Indexed {
 /// Slots are written in id order and locations in id order, the order `tools/ap-import`
 /// writes; any other order in `b` is normalized.
 ///
+/// The seed is sized before anything is allocated for it and refused when over `max_bytes`
+/// (the config's `bundle_max_bytes`): a bundle is untrusted (generation runs uploaded code),
+/// and a small one can name a huge game.
+///
 /// # Errors
-/// When the bundle is too large for the format's fields.
-pub fn encode(b: &SeedBundle, hash: &[u8; 32]) -> Result<Encoded, BundleError> {
+/// When the bundle is too large for the format's fields or for `max_bytes`.
+pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded, BundleError> {
     let games: Vec<(&String, &GameData)> = b.games.iter().collect();
     let packages: Vec<Vec<u8>> =
         games.iter().map(|(name, g)| GamePackage::content(name, g)).collect();
@@ -194,23 +204,50 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32]) -> Result<Encoded, BundleError> {
         return Err(bad("a placement field is too wide for a v2 seed file"));
     }
     let w_record = usize::from(w_item + w_recv + w_flags);
+    let w_start = start_width(w_item);
 
-    let mut strings = Strings::default();
     let connect: Vec<(&String, &(u32, u32))> = b.connect_names.iter().collect();
     let data_start =
         HEADER + ROOM + GAME * games.len() + SLOT * slots.len() + CONNECT * connect.len();
-    let mut data = Vec::new();
+    let raws: Vec<Vec<u8>> = slots.iter().map(|s| s.slot_data.to_string().into_bytes()).collect();
+    // An upper bound of the whole file (slot_data before compression, strings before
+    // interning), from the counts alone.
+    let words = |x: &Indexed| {
+        if x.placed.is_empty() {
+            0
+        } else {
+            tables.get(x.game).map_or(0, |t| t.locations().len().div_ceil(64))
+        }
+    };
+    let strings_max = slots.iter().map(|s| s.name.len()).sum::<usize>()
+        + connect.iter().map(|(n, _)| n.len()).sum::<usize>()
+        + b.seed_name.len()
+        + b.server_options.password.as_ref().map_or(0, String::len);
+    let need =
+        slots.iter().zip(&indexed).zip(&raws).fold(data_start + strings_max, |n, ((s, x), raw)| {
+            n.saturating_add(words(x) * 8)
+                .saturating_add(bits::bytes_for(x.placed.len(), w_record))
+                .saturating_add(raw.len())
+                .saturating_add(s.group_members.len() * 4)
+                .saturating_add(bits::bytes_for(x.start.len(), usize::from(w_start)))
+        });
+    if u64::try_from(need).unwrap_or(u64::MAX) > max_bytes {
+        return Err(bad(format!("the seed would take {need} bytes, over the {max_bytes} cap")));
+    }
+
+    let mut strings = Strings::default();
+    let mut data = Vec::with_capacity(need - data_start);
     let at = |data: &Vec<u8>| u32_of(data_start + data.len());
     let mut slot_table = Vec::with_capacity(SLOT * slots.len());
-    for (s, x) in slots.iter().zip(&indexed) {
-        let locations = tables.get(x.game).map_or(0, |t| t.locations().len());
-        let mut presence = vec![0_u64; locations.div_ceil(64)];
+    for ((s, x), raw) in slots.iter().zip(&indexed).zip(raws) {
+        // A slot that places nothing stores no presence words.
+        let mut presence = vec![0_u64; words(x)];
         for p in &x.placed {
             if let Some(w) = presence.get_mut(p.0 / 64) {
                 *w |= 1 << (p.0 % 64);
             }
         }
-        let presence_at = at(&data)?;
+        let presence_at = if presence.is_empty() { 0 } else { at(&data)? };
         for w in presence {
             data.extend_from_slice(&w.to_le_bytes());
         }
@@ -224,7 +261,6 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32]) -> Result<Encoded, BundleError> {
         let records = packer.finish();
         debug_assert_eq!(records.len(), bits::bytes_for(x.placed.len(), w_record));
         data.extend_from_slice(&records);
-        let raw = s.slot_data.to_string().into_bytes();
         let packed = package::deflate(&raw).map_err(|e| bad(e.to_string()))?;
         let (blob, raw_len) =
             if packed.len() < raw.len() { (packed, u32_of(raw.len())?) } else { (raw, 0) };
@@ -237,7 +273,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32]) -> Result<Encoded, BundleError> {
         let start_at = at(&data)?;
         let mut packer = Packer::default();
         for &i in &x.start {
-            packer.push(i as u64, w_item);
+            packer.push(i as u64, w_start);
         }
         data.extend_from_slice(&packer.finish());
 
@@ -403,6 +439,12 @@ pub struct Seed {
     games: Box<[Arc<GamePackage>]>,
     /// Slot ids by position (for [`World::slots`]).
     ids: Box<[SlotNo]>,
+    /// Placed locations before each slot position (`n + 1` entries): room-wide ordinals.
+    bases: Box<[u32]>,
+    /// Per slot, the set bits before each presence word, back to back; slot `pos` owns
+    /// `ranks[rank_at[pos]..rank_at[pos + 1]]`. Rank and select without a scan.
+    ranks: Box<[u32]>,
+    rank_at: Box<[u32]>,
 }
 
 impl std::fmt::Debug for Seed {
@@ -609,8 +651,16 @@ impl Seed {
         let n = usize::from(r.u16(10));
         let slots_at = HEADER + ROOM + GAME * games.len();
         let ids: Box<[SlotNo]> = (0..n).map(|p| SlotNo(r.u32(slots_at + SLOT * p))).collect();
-        let seed = Self { bytes: bytes.into_boxed_slice(), games: games.into(), ids };
+        let mut seed = Self {
+            bytes: bytes.into_boxed_slice(),
+            games: games.into(),
+            ids,
+            bases: Box::new([]),
+            ranks: Box::new([]),
+            rank_at: Box::new([]),
+        };
         seed.check(max_bytes)?;
+        seed.index()?;
         Ok(seed)
     }
 
@@ -626,7 +676,14 @@ impl Seed {
         if tables.is_none_or(|t| t > strings) || strings > len {
             return Err(bad("seed file sections overlap or run past its end"));
         }
-        let in_data = |at: usize, size: usize| at.checked_add(size).is_some_and(|e| e <= strings);
+        let data_from = tables.unwrap_or(usize::MAX);
+        // Every data area lies between the tables and the strings (an empty one anywhere).
+        let in_data = |at: usize, size: usize| {
+            size == 0 || (at >= data_from && at.checked_add(size).is_some_and(|e| e <= strings))
+        };
+        if r.u16(14) != 0 || r.u32(28) != 0 {
+            return Err(bad("reserved header fields are not 0"));
+        }
         let (w_item, w_recv, w_flags) = self.widths();
         if w_item > MAX_ITEM_BITS || w_recv > MAX_RECV_BITS || w_flags > MAX_FLAG_BITS {
             return Err(bad("a placement field is too wide"));
@@ -660,7 +717,8 @@ impl Seed {
             if byte_kind(r.u8(at + 18)).is_none_or(|k| k == SlotKind::Group) {
                 return Err(bad(format!("slot {id} has a bad or unsupported kind")));
             }
-            let words = g.locations().len().div_ceil(64);
+            let placed = s.placed();
+            let words = if placed == 0 { 0 } else { g.locations().len().div_ceil(64) };
             let presence = r.u32(at + 32) as usize;
             if !in_data(presence, words * 8) {
                 return Err(bad(format!("slot {id} presence out of range")));
@@ -671,7 +729,6 @@ impl Seed {
             if tail != 0 && words > 0 && r.u64(presence + 8 * (words - 1)) >> tail != 0 {
                 return Err(bad(format!("slot {id} names a location its game lacks")));
             }
-            let placed = s.placed();
             let w = usize::from(w_item + w_recv + w_flags);
             if set != placed || !in_data(r.u32(at + 40) as usize, bits::bytes_for(placed, w)) {
                 return Err(bad(format!("slot {id} placements out of range")));
@@ -698,7 +755,8 @@ impl Seed {
                 return Err(bad(format!("slot {id} group members out of range")));
             }
             let start = r.u32(at + 68) as usize;
-            if !in_data(r.u32(at + 64) as usize, bits::bytes_for(start, usize::from(w_item)))
+            let w_start = usize::from(start_width(w_item));
+            if !in_data(r.u32(at + 64) as usize, bits::bytes_for(start, w_start))
                 || s.start_indexes().any(|i| i >= g.items().len())
             {
                 return Err(bad(format!("slot {id} start inventory out of range")));
@@ -713,25 +771,43 @@ impl Seed {
         Ok(())
     }
 
-    /// The global ordinal of location `index` of slot `pos`: a dense number over every
-    /// placed location of the room (a compact handle for an item).
-    #[must_use]
-    pub fn ordinal(&self, pos: usize, index: usize) -> Option<u32> {
-        let before: usize = self.slots().take(pos).map(|s| s.placed()).sum();
-        (index < self.slot_at(pos)?.placed()).then(|| u32::try_from(before + index).ok())?
+    /// Build the prefix sums (`bases`) and rank tables of a checked seed.
+    fn index(&mut self) -> Result<(), BundleError> {
+        let (mut bases, mut ranks, mut rank_at) = (vec![0_u32], Vec::new(), vec![0_u32]);
+        for s in self.slots() {
+            let last = bases.last().copied().unwrap_or(0);
+            bases.push(
+                last.checked_add(u32_of(s.placed())?).ok_or_else(|| bad("too many placements"))?,
+            );
+            let p = s.presence();
+            let mut before = 0_u32;
+            for k in 0..p.len() / 8 {
+                ranks.push(before);
+                before += SlotView::word(p, k).count_ones();
+            }
+            rank_at.push(u32_of(ranks.len())?);
+        }
+        (self.bases, self.ranks, self.rank_at) = (bases.into(), ranks.into(), rank_at.into());
+        Ok(())
     }
 
-    /// The (slot position, location index) of an ordinal.
+    /// The global ordinal of location `index` of slot `pos`: a dense number over every
+    /// placed location of the room (a compact handle for an item). O(1).
+    #[must_use]
+    pub fn ordinal(&self, pos: usize, index: usize) -> Option<u32> {
+        let (base, end) = (*self.bases.get(pos)?, *self.bases.get(pos + 1)?);
+        let o = base.checked_add(u32::try_from(index).ok()?)?;
+        (o < end).then_some(o)
+    }
+
+    /// The (slot position, location index) of an ordinal: a binary search of the prefix sums.
     #[must_use]
     pub fn from_ordinal(&self, ordinal: u32) -> Option<(usize, usize)> {
-        let mut left = ordinal as usize;
-        for s in self.slots() {
-            if left < s.placed() {
-                return Some((s.pos, left));
-            }
-            left -= s.placed();
+        if ordinal >= *self.bases.last()? {
+            return None;
         }
-        None
+        let pos = self.bases.partition_point(|&b| b <= ordinal).checked_sub(1)?;
+        Some((pos, (ordinal - *self.bases.get(pos)?) as usize))
     }
 
     /// Back to the v1 bundle, with each game's full data from `games` (by package key).
@@ -787,7 +863,7 @@ impl Seed {
     /// # Errors
     /// When it does not encode.
     pub fn from_v1(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Self, BundleError> {
-        let Encoded { seed, packages } = encode(b, hash)?;
+        let Encoded { seed, packages } = encode(b, hash, max_bytes)?;
         let games = b
             .games
             .iter()
@@ -894,7 +970,7 @@ impl<'a> SlotView<'a> {
     fn start_indexes(&self) -> impl Iterator<Item = usize> + use<'a> {
         let (at, n) = (self.field(64) as usize, self.field(68) as usize);
         let bytes = self.seed.bytes.get(at..).unwrap_or_default();
-        let list = bits::PackedRef::from_bytes(bytes, self.seed.widths().0, n);
+        let list = bits::PackedRef::from_bytes(bytes, start_width(self.seed.widths().0), n);
         list.into_iter().flat_map(bits::PackedRef::iter).map(|v| v as usize)
     }
 
@@ -923,6 +999,9 @@ impl<'a> SlotView<'a> {
     }
 
     fn presence(&self) -> &'a [u8] {
+        if self.placed() == 0 {
+            return &[];
+        }
         let at = self.field(32) as usize;
         let words = self.package().locations().len().div_ceil(64);
         self.seed.bytes.get(at..at + 8 * words).unwrap_or_default()
@@ -952,7 +1031,7 @@ impl<'a> SlotView<'a> {
         if word >> (at % 64) & 1 == 0 {
             return None;
         }
-        let below: u32 = (0..at / 64).map(|k| Self::word(p, k).count_ones()).sum();
+        let below = self.ranks().get(at / 64).copied()?;
         let mask = (1_u64 << (at % 64)) - 1;
         Some((below + (word & mask).count_ones()) as usize)
     }
@@ -974,24 +1053,33 @@ impl<'a> SlotView<'a> {
     /// skipping whole words by their bit counts.
     #[must_use]
     pub fn location(&self, i: usize) -> Option<i64> {
-        let p = self.presence();
-        let mut left = i;
-        for k in 0..p.len() / 8 {
-            let mut w = Self::word(p, k);
-            let ones = w.count_ones() as usize;
-            if left < ones {
-                for _ in 0..left {
-                    w &= w - 1;
-                }
-                return self
-                    .package()
-                    .locations()
-                    .get(k * 64 + w.trailing_zeros() as usize)
-                    .copied();
-            }
-            left -= ones;
+        if i >= self.placed() {
+            return None;
         }
-        None
+        let ranks = self.ranks();
+        let i = u32::try_from(i).ok()?;
+        let k = ranks.partition_point(|&r| r <= i).checked_sub(1)?;
+        let mut w = Self::word(self.presence(), k);
+        for _ in 0..i - ranks.get(k)? {
+            w &= w.wrapping_sub(1);
+        }
+        self.package().locations().get(k * 64 + w.trailing_zeros() as usize).copied()
+    }
+
+    /// The set bits before each presence word of this slot.
+    fn ranks(&self) -> &'a [u32] {
+        let s = self.seed;
+        let (a, b) = (s.rank_at.get(self.pos), s.rank_at.get(self.pos + 1));
+        match (a, b) {
+            (Some(&a), Some(&b)) => s.ranks.get(a as usize..b as usize).unwrap_or_default(),
+            _ => &[],
+        }
+    }
+
+    /// The flags of placement `i`.
+    #[must_use]
+    pub fn flags(&self, i: usize) -> Option<u8> {
+        (i < self.placed()).then(|| self.record(i).2)
     }
 
     /// Placement `i` in protocol ids, given its location id.

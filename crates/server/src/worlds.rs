@@ -411,11 +411,12 @@ impl GenOut {
 
 /// Convert v1 bundle JSON to a v2 seed file at `path`, its packages in `packages/` beside it
 /// (each written once, atomically, before the seed that names them).
-pub(crate) fn write_v2(path: &Path, v1: &str) -> Result<(), String> {
+pub(crate) fn write_v2(path: &Path, v1: &str, limits: &Limits) -> Result<(), String> {
     let b = seed_bundle::SeedBundle::from_json(v1).map_err(|e| e.to_string())?;
     let hash: [u8; 32] =
         seed_bundle::bundle_hash(v1)?.try_into().map_err(|_| "bundle hash length".to_owned())?;
-    let e = seed_bundle::v2::encode(&b, &hash).map_err(|e| e.to_string())?;
+    let e =
+        seed_bundle::v2::encode(&b, &hash, limits.bundle_max_bytes).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or_else(|| Path::new(".")).join("packages");
     for c in &e.packages {
         seed_bundle::package::write(&dir, c).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -446,7 +447,7 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
             let (bundle, limits) = (world.join("bundle.seed"), w.limits);
             tokio::task::spawn_blocking(move || {
                 let out = GenOut::parse(&stdout)?;
-                write_v2(&bundle, out.bundle.get())?;
+                write_v2(&bundle, out.bundle.get(), &limits)?;
                 load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, out.report))
             })
             .await

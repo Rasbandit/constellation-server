@@ -43,7 +43,7 @@ fn hash_of(text: &str) -> [u8; 32] {
 
 fn encoded(text: &str) -> (SeedBundle, Encoded) {
     let b = SeedBundle::from_json(text).unwrap();
-    let e = encode(&b, &hash_of(text)).unwrap();
+    let e = encode(&b, &hash_of(text), 1 << 26).unwrap();
     (b, e)
 }
 
@@ -287,4 +287,128 @@ fn the_world_view_matches_the_placements() {
     assert_eq!(w.target(1, 2), None);
     let start: Vec<i64> = seed.slot(2).unwrap().start_inventory().collect();
     assert_eq!(start, [8, 8, 7]);
+}
+
+/// A one-game bundle: `locations` locations, ids 1..; `slots` slots, of which only slot 1
+/// places anything (its first `placed` locations, all item 1 to itself).
+fn wide(locations: usize, slots: u32, placed: usize) -> String {
+    let names: serde_json::Map<String, Value> =
+        (1..=locations).map(|n| (format!("L{n}"), json!(n))).collect();
+    let slot = |id: u32| {
+        let locations: Vec<Value> = (1..=if id == 1 { placed } else { 0 })
+            .map(|l| json!({"location": l, "item": 1, "receiver": 1, "flags": 0}))
+            .collect();
+        json!({"id": id, "team": 0, "name": format!("P{id}"), "game": "G", "kind": "player",
+               "minimum_client_version": {"major": 0, "minor": 1, "build": 6},
+               "group_members": [], "locations": locations, "slot_data": {},
+               "start_inventory": []})
+    };
+    json!({
+        "format": 1, "seed_name": "wide", "race_mode": 0,
+        "generator_version": {"major": 0, "minor": 6, "build": 8},
+        "server_options": {"password": null, "hint_cost": 10, "location_check_points": 1,
+            "release_mode": "auto", "collect_mode": "auto", "remaining_mode": "goal"},
+        "slots": (1..=slots).map(slot).collect::<Vec<_>>(),
+        "connect_names": {},
+        "games": {"G": {"item_name_to_id": {"One": 1}, "location_name_to_id": names,
+                        "checksum": "w", "item_name_groups": {}, "location_name_groups": {}}}
+    })
+    .to_string()
+}
+
+/// Review finding: presence was sized by the game for every slot, so empty slots of a huge
+/// game blew the seed (and the server's memory) up. Now an empty slot stores no presence
+/// words, and the seed is sized before anything is allocated and refused over the cap.
+#[test]
+fn empty_slots_of_a_huge_game_cost_nothing_and_an_oversized_seed_is_refused() {
+    // 30,000 locations: 469 presence words (3.7 KB) per slot that places something.
+    let text = wide(30_000, 40, 1);
+    let b = SeedBundle::from_json(&text).unwrap();
+    let e = encode(&b, &hash_of(&text), 1 << 26).unwrap();
+    // One slot's words plus 39 empty slot records, not 40 slots' words (150 KB).
+    assert!(e.seed.len() < 8_000, "{} bytes", e.seed.len());
+    let (seed, data) = opened(&text);
+    assert_eq!(seed.to_v1(&data).unwrap().slots.len(), 40);
+    assert_eq!(seed.slot(2).unwrap().placed(), 0);
+    assert_eq!(seed.slot(2).unwrap().find(1), None);
+    // Under a cap smaller than one slot's words: refused, before the words are written.
+    let err = encode(&b, &hash_of(&text), 3_000).unwrap_err().to_string();
+    assert!(err.contains("over the 3000 cap"), "{err}");
+}
+
+/// Review finding: with item width 0 a start inventory count cost no bytes, so a hostile
+/// count up to 2^32 passed the range check and `open` iterated it (18.7 s measured). Start
+/// entries now take at least one bit, so the count is bounded by the file's bytes.
+#[test]
+fn a_hostile_start_count_with_zero_item_bits_is_refused_at_once() {
+    let text = wide(3, 1, 2);
+    let (_, e) = encoded(&text);
+    let (seed, _) = opened(&text);
+    assert_eq!(seed.bit_widths(), (0, 0, 0), "one item, one receiver, no flags");
+    let mut b = e.seed.clone();
+    let slot0 = HEADER + ROOM + GAME;
+    b[slot0 + 68..slot0 + 72].copy_from_slice(&u32::MAX.to_le_bytes());
+    rehash(&mut b);
+    let started = std::time::Instant::now();
+    assert!(reopen(b, &text).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+}
+
+/// Review finding: ordinals and selects walked every slot and every presence word per item.
+/// Many slots, one game: every ordinal and index round trips (now through prefix sums and
+/// rank tables).
+#[test]
+fn ordinals_and_indexes_round_trip_across_many_slots() {
+    let mut v: Value = serde_json::from_str(&wide(700, 60, 0)).unwrap();
+    for (k, s) in v["slots"].as_array_mut().unwrap().iter_mut().enumerate() {
+        let locations: Vec<Value> = (0..k % 13)
+            .map(|j| json!({"location": 1 + (k * 7 + j * 53) % 700, "item": 1, "receiver": 1 + (j % 60), "flags": j % 3}))
+            .collect();
+        s["locations"] = json!(locations);
+    }
+    let text = v.to_string();
+    let b = SeedBundle::from_json(&text).unwrap();
+    let (seed, _) = opened(&text);
+    let mut ordinal = 0;
+    for s in &b.slots {
+        let view = seed.slot(s.id).unwrap();
+        let mut sorted = s.locations.clone();
+        sorted.sort_by_key(|p| p.location);
+        for (i, p) in sorted.iter().enumerate() {
+            assert_eq!(seed.ordinal(view.pos(), i), Some(ordinal));
+            assert_eq!(seed.from_ordinal(ordinal), Some((view.pos(), i)));
+            assert_eq!(view.location(i), Some(p.location));
+            assert_eq!(view.find(p.location), Some(i));
+            assert_eq!(view.flags(i), Some(p.flags));
+            ordinal += 1;
+        }
+        assert_eq!(view.location(sorted.len()), None);
+        assert_eq!(seed.ordinal(view.pos(), sorted.len()), None);
+    }
+    assert_eq!(seed.from_ordinal(ordinal), None);
+}
+
+/// Review finding: no test crossed games. Games A and B with disjoint item ids and different
+/// item counts: slot 1 (A) finds an item of B for slot 2 (B), slot 2 one of A for slot 1, and
+/// slot 3 (A) places nothing (`crates/e2e/fixtures/cross-games.json`, shared with the edge
+/// tests). Item indexes resolve against the receiver's game.
+fn cross_games() -> Value {
+    serde_json::from_str(include_str!("../../../e2e/fixtures/cross-games.json")).unwrap()
+}
+
+#[test]
+fn a_placement_across_games_resolves_against_the_receivers_game() {
+    let text = cross_games().to_string();
+    let (seed, data) = opened(&text);
+    assert_eq!(seed.to_v1(&data).unwrap(), SeedBundle::from_json(&text).unwrap());
+    let w: &dyn World = &seed;
+    // Slot 1's location 11 (index 0) sends B's item 202 (index 2 in B, beyond A's 2 items).
+    assert_eq!(w.target(0, 0), Some((1, 202)));
+    assert_eq!(w.target(1, 0), Some((0, 2)));
+    let p = seed.slot(1).unwrap().placement(0).unwrap();
+    assert_eq!((p.item, p.receiver, p.flags), (202, 2, 1));
+    assert_eq!(seed.slot(3).unwrap().placements().count(), 0);
+    assert_eq!(w.placed(2), 0);
+    // Item indexes up to 3 (B's b3 is unused; b2 is index 2): 2 bits.
+    assert_eq!(seed.bit_widths().0, 2);
 }

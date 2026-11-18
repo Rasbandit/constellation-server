@@ -845,7 +845,7 @@ fn fold(room: &CompatRoom, j: &mut Joined, e: &Event) -> Option<NetworkItem> {
             let pos = b.pos(from);
             let at = pos.and_then(|p| Some((p, b.slot_at(p)?.find(location)?)));
             let ordinal = at.and_then(|(p, i)| b.ordinal(p, i));
-            let flags = ordinal.and_then(|o| network_item(b, o)).map_or(0, |it| it.flags);
+            let flags = at.and_then(|(p, i)| b.slot_at(p)?.flags(i)).unwrap_or(0);
             if slot == j.slot
                 && let Some(o) = ordinal
             {

@@ -1361,6 +1361,7 @@ name = "seed-bundle"
 version = "0.0.0"
 dependencies = [
  "bits",
+ "config",
  "flate2",
  "proto",
  "room-core",

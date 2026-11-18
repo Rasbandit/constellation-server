@@ -342,9 +342,7 @@ impl Host {
                 LoadFrom::Pg(store) => {
                     let file =
                         store.room_bundle(id).await.map_err(|e| format!("postgres: {e:?}"))?;
-                    let file =
-                        file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?;
-                    file
+                    file.ok_or_else(|| format!("room {seed:?} is stored without its bundle"))?
                 }
                 LoadFrom::Mem(_, text) => {
                     text.clone().ok_or_else(|| format!("room {seed:?} has no bundle"))?

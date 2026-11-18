@@ -379,6 +379,14 @@ fn a_state_survives_a_json_snapshot_round_trip() {
         apply(&mut s, &at(3), check(1, 2, 12))
     );
     assert!(RoomState::from_snapshot(s.world(), b"{").is_err());
+    // A snapshot of the shape before versions (or any other version) is refused as such.
+    let mut old: serde_json::Value = serde_json::from_str(&j).unwrap();
+    old.as_object_mut().unwrap().remove("v");
+    let old = serde_json::to_vec(&old).unwrap();
+    assert_eq!(
+        RoomState::from_snapshot(s.world(), &old),
+        Err(CoreError::BadSnapshot(super::UNKNOWN_SNAPSHOT))
+    );
 }
 
 mod properties {

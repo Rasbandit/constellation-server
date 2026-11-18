@@ -112,9 +112,39 @@ fn toc(file: &[u8]) -> Result<Vec<Entry<'_>>, BundleError> {
             };
             let stored = at.checked_add(len).and_then(|end| file.get(at..end));
             let stored = stored.ok_or_else(|| bad("section past the end"))?;
-            Ok(Entry { id, deflate: flags & DEFLATED != 0, stored, raw, hash })
+            Ok((at, Entry { id, deflate: flags & DEFLATED != 0, stored, raw, hash }))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|mut all| {
+            // One entry per id, and no two over the same bytes: a small file must not stand
+            // for many large sections.
+            all.sort_by_key(|(at, _)| *at);
+            let overlap = all.windows(2).any(|w| w[0].0 + w[0].1.stored.len() > w[1].0);
+            let mut ids: Vec<u16> = all.iter().map(|(_, e)| e.id).collect();
+            ids.sort_unstable();
+            if overlap || ids.windows(2).any(|w| w[0] == w[1]) {
+                return Err(bad("sections repeat an id or overlap"));
+            }
+            Ok(all.into_iter().map(|(_, e)| e).collect())
+        })
+}
+
+/// Inflate (or copy) one entry, capped at `max`, and check its hash.
+fn open_entry(e: &Entry<'_>, max: u64) -> Result<Vec<u8>, BundleError> {
+    if e.raw as u64 > max {
+        return Err(BundleError::Invalid(format!("package section over {max} bytes")));
+    }
+    let bytes = if e.deflate { inflate(e.stored, e.raw as u64)? } else { e.stored.to_vec() };
+    checked(e, &bytes)?;
+    Ok(bytes)
+}
+
+/// Section `id` of a package file, inflated and checked; no other section is inflated.
+///
+/// # Errors
+/// A malformed file, a section over `max` bytes, or one that does not match its hash.
+pub fn section_of(file: &[u8], id: u16, max: u64) -> Result<Option<Vec<u8>>, BundleError> {
+    toc(file)?.iter().find(|e| e.id == id).map(|e| open_entry(e, max)).transpose()
 }
 
 fn checked(e: &Entry<'_>, bytes: &[u8]) -> Result<(), BundleError> {
@@ -124,23 +154,21 @@ fn checked(e: &Entry<'_>, bytes: &[u8]) -> Result<(), BundleError> {
     Ok(())
 }
 
-/// Every section of a package file, each checked against its hash. Sections this crate does
-/// not know are returned too; a reader skips what it does not use.
+/// Every section of a package file, each checked against its hash: for tools that copy or
+/// rewrite a whole package. Readers that want one section use [`section_of`]. `max` caps all
+/// of them together.
 ///
 /// # Errors
-/// A malformed file, a section over `max` bytes, or one that does not match its hash.
+/// A malformed file, sections over `max` bytes in all, or one that does not match its hash.
 pub fn sections(file: &[u8], max: u64) -> Result<Vec<Section>, BundleError> {
-    toc(file)?
-        .into_iter()
-        .map(|e| {
-            let cap = max.min(e.raw as u64);
-            if e.raw as u64 > max {
-                return Err(BundleError::Invalid(format!("package section over {max} bytes")));
-            }
-            let bytes = if e.deflate { inflate(e.stored, cap)? } else { e.stored.to_vec() };
-            checked(&e, &bytes)?;
-            Ok(Section { id: e.id, bytes, deflate: e.deflate })
-        })
+    let entries = toc(file)?;
+    let total = entries.iter().map(|e| e.raw as u64).fold(0, u64::saturating_add);
+    if total > max {
+        return Err(BundleError::Invalid(format!("package sections over {max} bytes")));
+    }
+    entries
+        .iter()
+        .map(|e| Ok(Section { id: e.id, bytes: open_entry(e, max)?, deflate: e.deflate }))
         .collect()
 }
 
@@ -169,7 +197,7 @@ pub fn section(dir: &Path, key: &Key, id: u16, max: u64) -> Result<Option<Vec<u8
     let path = file(dir, key);
     let bytes =
         std::fs::read(&path).map_err(|e| BundleError::Parse(format!("{}: {e}", path.display())))?;
-    Ok(sections(&bytes, max)?.into_iter().find(|s| s.id == id).map(|s| s.bytes))
+    section_of(&bytes, id, max)
 }
 
 /// One game's package as rooms use it.
@@ -371,7 +399,11 @@ pub fn write(dir: &Path, content: &[u8]) -> std::io::Result<Key> {
     let path = file(dir, &key);
     if !path.exists() {
         std::fs::create_dir_all(dir)?;
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        // A nonce per call: two threads of one process writing the same key never share a
+        // temporary file.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp{}-{n}", std::process::id()));
         let bytes =
             file_bytes(&[Section { id: SECTION_GAME, bytes: content.to_vec(), deflate: true }])?;
         std::fs::write(&tmp, bytes)?;
@@ -390,10 +422,8 @@ pub fn read(dir: &Path, key: &Key, max: u64) -> Result<Vec<u8>, BundleError> {
     let path = file(dir, key);
     let bytes =
         std::fs::read(&path).map_err(|e| BundleError::Parse(format!("{}: {e}", path.display())))?;
-    let game = sections(&bytes, max)?.into_iter().find(|s| s.id == SECTION_GAME);
-    let content = game
-        .ok_or_else(|| BundleError::Invalid(format!("{}: no game section", path.display())))?
-        .bytes;
+    let content = section_of(&bytes, SECTION_GAME, max)?
+        .ok_or_else(|| BundleError::Invalid(format!("{}: no game section", path.display())))?;
     if GamePackage::key_of(&content) != *key {
         return Err(BundleError::Invalid(format!("{} does not match its key", path.display())));
     }
@@ -518,6 +548,39 @@ mod tests {
         assert_eq!(section(&dir, &key, SECTION_GAME, 1 << 20).unwrap(), Some(content));
         assert_eq!(section(&dir, &key, SECTION_RULES, 1 << 20).unwrap(), None);
         assert!(section(&dir, &[9; 32], SECTION_GAME, 1 << 20).is_err());
+    }
+
+    /// Review finding: readers inflated every section to pick one, so a small file with big
+    /// sections held them all. A reader of the game section never inflates another, and
+    /// repeated or overlapping sections are refused.
+    #[test]
+    fn reading_one_section_never_inflates_another() {
+        let dir = std::env::temp_dir().join(format!("pkg-lazy-{}", std::process::id()));
+        let content = GamePackage::content("G", &game());
+        let key = GamePackage::key_of(&content);
+        let big = Section { id: SECTION_RULES, bytes: vec![0; 2 << 20], deflate: true };
+        let game_section = Section { id: SECTION_GAME, bytes: content.clone(), deflate: true };
+        let f = file_bytes(&[game_section.clone(), big]).unwrap();
+        assert!(f.len() < 10_000, "2 MiB of zeros deflate small: {}", f.len());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(file(&dir, &key), &f).unwrap();
+        // Capped at 1 MiB: the 2 MiB rules section is never opened by the game reader.
+        assert_eq!(read(&dir, &key, 1 << 20).unwrap(), content);
+        assert!(section(&dir, &key, SECTION_RULES, 1 << 20).is_err());
+        assert!(sections(&f, 1 << 20).is_err(), "all of them together are over the cap");
+        let twice = file_bytes(&[game_section.clone(), game_section]).unwrap();
+        assert!(section_of(&twice, SECTION_GAME, 1 << 20).is_err(), "a repeated id");
+        // Two entries over the same bytes (the second entry's offset set to the first's).
+        let two = file_bytes(&[
+            Section { id: 7, bytes: vec![1; 64], deflate: false },
+            Section { id: 8, bytes: vec![1; 64], deflate: false },
+        ])
+        .unwrap();
+        let mut overlap = two.clone();
+        let first_at = overlap[8 + 4..8 + 8].to_vec();
+        overlap[8 + ENTRY + 4..8 + ENTRY + 8].copy_from_slice(&first_at);
+        assert!(section_of(&overlap, 7, 1 << 20).is_err());
+        assert_eq!(section_of(&two, 8, 1 << 20).unwrap(), Some(vec![1; 64]));
     }
 
     /// Indexes are the position in the sorted ids of the game section, which the key hashes:

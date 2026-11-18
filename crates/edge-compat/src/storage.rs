@@ -207,8 +207,9 @@ pub(crate) fn read_only(room: &CompatRoom, key: &str) -> Option<Value> {
     })
 }
 
-/// A slot's `slot_data`, inflated from the seed; `null` (logged) if the stored bytes are bad,
-/// which `Seed::open`'s checks and the file hash make a bug, not an input.
+/// A slot's `slot_data`, inflated from the seed; `null` (logged) if the stored bytes do not
+/// decode. `Seed::open` checks its range and inflate cap, not its content (that waits for the
+/// first `Connect`); the file hash makes a bad one corruption or tampering.
 pub(crate) fn slot_data(s: &SlotView<'_>) -> Value {
     s.slot_data().unwrap_or_else(|e| {
         tracing::error!(slot = s.id(), error = %e, "slot_data does not decode");

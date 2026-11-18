@@ -174,12 +174,23 @@ impl Dedupes {
     }
 }
 
+/// The snapshot shape this crate writes and reads.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// [`CoreError::BadSnapshot`]'s text for a snapshot of another shape: not corrupt, only old,
+/// so the log alone rebuilds the room.
+pub const UNKNOWN_SNAPSHOT: &str = "unknown snapshot version";
+
 /// Everything the room remembers. Serializable as a snapshot, which leaves the world out (read
 /// one back with [`RoomState::from_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomState {
     #[serde(skip, default = "no_world")]
     world: Shared,
+    /// [`SNAPSHOT_VERSION`]; a snapshot without it (or another) is refused, and the caller
+    /// replays the log instead.
+    #[serde(default)]
+    v: u32,
     head: Seq,
     /// Highest `seq` known to be in the log. Live states lag `head` until `mark_durable`.
     durable: Seq,
@@ -379,6 +390,7 @@ impl RoomState {
         let checked = (0..n).map(|pos| vec![0; world.placed(pos).div_ceil(64)]).collect();
         Ok(Self {
             world: Shared(world),
+            v: SNAPSHOT_VERSION,
             head: Seq(0),
             durable: Seq(0),
             checked,
@@ -400,6 +412,16 @@ impl RoomState {
     /// # Errors
     /// `BadSnapshot` when it is not a snapshot.
     pub fn from_snapshot(world: Arc<dyn World>, json: &[u8]) -> Result<Self, CoreError> {
+        #[derive(Deserialize)]
+        struct Version {
+            #[serde(default)]
+            v: u32,
+        }
+        let version: Version =
+            serde_json::from_slice(json).map_err(|_| CoreError::BadSnapshot("not a snapshot"))?;
+        if version.v != SNAPSHOT_VERSION {
+            return Err(CoreError::BadSnapshot(UNKNOWN_SNAPSHOT));
+        }
         let mut s: Self =
             serde_json::from_slice(json).map_err(|_| CoreError::BadSnapshot("not a snapshot"))?;
         s.world = Shared(world);
@@ -518,6 +540,10 @@ impl RoomState {
     fn prune_pending(&mut self) {
         let durable = self.durable.0;
         self.pending.retain(|p| p.2.0.saturating_add(1) > durable);
+        // A burst of undurable checks must not keep its peak capacity for the room's life.
+        if self.pending.is_empty() {
+            self.pending.shrink_to_fit();
+        }
     }
 
     /// The stored value of `key`, if any.

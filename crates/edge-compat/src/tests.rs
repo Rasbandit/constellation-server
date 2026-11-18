@@ -733,6 +733,59 @@ async fn a_self_found_item_reads_found_their() {
     assert_eq!(texts, ["1", " found their ", "8", " (", "101", ")"]);
 }
 
+/// Two games with disjoint item ids (`crates/e2e/fixtures/cross-games.json`): P1 plays A and
+/// finds B's item 202 for P2; P2 plays B and finds A's item 2 (a trap) for P1; P3 places
+/// nothing. Ids at the wire come from the receiver's game.
+#[tokio::test]
+async fn items_across_games_carry_the_receivers_ids_at_the_wire() {
+    let v: Value =
+        serde_json::from_str(include_str!("../../e2e/fixtures/cross-games.json")).unwrap();
+    let b = seed(&v);
+    let store = Arc::new(MemLogStore::new());
+    let epoch = store.claim(RoomId(1));
+    let (h, _task) = RoomHandle::spawn(RoomId(1), epoch, state_of(&b), store, Limits::DESIGN);
+    let room = Arc::new(CompatRoom::new(b, h, None, Limits::DESIGN).unwrap());
+    let join = async |name: &str, game: &str| {
+        let mut s = Session::new(Arc::clone(&room));
+        let mut c = connect_packet(name, &json!(7));
+        c[0]["game"] = json!(game);
+        let ps = send(&mut s, &c).await;
+        assert_eq!(ps[0]["cmd"], "Connected", "{ps:?}");
+        pump(&mut s).await;
+        s
+    };
+    let (mut p1, mut p2, mut p3) =
+        (join("P1", "A").await, join("P2", "B").await, join("P3", "A").await);
+    let ps = send(&mut p1, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(
+        ps[0]["locations"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 2, "flags": 1}])
+    );
+    check(&mut p1, &[11]).await;
+    check(&mut p2, &[21]).await;
+    let to_p2 = pump(&mut p2).await;
+    assert_eq!(
+        of(&to_p2, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 202, "location": 11, "player": 1, "flags": 1}])
+    );
+    let to_p1 = pump(&mut p1).await;
+    assert_eq!(
+        of(&to_p1, "ReceivedItems")[0]["items"],
+        json!([{"class": "NetworkItem", "item": 2, "location": 21, "player": 2, "flags": 4}])
+    );
+    // A reconnect rebuilds the same inventory from the log and the seed.
+    let again = send(&mut Session::new(Arc::clone(&room)), &{
+        let mut c = connect_packet("P2", &json!(7));
+        c[0]["game"] = json!("B");
+        c
+    })
+    .await;
+    assert_eq!(of(&again, "ReceivedItems")[0]["items"][0]["item"], 202);
+    let ps = send(&mut p3, &json!([{"cmd": "LocationScouts", "locations": [11]}])).await;
+    assert_eq!(ps[0]["cmd"], "InvalidPacket", "P3 places nothing: {ps:?}");
+    assert_eq!(pump(&mut p3).await.iter().filter(|p| p["cmd"] == "ReceivedItems").count(), 0);
+}
+
 #[tokio::test]
 async fn scouts_answer_in_request_order_and_refuse_unknown_ids() {
     let mut a = joined(&room(), "A").await;

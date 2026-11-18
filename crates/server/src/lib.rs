@@ -252,12 +252,22 @@ async fn start_room<S: LogStore>(
     limits: &Limits,
 ) -> Result<JoinHandle<Stopped>, String> {
     let (state, from) = match store.snapshot_get(room).await.map_err(|e| format!("{e:?}"))? {
-        Some(snap) => {
-            let state = RoomState::from_snapshot(fresh.world(), &snap.data)
-                .map_err(|e| format!("stored snapshot at {}: {e}", snap.seq.0))?;
-            state.validate(snap.seq).map_err(|e| e.to_string())?;
-            (state, snap.seq)
-        }
+        Some(snap) => match RoomState::from_snapshot(fresh.world(), &snap.data) {
+            // A snapshot of an older shape is not corrupt: the log alone rebuilds the room.
+            Err(room_core::CoreError::BadSnapshot(room_core::UNKNOWN_SNAPSHOT)) => {
+                tracing::warn!(
+                    room = room.0,
+                    at = snap.seq.0,
+                    "old snapshot shape; replaying the log"
+                );
+                (fresh, Seq(0))
+            }
+            Err(e) => return Err(format!("stored snapshot at {}: {e}", snap.seq.0)),
+            Ok(state) => {
+                state.validate(snap.seq).map_err(|e| e.to_string())?;
+                (state, snap.seq)
+            }
+        },
         None => (fresh, Seq(0)),
     };
     let tail = store.read_tail(room, from, usize::MAX).await.map_err(|e| format!("{e:?}"))?;
@@ -770,7 +780,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("server-v2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let seed = dir.join("bundle.seed");
-        worlds::write_v2(&seed, &std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        worlds::write_v2(&seed, &std::fs::read_to_string(&fixture).unwrap(), &Limits::DESIGN)
+            .unwrap();
         let (v1, v2) =
             (load_bundle(&fixture, &Limits::DESIGN), load_bundle(&seed, &Limits::DESIGN));
         let (v1, v2) = (v1.unwrap(), v2.unwrap());

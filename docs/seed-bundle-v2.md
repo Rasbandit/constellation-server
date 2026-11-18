@@ -39,15 +39,15 @@ Then, in order:
    | 8 | name (ref) |
    | 16 | game index `u16`, kind `u8` (0 spectator, 1 player, 2 group), pad `u8` |
    | 20 | minimum client version, 3 × `u32` |
-   | 32 | presence offset: `ceil(L/64)` `u64` words, where `L` is the game's location count. Bit `i` set means location index `i` is placed. |
+   | 32 | presence offset: `ceil(L/64)` `u64` words, where `L` is the game's location count. Bit `i` set means location index `i` is placed. A slot that places nothing stores no words (offset 0). |
    | 36 | placed count `p` (equals the number of set presence bits) |
    | 40 | records offset: `p` records of `wi + wr + wf` bits |
    | 44 | `slot_data` offset, 48 its stored length, 52 its inflated length (0 means stored as plain JSON, otherwise raw deflate) |
    | 56 | group members offset, 60 count (`u32` slot ids) |
-   | 64 | start inventory offset, 68 count (`wi` bits each, item indexes in the slot's own game) |
+   | 64 | start inventory offset, 68 count (`max(wi, 1)` bits each, so every entry costs file bytes; item indexes in the slot's own game) |
 
 4. **Connect names**, `c` × 16 bytes, sorted by name: name (ref), team `u32`, slot id `u32`.
-5. **Data**: the areas the slot records point at.
+5. **Data**: the areas the slot records point at. Every non-empty area lies after the tables and before the string table; a reader refuses anything else. Reserved header fields must be 0.
 6. **String table**: UTF-8. Each distinct string is stored once, so a slot name and its connect name share bytes.
 
 **Bit fields** are packed least significant bit first: bit `k` of the stream is bit `k % 8` of byte `k / 8`. Record `r` starts at bit `r × (wi + wr + wf)`. Its fields are: item index (`wi` bits) in the receiver's game, receiver slot position (`wr` bits), flags (`wf` bits: 1 progression, 2 useful, 4 trap). The encoder sets each width to the fewest bits the seed needs: `ceil(log2(max + 1))`, which is 0 when every value is 0.
@@ -58,7 +58,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 
 ## Package file
 
-`packages/<hex key>.pkg` sits next to the seed file. The key is the SHA-256 of the game section's content.
+`packages/<hex key>.pkg` sits next to the seed file. The key is the SHA-256 of the game section's content. On disk each world folder keeps its own copies; sharing is in memory (one copy per key per process), not across folders.
 
 | At | Size | Field |
 |---|---|---|
@@ -67,7 +67,7 @@ Worked example (the real one-slot MM world): 2641 locations, 237 items and one s
 | 6 | 2 | section count `s` |
 | 8 | `s` × 48 | table of contents: id `u16`, flags `u16` (bit 0: deflated), offset `u32`, stored length `u32`, inflated length `u32`, SHA-256 of the inflated bytes |
 
-Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
+Each id appears once and no two sections share bytes (a reader refuses the file otherwise), and a reader inflates only the section it asks for, each under the caller's cap. Section ids: 1 is the game, the canonical JSON of `{"data": <v1 GameData>, "game": <name>}`. 2 is reserved for rules and regions. A reader skips sections it does not know. A section stored without deflate (flag bit 0 clear) can be read in place (`package::stored`); `package::section` loads any section from the file on request. A room keeps only the game section's id tables and JSON in memory, never other sections.
 
 **Index stability.** A game's location and item indexes are the positions of its ids, sorted ascending, in section 1. That section is exactly what the key hashes, so for a given package key the indexes never change, whatever order the names were listed in. Other sections, and seeds, may refer to them by index (test: `indexes_are_fixed_by_the_package_key`).
 

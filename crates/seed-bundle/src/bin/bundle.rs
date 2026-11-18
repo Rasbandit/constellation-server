@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// What one part may inflate to: the server's default bundle cap (64 MiB).
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// What a seed or one part of it may take: the server's bundle cap, from `config`.
+const MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
 
 const USAGE: &str =
     "usage: bundle v2-encode <v1.json> <out-dir> | bundle v2-decode <seed> [--packages <dir>]";
@@ -19,7 +19,7 @@ fn encode(input: &Path, out: &Path) -> Result<String, String> {
     let b = seed_bundle::SeedBundle::from_json(&text).map_err(|e| e.to_string())?;
     let hash: [u8; 32] =
         seed_bundle::bundle_hash(&text)?.try_into().map_err(|_| "hash length".to_owned())?;
-    let e = seed_bundle::v2::encode(&b, &hash).map_err(|e| e.to_string())?;
+    let e = seed_bundle::v2::encode(&b, &hash, MAX_BYTES).map_err(|e| e.to_string())?;
     let packages = out.join("packages");
     for c in &e.packages {
         seed_bundle::package::write(&packages, c).map_err(|e| e.to_string())?;
