@@ -67,9 +67,8 @@ impl View for At<'_, '_> {
         self.r.adjust[i] + i64::try_from(got).unwrap_or(i64::MAX)
     }
     fn counter(&self, c: u16) -> i64 {
-        let events = self.r.w.sites_into(EVENTS, usize::from(c));
-        let n = events.iter().filter(|e| self.r.fired[**e as usize] < self.rank).count();
-        i64::try_from(n).unwrap_or(i64::MAX)
+        let got = self.r.lit[usize::from(c)].partition_point(|k| *k < self.rank);
+        i64::try_from(got).unwrap_or(i64::MAX)
     }
     fn group(&self, g: u16) -> i64 {
         let members = self.r.w.group_members(usize::from(g));
@@ -535,6 +534,9 @@ pub struct Reach<'w> {
     loc_rank: Vec<u32>,
     /// Per item: ranks of the copies collected, ascending.
     copies: Vec<Vec<u32>>,
+    /// Per counter: ranks of the events that fired, ascending (the counter as of a rank is a
+    /// binary search, not a scan of its events).
+    lit: Vec<Vec<u32>>,
     /// Per item: copies held from the start (before any run, less what was removed).
     adjust: Vec<i64>,
     tm: Tms,
@@ -577,6 +579,10 @@ impl<'w> Reach<'w> {
             plan,
             counts: vec![0; w.items()],
             counters: vec![0; w.counters()],
+            // At most one rank per event, so these never grow.
+            lit: (0..w.counters())
+                .map(|c| Vec::with_capacity(w.sites_into(EVENTS, c).len()))
+                .collect(),
             groups: vec![0; w.groups()],
             masks: vec![0; n],
             reached: BitSet::new(w.locations()),
@@ -648,6 +654,7 @@ impl<'w> Reach<'w> {
         self.grows.iter_mut().for_each(Vec::clear);
         self.loc_rank.fill(NONE);
         self.copies.iter_mut().for_each(Vec::clear);
+        self.lit.iter_mut().for_each(Vec::clear);
         self.adjust.fill(0);
         self.start();
     }
@@ -997,7 +1004,7 @@ impl<'w> Reach<'w> {
             self.retract_half(f - sc);
             return;
         }
-        self.fired[f] = NONE;
+        let was = std::mem::replace(&mut self.fired[f], NONE);
         self.done.remove(f);
         let (_, g) = w.site_place(f);
         let t = w.site_target(f) as usize;
@@ -1008,6 +1015,9 @@ impl<'w> Reach<'w> {
             }
             EVENTS => {
                 self.counters[t] -= 1;
+                if let Ok(at) = self.lit[t].binary_search(&was) {
+                    self.lit[t].remove(at);
+                }
                 if w.def_reads_counter(t) {
                     self.epoch += 1;
                 }
@@ -1284,6 +1294,8 @@ impl<'w> Reach<'w> {
             EVENTS => {
                 let c = target as usize;
                 self.counters[c] += 1;
+                let at = self.lit[c].partition_point(|x| *x < k);
+                self.lit[c].insert(at, k);
                 if w.def_reads_counter(c) {
                     self.epoch += 1;
                 }
