@@ -770,6 +770,16 @@ impl Seed {
         self.r().u8(HEADER + 28)
     }
 
+    /// The room's hint economy: the one place it is read from a seed (the room and the edge
+    /// both use it).
+    #[must_use]
+    pub fn hint_rules(&self) -> room_core::HintRules {
+        room_core::HintRules {
+            cost_pct: self.hint_cost(),
+            check_points: self.location_check_points(),
+        }
+    }
+
     /// Hint points per checked location.
     #[must_use]
     pub fn location_check_points(&self) -> u32 {

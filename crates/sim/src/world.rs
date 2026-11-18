@@ -452,7 +452,7 @@ impl World {
         let fresh = RoomState::new(slot_ids(), self.placement.clone()).map_err(dbg)?;
         let base = match block_on(self.store.snapshot_get(ROOM)).map_err(dbg)? {
             Some(s) => {
-                let state = RoomState::from_snapshot(fresh.world(), &s.data).map_err(dbg)?;
+                let state = RoomState::from_snapshot(&fresh, &s.data).map_err(dbg)?;
                 state.validate(s.seq).map_err(|e| format!("stored snapshot rejected: {e}"))?;
                 state
             }

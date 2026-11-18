@@ -341,7 +341,7 @@ fn hints_fold_back_to_the_same_state_and_validate() {
     assert_eq!(folded, s);
     folded.validate(folded.head()).unwrap();
     let json = serde_json::to_vec(&folded).unwrap();
-    let back = RoomState::from_snapshot(folded.world(), &json).unwrap();
+    let back = RoomState::from_snapshot(&folded, &json).unwrap();
     assert_eq!(back, folded);
     assert_eq!(back.hint_points(SlotNo(2)), 0, "1 check earned 1, one paid hint cost 1");
 }
@@ -384,7 +384,7 @@ fn a_snapshot_whose_hints_disagree_with_its_counters_is_refused() {
         let mut v = serde_json::to_value(&s).unwrap();
         edit(&mut v);
         let json = serde_json::to_vec(&v).unwrap();
-        RoomState::from_snapshot(s.world(), &json).unwrap().validate(s.head())
+        RoomState::from_snapshot(&s, &json).unwrap().validate(s.head())
     };
     let bad =
         |e: &dyn Fn(&mut serde_json::Value)| matches!(tamper(e), Err(CoreError::BadSnapshot(_)));
@@ -541,4 +541,17 @@ mod properties {
             }
         }
     }
+}
+
+/// Review finding: the hint economy was read back from the snapshot, so a stale or edited
+/// snapshot changed the room's points while the edge kept the seed's. The seed is the one
+/// source: a snapshot takes the rules of the room it is read onto.
+#[test]
+fn a_snapshot_takes_its_hint_rules_from_the_room_not_the_file() {
+    let s = room(PAID);
+    let mut v = serde_json::to_value(&s).unwrap();
+    v["hint_rules"] = serde_json::json!({"cost_pct": 0, "check_points": 9});
+    let json = serde_json::to_vec(&v).unwrap();
+    let back = RoomState::from_snapshot(&s, &json).unwrap();
+    assert_eq!(back.hint_rules(), PAID);
 }

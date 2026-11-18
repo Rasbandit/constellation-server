@@ -17,7 +17,7 @@ pub use package::GamePackage;
 pub use v2::{Seed, SlotView};
 
 use proto::SlotNo;
-use room_core::{CoreError, HintRules, Placement, RoomState};
+use room_core::{CoreError, Placement, RoomState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -263,10 +263,8 @@ pub fn import_v1(bytes: &[u8], max_bytes: u64) -> Result<(Seed, Vec<Vec<u8>>), S
 /// # Errors
 /// What room-core refuses (`Seed::open` rules most of it out).
 pub fn room_state(seed: &Arc<Seed>) -> Result<RoomState, CoreError> {
-    let rules =
-        HintRules { cost_pct: seed.hint_cost(), check_points: seed.location_check_points() };
     let world: Arc<dyn room_core::World> = Arc::clone(seed) as _;
-    RoomState::from_world(world)?.with_hints(rules, seed.start_hints())
+    RoomState::from_world(world)?.with_hints(seed.hint_rules(), seed.start_hints())
 }
 
 fn id_ok(id: i64) -> bool {

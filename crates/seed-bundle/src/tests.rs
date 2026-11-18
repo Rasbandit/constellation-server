@@ -187,7 +187,7 @@ fn start_hints_and_the_hint_economy_reach_the_fresh_room() {
     let hints = s.hints_of(SlotNo(1));
     assert_eq!(hints.len(), 1);
     assert_eq!((hints[0].finding, hints[0].location, hints[0].status), (SlotNo(2), 101, 30));
-    assert_eq!(s.hint_rules(), HintRules { cost_pct: 10, check_points: 1 });
+    assert_eq!(s.hint_rules(), room_core::HintRules { cost_pct: 10, check_points: 1 });
     assert_eq!(s.head(), proto::Seq(0), "start hints are not log events");
     assert_eq!(parse(&good()).unwrap().start_hints, [], "absent means none");
 }

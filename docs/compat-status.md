@@ -92,6 +92,8 @@ Deviations from the reference server:
 - **Texts.** The `Hint` print keeps the reference's part types and fields (`NetUtils.py:421-442`) in our own wording; every `CommandResult` text is our own wording.
 - **Prints are not durable.** Like chat, `Hint` prints are fanned out once; a connection whose queue is full misses them (its `_read_hints_` key still converges).
 
+Forward only: a log that holds a hint event (`HintAdded`, `HintStatus`) cannot be folded by a server built before hints, so rolling back after the first hint leaves that room unable to start. Older logs and snapshots read forward (an older snapshot shape replays from the log).
+
 Accepted risk (see #47): `UpdateHint` can toggle a status forever, and each change is a logged event. The hint bucket bounds it at about one event per second per slot (estimate: about 86 400 small events a day per slot, not measured).
 
 ## Data storage: deviations from the reference server

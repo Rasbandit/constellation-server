@@ -88,10 +88,7 @@ impl CompatRoom {
         limits: Limits,
     ) -> Result<Self, String> {
         let password = password.or_else(|| bundle.password().map(str::to_owned));
-        let hint_rules = HintRules {
-            cost_pct: bundle.hint_cost(),
-            check_points: bundle.location_check_points(),
-        };
+        let hint_rules = bundle.hint_rules();
         let l = limits;
         let keys = l.rate_table_max_keys;
         Ok(Self {

@@ -231,8 +231,9 @@ pub struct RoomState {
     /// `Limits::kv_max_room_log_bytes`: the log keeps each write in full.
     #[serde(default)]
     kv_log_bytes: u64,
-    /// The hint economy, from the seed.
-    #[serde(default)]
+    /// The hint economy, from the seed. Not in a snapshot: [`RoomState::from_snapshot`] takes
+    /// it from the fresh room, so the seed is its one source.
+    #[serde(skip)]
     hint_rules: HintRules,
     /// Hints by the slot whose world holds the location, then the location.
     #[serde(default)]
@@ -443,12 +444,13 @@ impl RoomState {
         })
     }
 
-    /// A snapshot (the JSON of a [`RoomState`]) on its room's `world`. Check it with
-    /// [`RoomState::validate`] before use.
+    /// A snapshot (the JSON of a [`RoomState`]) read onto its room: the world and the hint
+    /// economy come from `fresh`, the room's state before any event, built from its seed.
+    /// Check it with [`RoomState::validate`] before use.
     ///
     /// # Errors
     /// `BadSnapshot` when it is not a snapshot.
-    pub fn from_snapshot(world: Arc<dyn World>, json: &[u8]) -> Result<Self, CoreError> {
+    pub fn from_snapshot(fresh: &Self, json: &[u8]) -> Result<Self, CoreError> {
         #[derive(Deserialize)]
         struct Version {
             #[serde(default)]
@@ -461,7 +463,8 @@ impl RoomState {
         }
         let mut s: Self =
             serde_json::from_slice(json).map_err(|_| CoreError::BadSnapshot("not a snapshot"))?;
-        s.world = Shared(world);
+        s.world = fresh.world.clone();
+        s.hint_rules = fresh.hint_rules;
         Ok(s)
     }
 
