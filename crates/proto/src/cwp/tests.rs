@@ -108,7 +108,17 @@ fn game_ids_checksums_and_item_uids_have_their_grammars() {
     assert!(Checksum::new("sha256:5f1c0a").is_err(), "too short");
     assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XH7Q").is_ok(), "26 Crockford base32 digits");
     assert!(ItemUid::new("iu_7QK2M4XH").is_err(), "too short for 128 bits");
-    assert!(ItemUid::new("iu_7QK2M4XH7QK2M4XH7QK2M4XI").is_err(), "I is not Crockford");
+    // 26 digits each, so only the one letter outside Crockford base32 can refuse them.
+    for (bad, why) in [
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7I", "I"),
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7L", "L"),
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7O", "O"),
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7U", "U"),
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7q", "lowercase"),
+        ("iu_7QK2M4XH7QK2M4XH7QK2M4XH7-", "punctuation"),
+    ] {
+        assert!(ItemUid::new(bad).is_err(), "{why} is not Crockford base32");
+    }
     assert!(
         ItemUid::new("iu_8QK2M4XH7QK2M4XH7QK2M4XH7Q").is_err(),
         "a 128-bit value starts 0 to 7"
