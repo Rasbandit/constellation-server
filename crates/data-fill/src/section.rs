@@ -290,9 +290,14 @@ struct Reads {
 }
 
 impl Reads {
+    /// Add what `o` reads; the lists stay sorted sets, so a def read twice does not double
+    /// them (a chain of such defs would grow them exponentially).
     fn merge(&mut self, o: &Reads) {
-        self.items.extend_from_slice(&o.items);
-        self.counters.extend_from_slice(&o.counters);
+        for (mine, theirs) in [(&mut self.items, &o.items), (&mut self.counters, &o.counters)] {
+            mine.extend_from_slice(theirs);
+            mine.sort_unstable();
+            mine.dedup();
+        }
         self.time |= o.time;
         self.region |= o.region;
     }

@@ -91,6 +91,7 @@ struct Env<'a, V> {
     /// Per def: 0 unknown, `TRUE` known true, else the epoch it was known false at.
     cache: &'a [Cell<u32>],
     epoch: u32,
+    memo: &'a DefMemo,
 }
 
 /// Def cache value for "true". Rules are monotone, so a true def stays true for the solve;
@@ -98,7 +99,48 @@ struct Env<'a, V> {
 /// epoch).
 const TRUE: u32 = u32::MAX;
 
+/// Def values within one evaluation (one root rule, one state or rank, one mask), so a def a
+/// rule reaches twice is evaluated once (a chain of defs that each read the next twice costs
+/// its length, not 2^length). Entries carry the evaluation's stamp, so starting one is O(1)
+/// and a solve step allocates nothing.
+#[derive(Debug, Clone, Default)]
+struct DefMemo {
+    /// Per def: `stamp << 1 | value`; a stale stamp means unknown.
+    vals: Vec<Cell<u64>>,
+    stamp: Cell<u64>,
+    /// Def bodies evaluated (memo misses), for the complexity tests.
+    bodies: Cell<u64>,
+}
+
+impl DefMemo {
+    fn new(defs: usize) -> Self {
+        Self { vals: (0..defs).map(|_| Cell::new(0)).collect(), ..Self::default() }
+    }
+
+    fn begin(&self) {
+        self.stamp.set(self.stamp.get() + 1);
+    }
+
+    fn get(&self, d: usize) -> Option<bool> {
+        let v = self.vals.get(d)?.get();
+        (v >> 1 == self.stamp.get()).then_some(v & 1 == 1)
+    }
+
+    fn set(&self, d: usize, v: bool) {
+        self.bodies.set(self.bodies.get() + 1);
+        if let Some(c) = self.vals.get(d) {
+            c.set(self.stamp.get() << 1 | u64::from(v));
+        }
+    }
+}
+
 impl<V: View> Env<'_, V> {
+    /// Evaluate the boolean rule at `pc` against region mask `t`: one evaluation.
+    fn eval(&self, pc: usize, t: u64) -> bool {
+        self.memo.begin();
+        self.b(pc, t).0
+    }
+
     /// The boolean node at `pc` against region mask `t`, and the offset after it.
     fn b(&self, pc: usize, t: u64) -> (bool, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (false, pc + 1) };
@@ -150,7 +192,11 @@ impl<V: View> Env<'_, V> {
             Some(e) if e == self.epoch => return false,
             _ => {}
         }
+        if let Some(v) = self.memo.get(d) {
+            return v;
+        }
         let v = self.b(*at as usize, t).0;
+        self.memo.set(d, v);
         if let Some(c) = cached {
             c.set(if v { TRUE } else { self.epoch });
         }
@@ -214,8 +260,9 @@ pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> 
         v: Now { counts: &[], counters: &[], groups: &[], masks: &[] },
         cache: &[],
         epoch: 1,
+        memo: &DefMemo::new(w.defs()),
     };
-    env.b(rule as usize, 0).0
+    env.eval(rule as usize, 0)
 }
 
 /// The held count of `item` from which no rule this seed reads more copies: with at least that
@@ -225,8 +272,15 @@ pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> 
 /// means true in every state.
 pub(crate) fn saturation(w: &World, plan: &Plan, item: u16, max: i64) -> i64 {
     let f = &plan.folded;
-    let mut s =
-        Sat { w, plan, x: item, max, defs: vec![None; w.defs()], counts: vec![0; w.items()] };
+    let mut s = Sat {
+        w,
+        plan,
+        x: item,
+        max,
+        defs: vec![None; w.defs()],
+        counts: vec![0; w.items()],
+        memo: DefMemo::new(w.defs()),
+    };
     let sites = w.site_count();
     w.item_sites(item as usize)
         .iter()
@@ -247,6 +301,7 @@ struct Sat<'a> {
     max: i64,
     defs: Vec<Option<i64>>,
     counts: Vec<i64>,
+    memo: DefMemo,
 }
 
 impl Sat<'_> {
@@ -345,8 +400,9 @@ impl Sat<'_> {
                 v: Now { counts: &self.counts, counters: &[], groups: &groups, masks: &[] },
                 cache: &[],
                 epoch: 1,
+                memo: &self.memo,
             };
-            if env.b(pc, 0).0 {
+            if env.eval(pc, 0) {
                 self.counts[x] = 0;
                 return k;
             }
@@ -461,6 +517,7 @@ pub struct Reach<'w> {
     /// Work counters since the last reset.
     pub stats: Stats,
     def_cache: Vec<Cell<u32>>,
+    def_memo: DefMemo,
     /// Bumped on every item or counter change; starts at 1 (0 means unknown in the cache).
     epoch: u32,
     /// Next rank.
@@ -538,6 +595,7 @@ impl<'w> Reach<'w> {
             ran: false,
             stats: Stats::default(),
             def_cache: (0..w.defs()).map(|_| Cell::new(0)).collect(),
+            def_memo: DefMemo::new(w.defs()),
             epoch: 1,
             seq: 1,
             fired: vec![NONE; sites],
@@ -866,8 +924,9 @@ impl<'w> Reach<'w> {
             v: At { r: self, rank: k },
             cache: &[],
             epoch: 1,
+            memo: &self.def_memo,
         };
-        env.b(rule as usize, t).0
+        env.eval(rule as usize, t)
     }
 
     /// Region `r`'s mask as of rank `k`.
@@ -1099,7 +1158,7 @@ impl<'w> Reach<'w> {
     /// Whether the goal rule holds now.
     #[must_use]
     pub fn goal(&self) -> bool {
-        self.env().b(self.plan.folded.goal as usize, 0).0
+        self.env().eval(self.plan.folded.goal as usize, 0)
     }
 
     /// Reached regions with their masks.
@@ -1126,12 +1185,13 @@ impl<'w> Reach<'w> {
             },
             cache: &self.def_cache,
             epoch: self.epoch,
+            memo: &self.def_memo,
         }
     }
 
     fn eval(&mut self, rule: u32, t: u64) -> bool {
         self.stats.evals += 1;
-        self.env().b(rule as usize, t).0
+        self.env().eval(rule as usize, t)
     }
 
     fn push_site(&mut self, s: u32) {
@@ -1253,7 +1313,7 @@ impl<'w> Reach<'w> {
             let blocked = self.tm.active && !self.tm.out.contains(sc + h);
             if self.half_rank[h] == NONE
                 && !blocked
-                && self.env().b(self.plan.folded.halves[h] as usize, 0).0
+                && self.env().eval(self.plan.folded.halves[h] as usize, 0)
             {
                 self.half_rank[h] = self.next();
             }
@@ -1300,7 +1360,7 @@ impl<'w> Reach<'w> {
                     continue;
                 }
                 match stays.clone().find(|s| w.site_target(*s) == i) {
-                    Some(s) if !self.env().b(self.plan.folded.sites[s] as usize, m).0 => {
+                    Some(s) if !self.env().eval(self.plan.folded.sites[s] as usize, m) => {
                         can_wait = false;
                     }
                     _ => out |= bit,
@@ -1315,7 +1375,7 @@ impl<'w> Reach<'w> {
         let Some(o) = w.time.owned.filter(|_| self.plan.clocks) else { return w.time.all };
         let env = self.env();
         let m = (0..o.halves)
-            .filter(|h| env.b(self.plan.folded.halves[*h] as usize, 0).0)
+            .filter(|h| env.eval(self.plan.folded.halves[*h] as usize, 0))
             .fold(0, |a, h| a | w.half(h).0);
         if m == 0 { o.none_owned_mask } else { m }
     }
@@ -1408,6 +1468,47 @@ mod tests {
         };
         assert!(!r.reached(w.loc("la").unwrap()), "a gem behind `a` does not open `a`");
         assert_eq!(r.masks[w.region("a").unwrap() as usize], 0);
+    }
+
+    /// Defs `d0` to `d{n}`, each reading the next twice (`all`, so both are evaluated while
+    /// they hold), and the last reading an item and time, so no def is cached per solve.
+    fn doubling(n: usize) -> (World, Instance) {
+        let mut defs = serde_json::Map::new();
+        for k in 0..n {
+            let next = json!({"ref": format!("d{}", k + 1)});
+            defs.insert(format!("d{k}"), json!({"all": [next, next]}));
+        }
+        defs.insert(format!("d{n}"), json!({"all": [{"has": "key"}, {"x.time_any": 1}]}));
+        let m = json!({
+            "options": [],
+            "items": [{"key": "key", "id": 1}],
+            "locations": [{"key": "la", "id": 1}],
+            "start": "s",
+            "x.time": {"slices": 2, "start_mask": 1},
+            "defs": defs,
+            "regions": [{"key": "s", "can_stay": false, "events": [], "stays": [], "exits": [],
+                         "checks": [{"loc": "la", "rule": {"ref": "d0"}}]}],
+            "goal": {"true": {}}
+        });
+        let inst = Instance { locations: vec!["la".to_owned()], ..Instance::default() };
+        (World::load(&m).unwrap(), inst)
+    }
+
+    #[test]
+    fn a_def_read_twice_is_evaluated_once_per_evaluation() {
+        let (w, inst) = doubling(40);
+        assert!(!w.def_timeless(0), "time-dependent, so not cached per solve");
+        let plan = Plan::new(&w, &inst).unwrap();
+        let key = w.item("key").unwrap();
+        let mut r = plan.state(&w, &[key], &[]);
+        assert!(r.reached(w.loc("la").unwrap()));
+        let solve = r.def_memo.bodies.get();
+        assert!(solve <= 41 * r.stats.evals.max(1), "solve: {solve} def bodies");
+        // Taking the key back checks the site as of its rank (the take-back path).
+        r.remove(key);
+        assert!(!r.reached(w.loc("la").unwrap()));
+        let back = r.def_memo.bodies.get() - solve;
+        assert!((1..=41 * 4).contains(&back), "take-back: {back} def bodies");
     }
 
     #[test]
