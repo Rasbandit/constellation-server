@@ -335,6 +335,35 @@ mod tests {
         assert!(a.idle_for().unwrap() < Duration::from_secs(60), "the clock restarts on close");
     }
 
+    #[test]
+    fn a_room_with_a_connection_open_was_last_used_at_the_moment_asked() {
+        let a = Activity::new(Duration::from_secs(3_600));
+        let asked = Moment::now().minus(Duration::from_secs(60));
+        let last = a.last_used(asked);
+        assert!(asked.since(last) >= Duration::from_secs(3_540), "closed: its last connection");
+        let open = a.enter();
+        assert_eq!(a.last_used(asked), asked, "open: in use at that moment");
+        drop(open);
+        assert!(a.last_used(asked) > asked, "closed again: the close just now");
+    }
+
+    #[test]
+    fn a_listed_room_is_found_by_its_id_and_nothing_else_is() {
+        let mut rooms = Rooms::default();
+        assert!(rooms.is_empty());
+        let (key, id) = (RoomKey::from_bits(1 << 14), crate::room_id("alpha"));
+        let activity = Activity::new(Duration::ZERO);
+        rooms
+            .insert(
+                key.clone(),
+                Listing { id, seed: "alpha".into(), hash: vec![], room: None, activity },
+            )
+            .unwrap();
+        assert!(!rooms.is_empty());
+        assert_eq!(rooms.key_of(id), Some(&key));
+        assert_eq!(rooms.key_of(crate::room_id("beta")), None);
+    }
+
     /// A room idle for longer than the machine has been up (a restart after a reboot) keeps
     /// its idle time; an `Instant` would have clamped it to zero.
     #[test]

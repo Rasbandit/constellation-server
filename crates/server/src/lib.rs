@@ -725,9 +725,12 @@ mod tests {
     // test would wait out its guard timeout instead of failing here in milliseconds.
     #[test]
     fn init_logging_installs_the_global_subscriber() {
-        assert!(!tracing::dispatcher::has_been_set(), "no other unit test installs one");
+        // `has_been_set` also counts a test's thread-scoped subscriber (the host's log
+        // capture), so the check is that no second global one can be set.
         init_logging();
-        assert!(tracing::dispatcher::has_been_set());
+        let again =
+            tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new());
+        assert!(again.is_err(), "the global subscriber is in place");
     }
 
     fn parse(s: &str) -> Result<Args, String> {

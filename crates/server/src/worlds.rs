@@ -698,6 +698,148 @@ mod tests {
         assert!(!authorized(&HeaderMap::new(), &want));
     }
 
+    /// Two bytes of the hash off by the same bit: an XOR fold would cancel them out.
+    #[test]
+    fn a_token_whose_hash_differs_in_two_bytes_alike_is_refused() {
+        let mut want: [u8; 32] = Sha256::digest(b"s3cret").into();
+        want[0] ^= 1;
+        want[1] ^= 1;
+        assert!(!authorized(&headers("Bearer s3cret"), &want));
+    }
+
+    #[test]
+    fn an_internal_error_is_a_500_that_hides_its_detail() {
+        let (status, text) = internal("/srv/data/secret.json: permission denied");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!text.is_empty() && !text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn an_unavailable_room_is_a_503_that_asks_to_try_again() {
+        let (status, text) = unavailable("room task stopped");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text, "the room is not available right now; try again");
+    }
+
+    /// Shows the data folder only: never the token's hash, the sandbox or the limits.
+    #[test]
+    fn the_state_shows_its_folder_and_not_the_token() {
+        let root = temp("debug");
+        let w = worlds(&root, Limits::DESIGN);
+        let shown = format!("{w:?}");
+        assert_eq!(shown, format!("Worlds {{ dir: {:?}, .. }}", root.join("data")));
+        assert!(!shown.contains("token") && !shown.contains(&hex(&w.token)), "{shown}");
+    }
+
+    /// The API's state on a fake checkout under `root`, data in `root/data`.
+    fn worlds(root: &Path, limits: Limits) -> Worlds {
+        let paths = crate::sandbox::tests::layout(root);
+        open(&root.join("data"), "token", paths, limits).unwrap()
+    }
+
+    /// Store `body` under `data/<folder>` as an earlier upload did, with record `meta` plus
+    /// its id; returns the record.
+    fn stored(root: &Path, folder: &str, ext: &str, body: &[u8], mut meta: Value) -> Value {
+        let id = content_id(body);
+        meta["id"] = json!(id);
+        let dir = root.join("data").join(folder);
+        std::fs::write(dir.join(format!("{id}.{ext}")), body).unwrap();
+        std::fs::write(dir.join(format!("{id}.json")), meta.to_string()).unwrap();
+        meta
+    }
+
+    async fn json_of(r: Response) -> Value {
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap())
+            .unwrap()
+    }
+
+    /// An upload already stored is answered from its record, so this never reaches the
+    /// sandbox: what is left to see is the size check in front of it.
+    #[tokio::test]
+    async fn an_upload_of_exactly_its_cap_is_taken_and_one_byte_more_is_refused() {
+        let root = temp("cap");
+        let w = worlds(&root, Limits { apworld_max_bytes: 8, yaml_max_bytes: 4, ..Limits::DESIGN });
+        for (kind, folder, ext, cap) in
+            [(Kind::Apworld, "apworlds", "apworld", 8), (Kind::Yaml, "yamls", "yaml", 4)]
+        {
+            let body = vec![b'x'; cap];
+            let meta = stored(&root, folder, ext, &body, json!({"name": "a"}));
+            let r = upload(&w, kind, Some("name=a"), &body).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{folder}");
+            assert_eq!(json_of(r).await, meta);
+            let over = upload(&w, kind, Some("name=a"), &vec![b'x'; cap + 1]).await.unwrap_err();
+            assert_eq!(over.0, StatusCode::PAYLOAD_TOO_LARGE, "{folder}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_holds_each_stored_record_once() {
+        let root = temp("list");
+        let w = worlds(&root, Limits::DESIGN);
+        let meta = stored(&root, "yamls", "yaml", b"name: a", json!({"name": "a.yaml"}));
+        let r = list(&w, Kind::Yaml).unwrap();
+        assert_eq!(json_of(r).await, json!([meta]));
+        assert_eq!(json_of(list(&w, Kind::Apworld).unwrap()).await, json!([]));
+    }
+
+    #[test]
+    fn chosen_ids_must_each_be_stored_and_listed_once() {
+        let root = temp("chosen");
+        let w = worlds(&root, Limits::DESIGN);
+        let a = stored(&root, "yamls", "yaml", b"a", json!({"name": "a"}));
+        let b = stored(&root, "yamls", "yaml", b"b", json!({"name": "b"}));
+        let pick = |ids: Value| chosen(&w, &json!({ "yamls": ids }), "yamls", Kind::Yaml);
+        assert_eq!(pick(json!([a["id"], b["id"]])).unwrap(), [a.clone(), b]);
+        assert!(pick(json!([a["id"], a["id"]])).unwrap_err().contains("listed twice"));
+        assert!(pick(json!([content_id(b"c")])).unwrap_err().contains("no upload"));
+        assert!(pick(json!(["../x"])).unwrap_err().contains("bad id"));
+        assert!(pick(json!("x")).unwrap_err().contains("must be a list"));
+        let none = chosen(&w, &json!({}), "apworlds", Kind::Apworld).unwrap_err();
+        assert!(none.contains("apworlds must be a list"), "{none}");
+    }
+
+    #[test]
+    fn a_world_folder_holds_the_chosen_files_apworlds_named_by_module() {
+        let root = temp("prepare");
+        let w = worlds(&root, Limits::DESIGN);
+        let apworld = stored(&root, "apworlds", "apworld", b"zip", json!({"module": "clique"}));
+        let yaml = stored(&root, "yamls", "yaml", b"name: a", json!({}));
+        let world = root.join("data/worlds/w");
+        prepare(&w, &world, &[apworld], std::slice::from_ref(&yaml)).unwrap();
+        let names = |sub: &str| -> Vec<String> {
+            let entries = std::fs::read_dir(world.join(sub)).unwrap().filter_map(Result::ok);
+            entries.map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names("apworlds"), ["clique.apworld"]);
+        assert_eq!(std::fs::read(world.join("apworlds/clique.apworld")).unwrap(), b"zip");
+        let id = yaml["id"].as_str().unwrap();
+        assert_eq!(names("yamls"), [format!("{id}.yaml")]);
+        assert_eq!(std::fs::read(world.join(format!("yamls/{id}.yaml"))).unwrap(), b"name: a");
+    }
+
+    #[tokio::test]
+    async fn two_apworlds_with_one_module_name_are_refused_before_anything_runs() {
+        let root = temp("same-module");
+        let w = Arc::new(worlds(&root, Limits::DESIGN));
+        let one = stored(&root, "apworlds", "apworld", b"1", json!({"module": "clique"}));
+        let two = stored(&root, "apworlds", "apworld", b"2", json!({"module": "clique"}));
+        let yaml = stored(&root, "yamls", "yaml", b"y", json!({}));
+        let req = json!({"apworlds": [one["id"], two["id"]], "yamls": [yaml["id"]]});
+        let e = create_world(State(w), Bytes::from(req.to_string())).await.unwrap_err();
+        assert_eq!(e, (StatusCode::BAD_REQUEST, "two apworlds have the same module name".into()));
+        let worlds_dir = std::fs::read_dir(root.join("data/worlds")).unwrap();
+        assert_eq!(worlds_dir.count(), 0, "no world folder was made");
+    }
+
+    #[test]
+    fn a_world_status_needs_a_valid_id_and_an_existing_world() {
+        let root = temp("status");
+        let w = worlds(&root, Limits::DESIGN);
+        assert_eq!(read_status(&w, "../../token").unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(read_status(&w, &content_id(b"none")).unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn upload_names_are_decoded_and_must_be_plain_file_names() {
         assert_eq!(upload_name(Some("name=Majoras%20Mask.yaml")).unwrap(), "Majoras Mask.yaml");

@@ -24,7 +24,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --features log/pg-tests,server/pg-tests
+      # The generation sandbox suite (`server/sandbox-tests`, crates/server/tests/worlds.rs).
+      - uses: ./.github/actions/sandbox-host
+      - run: >-
+          cargo test --workspace --locked
+          --features log/pg-tests,server/pg-tests,server/sandbox-tests
         env:
           PROPTEST_CASES: "50000"
   # Gate G-DB throughput (doc 11 section 4.8): fails below 60 percent of 20,000 rows per second.
@@ -51,14 +55,24 @@ jobs:
   # their timeout. Each shard runs the unmutated baseline, then its share of the mutants.
   # cargo-mutants builds each mutant with -p <its package>, so a workspace-style
   # `--features log/pg-tests` made every build fail ("package does not contain this feature"):
-  # the Postgres crates run in their own job with their own `pg-tests` feature.
+  # the Postgres crates run in their own job with their own `pg-tests` feature. For the same
+  # reason log and server run apart: only server has `sandbox-tests`, and without that suite
+  # (the upload and generation API through the real sandbox) its mutants there go unseen.
+  # About 75 log mutants and 310 server ones; a server mutant runs that suite too.
   mutants-pg:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        include:
+          - { package: log, features: pg-tests, shard: 0, shards: 1 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 0, shards: 6 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 1, shards: 6 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 2, shards: 6 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 3, shards: 6 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 4, shards: 6 }
+          - { package: server, features: "pg-tests,sandbox-tests", shard: 5, shards: 6 }
     # Postgres for the log store's contract suite and the restart scenarios (D-98, gate G-DB).
     # A throwaway container; the password is not a secret.
     services:
@@ -81,21 +95,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with: { tool: "cargo-mutants,cargo-nextest" }
+      - if: matrix.package == 'server'
+        uses: ./.github/actions/sandbox-host
       # Excluded: one equivalent mutant, `&&` to `||` in log's `fence` (reasoning in the comment
       # above that line in crates/log/src/pg.rs). Matched by name, not line number; the unit test
       # `fence_has_exactly_the_one_and_the_mutants_exclusion_names` fails if `fence` gains a
       # second `&&` that this pattern would also hide.
       - run: >-
-          cargo mutants --package log --package server --features pg-tests
+          cargo mutants --package ${{ matrix.package }} --features ${{ matrix.features }}
           --exclude-re 'pg\.rs:[0-9]+:[0-9]+: replace && with \|\| in fence$'
           --test-tool nextest --minimum-test-timeout 120
           --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
-          --sharding round-robin --shard ${{ matrix.shard }}/3
+          --sharding round-robin --shard ${{ matrix.shard }}/${{ matrix.shards }}
       # The per-mutant logs, to triage a survivor without rerunning the job.
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: mutants-pg-shard-${{ matrix.shard }}
+          name: mutants-pg-${{ matrix.package }}-shard-${{ matrix.shard }}
           path: mutants.out
           retention-days: 14
   mutants:
@@ -104,7 +120,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        # Six: with four, each shard had about 270 mutants and two ran past the 60 minutes
+        # (2026-11-18); the other two took 44 and 48.
+        shard: [0, 1, 2, 3, 4, 5]
     env:
       # As in mutants-pg: lints capped for mutants only.
       RUSTFLAGS: ""
@@ -125,7 +143,7 @@ jobs:
           cargo mutants --workspace -e 'crates/log/**' -e 'crates/server/**' -e 'crates/e2e/**'
           -e 'crates/sim/**' --test-workspace=true --test-tool nextest --minimum-test-timeout 120
           --cap-lints=true --cargo-arg=--locked --in-place --no-shuffle
-          --sharding round-robin --shard ${{ matrix.shard }}/4
+          --sharding round-robin --shard ${{ matrix.shard }}/6
       # The per-mutant logs, to triage a survivor without rerunning the job.
       - uses: actions/upload-artifact@v7
         if: always()

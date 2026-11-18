@@ -65,6 +65,11 @@ const ABANDONED: &str = "abandoned";
 /// Seconds in a day, for the log line of an abandoned room.
 const DAY_SECS: u64 = 24 * 60 * 60;
 
+/// How many whole days `d` is.
+const fn whole_days(d: Duration) -> u64 {
+    d.as_secs() / DAY_SECS
+}
+
 /// A room just loaded: what its sessions share, and its task.
 type Ready = (crate::rooms::Room, JoinHandle<Stopped>);
 
@@ -850,8 +855,7 @@ impl Host {
             if let Some(r) = self.running.remove(&key) {
                 r.task.abort();
             }
-            let days = limit.as_secs() / DAY_SECS;
-            tracing::info!(%key, days, "room abandoned; it has ended (D-30)");
+            tracing::info!(%key, days = whole_days(limit), "room abandoned; it has ended (D-30)");
         }
     }
 
@@ -1067,6 +1071,89 @@ mod tests {
         assert_eq!(key_of(&host, "alpha"), alpha, "a listed room keeps its key");
         host.scan().await;
         assert_eq!(host.len(), 2);
+        assert!(!host.is_empty());
+    }
+
+    #[test]
+    fn an_abandon_time_is_logged_in_whole_days() {
+        assert_eq!(whole_days(Duration::from_secs(30 * 86_400 + 86_399)), 30);
+        assert_eq!(whole_days(Duration::from_secs(86_399)), 0);
+        assert_eq!(whole_days(Duration::from_secs(86_400)), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_shows_its_folder_and_how_many_rooms_are_in_memory() {
+        let dir = TempDir::new("debug");
+        let host = host(&dir, Limits::DESIGN).await;
+        let shown = format!("{host:?}");
+        assert!(shown.starts_with("Host {"), "{shown}");
+        assert!(
+            shown.contains(&format!("{:?}", dir.0)) && shown.contains("resident: 0"),
+            "{shown}"
+        );
+    }
+
+    /// The supervisor's first tick (scan, unload, abandon) comes one period after it starts,
+    /// not at once: startup has just scanned. The clock is tokio's paused one, so nothing
+    /// waits for real time (docs/TESTING.md rule 5).
+    #[tokio::test(start_paused = true)]
+    async fn the_first_supervisor_tick_comes_one_scan_period_after_the_start() {
+        let dir = TempDir::new("first-tick");
+        let mut host = host(&dir, Limits { rooms_scan_ms: 60_000, ..Limits::DESIGN }).await;
+        dir.bundle("a.json", "alpha");
+        let early = tokio::time::timeout(Duration::from_secs(59), host.supervise()).await;
+        assert!(early.is_err() && host.is_empty(), "no scan before the first period");
+        // A new call starts a new period: its first tick is 60 s after this call.
+        let late = tokio::time::timeout(Duration::from_secs(61), host.supervise()).await;
+        assert!(late.is_err());
+        assert_eq!(seeds(&host), ["alpha"], "the tick one period in scanned");
+    }
+
+    #[tokio::test]
+    async fn a_scan_forgets_files_that_left_the_folder() {
+        let dir = TempDir::new("forget");
+        for f in ["a.json", "b.json"] {
+            std::fs::write(dir.0.join(f), "{not json").unwrap();
+        }
+        let mut host = host(&dir, Limits::DESIGN).await;
+        std::fs::remove_file(dir.0.join("b.json")).unwrap();
+        host.scan().await;
+        let seen: Vec<&PathBuf> = host.seen.keys().collect();
+        assert_eq!(seen, [&dir.0.join("a.json")]);
+    }
+
+    /// A file a scan already skipped for good is not read again while its size and time stay
+    /// the same, even when its bytes changed (what a scan compares is the size and the time).
+    #[tokio::test]
+    async fn a_skipped_file_with_the_same_size_and_time_is_not_read_again() {
+        let dir = TempDir::new("unchanged");
+        dir.bundle("a.json", "alpha");
+        let (path, good) = (dir.0.join("a.json"), std::fs::read(dir.0.join("a.json")).unwrap());
+        let broken = [b"x", good.get(1..).unwrap()].concat();
+        std::fs::write(&path, &broken).unwrap();
+        let mut host = host(&dir, Limits::DESIGN).await;
+        assert!(host.is_empty());
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, &good).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        host.scan().await;
+        assert!(host.is_empty(), "the same size and time: not read again");
+    }
+
+    #[tokio::test]
+    async fn the_room_list_is_running_until_a_room_in_memory_stops() {
+        let dir = TempDir::new("all-running");
+        dir.bundle("a.json", "alpha");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let key = key_of(&host, "alpha");
+        assert!(read(&host.rooms).all_running(), "a cold room does not count");
+        host.wake(&key).await.unwrap();
+        assert!(read(&host.rooms).all_running());
+        host.running[&key].task.abort();
+        // The watcher returns once the room task is gone, mailbox and all.
+        let (_, _, why) = host.tasks.join_next().await.unwrap().unwrap();
+        assert!(why.is_err_and(|e| e.is_cancelled()), "aborted");
+        assert!(!read(&host.rooms).all_running());
     }
 
     /// Review of #55, M1: a bundle skipped for a reason that goes away on its own (the room
@@ -1463,6 +1550,67 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(fixture()).unwrap()).unwrap();
             v["seed_name"] = serde_json::json!(seed);
             parse_bundle(v.to_string().as_bytes(), &Limits::DESIGN).unwrap()
+        }
+
+        /// Everything logged at `debug` and above while `run` runs.
+        async fn logged(run: impl Future<Output = ()>) -> String {
+            #[derive(Clone, Default)]
+            struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Buf::default();
+            let out = buf.clone();
+            let logs = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || out.clone())
+                .finish();
+            {
+                // This test's thread only: the scan logs from it (current-thread runtime).
+                let _logs = tracing::subscriber::set_default(logs);
+                run.await;
+            }
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+        }
+
+        /// A bundle skipped for a reason that may pass (no key drawn here, as when every draw
+        /// collides or the database fails) warns once, then is tried again on each scan with
+        /// a debug line only, and is listed once the reason is gone.
+        #[tokio::test]
+        async fn a_bundle_skipped_for_now_warns_once_then_is_tried_again_quietly() {
+            let (db, dir) = (database().await, TempDir::new("pg-later"));
+            let limits = Limits { room_key_draws: 0, ..Limits::DESIGN };
+            let mut host = pg_host(&dir, &db, limits).await;
+            dir.bundle("a.json", "alpha");
+            let log = logged(async {
+                host.scan().await;
+                host.scan().await;
+            })
+            .await;
+            assert_eq!(log.matches("skipped for now, tried again").count(), 1, "{log}");
+            assert_eq!(log.matches("still skipped").count(), 1, "{log}");
+            host.limits.room_key_draws = Limits::DESIGN.room_key_draws;
+            host.scan().await;
+            assert_eq!(seeds(&host), ["alpha"]);
+        }
+
+        /// A room nobody used since its last write is not written again on a clean stop: the
+        /// database keeps what it has (here an older time set behind the host's back).
+        #[tokio::test]
+        async fn a_clean_stop_leaves_a_room_unused_since_its_last_write_alone() {
+            let (db, dir) = (database().await, TempDir::new("pg-unused"));
+            dir.bundle("a.json", "alpha");
+            let mut host = pg_host(&dir, &db, Limits::DESIGN).await;
+            sql(&db, FORTY_DAYS).await;
+            host.stop().await;
+            assert!(stored_idle_secs(&db).await > 39 * 86_400);
         }
 
         /// A key source that hands out `keys` in order.
