@@ -29,4 +29,4 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
 - Never push to someone else's branch or edit a PR you did not open.
 - One PR per issue. Follow-up fixes are commits on that PR.
 - Issues, PRs and comments in this repo are public. Anything that mentions Archipelago follows the rules in `CONTRIBUTING.md`, and a human reviews it before it is posted.
-- Do not run heavy work on a shared machine: targeted tests locally, the full suite on CI.
+- Do not run heavy work on a shared machine: targeted tests locally, the full suite on the manual `nightly` workflow.
