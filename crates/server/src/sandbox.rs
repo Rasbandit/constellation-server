@@ -105,14 +105,20 @@ impl Sandbox {
             .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "py"))
             .collect();
         world_files.sort();
-        let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_owned());
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+        // Never shown to uploaded code: the data folder, the home folder, the secret files.
+        let private: Vec<PathBuf> = [data_dir]
+            .into_iter()
+            .chain(paths.private.iter().map(PathBuf::as_path))
+            .map(real)
+            .collect();
         let sources = python.binds.iter().chain(tools.iter().map(|(h, _)| h)).chain([ap]);
         for src in sources {
-            let real = std::fs::canonicalize(src).unwrap_or_else(|_| src.clone());
-            if real == Path::new("/") || data.starts_with(&real) {
+            let src_real = real(src);
+            if src_real == Path::new("/") || private.iter().any(|p| p.starts_with(&src_real)) {
                 return Err(format!(
-                    "{} would show the whole host or the data folder to uploaded code; \
-                     move it into its own folder",
+                    "{} would show the whole host, the home folder, the data folder or a \
+                     secret file to uploaded code; move it into its own folder",
                     src.display()
                 ));
             }
@@ -127,6 +133,17 @@ impl Sandbox {
         let mut push = |xs: &[&dyn AsRef<std::ffi::OsStr>]| {
             a.extend(xs.iter().map(|x| x.as_ref().to_owned()));
         };
+        // Its own cgroup first: the memory cap there also counts tmpfs, memfd and shared memory
+        // pages, and an out-of-memory kill lands on the sandbox, not the server. `env -i`:
+        // bwrap's own process stays in the sandbox as its first process, and its environment
+        // is readable there (`/proc/1/environ`), so it gets none of ours (the admin token).
+        let l = &self.limits;
+        let (mem_max, tasks) = (
+            format!("MemoryMax={}", l.gen_cgroup_memory_bytes),
+            format!("TasksMax={}", l.gen_cgroup_tasks),
+        );
+        push(&[&"systemd-run", &"--user", &"--scope", &"--quiet", &"--collect"]);
+        push(&[&"-p", &mem_max, &"-p", &"MemorySwapMax=0", &"-p", &tasks, &"--", &"env", &"-i"]);
         push(&[&"bwrap", &"--unshare-all", &"--unshare-user", &"--disable-userns"]);
         push(&[&"--cap-drop", &"ALL", &"--die-with-parent", &"--new-session", &"--clearenv"]);
         push(&[&"--setenv", &"PATH", &"/usr/bin", &"--setenv", &"HOME", &"/tmp"]);
@@ -169,15 +186,16 @@ impl Sandbox {
         let (mem, procs) =
             (format!("--as={}", l.gen_memory_bytes), format!("--nproc={}", l.gen_max_processes));
         let fsize = format!("--fsize={}", l.gen_file_max_bytes);
+        let nofile = format!("--nofile={}", l.gen_max_open_files);
         push(&[&"--chdir", &if with_ap { AP } else { "/tmp" }, &"/usr/bin/prlimit"]);
-        push(&[&mem, &procs, &fsize, &"--"]);
+        push(&[&mem, &procs, &fsize, &nofile, &"--"]);
         // -I: ignore PYTHON* variables, the user site and the script's folder on sys.path.
         push(&[&self.paths.python, &"-I", &script]);
         a.extend(args.iter().map(OsString::from));
         a
     }
 
-    /// Run the sidecar and parse its stdout as JSON.
+    /// Run the sidecar and return its stdout (at most `Limits::gen_stdout_max_bytes`).
     ///
     /// # Errors
     /// [`Failure::Refused`] with the end of its error output when the sidecar fails;
@@ -188,15 +206,11 @@ impl Sandbox {
         mounts: &[Mount],
         args: &[&str],
         timeout: Duration,
-    ) -> Result<serde_json::Value, Failure> {
+    ) -> Result<Vec<u8>, Failure> {
         let argv = self.argv(with_ap, mounts, args);
         let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
         let mut child = tokio::process::Command::new(program)
             .args(rest)
-            // bwrap's own process stays in the sandbox as its first process, and its
-            // environment is readable there (`/proc/1/environ`), so it gets none of ours
-            // (the admin token, the database URL). `--clearenv` covers only the child.
-            .env_clear()
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -238,8 +252,30 @@ impl Sandbox {
                 l.gen_stdout_max_bytes
             )));
         }
-        serde_json::from_slice(&out)
-            .map_err(|e| Failure::Broken(format!("sidecar printed bad JSON: {e}")))
+        Ok(out)
+    }
+}
+
+/// Check once at startup that each job can get its own cgroup (`systemd-run --user`
+/// needs a user session with the memory controller); without it no job could run.
+///
+/// # Errors
+/// What `systemd-run` said.
+pub fn check_host(l: &Limits) -> Result<(), String> {
+    let out = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "-p"])
+        .arg(format!("MemoryMax={}", l.gen_cgroup_memory_bytes))
+        .args(["--", "true"])
+        .output()
+        .map_err(|e| format!("cannot run systemd-run for the sandbox's cgroup: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the sandbox needs `systemd-run --user --scope` (a user session with the memory \
+             controller): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 
@@ -361,6 +397,7 @@ mod tests {
             ap_dir: root.join("ap"),
             python: "/usr/bin/python3".into(),
             sidecar: root.join("tools/ap-gen/ap_gen.py"),
+            private: vec![],
         }
     }
 
@@ -377,7 +414,7 @@ mod tests {
     fn every_call_is_isolated_read_only_and_capped() {
         let root = temp("argv");
         let a = joined(&sandbox(&root).argv(false, &[], &["inspect-yaml", "/job/x.yaml"]));
-        assert!(a.starts_with("bwrap --unshare-all --unshare-user --disable-userns --cap-drop ALL --die-with-parent --new-session --clearenv"), "{a}");
+        assert!(a.starts_with("systemd-run --user --scope --quiet --collect -p MemoryMax=4294967296 -p MemorySwapMax=0 -p TasksMax=80 -- env -i bwrap --unshare-all --unshare-user --disable-userns --cap-drop ALL --die-with-parent --new-session --clearenv"), "{a}");
         assert!(
             !a.contains("--share-net") && !a.contains("--bind ") && !a.contains("overlay"),
             "{a}"
@@ -390,7 +427,7 @@ mod tests {
             a.contains("--remount-ro /dev --remount-ro / --chdir /tmp /usr/bin/prlimit"),
             "{a}"
         );
-        assert!(a.contains("--as=1000 --nproc=7 --fsize=268435456 -- /usr/bin/python3 -I /tools/ap-gen/ap_gen.py inspect-yaml /job/x.yaml"), "{a}");
+        assert!(a.contains("--as=1000 --nproc=7 --fsize=268435456 --nofile=256 -- /usr/bin/python3 -I /tools/ap-gen/ap_gen.py inspect-yaml /job/x.yaml"), "{a}");
         let tools = root.join("tools");
         assert!(a.contains(&format!("--ro-bind {}/ap-gen /tools/ap-gen", tools.display())), "{a}");
         assert!(
@@ -432,6 +469,17 @@ mod tests {
         assert!(e.contains("data folder"), "{e}");
         let at_root = Generation { sidecar: "/ap_gen.py".into(), ..g.clone() };
         assert!(Sandbox::new(at_root, Limits::DESIGN, &root.join("data")).is_err());
+        // The home folder itself, or a folder holding a secret file.
+        let home = Generation { private: vec![root.join("tools/ap-gen")], ..g.clone() };
+        let e = Sandbox::new(home, Limits::DESIGN, &root.join("data")).unwrap_err();
+        assert!(e.contains("home folder"), "{e}");
+        let token = Generation { private: vec![root.join("ap/token")], ..g.clone() };
+        assert!(Sandbox::new(token, Limits::DESIGN, &root.join("data")).is_err());
+        let home_above = Generation { private: vec![root.clone()], ..g.clone() };
+        assert!(
+            Sandbox::new(home_above, Limits::DESIGN, &root.join("data")).is_ok(),
+            "below home is fine"
+        );
         let not_ap = Generation { ap_dir: root.join("tools"), ..g };
         assert!(
             Sandbox::new(not_ap, Limits::DESIGN, &root.join("data"))

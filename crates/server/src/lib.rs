@@ -407,6 +407,9 @@ pub async fn run(
     let mut stop = shutdown();
     let startup = async {
         let loaded = load_bundle(&args.bundle, &limits)?;
+        if args.data_dir.is_some() {
+            sandbox::check_host(&limits)?;
+        }
         let api = worlds_api(
             args.data_dir.as_deref(),
             secrets.admin_token.as_deref(),
@@ -622,6 +625,7 @@ mod tests {
                 ap_dir: root.join("ap"),
                 python: "/usr/bin/python3".into(),
                 sidecar: root.join("tools/ap-gen/ap_gen.py"),
+                private: vec![],
             })
         };
         assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());

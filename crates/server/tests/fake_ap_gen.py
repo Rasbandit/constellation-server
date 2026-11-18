@@ -1,6 +1,7 @@
 """A stand-in for tools/ap-gen/ap_gen.py for crates/server/tests/worlds.rs: same command line and
 output shape, no Archipelago. It runs inside the real sandbox and reports what the sandbox let
-it do. A yaml's text picks a behaviour: a player name, or SLOW, WAIT, FLOOD_ERR, FLOOD_OUT."""
+it do. A yaml's text picks a behaviour: a player name, or SLOW, WAIT, FLOOD_ERR, FLOOD_OUT,
+BAD_RESULT, MEMFD."""
 
 import json
 import os
@@ -37,6 +38,20 @@ def forks(n: int) -> int:
     return started
 
 
+def memfds(n: int) -> int:
+    """How many of n memfds could be open at once."""
+    fds = []
+    try:
+        for _ in range(n):
+            fds.append(os.memfd_create("probe"))
+    except OSError:
+        pass
+    count = len(fds)
+    for fd in fds:
+        os.close(fd)
+    return count
+
+
 def probes() -> dict:
     canary = json.loads((HERE / "probe.json").read_text())
     try:
@@ -57,6 +72,7 @@ def probes() -> dict:
         "core_worlds": sorted(os.listdir("/ap/worlds")),
         "nested_userns_exit": userns,
         "forks_of_100": forks(100),
+        "memfds_of_300": memfds(300),
     }
 
 
@@ -97,6 +113,20 @@ def main(argv):
             chunk = b" " * (1 << 20)
             for _ in range(80):
                 os.write(1, chunk)
+            return 0
+        if "BAD_RESULT" in texts:
+            print("[]")
+            return 0
+        if "MEMFD" in texts:
+            # Memory no address space cap sees: only the sandbox's cgroup can stop this.
+            chunk = b"m" * (1 << 20)
+            for _ in range(3):
+                fd = os.memfd_create("pin")
+                for _ in range(100):
+                    os.write(fd, chunk)
+            # A valid result: without the cgroup cap this job would end `done`.
+            bundle = json.loads((HERE / "bundle.json").read_text())
+            print(json.dumps({"report": {}, "bundle": bundle}))
             return 0
         out = Path(a["--out"])
         # Anything left in the scratch folder must stay in the sandbox.

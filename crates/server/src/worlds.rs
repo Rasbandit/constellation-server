@@ -269,6 +269,8 @@ async fn inspect_and_store(
             Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
             Failure::Broken(why) => internal(why),
         })?;
+    let found: Value = serde_json::from_slice(&found)
+        .map_err(|e| internal(format!("sidecar printed bad JSON: {e}")))?;
     let mut meta = match (kind, found) {
         (Kind::Apworld, Value::Object(o)) => {
             if !o.get("module").and_then(Value::as_str).is_some_and(valid_module) {
@@ -390,6 +392,21 @@ fn write_status(world: &Path, status: &Value) -> std::io::Result<()> {
     write_atomic(&world.join("status.json"), status.to_string().as_bytes())
 }
 
+/// What `ap_gen.py generate` prints. The bundle stays raw text (no tree of values in memory);
+/// `load_bundle` parses it into its typed form.
+#[derive(Debug, serde::Deserialize)]
+struct GenOut {
+    report: Value,
+    bundle: Box<serde_json::value::RawValue>,
+}
+
+impl GenOut {
+    fn parse(stdout: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(stdout)
+            .map_err(|e| format!("the sidecar's result is malformed: {e}"))
+    }
+}
+
 /// Run one queued generation (one at a time) and record how it ended.
 async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let Ok(_permit) = w.one_gen.acquire().await else { return };
@@ -409,14 +426,12 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
     let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
-        Ok(mut found) => {
+        Ok(stdout) => {
             let (bundle, limits) = (world.join("bundle.json"), w.limits);
-            let report = found["report"].take();
-            let text = found.get("bundle").map(Value::to_string);
             tokio::task::spawn_blocking(move || {
-                let text = text.ok_or("the sidecar sent no bundle")?;
-                write_atomic(&bundle, text.as_bytes()).map_err(|e| e.to_string())?;
-                load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, report))
+                let out = GenOut::parse(&stdout)?;
+                write_atomic(&bundle, out.bundle.get().as_bytes()).map_err(|e| e.to_string())?;
+                load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, out.report))
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
@@ -558,6 +573,16 @@ mod tests {
         drop(std::fs::remove_dir_all(&d));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_generation_result_must_be_an_object_with_a_report_and_a_bundle() {
+        let ok = GenOut::parse(br#"{"report": {"seconds": 1}, "bundle": {"a": [1, 2]}}"#).unwrap();
+        assert_eq!((ok.report, ok.bundle.get()), (json!({"seconds": 1}), r#"{"a": [1, 2]}"#));
+        for bad in [&b"[]"[..], b"\"x\"", b"{}", br#"{"report": 1}"#, b"", b"{nope"] {
+            let e = GenOut::parse(bad).unwrap_err();
+            assert!(e.contains("malformed"), "{e}");
+        }
     }
 
     #[test]

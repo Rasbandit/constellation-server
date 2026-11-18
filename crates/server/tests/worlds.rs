@@ -189,6 +189,7 @@ async fn upload_list_generate_poll_and_done() {
     }
     assert_ne!(g["nested_userns_exit"], 0, "no user namespaces inside");
     assert!(g["forks_of_100"].as_u64().unwrap() < 64, "{}", g["forks_of_100"]);
+    assert!(g["memfds_of_300"].as_u64().unwrap() < 256, "{}", g["memfds_of_300"]);
     // The sidecar's spoofed `id` and `name` never replaced the server's.
     assert_eq!(world["id"].as_str(), Some(world_id.as_str()));
     drop(server.stop());
@@ -264,6 +265,31 @@ async fn a_flood_of_output_is_cut_to_its_caps_not_held() {
     server.wait_for_log(&line).unwrap();
     let st = status(&server, &out).await;
     assert!(st["error"].as_str().unwrap().contains("printed more than"), "{st}");
+}
+
+#[tokio::test]
+async fn a_result_that_is_not_an_object_fails_the_job() {
+    let setup = Setup::new("badresult");
+    let server = setup.start();
+    let id = generate_one(&server, b"BAD_RESULT").await;
+    server.wait_for_log(&format!("generation failed world={id}")).unwrap();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "failed", "{st}");
+    assert!(st["error"].as_str().unwrap().contains("malformed"), "{st}");
+}
+
+/// memfd pages count against no address space limit; the sandbox's own cgroup must stop them.
+#[tokio::test]
+async fn memory_past_the_cgroup_cap_kills_the_job_not_the_server() {
+    let setup = Setup::new("memfd");
+    let cap = (200 * 1024 * 1024).to_string();
+    let server = setup.start_with(&[("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &cap)]);
+    let id = generate_one(&server, b"MEMFD").await;
+    server.wait_for_log(&format!("generation failed world={id}")).unwrap();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "failed", "{st}");
+    let room = server.url().trim_start_matches("ws://").to_owned();
+    assert_eq!(request(&room, "GET", "/healthz", None, b"").await.0, 200, "the server lives");
 }
 
 #[tokio::test]

@@ -135,6 +135,15 @@ pub struct Limits {
     /// Most processes and threads in the sandbox (`prlimit --nproc`, counted per sandbox
     /// because each has its own user namespace; design value).
     pub gen_max_processes: u64,
+    /// Most open files in the sandbox (`prlimit --nofile`; bounds memfd use; design value).
+    pub gen_max_open_files: u64,
+    /// Memory cap of each sandbox's own cgroup (`systemd-run --user --scope -p MemoryMax`),
+    /// bytes. It counts what the address space cap misses: tmpfs, memfd and shared memory
+    /// pages, and all processes together (`CONSTELLATION_GEN_CGROUP_MEMORY_BYTES`; design value).
+    pub gen_cgroup_memory_bytes: u64,
+    /// Task cap of each sandbox's cgroup (`TasksMax`; bwrap's own processes included; design
+    /// value).
+    pub gen_cgroup_tasks: u64,
 }
 
 /// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
@@ -197,6 +206,9 @@ impl Limits {
         gen_tmpfs_bytes: 256 * 1024 * 1024,
         gen_file_max_bytes: 256 * 1024 * 1024,
         gen_max_processes: 64,
+        gen_max_open_files: 256,
+        gen_cgroup_memory_bytes: 4 * 1024 * 1024 * 1024,
+        gen_cgroup_tasks: 80,
     };
 }
 
@@ -230,6 +242,7 @@ pub fn load() -> Limits {
         ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
         ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
         ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
+        ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -336,7 +349,18 @@ pub struct Generation {
     pub python: std::path::PathBuf,
     /// The sidecar script, normally `tools/ap-gen/ap_gen.py`: `CONSTELLATION_AP_GEN_SCRIPT`.
     pub sidecar: std::path::PathBuf,
+    /// Host paths no sandbox mount may contain: the server user's home (`HOME`) and the secret
+    /// files (`CONSTELLATION_*_FILE`).
+    pub private: Vec<std::path::PathBuf>,
 }
+
+/// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
+#[cfg(feature = "std")]
+const SECRET_FILE_VARS: [&str; 3] = [
+    "CONSTELLATION_ROOM_PASSWORD_FILE",
+    "CONSTELLATION_DATABASE_URL_FILE",
+    "CONSTELLATION_ADMIN_TOKEN_FILE",
+];
 
 /// Read [`Generation`] from the environment: `None` when none of its variables is set.
 ///
@@ -362,10 +386,17 @@ fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Genera
         let p = std::path::PathBuf::from(v);
         if p.is_absolute() { Ok(p) } else { Err(format!("{k} must be an absolute path")) }
     };
+    let private = ["HOME"]
+        .iter()
+        .chain(SECRET_FILE_VARS.iter())
+        .filter_map(|k| var(k).filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from)
+        .collect();
     Ok(Some(Generation {
         ap_dir: path(ap, KEYS[0])?,
         python: path(py, KEYS[1])?,
         sidecar: path(side, KEYS[2])?,
+        private,
     }))
 }
 
@@ -631,6 +662,11 @@ mod tests {
             (l.gen_tmpfs_bytes, l.gen_file_max_bytes, l.gen_max_processes),
             (256 << 20, 256 << 20, 64)
         );
+        assert_eq!(
+            (l.gen_max_open_files, l.gen_cgroup_memory_bytes, l.gen_cgroup_tasks),
+            (256, 4 << 30, 80)
+        );
+        assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
     }
 
     #[test]
@@ -673,6 +709,19 @@ mod tests {
         assert_eq!(g.ap_dir, std::path::PathBuf::from("/ap"));
         assert_eq!(g.python, std::path::PathBuf::from("/venv/bin/python"));
         assert_eq!(g.sidecar, std::path::PathBuf::from("/tools/ap-gen/ap_gen.py"));
+        assert!(g.private.is_empty());
+        let with_private: &'static [(&str, &str)] = &[
+            ("CONSTELLATION_AP_DIR", "/ap"),
+            ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+            ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
+            ("HOME", "/home/u"),
+            ("CONSTELLATION_ADMIN_TOKEN_FILE", "/etc/c/token"),
+            ("CONSTELLATION_DATABASE_URL_FILE", "/etc/c/db"),
+        ];
+        let g = generation_from(env(with_private)).unwrap().unwrap();
+        let want: Vec<std::path::PathBuf> =
+            ["/home/u", "/etc/c/db", "/etc/c/token"].iter().map(Into::into).collect();
+        assert_eq!(g.private, want);
         let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
         assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");
         let rel: &'static [(&str, &str)] = &[
