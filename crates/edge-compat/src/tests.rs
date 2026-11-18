@@ -1053,3 +1053,86 @@ async fn slot_data_is_sent_when_connect_leaves_the_flag_out() {
     p[0].as_object_mut().unwrap().remove("slot_data");
     assert_eq!(send(&mut s, &p).await[0]["slot_data"], json!({"answer": 42}));
 }
+
+/// Slot A starts with items 8 and 7 (protocol doc, "`items_handling` flags" bit 2 and "Data
+/// Package Contents": location -2, player 0).
+fn start_room() -> Arc<CompatRoom> {
+    room_edit(|v| v["slots"][0]["start_inventory"] = json!([8, 7]))
+}
+
+fn start_item(item: i64) -> Value {
+    json!({"item": item, "location": -2, "player": 0, "flags": 0})
+}
+
+#[tokio::test]
+async fn a_client_with_the_start_inventory_flag_gets_start_items_first_from_index_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(7))).await;
+    assert_eq!(
+        ps[1],
+        json!({"cmd": "ReceivedItems", "index": 0, "items": [start_item(8), start_item(7)]})
+    );
+    pump(&mut a).await;
+    let mut b = joined(&room, "B").await;
+    check(&mut b, &[100]).await;
+    // Live items continue after the start inventory in the index.
+    let got = pump(&mut a).await;
+    assert_eq!(
+        *of(&got, "ReceivedItems")[0],
+        json!({"cmd": "ReceivedItems", "index": 2,
+               "items": [{"item": 7, "location": 100, "player": 2, "flags": 4}]})
+    );
+    let sync = send(&mut a, &json!([{"cmd": "Sync"}])).await;
+    assert_eq!(sync[0]["items"].as_array().unwrap().len(), 3, "{sync:?}");
+    // No print for a start item: the only prints are the check's.
+    assert!(got.iter().all(|p| p["item"]["location"] != -2), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_client_without_the_flag_never_sees_start_items_and_indexes_from_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    let ps = send(&mut a, &connect_packet("A", &json!(3))).await;
+    assert_eq!(of(&ps, "ReceivedItems"), Vec::<&Value>::new());
+    pump(&mut a).await;
+    let mut b = joined(&room, "B").await;
+    check(&mut b, &[100]).await;
+    assert_eq!(of(&pump(&mut a).await, "ReceivedItems")[0]["index"], 0);
+    // Another slot's start inventory is never sent to B.
+    assert_eq!(of(&pump(&mut b).await, "ReceivedItems"), Vec::<&Value>::new());
+}
+
+#[tokio::test]
+async fn turning_on_the_start_inventory_flag_resends_everything_from_zero() {
+    let room = start_room();
+    let mut a = Session::new(Arc::clone(&room));
+    send(&mut a, &connect_packet("A", &json!(3))).await;
+    check(&mut a, &[101]).await;
+    pump(&mut a).await;
+    let ps = send(&mut a, &json!([{"cmd": "ConnectUpdate", "items_handling": 7}])).await;
+    assert_eq!(
+        ps[0],
+        json!({"cmd": "ReceivedItems", "index": 0, "items": [start_item(8), start_item(7),
+               {"item": 8, "location": 101, "player": 1, "flags": 0}]})
+    );
+}
+
+#[tokio::test]
+async fn the_archipelago_game_is_listed_and_its_package_is_served_without_name_groups() {
+    let room = room_edit(|v| {
+        v["games"]["Archipelago"] = json!({"item_name_to_id": {"Nothing": -1},
+            "location_name_to_id": {"Server": -2}, "checksum": "ap"});
+        v["games"][GAME]["item_name_groups"] = json!({"Both": ["Seven", "Eight"]});
+    });
+    let mut s = Session::new(room);
+    let info = &packets(&[s.hello()])[0];
+    assert_eq!(info["games"], json!(["Archipelago", GAME]));
+    assert_eq!(info["datapackage_checksums"]["Archipelago"], "ap");
+    let ps = send(&mut s, &json!([{"cmd": "GetDataPackage"}])).await;
+    let games = &ps[0]["data"]["games"];
+    assert_eq!(games["Archipelago"]["location_name_to_id"]["Server"], -2);
+    // Clients read groups through `Get`, never in the package (protocol doc, "Get").
+    let keys: Vec<&String> = games[GAME].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["checksum", "item_name_to_id", "location_name_to_id"]);
+}

@@ -76,7 +76,7 @@ fn unknown_fields_are_refused_so_schema_drift_is_loud() {
 #[test]
 fn every_broken_rule_is_named() {
     type Edit = fn(&mut Value);
-    let cases: [(&str, Edit); 16] = [
+    let cases: [(&str, Edit); 17] = [
         ("format", |v| v["format"] = json!(2)),
         ("no slots", |v| v["slots"] = json!([])),
         ("hint_cost", |v| v["server_options"]["hint_cost"] = json!(101)),
@@ -93,6 +93,7 @@ fn every_broken_rule_is_named() {
         ("lacks", |v| v["slots"][0]["locations"][0]["item"] = json!(9)),
         ("connect name", |v| v["connect_names"]["C"] = json!([1, 1])),
         ("2^53", |v| v["games"]["G"]["item_name_to_id"]["Big"] = json!(1_i64 << 53)),
+        ("starts with item 9", |v| v["slots"][0]["start_inventory"] = json!([7, 9])),
     ];
     for (want, edit) in cases {
         let msg = refused(edit);
@@ -133,6 +134,41 @@ fn the_imported_fixture_bundle_is_valid() {
     assert_eq!(b.server_options.password, None);
     let cross = b.slots[0].locations.iter().filter(|p| p.receiver == 2).count();
     assert!(cross > 0, "the fixture must send items across slots");
+}
+
+/// Protocol doc, "Data Package Contents": start items come from location -2 and player 0, so
+/// they are item ids of the slot's own game, repeats allowed (two copies of one item).
+#[test]
+fn a_starting_inventory_is_kept_in_order_with_repeats() {
+    let mut v = good();
+    v["slots"][0]["start_inventory"] = json!([8, 7, 8]);
+    let b = parse(&v).unwrap();
+    assert_eq!(b.slots[0].start_inventory, [8, 7, 8]);
+    assert!(b.slots[1].start_inventory.is_empty(), "absent means none");
+}
+
+/// The name groups a client reads as `_read_item_name_groups_<game>` and
+/// `_read_location_name_groups_<game>` (protocol doc, "Get"), kept as given; absent is empty.
+#[test]
+fn name_groups_are_kept_per_game_and_default_to_empty() {
+    let mut v = good();
+    v["games"]["G"]["item_name_groups"] = json!({"Both": ["Seven", "Eight"]});
+    v["games"]["G"]["location_name_groups"] = json!({"First": ["L100"]});
+    let b = parse(&v).unwrap();
+    let g = &b.games["G"];
+    assert_eq!(g.item_name_groups["Both"], ["Seven", "Eight"]);
+    assert_eq!(g.location_name_groups["First"], ["L100"]);
+    assert!(parse(&good()).unwrap().games["G"].item_name_groups.is_empty());
+}
+
+/// The generic `Archipelago` game names location -2 and player 0 for start items; a bundle
+/// may carry its package although no slot plays it.
+#[test]
+fn a_game_no_slot_plays_is_accepted() {
+    let mut v = good();
+    v["games"]["Archipelago"] = json!({"item_name_to_id": {"Nothing": -1},
+        "location_name_to_id": {"Cheat Console": -1, "Server": -2}, "checksum": "ap"});
+    assert!(parse(&v).unwrap().games.contains_key("Archipelago"));
 }
 
 #[test]

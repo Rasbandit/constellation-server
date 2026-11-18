@@ -471,7 +471,7 @@ mod tests {
 
     /// Golden value from an independent implementation: Python's `json.dumps(json.load(f),
     /// sort_keys=True, separators=(",", ":"), ensure_ascii=False)` hashed with `hashlib.sha256`
-    /// (run 2026-11-16 on the committed fixture). The hash depends on the bundle file's content
+    /// (rerun 2026-11-17 on the regenerated fixture). The hash depends on the bundle file's content
     /// only, never on the Rust type, so adding a defaulted field to `SeedBundle` cannot lock an
     /// existing room out.
     #[test]
@@ -486,7 +486,7 @@ mod tests {
                 h
             },
         );
-        assert_eq!(hex, "a78ee159f63ad862df2636415f1ce02922dd714d6ffa9290f67ded38b76eab7a");
+        assert_eq!(hex, "97cee53e7307b8ec357b4419cc1cfd89bfc52d72b57767297d22905ededb9275");
     }
 
     #[test]

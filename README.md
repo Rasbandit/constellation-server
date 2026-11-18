@@ -51,7 +51,7 @@ PYTHONPATH=. $PY -c 'import runpy,sys,ModuleUpdate; ModuleUpdate.update_ran=True
 PYTHONPATH=. $PY $ROOT/tools/ap-import/ap_import.py $OUT/AP_*.zip $ROOT/crates/e2e/fixtures/two-slot.json
 cd $ROOT
 ```
-Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-16). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.
+Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-17; Bob has a starting inventory). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.
 
 ## Licences
 This repo is source-available, not open source: [PolyForm Strict 1.0.0](LICENSE.md). You may read, run and test it for noncommercial purposes; commercial use, redistribution and derived works need a written license from the owner. Contributors get the extra permissions in [`CONTRIBUTING.md`](CONTRIBUTING.md).

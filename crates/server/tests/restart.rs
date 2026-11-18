@@ -46,6 +46,11 @@ mod restart {
             .collect()
     }
 
+    /// The fixture's start items for `slot` as (location -2, player 0) pairs.
+    fn start_items(slot: u32) -> Vec<(i64, i64)> {
+        e2e::start_items(slot).unwrap().iter().map(|_| (-2, 0)).collect()
+    }
+
     async fn wait_goal_print(c: &mut Client) {
         loop {
             let (p, _) = c.next_cmd("PrintJSON").await.unwrap();
@@ -86,8 +91,9 @@ mod restart {
         assert_eq!(locations(&u["checked_locations"]), b_to_a);
         alice.send(&json!([{"cmd": "StatusUpdate", "status": 30}])).await.unwrap();
         wait_goal_print(&mut alice).await;
-        let bob_items: Vec<(i64, i64)> =
-            alice_checked.iter().filter(|l| a_to_b.contains(l)).map(|&l| (l, 1)).collect();
+        // Bob asks for his starting inventory (bit 2), so it leads his list.
+        let mut bob_items = start_items(2);
+        bob_items.extend(alice_checked.iter().filter(|l| a_to_b.contains(l)).map(|&l| (l, 1)));
         let mut alice_items = vec![(a_own, 1)];
         alice_items.extend(b_to_a.iter().map(|&l| (l, 2)));
         Played { alice_checked, bob_checked: b_to_a, alice_items, bob_items }
@@ -176,11 +182,8 @@ mod restart {
         let prefix: BTreeSet<i64> = all.iter().take(n).map(|p| p.0).collect();
         assert_eq!(kept, prefix, "the surviving checks are not a prefix of those sent");
         let (mut bob, _, _) = join(&server.url(), "Bob").await.unwrap();
-        let want: Vec<(i64, i64)> =
-            all.iter().take(n).filter(|p| p.1 == 2).map(|p| (p.0, 1)).collect();
-        if want.is_empty() {
-            return;
-        }
+        let mut want = start_items(2);
+        want.extend(all.iter().take(n).filter(|p| p.1 == 2).map(|p| (p.0, 1)));
         let (inv, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!((inv["index"].clone(), items(&inv)), (json!(0), want));
     }

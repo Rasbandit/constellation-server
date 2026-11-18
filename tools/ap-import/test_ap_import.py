@@ -64,9 +64,25 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual((bob["team"], bob["kind"]), (0, "player"))
 
     def test_only_played_games_are_kept_and_extra_package_keys_dropped(self):
-        games = convert(multidata())["games"]
+        md = multidata()
+        md["datapackage"]["G"]["extra"] = 1
+        games = convert(md)["games"]
         self.assertEqual(list(games), ["G"])
-        self.assertEqual(set(games["G"]), {"item_name_to_id", "location_name_to_id", "checksum"})
+        self.assertEqual(set(games["G"]), {"item_name_to_id", "location_name_to_id", "checksum",
+                                           "item_name_groups", "location_name_groups"})
+
+    def test_name_groups_are_kept_and_missing_ones_are_empty(self):
+        md = multidata()
+        md["datapackage"]["G"]["item_name_groups"] = {"Both": ["I7", "I8"], "Set": {"I8"}}
+        g = convert(md)["games"]["G"]
+        self.assertEqual(g["item_name_groups"], {"Both": ["I7", "I8"], "Set": ["I8"]})
+        self.assertEqual(g["location_name_groups"], {})
+
+    def test_the_generic_archipelago_package_is_kept_although_no_slot_plays_it(self):
+        md = multidata()
+        md["datapackage"]["Archipelago"] = {"item_name_to_id": {"Nothing": -1},
+                                            "location_name_to_id": {"Server": -2}, "checksum": "a"}
+        self.assertEqual(sorted(convert(md)["games"]), ["Archipelago", "G"])
 
     def test_options_missing_or_null_fall_back_to_defaults(self):
         o = convert(multidata())["server_options"]
@@ -80,13 +96,11 @@ class ConvertTests(unittest.TestCase):
             convert(md)
 
 
-    def test_starting_inventory_is_refused_until_supported(self):
+    def test_starting_inventory_is_kept_per_slot_in_order(self):
         md = multidata()
-        md["precollected_items"] = {1: [], 2: [8]}
-        with self.assertRaisesRegex(ValueError, "starting inventory"):
-            convert(md)
-        md["precollected_items"] = {1: [], 2: []}
-        convert(md)  # empty lists are fine
+        md["precollected_items"] = {2: [8, 7, 8]}
+        slots = convert(md)["slots"]
+        self.assertEqual([s["start_inventory"] for s in slots], [[], [8, 7, 8]])
 
     def test_group_slots_are_refused_until_supported(self):
         md = multidata()

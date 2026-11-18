@@ -79,10 +79,19 @@ impl CompatRoom {
             .iter()
             .flat_map(|s| s.locations.iter().map(move |p| ((s.id, p.location), p.flags)))
             .collect();
+        // Name groups are not part of the package clients get; they read them through `Get`
+        // (reference server: the reduced package, `MultiServer.py:624-641`).
         let packages = bundle
             .games
             .iter()
-            .map(|(name, g)| serde_json::to_string(g).map(|json| (name.clone(), json)))
+            .map(|(name, g)| {
+                let reduced = serde_json::json!({
+                    "item_name_to_id": g.item_name_to_id,
+                    "location_name_to_id": g.location_name_to_id,
+                    "checksum": g.checksum,
+                });
+                serde_json::to_string(&reduced).map(|json| (name.clone(), json))
+            })
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let password = password.or_else(|| bundle.server_options.password.clone());

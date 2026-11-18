@@ -41,6 +41,8 @@ struct Handling {
     any: bool,
     /// Items found in the client's own world too (bit 1).
     own: bool,
+    /// The starting inventory, before every received item (bit 2).
+    start: bool,
 }
 
 impl Handling {
@@ -59,8 +61,7 @@ impl Handling {
         if !any && bits != 0 {
             return None;
         }
-        // Bit 2 (starting inventory) is accepted; seeds we import carry none yet.
-        Some(Self { any, own: bits & 0b010 != 0 })
+        Some(Self { any, own: bits & 0b010 != 0, start: bits & 0b100 != 0 })
     }
 
     const fn wants(self, me: u32, item: &NetworkItem) -> bool {
@@ -78,6 +79,10 @@ struct Joined {
     sent: usize,
     /// Every item the slot received, in order, `player` being the finder.
     items: Vec<NetworkItem>,
+    /// The slot's starting inventory. A client that asks for it (bit 2) gets these first, so
+    /// its index space is `start` then `items`; any other client indexes `items` from 0
+    /// (reference server: start items lead the list it indexes, `MultiServer.py:1146-1168`).
+    start: Vec<NetworkItem>,
     checked: BTreeSet<i64>,
     goals: BTreeSet<u32>,
     live: mpsc::Receiver<Arc<Published>>,
@@ -95,7 +100,9 @@ impl Joined {
     }
 
     fn wanted(&self) -> Vec<NetworkItem> {
-        self.items.iter().filter(|i| self.handling.wants(self.slot, i)).copied().collect()
+        let start = if self.handling.start { self.start.as_slice() } else { &[] };
+        let received = self.items.iter().filter(|i| self.handling.wants(self.slot, i));
+        start.iter().chain(received).copied().collect()
     }
 }
 
@@ -261,6 +268,11 @@ impl Session {
             handling,
             sent: 0,
             items: Vec::new(),
+            start: slot
+                .start_inventory
+                .iter()
+                .map(|&item| NetworkItem { item, location: START_LOCATION, player: 0, flags: 0 })
+                .collect(),
             checked: BTreeSet::new(),
             goals: BTreeSet::new(),
             live,
@@ -600,6 +612,10 @@ impl Session {
         Ok(self.full_items().into_iter().collect())
     }
 }
+
+/// Location id of a start item: the generic game's "Server" location (protocol doc, "Data
+/// Package Contents"); its player is 0, the server.
+const START_LOCATION: i64 = -2;
 
 /// Why a command stopped early.
 #[derive(Debug)]

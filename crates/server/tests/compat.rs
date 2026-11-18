@@ -49,7 +49,10 @@ mod scenarios {
         assert_eq!(info["cmd"], "RoomInfo");
         assert_eq!(info["seed_name"], b.seed_name);
         assert_eq!(info["password"], false);
-        assert_eq!(info["games"], json!([GAME]));
+        // The generic game names location -2 and player 0 of start items (protocol doc, "Data
+        // Package Contents"); it is listed next to the seed's game.
+        assert_eq!(info["games"], json!([GAME, "Archipelago"]));
+        assert_eq!(info["datapackage_checksums"]["Archipelago"], b.games["Archipelago"].checksum);
         assert_eq!(info["datapackage_checksums"][GAME], b.games[GAME].checksum);
         assert_eq!(info["hint_cost"], 10);
     }
@@ -90,11 +93,15 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let (loc, item, flags) = alice_locations_for(2)[0];
+        // Bob's starting inventory comes first, at index 0, as he asked for it (bit 2).
+        let start = e2e::start_items(2).unwrap();
+        let (got, _) = bob.next_cmd("ReceivedItems").await.unwrap();
+        assert_eq!(got, json!({"cmd": "ReceivedItems", "index": 0, "items": start}));
         check(&mut alice, &[loc]).await;
         let (got, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!(
             got,
-            json!({"cmd": "ReceivedItems", "index": 0,
+            json!({"cmd": "ReceivedItems", "index": start.len(),
             "items": [{"item": item, "location": loc, "player": 1, "flags": flags}]})
         );
         let (update, _) = alice.next_cmd("RoomUpdate").await.unwrap();
@@ -121,16 +128,19 @@ mod scenarios {
         let (mut alice, _, _) = joined(&server, "Alice").await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
         let to_bob = alice_locations_for(2);
+        let start = e2e::start_items(2).unwrap().len();
+        bob.next_cmd("ReceivedItems").await.unwrap(); // the starting inventory
         check(&mut alice, &[to_bob[0].0, to_bob[0].0]).await;
         check(&mut alice, &[to_bob[0].0]).await;
-        // The signal: a fresh check after the repeats. Bob's next item must be that one, at 1.
+        // The signal: a fresh check after the repeats. Bob's next item must be that one, right
+        // after the first.
         check(&mut alice, &[to_bob[1].0]).await;
         let (first, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         let (second, _) = bob.next_cmd("ReceivedItems").await.unwrap();
-        assert_eq!(first["index"], 0);
+        assert_eq!(first["index"], start);
         assert_eq!(
             (second["index"].clone(), second["items"][0]["location"].clone()),
-            (json!(1), json!(to_bob[1].0))
+            (json!(start + 1), json!(to_bob[1].0))
         );
     }
 
@@ -141,9 +151,10 @@ mod scenarios {
         let to_bob: Vec<i64> = alice_locations_for(2).iter().take(3).map(|p| p.0).collect();
         check(&mut alice, &to_bob).await;
         let (mut bob, _, _) = joined(&server, "Bob").await;
+        let start = e2e::start_items(2).unwrap();
         let (first, _) = bob.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!(first["index"], 0);
-        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert_eq!(first["items"].as_array().unwrap().len(), start.len() + 3);
         bob.close().await.unwrap();
         let extra = alice_locations_for(2)[3].0;
         check(&mut alice, &[extra]).await;
@@ -154,7 +165,8 @@ mod scenarios {
         assert_eq!(again["index"], 0, "index 0 means: this is the whole inventory");
         let locations: Vec<Value> =
             again["items"].as_array().unwrap().iter().map(|i| i["location"].clone()).collect();
-        let mut want: Vec<Value> = to_bob.iter().map(|l| json!(l)).collect();
+        let mut want: Vec<Value> = start.iter().map(|_| json!(-2)).collect();
+        want.extend(to_bob.iter().map(|l| json!(l)));
         want.push(json!(extra));
         assert_eq!(locations, want);
         bob.send(&json!([{"cmd": "Sync"}])).await.unwrap();
