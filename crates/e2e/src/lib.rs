@@ -90,11 +90,13 @@ impl Server {
         let eof = Arc::clone(&closed);
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(addr) = listening_addr(&line) {
-                    let _ = tx.send(addr);
-                }
+                let addr = listening_addr(&line);
                 sink.0.lock().unwrap_or_else(PoisonError::into_inner).push(line);
                 sink.1.notify_all();
+                // After the push: a started server's log always holds its listening line.
+                if let Some(addr) = addr {
+                    let _ = tx.send(addr);
+                }
             }
             let _guard = sink.0.lock().unwrap_or_else(PoisonError::into_inner);
             eof.store(true, Ordering::SeqCst);
