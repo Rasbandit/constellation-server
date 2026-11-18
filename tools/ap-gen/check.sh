@@ -11,7 +11,7 @@ work=$(mktemp -d)
 pid=
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$work"' EXIT
 
-token=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+token=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 # The header goes to curl from a file, so the token never shows in `ps`.
 printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
 CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHON=$python \
@@ -20,9 +20,11 @@ CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHO
     --port 0 --data-dir "$work/data" 2>"$work/log" &
 pid=$!
 for _ in $(seq 100); do
-    addr=$(grep -o 'listening addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2) && [ -n "$addr" ] && break
+    # The admin API has its own listener (loopback); its line comes before the room's.
+    grep -q 'listening addr=' "$work/log" && break
     sleep 0.1
 done
+addr=$(grep -o 'admin api addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
 [ -n "${addr:-}" ] || { cat "$work/log"; exit 1; }
 
 api() { curl -sS --fail-with-body -H @"$work/auth" "$@"; }
@@ -47,8 +49,7 @@ echo "done in $(($(date +%s) - start)) s (queue to done, as seen by polling)"
 python3 -c '
 import json, sys
 s = json.loads(sys.argv[1])
-b = json.load(open(s["bundle"]))
-locations = sum(len(x["locations"]) for x in b["slots"])
-print("seed", s["seed_name"], "-", s["slots"], "slots,", locations, "locations, sidecar",
-      s["generation"]["seconds"], "s; load_bundle accepted it (status done)")
+g = s["generation"]
+print("seed", s["seed_name"], "-", s["slots"], "slots,", g["locations"], "locations, sidecar",
+      g["seconds"], "s; load_bundle accepted it (status done)")
 ' "$status"

@@ -1,7 +1,9 @@
 """Generation sidecar: inspects uploads and generates a seed bundle with an Archipelago checkout.
 
 The server runs every call inside its sandbox (crates/server/src/sandbox.rs). It prints one JSON
-value to stdout; on failure it prints the reason to stderr and exits non-zero.
+value to stdout; on failure it prints the reason to stderr and exits non-zero. `generate`
+prints `{"report": ..., "bundle": ...}`: the server writes the bundle file itself, so nothing the
+sandbox writes ever reaches the host.
 
     ap_gen.py inspect-apworld <path> --max-unpacked <bytes> --max-entries <n>
     ap_gen.py inspect-yaml <path>
@@ -11,11 +13,12 @@ value to stdout; on failure it prints the reason to stderr and exits non-zero.
 world code, which is why the server sandboxes it.
 
 How generation follows Archipelago 0.6.8 (files in its checkout, read, not copied):
-- `worlds/__init__.py` loads `.apworld` files from `user_path("custom_worlds")`, which is the
-  checkout's own `custom_worlds/` when the checkout is writable (`Utils.user_path`). The
-  sandbox shows a writable throwaway overlay of the checkout with the job's apworlds mounted
-  there, so `--apworlds` must be that folder. A world loads as `worlds.<file stem>`, so each
-  file is named after the top-level folder inside it.
+- `worlds/__init__.py` loads `.apworld` files from `user_path("custom_worlds")` when
+  `Utils.user_path` is the checkout itself, which it picks only for a writable checkout. The
+  sandbox mounts the checkout read-only, so this sets that choice (`user_path.cached_path`)
+  before anything reads it. The sandbox mounts the job's apworlds at `custom_worlds/`, so
+  `--apworlds` must be that folder. A world loads as `worlds.<file stem>`, so each file is
+  named after the top-level folder inside it.
 - `Generate.mystery_argparse` and `Generate.main` roll the player settings from the yamls in
   `--player_files_path`, then `Main.main` generates and writes `AP_<seed>.zip` (the
   `.archipelago` multidata plus any patch files) to `--outputpath`; `WebHostLib/generate.py`
@@ -141,16 +144,21 @@ def inspect_yaml(path: Path) -> list[dict[str, str]]:
 
 
 def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]:
-    """Generate a multiworld from the yamls and write `<out>/bundle.json`."""
+    """Generate a multiworld from the yamls; `out` is scratch space for Archipelago's output."""
     if not (ap / "custom_worlds").exists() or not os.path.samefile(apworlds, ap / "custom_worlds"):
         raise Refused("--apworlds must be the checkout's custom_worlds folder (the sandbox mounts it)")
     out.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     os.chdir(ap)
     sys.path.insert(0, str(ap))
-    # Archipelago logs and prints to stdout; ours carries only the JSON result.
+    # Archipelago logs and prints to stdout; ours carries only the JSON result (main() writes
+    # it to the original stdout, which _quiet_stdout keeps aside).
     with contextlib.redirect_stdout(sys.stderr):
         import logging
+
+        import Utils
+
+        Utils.user_path.cached_path = Utils.local_path()
 
         logging.basicConfig(stream=sys.stderr, level=logging.INFO)
         import ModuleUpdate
@@ -172,14 +180,22 @@ def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]
     if len(zips) != 1:
         raise Refused(f"expected one AP_*.zip in the output, found {len(zips)}")
     bundle = ap_import.convert(ap_import.load_multidata(zips[0]))
-    (out / "bundle.json").write_text(json.dumps(bundle, sort_keys=True, indent=1) + "\n")
-    return {
-        "bundle": "bundle.json",
+    report = {
         "seed_name": bundle["seed_name"],
         "slots": len(bundle["slots"]),
         "locations": sum(len(s["locations"]) for s in bundle["slots"]),
         "seconds": round(time.monotonic() - start, 1),
     }
+    return {"report": report, "bundle": bundle}
+
+
+def _quiet_stdout() -> Any:
+    """Point fd 1 at stderr, so code that writes to it directly (world code can) cannot mix
+    with the result; return a file on the original stdout for the result."""
+    sys.stdout.flush()
+    result = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
+    return result
 
 
 def main(argv: list[str]) -> int:
@@ -194,6 +210,7 @@ def main(argv: list[str]) -> int:
     for flag in ("--ap", "--apworlds", "--yamls", "--out"):
         g.add_argument(flag, type=Path, required=True)
     a = p.parse_args(argv)
+    result_out = _quiet_stdout() if a.cmd == "generate" else sys.stdout
     try:
         if a.cmd == "inspect-apworld":
             result: Any = inspect_apworld(a.path, a.max_unpacked, a.max_entries)
@@ -204,7 +221,7 @@ def main(argv: list[str]) -> int:
     except (Refused, OSError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 1
-    print(json.dumps(result))
+    print(json.dumps(result), file=result_out, flush=True)
     return 0
 
 

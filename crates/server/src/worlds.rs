@@ -5,13 +5,14 @@
 //! - `apworlds/<sha256>.apworld` and `yamls/<sha256>.yaml`, content-addressed, each with a
 //!   `<sha256>.json` holding the upload's name and what the sidecar's inspect found;
 //! - `worlds/<id>/` per generation: `apworlds/<module>.apworld` and `yamls/` (the chosen
-//!   files), `out/` (the sidecar's output, `bundle.json` on success) and `status.json`.
+//!   files), `status.json`, and `bundle.json` on success. The server writes `bundle.json` from
+//!   the sidecar's stdout; no folder here is ever writable inside the sandbox.
 //!
 //! The flow follows Archipelago's web host (`WebHostLib/upload.py` checks uploads before it
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
-use crate::sandbox::{AP, JOB, Mount, Sandbox};
+use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
 use crate::{hex, load_bundle};
 use axum::Router;
 use axum::body::Bytes;
@@ -94,14 +95,19 @@ pub fn router(
     paths: Generation,
     limits: Limits,
 ) -> Result<Router, String> {
+    let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+    // Uploads a previous process was inspecting when it stopped.
+    if dir.join("tmp").exists() {
+        std::fs::remove_dir_all(dir.join("tmp")).map_err(io)?;
+    }
     for sub in ["apworlds", "yamls", "worlds", "tmp"] {
-        std::fs::create_dir_all(dir.join(sub)).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     recover(&dir.join("worlds"))?;
     let state = Arc::new(Worlds {
         dir: dir.to_owned(),
         token: Sha256::digest(token.as_bytes()).into(),
-        sandbox: Sandbox::new(paths, limits),
+        sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Semaphore::new(1),
         seq: AtomicU64::new(0),
@@ -185,8 +191,11 @@ fn percent_decode(s: &str) -> Option<String> {
 }
 
 /// Write `bytes` to `path` through a temporary file and a rename, so a reader never sees half.
+/// The temporary name is unique, so two writers of one path never share it.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)
 }
@@ -254,21 +263,25 @@ async fn inspect_and_store(
     let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
     let found = w
         .sandbox
-        .run(false, &[Mount::ro(tmp, JOB)], &args, timeout)
+        .run(false, &[Mount::Ro(tmp.to_owned(), JOB.to_owned())], &args, timeout)
         .await
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    let mut meta = json!({"id": id, "name": name, "bytes": body.len()});
-    match (kind, found) {
+        .map_err(|e| match e {
+            Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
+            Failure::Broken(why) => internal(why),
+        })?;
+    let mut meta = match (kind, found) {
         (Kind::Apworld, Value::Object(o)) => {
             if !o.get("module").and_then(Value::as_str).is_some_and(valid_module) {
                 return Err((StatusCode::UNPROCESSABLE_ENTITY, "bad module name".to_owned()));
             }
-            if let Some(m) = meta.as_object_mut() {
-                m.extend(o);
-            }
+            Value::Object(o)
         }
-        (Kind::Yaml, players @ Value::Array(_)) => meta["players"] = players,
+        (Kind::Yaml, players @ Value::Array(_)) => json!({"players": players}),
         (_, other) => return Err(internal(format!("unexpected inspect result {other}"))),
+    };
+    // The server's own fields last, so the sidecar can never set them.
+    for (k, v) in [("id", json!(id)), ("name", json!(name)), ("bytes", json!(body.len()))] {
+        meta[k] = v;
     }
     let store = w.dir.join(kind.folder());
     std::fs::rename(tmp.join(&file), store.join(format!("{id}.{}", kind.ext())))
@@ -323,10 +336,10 @@ fn chosen(w: &Worlds, body: &Value, field: &str, kind: Kind) -> Result<Vec<Value
 }
 
 /// Lay out a world folder: the chosen files (apworlds named by module, as Archipelago loads
-/// them), an empty `out/` and a `queued` status.
+/// them).
 fn prepare(w: &Worlds, world: &Path, apworlds: &[Value], yamls: &[Value]) -> Result<(), String> {
     let e = |e: std::io::Error| e.to_string();
-    for sub in ["apworlds", "yamls", "out"] {
+    for sub in ["apworlds", "yamls"] {
         std::fs::create_dir_all(world.join(sub)).map_err(e)?;
     }
     for (kind, metas) in [(Kind::Apworld, apworlds), (Kind::Yaml, yamls)] {
@@ -368,7 +381,7 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
     prepare(&w, &world, &apworlds, &yamls).map_err(internal)?;
     let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
     write_status(&world, &status).map_err(internal)?;
-    tracing::info!(world = id, "generation queued");
+    tracing::info!(world = %id, "generation queued");
     tokio::spawn(generate(Arc::clone(&w), world, status));
     Ok(json_reply(StatusCode::ACCEPTED, &json!({"id": id, "status": "queued"})))
 }
@@ -380,29 +393,37 @@ fn write_status(world: &Path, status: &Value) -> std::io::Result<()> {
 /// Run one queued generation (one at a time) and record how it ended.
 async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let Ok(_permit) = w.one_gen.acquire().await else { return };
+    let id = status["id"].as_str().unwrap_or("").to_owned();
     status["status"] = json!("running");
     if let Err(e) = write_status(&world, &status) {
         tracing::error!(error = %e, "status write failed");
     }
-    let out = world.join("out");
+    tracing::info!(world = %id, "generation running");
+    let (custom, yamls, out) =
+        (format!("{AP}/custom_worlds"), format!("{JOB}/yamls"), format!("{JOB}/out"));
     let mounts = [
-        Mount::ro(&world.join("apworlds"), &format!("{AP}/custom_worlds")),
-        Mount::ro(&world.join("yamls"), &format!("{JOB}/yamls")),
-        Mount::rw(&out, &format!("{JOB}/out")),
+        Mount::Ro(world.join("apworlds"), custom.clone()),
+        Mount::Ro(world.join("yamls"), yamls.clone()),
+        Mount::Scratch(out.clone()),
     ];
-    let custom = format!("{AP}/custom_worlds");
-    let (yamls, out_inside) = (format!("{JOB}/yamls"), format!("{JOB}/out"));
-    let args =
-        ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out_inside];
+    let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
     let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
-        Ok(report) => {
-            let bundle = out.join("bundle.json");
-            load_bundle(&bundle, &w.limits).map(|loaded| (bundle, loaded, report))
+        Ok(mut found) => {
+            let (bundle, limits) = (world.join("bundle.json"), w.limits);
+            let report = found["report"].take();
+            let text = found.get("bundle").map(Value::to_string);
+            tokio::task::spawn_blocking(move || {
+                let text = text.ok_or("the sidecar sent no bundle")?;
+                write_atomic(&bundle, text.as_bytes()).map_err(|e| e.to_string())?;
+                load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, report))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.to_string()),
     };
-    let id = status["id"].as_str().unwrap_or("").to_owned();
+    let done = result.is_ok();
     match result {
         Ok((bundle, loaded, report)) => {
             status["status"] = json!("done");
@@ -411,16 +432,20 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
             status["slots"] = json!(loaded.bundle.slots.len());
             status["bundle_hash"] = json!(hex(&loaded.hash));
             status["generation"] = report;
-            tracing::info!(world = id, "generation done");
         }
         Err(e) => {
             status["status"] = json!("failed");
             status["error"] = json!(e);
-            tracing::warn!(world = id, "generation failed");
         }
     }
     if let Err(e) = write_status(&world, &status) {
         tracing::error!(error = %e, "status write failed");
+    }
+    // Logged after the status is on disk: tests and operators wait on these lines.
+    if done {
+        tracing::info!(world = %id, "generation done");
+    } else {
+        tracing::warn!(world = %id, "generation failed");
     }
 }
 
@@ -533,6 +558,25 @@ mod tests {
         drop(std::fs::remove_dir_all(&d));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn concurrent_writers_of_one_path_never_collide() {
+        let dir = temp("atomic");
+        let path = dir.join("status.json");
+        let writers: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    (0..50).try_for_each(|_| write_atomic(&path, format!("{i}").as_bytes()))
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap().unwrap();
+        }
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).collect();
+        assert_eq!(left.len(), 1, "no temporary file is left behind");
     }
 
     #[test]

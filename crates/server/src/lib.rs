@@ -45,11 +45,16 @@ pub struct Args {
     pub host: IpAddr,
     /// Folder for uploads and generated seeds; turns on the admin API (needs the admin token).
     pub data_dir: Option<PathBuf>,
+    /// Address of the admin API's own listener (default loopback: it runs uploaded code, so it
+    /// is never on the room's port; reach it through SSH or a TLS proxy).
+    pub admin_host: IpAddr,
+    /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
+    pub admin_port: u16,
 }
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server --bundle <path> --port <port> [--host <ip>] \
-     [--data-dir <path>] (room password: CONSTELLATION_ROOM_PASSWORD or \
+     [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] (room password: CONSTELLATION_ROOM_PASSWORD or \
      CONSTELLATION_ROOM_PASSWORD_FILE; durable log: CONSTELLATION_DATABASE_URL or \
      CONSTELLATION_DATABASE_URL_FILE; --data-dir needs CONSTELLATION_ADMIN_TOKEN or \
      CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
@@ -62,6 +67,7 @@ impl Args {
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let (mut bundle, mut port, mut host, mut data_dir) = (None, None, None, None);
+        let (mut admin_host, mut admin_port) = (None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -70,6 +76,12 @@ impl Args {
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--admin-host" => {
+                    admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
+                }
+                "--admin-port" => {
+                    admin_port = Some(value()?.parse().map_err(|_| "--admin-port needs a number")?);
+                }
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -78,6 +90,8 @@ impl Args {
             port: port.ok_or("--port is required")?,
             host: host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             data_dir,
+            admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            admin_port: admin_port.unwrap_or(0),
         })
     }
 }
@@ -405,15 +419,23 @@ pub async fn run(
             .map_err(|e| format!("bind: {e}"))?;
         let (router, room) =
             app(loaded, secrets.room_password, secrets.database_url.as_deref(), limits).await?;
-        let router = match api {
-            Some(api) => router.merge(api),
-            None => router,
+        let admin = match api {
+            Some(api) => {
+                let at = SocketAddr::new(args.admin_host, args.admin_port);
+                let l = tokio::net::TcpListener::bind(at)
+                    .await
+                    .map_err(|e| format!("bind the admin API: {e}"))?;
+                let addr = l.local_addr().map_err(|e| e.to_string())?;
+                tracing::info!(%addr, "admin api");
+                Some((l, api))
+            }
+            None => None,
         };
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%addr, seed, "listening");
-        Ok::<_, RunError>((listener, router, room))
+        Ok::<_, RunError>((listener, router, room, admin))
     };
-    let (listener, router, room) = tokio::select! {
+    let (listener, router, room, admin) = tokio::select! {
         r = startup => r?,
         () = &mut stop => {
             tracing::info!("stopped before listening");
@@ -422,8 +444,16 @@ pub async fn run(
     };
     let serve = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(stop);
+    // The admin API ends with the room's listener (dropped by the select below).
+    let admin = async {
+        match admin {
+            Some((l, api)) => axum::serve(l, api).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
+        r = admin => return Err(RunError::Failed(format!("the admin API stopped: {r:?}"))),
         r = room => return Err(room_ended(r)),
     }
     tracing::info!("stopped");
@@ -479,10 +509,15 @@ mod tests {
         let a = parse("--bundle b.json --port 0").unwrap();
         assert_eq!(a.bundle, PathBuf::from("b.json"));
         assert_eq!((a.port, a.host), (0, IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert_eq!(a.data_dir, None);
+        assert_eq!(
+            (a.data_dir, a.admin_host, a.admin_port),
+            (None, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        );
         let a = parse("--port 38281 --host 0.0.0.0 --bundle x --data-dir /d").unwrap();
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
+        let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
+        assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
     }
 
     #[test]
@@ -496,6 +531,8 @@ mod tests {
             ("--bundle b --port 1 --verbose", "unknown argument"),
             ("--bundle b --port 1 --password pw", "unknown argument"),
             ("--bundle b --port 1 --data-dir", "--data-dir needs a value"),
+            ("--bundle b --port 1 --admin-port x", "--admin-port needs a number"),
+            ("--bundle b --port 1 --admin-host x", "--admin-host needs an IP"),
         ] {
             assert!(parse(args).unwrap_err().contains(want), "{args:?}");
         }
@@ -575,22 +612,30 @@ mod tests {
 
     #[test]
     fn the_admin_api_is_off_without_a_data_dir_and_refused_without_its_token() {
+        let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
+        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
         let g = || {
             Some(Generation {
-                ap_dir: "/ap".into(),
+                ap_dir: root.join("ap"),
                 python: "/usr/bin/python3".into(),
-                sidecar: "/t/ap-gen/ap_gen.py".into(),
+                sidecar: root.join("tools/ap-gen/ap_gen.py"),
             })
         };
         assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
         assert!(worlds_api(None, Some("t"), g(), Limits::DESIGN).unwrap().is_none());
-        let dir = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
+        let dir = root.join("data");
+        // A temporary upload a previous process left behind is cleared at start.
+        std::fs::create_dir_all(dir.join("tmp/left-behind")).unwrap();
         let e = worlds_api(Some(&dir), None, g(), Limits::DESIGN).unwrap_err();
         assert!(e.contains("CONSTELLATION_ADMIN_TOKEN"), "{e}");
         let e = worlds_api(Some(&dir), Some("t"), None, Limits::DESIGN).unwrap_err();
         assert!(e.contains("CONSTELLATION_AP_DIR"), "{e}");
         assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
         assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
+        assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
     }
 
     #[test]
