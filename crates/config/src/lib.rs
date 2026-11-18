@@ -183,6 +183,15 @@ pub struct Limits {
 /// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
 pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
 
+/// Deepest rule nesting a world's rules section may hold, counting every node and every def a
+/// rule reaches through `ref`: the loader rejects deeper rules, so the recursive evaluators
+/// stay well inside a thread's stack (design value; real worlds nest under 20).
+pub const RULES_MAX_DEPTH: u32 = 256;
+
+/// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
+/// the next draws of the seed's random stream; a design value).
+pub const FILL_MAX_ATTEMPTS: u32 = 20;
+
 impl Limits {
     /// The design values (see each field).
     pub const DESIGN: Self = Self {

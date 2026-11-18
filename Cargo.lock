@@ -290,6 +290,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-fill"
+version = "0.0.0"
+dependencies = [
+ "allocation-counter",
+ "bits",
+ "config",
+ "seed-bundle",
+ "serde",
+ "serde_json",
+ "spec-rng",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

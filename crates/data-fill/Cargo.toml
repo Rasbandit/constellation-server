@@ -1,0 +1,38 @@
+[package]
+name = "data-fill"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[test]]
+name = "memory"
+required-features = ["memory-harness"]
+
+[[example]]
+name = "measure"
+required-features = ["memory-harness"]
+
+[features]
+# The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
+memory-harness = ["dep:allocation-counter"]
+
+[dependencies]
+# Counts allocations per thread for the memory harness only (feature `memory-harness`).
+allocation-counter = { version = "0.8", optional = true }
+bits = { path = "../bits" }
+# The one source of limits (rule nesting depth, fill attempts).
+config = { path = "../config", default-features = false }
+seed-bundle = { path = "../seed-bundle" }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+spec-rng = { path = "../spec-rng" }
+
+[lints]
+workspace = true
