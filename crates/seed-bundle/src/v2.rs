@@ -51,6 +51,21 @@ const STATUSES: [u8; 5] = [
     hint_status::FOUND,
 ];
 
+/// Whether placement fields of these widths (item, receiver, flags) fit the format: the one
+/// rule the writer and the reader share.
+const fn placement_fits((w_item, w_recv, w_flags): (u8, u8, u8)) -> bool {
+    w_item <= MAX_ITEM_BITS && w_recv <= MAX_RECV_BITS && w_flags <= MAX_FLAG_BITS
+}
+
+/// Whether hint fields of these widths (sphere, location, entrance, slot position) fit the
+/// format: the one rule the writer and the reader share.
+const fn hint_fits((ws, wl, we, wp): (u8, u8, u8, u8)) -> bool {
+    ws <= MAX_SPHERE_BITS
+        && wl <= MAX_LOCATION_BITS
+        && we <= MAX_ENTRANCE_BITS
+        && wp <= MAX_RECV_BITS
+}
+
 /// The sphere value that means "none recorded" at `width` bits: all ones.
 const fn no_sphere(width: u8) -> u64 {
     (1 << width) - 1
@@ -221,7 +236,7 @@ impl HintData {
     /// bit fields.
     fn bytes(&self, at: usize, strings: &mut Strings) -> Result<Vec<u8>, BundleError> {
         let (ws, wl, we, wp) = self.widths();
-        if ws > MAX_SPHERE_BITS || wl > MAX_LOCATION_BITS || we > MAX_ENTRANCE_BITS {
+        if !hint_fits((ws, wl, we, wp)) {
             return Err(bad("a hint field is too wide for a v2 seed file"));
         }
         let n = self.spheres.len();
@@ -342,7 +357,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     let w_item = bits::width(max(|p| p.1 as u64).max(start_max as u64));
     let w_recv = bits::width(max(|p| p.2 as u64));
     let w_flags = bits::width(max(|p| u64::from(p.3)));
-    if w_item > MAX_ITEM_BITS || w_recv > MAX_RECV_BITS || w_flags > MAX_FLAG_BITS {
+    if !placement_fits((w_item, w_recv, w_flags)) {
         return Err(bad("a placement field is too wide for a v2 seed file"));
     }
     let w_record = usize::from(w_item + w_recv + w_flags);
@@ -910,7 +925,7 @@ impl Seed {
             return Err(bad("reserved header fields are not 0"));
         }
         let (w_item, w_recv, w_flags) = self.widths();
-        if w_item > MAX_ITEM_BITS || w_recv > MAX_RECV_BITS || w_flags > MAX_FLAG_BITS {
+        if !placement_fits((w_item, w_recv, w_flags)) {
             return Err(bad("a placement field is too wide"));
         }
         let ok_str = |at: usize| r.u32(at + 4) == NONE || self.str_at(at).is_some();
@@ -1005,11 +1020,7 @@ impl Seed {
             return Err(bad("hint block out of range"));
         }
         let (ws, wl, we, wp) = self.hint_widths();
-        if ws > MAX_SPHERE_BITS
-            || wl > MAX_LOCATION_BITS
-            || we > MAX_ENTRANCE_BITS
-            || wp > MAX_RECV_BITS
-        {
+        if !hint_fits((ws, wl, we, wp)) {
             return Err(bad("a hint field is too wide"));
         }
         let r = self.r();
@@ -1116,7 +1127,7 @@ impl Seed {
             );
             let p = s.presence();
             let mut before = 0_u32;
-            for k in 0..p.len() / 8 {
+            for k in 0..SlotView::words(p) {
                 ranks.push(before);
                 before += SlotView::word(p, k).count_ones();
             }
@@ -1356,6 +1367,11 @@ impl<'a> SlotView<'a> {
         self.seed.bytes.get(at..at + 8 * words).unwrap_or_default()
     }
 
+    /// How many 64-bit words a presence set holds.
+    const fn words(presence: &[u8]) -> usize {
+        presence.len() / 8
+    }
+
     fn word(presence: &[u8], k: usize) -> u64 {
         Reader(presence).u64(8 * k)
     }
@@ -1389,8 +1405,7 @@ impl<'a> SlotView<'a> {
     pub fn locations(&self) -> impl Iterator<Item = i64> + use<'a> {
         let p = self.presence();
         let ids = self.package().locations();
-        let words = p.len() / 8;
-        (0..words).flat_map(move |k| {
+        (0..Self::words(p)).flat_map(move |k| {
             let w = Self::word(p, k);
             (0..64)
                 .filter(move |b| w >> b & 1 == 1)
@@ -1451,10 +1466,11 @@ impl<'a> SlotView<'a> {
         self.locations().enumerate().map(move |(i, l)| me.resolve(i, l))
     }
 
-    /// Whether location index `i` of this slot's game is placed (its presence bit).
+    /// Whether location index `i` of this slot's game is placed (its presence bit). No bound
+    /// check on `i`: `check` refused set bits past the game's locations, and a word past the
+    /// set reads as 0.
     fn present(&self, i: usize) -> bool {
-        i < self.package().locations().len()
-            && Self::word(self.presence(), i / 64) >> (i % 64) & 1 == 1
+        Self::word(self.presence(), i / 64) >> (i % 64) & 1 == 1
     }
 
     /// Field `off` of this slot's hint block entry (0 without a hint block).

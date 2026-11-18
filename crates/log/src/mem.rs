@@ -243,4 +243,29 @@ mod tests {
         s.put(&key, b"package").await.unwrap();
         assert_eq!(s.get(&key).await.unwrap().as_deref(), Some(&b"package"[..]));
     }
+
+    /// `blobs` counts distinct keys: a second put of the same bytes adds none.
+    #[tokio::test]
+    async fn blobs_counts_each_distinct_blob_once() {
+        let s = MemLogStore::new();
+        assert_eq!(s.blobs(), 0);
+        for b in [&b"one"[..], b"two", b"one"] {
+            s.put(&blob_key(b), b).await.unwrap();
+        }
+        assert_eq!(s.blobs(), 2);
+    }
+
+    /// `forget_seed` drops only that room's seed, and the room can then take another one.
+    #[tokio::test]
+    async fn forget_seed_drops_only_that_rooms_seed() {
+        let s = MemLogStore::new();
+        let (a, b) = (RoomId(1), RoomId(2));
+        s.seed_put(a, b"seed a").await.unwrap();
+        s.seed_put(b, b"seed b").await.unwrap();
+        s.forget_seed(a);
+        assert_eq!(s.seed_get(a).await.unwrap(), None);
+        assert_eq!(s.seed_get(b).await.unwrap().as_deref(), Some(&b"seed b"[..]));
+        s.seed_put(a, b"new seed").await.unwrap();
+        assert_eq!(s.seed_get(a).await.unwrap().as_deref(), Some(&b"new seed"[..]));
+    }
 }

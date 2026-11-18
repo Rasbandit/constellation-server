@@ -97,3 +97,64 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const V1: &str = include_str!("../../../e2e/fixtures/cross-games.json");
+
+    /// A fresh folder for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bundle-cli-{name}-{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cli(args: &[&Path]) -> Result<String, String> {
+        run(&args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>())
+    }
+
+    fn same_bundle(json: &str) -> bool {
+        seed_bundle::SeedBundle::from_json(json).unwrap()
+            == seed_bundle::SeedBundle::from_json(V1).unwrap()
+    }
+
+    #[test]
+    fn a_seed_decodes_back_to_its_v1_file_with_either_packages_folder() {
+        let d = scratch("round-trip");
+        let input = d.join("cross-games.json");
+        std::fs::write(&input, V1).unwrap();
+        let out = d.join("out");
+        let said = cli(&[Path::new("v2-encode"), &input, &out]).unwrap();
+        let seed = out.join("cross-games.seed");
+        assert!(said.starts_with(&seed.display().to_string()), "{said}");
+        let decode = Path::new("v2-decode");
+        assert!(same_bundle(&cli(&[decode, &seed]).unwrap()), "packages beside the seed");
+        let moved = d.join("elsewhere");
+        std::fs::rename(out.join("packages"), &moved).unwrap();
+        assert!(cli(&[decode, &seed]).is_err(), "no packages beside the seed any more");
+        let flag = Path::new("--packages");
+        assert!(same_bundle(&cli(&[decode, &seed, flag, &moved]).unwrap()), "--packages");
+        assert_eq!(cli(&[decode, &seed, Path::new("--pkgs"), &moved]), Err(USAGE.to_owned()));
+        assert_eq!(cli(&[Path::new("v2-decod"), &seed]), Err(USAGE.to_owned()));
+        assert_eq!(cli(&[Path::new("v2-encod"), &input, &out]), Err(USAGE.to_owned()));
+        assert_eq!(cli(&[]), Err(USAGE.to_owned()));
+    }
+
+    #[test]
+    fn a_package_that_does_not_match_its_key_is_refused() {
+        let d = scratch("tampered");
+        let input = d.join("cross-games.json");
+        std::fs::write(&input, V1).unwrap();
+        let out = d.join("out");
+        cli(&[Path::new("v2-encode"), &input, &out]).unwrap();
+        let pkg = std::fs::read_dir(out.join("packages")).unwrap().next().unwrap().unwrap().path();
+        std::fs::write(&pkg, b"other bytes").unwrap();
+        let err = cli(&[Path::new("v2-decode"), &out.join("cross-games.seed")]).unwrap_err();
+        assert!(err.contains("does not match its key"), "{err}");
+    }
+}

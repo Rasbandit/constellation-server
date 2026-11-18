@@ -49,6 +49,11 @@ pub const fn valid(s: u8) -> bool {
     )
 }
 
+/// Whether a status update may set `s`: a stored status, but never found (only a check finds).
+const fn settable(s: u8) -> bool {
+    valid(s) && s != status::FOUND
+}
+
 /// The room's hint economy, from the seed's server options.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HintRules {
@@ -282,7 +287,7 @@ impl RoomState {
                 self.hints.add(pos, i, HintRec { status: s, seq: ev.seq });
             }
             EventKind::HintStatus { finding, location, status: s } => {
-                if !valid(s) || s == status::FOUND {
+                if !settable(s) {
                     return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
                 }
                 let (pos, i, ..) = self.place(finding, location).ok_or(CoreError::BadEvent)?;
@@ -428,7 +433,7 @@ pub(crate) fn set_status(
     if receiver != slot {
         return Err(CoreError::Hint(HintRefusal::NoPermission));
     }
-    if !valid(s) || s == status::FOUND {
+    if !settable(s) {
         return Err(CoreError::Hint(HintRefusal::BadStatus(s)));
     }
     if state.is_checked(pos, i) || rec.status == s {

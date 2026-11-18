@@ -87,10 +87,9 @@ struct Entry<'a> {
 
 fn toc(file: &[u8]) -> Result<Vec<Entry<'_>>, BundleError> {
     let bad = |why: &str| BundleError::Invalid(format!("package file: {why}"));
-    let u16_at = |at: usize| file.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-    let u32_at = |at: usize| {
-        file.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    };
+    let u16_at = |at: usize| file.get(at..at + 2)?.try_into().ok().map(u16::from_le_bytes);
+    let u32_at =
+        |at: usize| file.get(at..at + 4)?.try_into().ok().map(|b| u32::from_le_bytes(b) as usize);
     if !file.starts_with(&MAGIC) {
         return Err(bad("not a package file"));
     }
@@ -609,6 +608,8 @@ mod tests {
         let f = file_bytes(&all).unwrap();
         assert_eq!(sections(&f, 1 << 20).unwrap(), all, "an unknown section is kept, not refused");
         assert!(sections(&f, 10).is_err(), "over the cap");
+        assert_eq!(sections(&f, 304).unwrap(), all, "4 + 300 bytes: exactly at the cap");
+        assert!(sections(&f, 303).is_err(), "one byte over the cap");
         for cut in [0, 4, 7, 20, f.len() - 1] {
             assert!(sections(&f[..cut], 1 << 20).is_err(), "cut at {cut}");
         }
@@ -698,5 +699,33 @@ mod tests {
         g.item_name_to_id.insert("big".into(), i64::MAX);
         assert!(GamePackage::parse(&GamePackage::content("G", &g)).is_err());
         assert!(GamePackage::parse(b"[]").is_err());
+    }
+
+    #[test]
+    fn a_section_may_be_exactly_the_cap_and_inflates_below_it() {
+        let f = file_bytes(&[
+            Section { id: 7, bytes: vec![1; 300], deflate: false },
+            Section { id: 8, bytes: b"words words words".to_vec(), deflate: true },
+        ])
+        .unwrap();
+        assert_eq!(section_of(&f, 7, 300).unwrap(), Some(vec![1; 300]), "exactly the cap");
+        assert!(section_of(&f, 7, 299).is_err(), "one byte over");
+        let packed = deflate(b"hello").unwrap();
+        assert_eq!(inflate(&packed, 100).unwrap(), b"hello", "well under the cap");
+        assert_eq!(inflate(&packed, 5).unwrap(), b"hello", "exactly the cap");
+        assert!(inflate(&packed, 4).is_err(), "over the cap");
+    }
+
+    /// A package no room holds any more leaves the process table on the next load.
+    #[test]
+    fn a_dropped_package_is_pruned_from_the_shared_table() {
+        let (gone, kept) = ([0xd1; 32], [0xd2; 32]);
+        let p = shared(&gone, || Ok(GamePackage::new(gone, "G", &game()))).unwrap();
+        drop(p);
+        let q = shared(&kept, || Ok(GamePackage::new(kept, "G", &game()))).unwrap();
+        let table = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!table.contains_key(&gone), "the dead entry is pruned");
+        assert!(table.contains_key(&kept));
+        drop((table, q));
     }
 }

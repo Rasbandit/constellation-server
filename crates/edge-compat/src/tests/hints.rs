@@ -577,7 +577,8 @@ async fn a_check_touches_at_most_two_hint_lists() {
     check(&mut a, &all).await;
     let got = pump(&mut b).await;
     let (touched, reread) = (b.hint_work().0 - before.0, b.hint_work().1 - before.1);
-    assert!(touched <= 2 * n, "{touched} list entries for {n} checks");
+    // Each check touches the finder's watched list, and at most the receiver's too.
+    assert!((n..=2 * n).contains(&touched), "{touched} list entries for {n} checks");
     assert!(reread <= 2 * n, "{reread} lists reread for {n} checks");
     let replies = of(&got, "SetReply");
     assert!(!replies.is_empty() && replies.len() as u64 <= reread, "{} replies", replies.len());

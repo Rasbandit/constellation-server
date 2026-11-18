@@ -400,6 +400,13 @@ fn a_snapshot_whose_hints_disagree_with_its_counters_is_refused() {
         }),
         "out of order"
     );
+    assert!(
+        bad(&|v| {
+            let same = v["hints"][0].clone();
+            v["hints"].as_array_mut().unwrap().push(same);
+        }),
+        "the same hint twice"
+    );
     assert!(bad(&|v| v["hints_used"]["9"] = 1.into()));
     assert!(bad(&|v| v["hints_used"]["2"] = 2.into()));
 }
@@ -554,4 +561,14 @@ fn a_snapshot_takes_its_hint_rules_from_the_room_not_the_file() {
     let json = serde_json::to_vec(&v).unwrap();
     let back = RoomState::from_snapshot(&s, &json).unwrap();
     assert_eq!(back.hint_rules(), PAID);
+}
+
+#[test]
+fn is_hinted_is_true_only_for_a_stored_hint() {
+    let mut s = room(FREE);
+    assert!(!s.is_hinted(SlotNo(1), 11));
+    apply(&mut s, &at(), scout(1, &[11])).unwrap();
+    assert!(s.is_hinted(SlotNo(1), 11));
+    assert!(!s.is_hinted(SlotNo(1), 12), "another location");
+    assert!(!s.is_hinted(SlotNo(2), 11), "another slot's world");
 }
