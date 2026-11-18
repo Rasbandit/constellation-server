@@ -13,8 +13,7 @@ categories.workspace = true
 
 [dependencies]
 serde.workspace = true
-# Stored values are arbitrary JSON; `alloc` only, so the crate stays `no_std`.
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

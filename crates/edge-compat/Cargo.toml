@@ -19,7 +19,7 @@ room-core = { path = "../room-core" }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "macros", "io-util", "time"] }
 tracing.workspace = true
 yawc.workspace = true

@@ -1011,3 +1011,40 @@ mod hostile_logs_and_snapshots_events {
         }
     }
 }
+
+mod float_round_trip {
+    use super::*;
+    use proptest::prelude::{any, prop_assert_eq, proptest};
+    use serde_json::json;
+    use std::boxed::Box;
+
+    /// A stored float must come back bit for bit from the log's JSON bytes, or a replayed room
+    /// disagrees with the live one. Found with a search over random floats: `serde_json`'s
+    /// default parser reads this one back 1 ULP off (unit in the last place); the
+    /// `float_roundtrip` feature fixes it.
+    #[test]
+    fn a_float_that_the_default_parser_rounds_survives_the_log() {
+        for x in [1.071_566_039_146_582_6e-75, -1.819_967_304_027_17e-179, 0.1 + 0.2] {
+            let e = Event {
+                seq: Seq(1),
+                slot: Some(SlotNo(1)),
+                kind: EventKind::KvSet { key: "k".into(), value: Box::new(json!(x)) },
+            };
+            let back: Event = serde_json::from_slice(&serde_json::to_vec(&e).unwrap()).unwrap();
+            assert_eq!(back, e, "{x:e}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn every_finite_float_survives_the_log(bits in any::<u64>()) {
+            let x = f64::from_bits(bits);
+            if x.is_finite() {
+                let v = json!(x);
+                let back: serde_json::Value =
+                    serde_json::from_slice(&serde_json::to_vec(&v).unwrap()).unwrap();
+                prop_assert_eq!(back.as_f64().map(f64::to_bits), Some(bits));
+            }
+        }
+    }
+}

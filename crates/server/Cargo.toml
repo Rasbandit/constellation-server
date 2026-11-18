@@ -33,7 +33,7 @@ proto = { path = "../proto" }
 room-core = { path = "../room-core" }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 sha2 = { version = "0.11", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
 tracing.workspace = true
