@@ -9,6 +9,7 @@
 use edge_compat::CompatRoom;
 use runtime::RoomHandle;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Characters in a room key.
@@ -83,6 +84,8 @@ pub struct Room {
     pub compat: Arc<CompatRoom>,
     /// The room task's liveness.
     pub live: RoomHandle,
+    /// The bundle file in the rooms folder it was started from (`None` for `--bundle`).
+    pub file: Option<PathBuf>,
 }
 
 /// Every room this process runs, by key.

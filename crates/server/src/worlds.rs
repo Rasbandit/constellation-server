@@ -12,6 +12,7 @@
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
+use crate::host::RoomsFolder;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
 use crate::{hex, load_bundle};
 use axum::Router;
@@ -31,7 +32,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 /// The API's shared state.
-struct Worlds {
+pub(crate) struct Worlds {
     dir: PathBuf,
     /// SHA-256 of the admin token (compared in constant time, see [`authorized`]).
     token: [u8; 32],
@@ -41,6 +42,9 @@ struct Worlds {
     one_gen: Semaphore,
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
+    /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
+    /// `<world id>.json`, and the public `host:port` its join address is under.
+    rooms: Option<(RoomsFolder, String)>,
 }
 
 /// The two kinds of upload.
@@ -84,17 +88,17 @@ fn json_reply(status: StatusCode, v: &Value) -> Response {
     r
 }
 
-/// The routes, rooted at `/api`. Makes the data folders and marks jobs a previous process left
-/// unfinished as failed.
+/// Make the data folders and mark jobs a previous process left unfinished as failed; the
+/// routes come from [`Worlds::router`].
 ///
 /// # Errors
 /// When the data folder cannot be made or read.
-pub fn router(
+pub(crate) fn open(
     dir: &Path,
     token: &str,
     paths: Generation,
     limits: Limits,
-) -> Result<Router, String> {
+) -> Result<Worlds, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
     // Uploads a previous process was inspecting when it stopped.
     if dir.join("tmp").exists() {
@@ -104,23 +108,42 @@ pub fn router(
         std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     recover(&dir.join("worlds"))?;
-    let state = Arc::new(Worlds {
+    Ok(Worlds {
         dir: dir.to_owned(),
         token: Sha256::digest(token.as_bytes()).into(),
         sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Semaphore::new(1),
         seq: AtomicU64::new(0),
-    });
-    let body_cap = limits.apworld_max_bytes.max(limits.yaml_max_bytes);
-    Ok(Router::new()
+        rooms: None,
+    })
+}
+
+impl core::fmt::Debug for Worlds {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Worlds").field("dir", &self.dir).finish_non_exhaustive()
+    }
+}
+
+impl Worlds {
+    /// The routes, rooted at `/api`. With `rooms` (the host's rooms folder and the public
+    /// `host:port`), finished worlds are hosted as rooms.
+    pub(crate) fn router(mut self, rooms: Option<(RoomsFolder, String)>) -> Router {
+        self.rooms = rooms;
+        routes(Arc::new(self))
+    }
+}
+
+fn routes(state: Arc<Worlds>) -> Router {
+    let body_cap = state.limits.apworld_max_bytes.max(state.limits.yaml_max_bytes);
+    Router::new()
         .route("/api/apworlds", get(list_apworlds).put(put_apworld))
         .route("/api/yamls", get(list_yamls).put(put_yaml))
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
         .layer(DefaultBodyLimit::max(body_cap))
-        .with_state(state))
+        .with_state(state)
 }
 
 async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
@@ -428,10 +451,17 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
         Ok(stdout) => {
             let (bundle, limits) = (world.join("bundle.json"), w.limits);
+            let room_file = room_file(&w, &id);
             tokio::task::spawn_blocking(move || {
                 let out = GenOut::parse(&stdout)?;
-                write_atomic(&bundle, out.bundle.get().as_bytes()).map_err(|e| e.to_string())?;
-                load_bundle(&bundle, &limits).map(|loaded| (bundle, loaded, out.report))
+                let text = out.bundle.get().as_bytes();
+                write_atomic(&bundle, text).map_err(|e| e.to_string())?;
+                let loaded = load_bundle(&bundle, &limits)?;
+                // Only a bundle that loads reaches the rooms folder, and never half written.
+                if let Some(file) = room_file {
+                    write_atomic(&file, text).map_err(|e| format!("rooms folder: {e}"))?;
+                }
+                Ok((bundle, loaded, out.report))
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
@@ -464,12 +494,25 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     }
 }
 
+/// Where a world's bundle goes in the rooms folder (`--rooms` only). `id` is a checked world id.
+fn room_file(w: &Worlds, id: &str) -> Option<PathBuf> {
+    w.rooms.as_ref().map(|(folder, _)| folder.dir().join(format!("{id}.json")))
+}
+
+/// The status on disk, plus `room_key` and `address` (`{key}.{host}:{port}`) once the host runs
+/// the world's room.
 async fn world_status(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
     if !valid_id(&id) {
         return Err((StatusCode::BAD_REQUEST, "bad id".to_owned()));
     }
-    let status = read_json(&w.dir.join("worlds").join(&id).join("status.json"))
+    let mut status = read_json(&w.dir.join("worlds").join(&id).join("status.json"))
         .ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))?;
+    if let (Some((folder, public)), Some(file)) = (&w.rooms, room_file(&w, &id))
+        && let Some(key) = folder.key_of(&file)
+    {
+        status["room_key"] = json!(key.as_str());
+        status["address"] = json!(format!("{key}.{public}"));
+    }
     Ok(json_reply(StatusCode::OK, &status))
 }
 

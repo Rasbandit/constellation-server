@@ -14,7 +14,7 @@
 //! is renamed `<name>.json.expired` so neither a scan nor a restart brings it back. Its data
 //! stays in the log store.
 
-use crate::rooms::{RoomKey, Rooms};
+use crate::rooms::{Room, RoomKey, Rooms};
 use crate::{Loaded, Prepared, RunError, load_bundle, open_with_key, prepare, room_ended, start};
 use config::Limits;
 use log::{MemLogStore, PgLogStore};
@@ -119,6 +119,12 @@ impl Host {
         Arc::clone(&self.rooms)
     }
 
+    /// The rooms folder and a view of its running rooms (`--rooms`); `None` for `--bundle`.
+    pub(crate) fn folder(&self) -> Option<RoomsFolder> {
+        let dir = self.folder.clone()?;
+        Some(RoomsFolder { dir, rooms: self.rooms() })
+    }
+
     /// How many rooms run.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -139,7 +145,7 @@ impl Host {
     ) -> Result<(), String> {
         let p: Prepared = prepare(loaded, self.password.as_ref(), self.limits)?;
         let id = p.id;
-        let room = p.room.clone();
+        let room = Room { file: path.clone(), ..p.room.clone() };
         let (key, handle) = match &mut self.store {
             Store::Pg(store) => {
                 let key = open_with_key(store, &p).await?;
@@ -288,6 +294,28 @@ impl Host {
             return Err(format!("the server runs {} rooms, its most", self.limits.max_rooms));
         }
         self.add(loaded, Some(path.to_owned())).await
+    }
+}
+
+/// The rooms folder of a running host: where to put a bundle so the next scan starts it, and
+/// which key the room from a file got.
+#[derive(Debug, Clone)]
+pub(crate) struct RoomsFolder {
+    dir: PathBuf,
+    rooms: Arc<RwLock<Rooms>>,
+}
+
+impl RoomsFolder {
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The key of the running room started from `file`, if any.
+    pub(crate) fn key_of(&self, file: &Path) -> Option<RoomKey> {
+        crate::read(&self.rooms)
+            .iter()
+            .find(|(_, r)| r.file.as_deref() == Some(file))
+            .map(|(k, _)| k.clone())
     }
 }
 
@@ -503,6 +531,29 @@ mod tests {
         let run = host.live[&key].run;
         let fenced = Ok(Stopped::Fenced { current: proto::Epoch(9) });
         assert_eq!(host.ended((key, run, fenced)).map(|e| e.exit_code()), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_folder_files_room_key_is_found_only_while_its_room_runs() {
+        let dir = TempDir::new("key-of");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let mut host = host(&dir, Limits { room_lifetime_secs: 0, ..Limits::DESIGN }).await;
+        let folder = host.folder().unwrap();
+        assert_eq!(folder.dir(), dir.0.as_path());
+        assert_eq!(folder.key_of(&dir.0.join("a.json")), Some(key_of(&host, "alpha")));
+        assert_eq!(folder.key_of(&dir.0.join("b.json")), Some(key_of(&host, "beta")));
+        assert_eq!(folder.key_of(&dir.0.join("c.json")), None, "no such file");
+        host.expire();
+        assert_eq!(folder.key_of(&dir.0.join("a.json")), None, "an expired room has no key");
+    }
+
+    #[tokio::test]
+    async fn a_single_bundle_host_has_no_rooms_folder() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+        let (_, host) = app(&Source::Bundle(fixture), None, None, Limits::DESIGN).await.unwrap();
+        assert!(host.folder().is_none());
     }
 
     #[tokio::test]

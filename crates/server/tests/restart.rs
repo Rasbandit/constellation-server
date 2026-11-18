@@ -323,7 +323,7 @@ mod restart {
             std::fs::write(dir.join(format!("{seed}.json")), v.to_string()).unwrap();
         }
         let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
-        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
         assert_ne!(a, b);
         let url = |s: &Server, key: &str| format!("ws://{key}.example:{}", s.addr.port());
@@ -334,7 +334,7 @@ mod restart {
         alice.next_cmd("RoomUpdate").await.unwrap();
         assert!(!server.kill().unwrap().success());
 
-        let server = Server::start_rooms(Path::new(BIN), &dir, &env).unwrap();
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         assert_eq!((key_of(&server, "alpha"), key_of(&server, "beta")), (a.clone(), b.clone()));
         let (_, room_a, _) = e2e::join_via(server.addr, &url(&server, &a), "Alice").await.unwrap();
         assert_eq!(locations(&room_a["checked_locations"]), [loc]);

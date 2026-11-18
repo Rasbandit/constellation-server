@@ -201,6 +201,55 @@ async fn upload_list_generate_poll_and_done() {
 }
 
 #[tokio::test]
+async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key() {
+    let setup = Setup::new("to-room");
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    // A second room, so a connection must name its key to reach the generated one.
+    let mut other: Value =
+        serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
+    other["seed_name"] = json!("other-room");
+    std::fs::write(rooms.join("other.json"), other.to_string()).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let mut env = setup.env();
+    env.push(("CONSTELLATION_ROOMS_SCAN_MS".into(), "50".into()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("generation done").unwrap();
+    let published = rooms.join(format!("{id}.json"));
+    let read = |p: &Path| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
+    assert_eq!(read(&published), read(&e2e::fixture_path()), "the bundle is in the rooms folder");
+    let left: Vec<_> = std::fs::read_dir(&rooms).unwrap().filter_map(Result::ok).collect();
+    assert_eq!(left.len(), 2, "no temporary file is left in the rooms folder");
+
+    let seed = e2e::fixture().unwrap().seed_name;
+    let ready = server.wait_for_log(&format!("seed=\"{seed}\"")).unwrap();
+    let key = ready.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "done", "{st}");
+    assert_eq!(st["room_key"], key.as_str(), "{st}");
+    let port = server.addr.port();
+    assert_eq!(st["address"], format!("{key}.localhost:{port}"), "{st}");
+
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (_, connected, _) = e2e::join_via(server.addr, &url, "Alice").await.unwrap();
+    assert_eq!(connected["cmd"], "Connected", "{connected}");
+}
+
+#[tokio::test]
+async fn without_a_rooms_folder_a_world_status_has_no_room() {
+    let setup = Setup::new("no-room");
+    let server = setup.start();
+    let id = generate_one(&server, b"Alice").await;
+    server.wait_for_log("generation done").unwrap();
+    let st = status(&server, &id).await;
+    assert_eq!(st["status"], "done", "{st}");
+    assert!(st.get("room_key").is_none() && st.get("address").is_none(), "{st}");
+}
+
+#[tokio::test]
 async fn a_generation_past_its_time_limit_is_killed_and_reported_failed() {
     let setup = Setup::new("timeout");
     let server = setup.start_with(&[("CONSTELLATION_GEN_TIMEOUT_MS", "1000")]);

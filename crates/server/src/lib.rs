@@ -68,11 +68,15 @@ pub struct Args {
     pub admin_host: IpAddr,
     /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
     pub admin_port: u16,
+    /// The host name clients reach this server by; a room's join address is
+    /// `{room_key}.{public_host}:{port}` (default `localhost`).
+    pub public_host: String,
 }
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
-     --port <port> [--host <ip>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
+     --port <port> [--host <ip>] [--public-host <name>] \
+     [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
      needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
@@ -85,7 +89,7 @@ impl Args {
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
-        let (mut admin_host, mut admin_port) = (None, None);
+        let (mut admin_host, mut admin_port, mut public_host) = (None, None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -102,6 +106,7 @@ impl Args {
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--public-host" => public_host = Some(value()?),
                 "--admin-host" => {
                     admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
                 }
@@ -118,6 +123,7 @@ impl Args {
             data_dir,
             admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             admin_port: admin_port.unwrap_or(0),
+            public_host: public_host.unwrap_or_else(|| "localhost".to_owned()),
         })
     }
 }
@@ -187,7 +193,7 @@ fn worlds_api(
     token: Option<&str>,
     generation: Option<Generation>,
     limits: Limits,
-) -> Result<Option<Router>, String> {
+) -> Result<Option<worlds::Worlds>, String> {
     let Some(dir) = data_dir else { return Ok(None) };
     let token = token.ok_or(
         "--data-dir serves an admin API that runs uploaded code; set \
@@ -197,7 +203,7 @@ fn worlds_api(
         "--data-dir needs CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
          CONSTELLATION_AP_GEN_SCRIPT",
     )?;
-    worlds::router(dir, token, generation, limits).map(Some)
+    worlds::open(dir, token, generation, limits).map(Some)
 }
 
 /// SHA-256 of the bundle file's canonical JSON.
@@ -276,7 +282,7 @@ fn prepare(loaded: Loaded, password: Option<&String>, limits: Limits) -> Result<
     let (seed, format) = (bundle.seed_name.clone(), bundle.format);
     let compat =
         Arc::new(CompatRoom::new(Arc::new(bundle), live.clone(), password.cloned(), limits)?);
-    Ok(Prepared { id, hash, format, fresh, room: Room { seed, compat, live }, mailbox })
+    Ok(Prepared { id, hash, format, fresh, room: Room { seed, compat, live, file: None }, mailbox })
 }
 
 /// Draws of a new room key before giving up; each draw collides with an existing key only
@@ -545,7 +551,9 @@ pub async fn run(
         let (router, host) =
             app(&args.source, secrets.room_password, secrets.database_url.as_deref(), limits)
                 .await?;
-        let admin = match api {
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
+        let admin = match api.map(|w| w.router(host.folder().map(published))) {
             Some(api) => {
                 let at = SocketAddr::new(args.admin_host, args.admin_port);
                 let l = tokio::net::TcpListener::bind(at)
@@ -557,7 +565,6 @@ pub async fn run(
             }
             None => None,
         };
-        let addr = listener.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%addr, rooms = host.len(), "listening");
         Ok::<_, RunError>((listener, router, host, admin))
     };
@@ -642,6 +649,11 @@ mod tests {
         let a = parse("--port 38281 --host 0.0.0.0 --bundle x --data-dir /d").unwrap();
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
+        assert_eq!(a.public_host, "localhost");
+        assert_eq!(
+            parse("--bundle x --port 1 --public-host play.example").unwrap().public_host,
+            "play.example"
+        );
         let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
         assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
         let a = parse("--rooms seeds --port 1").unwrap();
