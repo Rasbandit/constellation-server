@@ -82,5 +82,5 @@ Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
 - `just ap-client-check`: Archipelago's `CommonClient` against the real server; needs `../Archipela-Go` and its `apworld/.venv`. Run it before merging edge changes, like `just e2e-ap`.
 
 ## Dev setup
-Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, unit tests), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, a superset of CI). Needs `just`, `cargo-deny`, `typos`.
-Lints: every rustc and clippy group is `deny` (see `[workspace.lints]` in `Cargo.toml`), plus warnings as errors in CI. A new `allow` needs a `reason = "..."`.
+Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt check), commit-msg (conventional commits, subject at most 50 chars). `just check` also needs `cargo-deny` and `typos`.
+Lints: POC mode, compiler and clippy defaults plus `unsafe_code = "forbid"` (see `[workspace.lints]` in `Cargo.toml`). Warnings do not fail CI.

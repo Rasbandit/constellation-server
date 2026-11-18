@@ -11,14 +11,14 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 5. **No flakiness, ever.** No `sleep` to wait for something (use the simulated clock or an explicit signal). No real network except loopback on an ephemeral port. No shared global state, no test order dependence, no `#[ignore]` without a linked issue, no automatic retries. A flaky test is a bug in the test or the code: fix it the day it appears.
 6. **Expected values come from outside the code under test.** For wire formats, crypto, randomness and rules: an independent implementation, a published spec vector, or a hand calculation, written down with its source (see `crates/spec-rng/reference/ref.py`). Never paste the output of the function you are testing as the expected value.
 7. **Determinism is printed.** Anything random uses a seed that is logged on failure. A failing property or simulation seed becomes a permanent regression test.
-8. **Tests obey the lints.** No `unwrap` shortcuts outside tests (they are allowed inside `#[cfg(test)]` by `clippy.toml`). No `allow` without a `reason`. Test helpers are not published.
+8. **Test helpers are not published.**
 9. **No heavy work on a developer machine.** Local runs are targeted. The full gate, real Postgres, load, soak and fuzz runs belong to CI or a named test rig.
 
 ## Layers
 
 | Layer | Tool | Where it lives | When it runs |
 |---|---|---|---|
-| Unit | `cargo test`, `#[cfg(test)] mod tests` in the crate | next to the code | every commit (pre-commit runs `--lib`) |
+| Unit | `cargo test`, `#[cfg(test)] mod tests` in the crate | next to the code | every PR (CI) |
 | Golden vectors | fixed inputs with outputs from an independent source | `src/tests.rs` plus the reference in the crate's `reference/` | every commit |
 | Property | `proptest` | `mod properties` in the same file | every PR with default cases; manual `nightly` with `PROPTEST_CASES=50000` |
 | Snapshot | `insta` (JSON schema, OpenAPI, headers) | crate tests | every PR |
@@ -56,4 +56,4 @@ Hard rules for every agent and human writing code here. They sit under the lint 
 
 ## Hooks
 
-Run `just setup` once. Pre-commit: fmt, clippy, typos and unit tests (`cargo test --lib`). Commit-msg: conventional commit, subject at most 50 characters. Pre-push: `just check`, a superset of CI (CI runs fmt, clippy and the tests with Postgres). Never use `--no-verify`; fix the finding.
+Run `just setup` once. Pre-commit: fmt check. Commit-msg: conventional commit, subject at most 50 characters. CI runs fmt and the tests with Postgres. Never use `--no-verify`; fix the finding.

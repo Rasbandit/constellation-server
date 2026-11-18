@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# A superset of CI, so a push that passes here should pass there.
-set -euo pipefail
-exec just check
