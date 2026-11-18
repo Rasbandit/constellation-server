@@ -375,3 +375,10 @@ async fn stopped_stays_pending_while_the_room_runs() {
         () = std::future::ready(()) => {}
     }
 }
+
+/// A read query has no useful debug form; it prints its kind and never runs.
+#[test]
+fn a_read_query_debugs_as_its_kind() {
+    let run = ReadFn(Box::new(|_| panic!("a debug print must not run the query")));
+    assert_eq!(format!("{run:?}"), "ReadFn");
+}
