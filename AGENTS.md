@@ -25,6 +25,7 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
 6. **Release** when you stop without finishing: comment `RELEASE: <what is done, what is left>`, then remove the label and the assignee, but only if you held the claim at that point (never remove them from someone else's claim).
 
 ## While you work
+- Work in a git worktree, never in the main checkout. Pull `main` first, then `git worktree add -b <branch> ../constellation-server-<slug> main`. Remove it with `git worktree remove` once the PR merges.
 - Stay inside the issue's scope. New work you discover becomes a new issue (with `finding` if it surprised you), not part of your PR.
 - Never push to someone else's branch or edit a PR you did not open.
 - One PR per issue. Follow-up fixes are commits on that PR.
