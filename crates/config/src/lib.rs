@@ -573,6 +573,9 @@ mod tests {
             .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
             .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
+            .env("CONSTELLATION_AP_DIR", "/probe/ap")
+            .env("CONSTELLATION_AP_PYTHON", "/probe/python")
+            .env("CONSTELLATION_AP_GEN_SCRIPT", "/probe/ap_gen.py")
             .env("CONSTELLATION_DATABASE_URL_FILE", &url_file)
             .env_remove("CONSTELLATION_ROOM_PASSWORD_FILE")
             .env_remove("CONSTELLATION_DATABASE_URL")
@@ -589,6 +592,10 @@ mod tests {
         assert!(text.contains(&want), "want {want:?} in {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
+            "{text}"
+        );
+        assert!(
+            text.contains("probe generation /probe/ap /probe/python /probe/ap_gen.py"),
             "{text}"
         );
     }
@@ -614,6 +621,13 @@ mod tests {
         );
         let s = load_secrets().unwrap();
         println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
+        let g = load_generation().unwrap().expect("the paths are set");
+        println!(
+            "probe generation {} {} {}",
+            g.ap_dir.display(),
+            g.python.display(),
+            g.sidecar.display()
+        );
     }
 
     #[test]

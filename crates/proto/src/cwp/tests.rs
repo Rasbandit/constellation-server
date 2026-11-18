@@ -62,6 +62,8 @@ fn command_ids_are_one_to_sixty_four_visible_ascii_characters() {
     assert!(CmdId::new("x".repeat(CMD_ID_MAX)).is_ok(), "64 is the limit");
     assert_eq!(CmdId::new("x".repeat(CMD_ID_MAX.saturating_add(1))), Err(NameError::Length));
     assert_eq!(CmdId::new(""), Err(NameError::Length));
+    assert_eq!(NameError::Length.to_string(), "empty or too long");
+    assert_eq!(NameError::Syntax.to_string(), "not well formed");
     for bad in ["a b", "a\nb", "\0", "na\u{ef}ve"] {
         assert_eq!(CmdId::new(bad), Err(NameError::Syntax), "{bad:?}");
     }
@@ -174,7 +176,8 @@ fn secrets_never_print_their_value() {
             .unwrap();
     assert!(!format!("{f:?}").contains("SECRET"), "Debug leaks the token");
     let s = Secret::new("cst1_SECRET").unwrap();
-    assert!(!s.to_string().contains("SECRET"), "Display leaks the token");
+    assert_eq!(s.to_string(), "<redacted>", "Display leaks the token");
+    assert_eq!(format!("{s:?}"), "Secret(<redacted>)", "Debug says what it hides");
     assert_eq!(
         serde_json::to_value(&s).unwrap(),
         json!("cst1_SECRET"),
@@ -201,12 +204,43 @@ fn integers_above_two_to_the_53_are_refused_both_ways() {
     assert!(one_client(&big).is_err(), "2^53 is refused");
     let frame = ClientFrame::Ack(Ack { applied: ItemSeq(MAX_SAFE.saturating_add(1)) });
     assert!(serde_json::to_string(&frame).is_err(), "and never sent");
+    let at_bound = ClientFrame::Ack(Ack { applied: ItemSeq(MAX_SAFE) });
+    assert_eq!(serde_json::to_value(&at_bound).unwrap()["applied"], json!(MAX_SAFE), "sent");
     let neg = Check { location: -MAX_SAFE_I64 };
     assert!(serde_json::to_value(neg).is_ok(), "the negative bound is allowed");
     assert!(
         serde_json::from_value::<Check>(json!({"location": i64::MIN})).is_err(),
         "below it is not"
     );
+}
+
+/// A minimal `hello` frame with `patch`'s fields set.
+fn hello_frame(patch: &Value) -> String {
+    let base = json!({"op":"hello","proto":[1],"token":"t","client":{"kind":"game"}});
+    patched(base, patch).to_string()
+}
+
+/// The optional unsigned fields (`de_opt_u`) have the same bound as the required ones.
+#[test]
+fn an_optional_integer_above_two_to_the_53_is_refused_and_absent_is_none() {
+    let time = |t: &Value| {
+        let text = hello_frame(&json!({"client_time_ms": t}));
+        one_client(&text).map(|f| match f {
+            ClientFrame::Hello(h) => h.client_time_ms,
+            other => panic!("not a hello: {other:?}"),
+        })
+    };
+    assert_eq!(time(&json!(MAX_SAFE)).unwrap(), Some(MAX_SAFE), "2^53 - 1 is allowed");
+    assert!(time(&json!(MAX_SAFE.saturating_add(1))).is_err(), "2^53 is refused");
+    assert_eq!(time(&Value::Null).unwrap(), None);
+    // The frame decoder refuses any out-of-range number first; the field refuses it on its own
+    // too, for a `Hello` read another way.
+    let mut direct = json!({"proto":[1],"token":"t","client":{"kind":"game"}});
+    direct["client_time_ms"] = json!(MAX_SAFE.saturating_add(1));
+    assert!(serde_json::from_value::<Hello>(direct.clone()).is_err(), "2^53 is refused");
+    direct["client_time_ms"] = json!(MAX_SAFE);
+    let h = serde_json::from_value::<Hello>(direct).unwrap();
+    assert_eq!(h.client_time_ms, Some(MAX_SAFE));
 }
 
 // ---- frames ------------------------------------------------------------------------------
@@ -230,7 +264,45 @@ fn a_minimal_hello_wants_every_item_and_presents_one_credential() {
     .unwrap();
     let ClientFrame::Hello(both) = both else { panic!("not a hello") };
     assert_eq!(both.credential(), None, "token and ticket together are refused");
+    let ticket =
+        one_client(r#"{"op":"hello","proto":[1],"ticket":"u","client":{"kind":"game"}}"#).unwrap();
+    let ClientFrame::Hello(ticket) = ticket else { panic!("not a hello") };
+    assert!(matches!(ticket.credential(), Some(Credential::Ticket(t)) if t.as_str() == "u"));
+    let neither = one_client(r#"{"op":"hello","proto":[1],"client":{"kind":"game"}}"#).unwrap();
+    let ClientFrame::Hello(neither) = neither else { panic!("not a hello") };
+    assert_eq!(neither.credential(), None, "no credential");
     assert!(one_client(r#"{"op":"hello","proto":[1],"token":"t"}"#).is_err(), "client is required");
+}
+
+/// `takeover` is sent only when true (`is_false`), and survives a round trip.
+#[test]
+fn takeover_is_sent_only_when_set() {
+    let encode = |takeover: bool| {
+        let text = hello_frame(&json!({"takeover": takeover}));
+        serde_json::to_value(one_client(&text).unwrap()).unwrap()
+    };
+    assert_eq!(encode(true)["takeover"], json!(true));
+    assert_eq!(encode(false).get("takeover"), None, "false is left out");
+}
+
+/// `from` and `location` come together for a source with a location and are both absent for
+/// one without; half of the pair is never consistent.
+#[test]
+fn a_grant_is_consistent_only_with_both_or_neither_of_from_and_location() {
+    let grant = |source: &str, from: Option<u32>, location: Option<i64>| {
+        let mut v = sample("item.grant");
+        v["source"] = json!(source);
+        v["from"] = json!(from);
+        v["location"] = json!(location);
+        serde_json::from_value::<ItemGrant>(v).unwrap().is_consistent()
+    };
+    assert!(grant("check", Some(1), Some(104)));
+    assert!(!grant("check", Some(1), None) && !grant("check", None, Some(104)));
+    assert!(!grant("check", None, None));
+    assert!(grant("start", None, None));
+    assert!(!grant("start", Some(1), None) && !grant("start", None, Some(104)));
+    assert!(!grant("admin", Some(1), Some(104)));
+    assert!(grant("from_the_future", Some(1), None), "an unknown source is not checked");
 }
 
 #[test]
