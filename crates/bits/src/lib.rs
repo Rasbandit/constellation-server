@@ -18,19 +18,27 @@ pub const fn width(max: u64) -> u8 {
     (u64::BITS - max.leading_zeros()) as u8
 }
 
-/// The `width`-bit field (at most 57 bits) that starts at bit `bit` of `bytes`. Bits past the
-/// end read as 0, so a reader never panics on a short slice.
+/// The `width`-bit field (at most 57 bits, so `bit % 8 + width` fits one `u64`) that starts at
+/// bit `bit` of `bytes`. Bits past the end read as 0, so a reader never panics on a short
+/// slice. One 8-byte little-endian load where 8 bytes remain; only the last 7 bytes of a buffer
+/// take the zero-padded copy.
 #[must_use]
 pub fn read(bytes: &[u8], bit: usize, width: u8) -> u64 {
     if width == 0 {
         return 0;
     }
-    let mut word = [0_u8; 8];
-    let tail = bytes.get(bit / 8..).unwrap_or_default();
-    let n = tail.len().min(8);
-    word[..n].copy_from_slice(&tail[..n]);
+    let start = bit / 8;
+    let word = match bytes.get(start..).and_then(|t| t.first_chunk::<8>()) {
+        Some(w) => u64::from_le_bytes(*w),
+        None => {
+            let mut w = [0_u8; 8];
+            let tail = bytes.get(start..).unwrap_or_default();
+            w[..tail.len()].copy_from_slice(tail);
+            u64::from_le_bytes(w)
+        }
+    };
     let mask = if width >= 64 { u64::MAX } else { (1_u64 << width) - 1 };
-    (u64::from_le_bytes(word) >> (bit % 8)) & mask
+    (word >> (bit % 8)) & mask
 }
 
 /// Bytes that `count` fields of `width` bits take.
@@ -387,6 +395,42 @@ mod tests {
         let mut zero = Packed::new(0);
         assert!(zero.push(0) && !zero.push(1));
         assert_eq!(zero.get(0), Some(0));
+    }
+
+    /// The byte-by-byte reader `read` replaced, kept as the reference.
+    fn read_reference(bytes: &[u8], bit: usize, width: u8) -> u64 {
+        (0..u64::from(width)).fold(0, |acc, k| {
+            let b = bit + k as usize;
+            let set = bytes.get(b / 8).is_some_and(|byte| byte >> (b % 8) & 1 == 1);
+            acc | (u64::from(set) << k)
+        })
+    }
+
+    #[test]
+    fn the_word_load_matches_the_byte_by_byte_reader_everywhere() {
+        // SplitMix64, seed printed on failure.
+        let mut x: u64 = 0x5eed_0068;
+        let mut next = move || {
+            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for len in [0_usize, 1, 7, 8, 9, 15, 16, 33] {
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // Every offset into (and just past) the buffer, every width up to 57, so the last
+            // bytes of the buffer are always covered.
+            for bit in 0..(len * 8 + 16) {
+                for width in 0..=57_u8 {
+                    assert_eq!(
+                        read(&bytes, bit, width),
+                        read_reference(&bytes, bit, width),
+                        "len {len} bit {bit} width {width} seed 0x5eed0068"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
