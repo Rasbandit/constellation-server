@@ -23,7 +23,7 @@ from typing import Any
 from ap_client import Failure, check, load_archipelago, make_probe
 
 
-async def run(CommonContext: type, url: str, bundle: dict[str, Any], slot: str, game: str) -> None:
+async def run(CommonContext: type, url: str, bundle: dict[str, Any], slot: str, game: str, stay: bool = False) -> None:
     team, slot_id = bundle["connect_names"][slot]
     placed = next(s for s in bundle["slots"] if s["id"] == slot_id)
     check(placed["game"] == game, f"slot {slot} plays {game!r} in the bundle")
@@ -56,6 +56,9 @@ async def run(CommonContext: type, url: str, bundle: dict[str, Any], slot: str, 
     check((got.item, got.player, got.flags) == (target["item"], slot_id, target["flags"]),
           f"checking location {target['location']} gives item {target['item']}, as the bundle placed it")
     check(client.invalid() == [], f"no InvalidPacket ({client.invalid()})")
+    if stay:
+        print("staying connected; stop with Ctrl-C or SIGTERM", flush=True)
+        await asyncio.Event().wait()
     await client.disconnect()
 
 
@@ -66,6 +69,7 @@ def main() -> int:
     parser.add_argument("--game", required=True)
     parser.add_argument("--url", default=os.environ.get("ROOM_URL"), help="default: $ROOM_URL")
     parser.add_argument("--bundle", default=os.environ.get("ROOM_BUNDLE"), help="default: $ROOM_BUNDLE")
+    parser.add_argument("--stay", action="store_true", help="stay connected after the checks")
     args = parser.parse_args()
     if not args.url or not args.bundle:
         parser.error("--url and --bundle (or ROOM_URL and ROOM_BUNDLE) are required")
@@ -74,7 +78,7 @@ def main() -> int:
     CommonContext = load_archipelago(args.ap)
     print(f"connecting to {args.url} as {args.slot}")
     try:
-        asyncio.run(run(CommonContext, args.url, bundle, args.slot, args.game))
+        asyncio.run(run(CommonContext, args.url, bundle, args.slot, args.game, args.stay))
     except Failure as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 1
