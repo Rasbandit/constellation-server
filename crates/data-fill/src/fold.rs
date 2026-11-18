@@ -116,9 +116,15 @@ impl Folder<'_> {
                     0 => (B::K(all), stop),
                     1 => (B::Code(body), stop),
                     m => {
+                        // A folded constant can be a byte longer than the read it replaces, so
+                        // a body near the limit may outgrow its length field: keep the
+                        // original bytes, which read the same values at solve time.
+                        let Ok(len) = u16::try_from(body.len()) else {
+                            return (orig(stop, self.code), stop);
+                        };
                         let mut c =
                             vec![if all { op::ALL } else { op::ANY }, u8::try_from(m).unwrap_or(0)];
-                        c.extend_from_slice(&u16::try_from(body.len()).unwrap_or(0).to_le_bytes());
+                        c.extend_from_slice(&len.to_le_bytes());
                         c.extend_from_slice(&body);
                         (B::Code(c), stop)
                     }

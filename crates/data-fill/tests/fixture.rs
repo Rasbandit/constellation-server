@@ -482,6 +482,25 @@ fn an_index_that_disagrees_with_the_rules_is_rejected() {
     assert!(load(b).unwrap_err().contains("goal"));
 }
 
+/// Folding an option read into a 16-bit constant adds a byte, so a rule near the 64 KiB list
+/// limit can grow past it; the fold keeps such a rule's original bytes, and the rule after it
+/// in an `any` still reads right (`rope` alone opens the well).
+#[test]
+fn a_rule_that_folds_past_the_length_field_keeps_its_bytes() {
+    let mut m = manifest();
+    let cmp = json!({"ge": [{"count": "lamp"}, {"opt": "hard"}]});
+    let part = json!({"all": vec![cmp; 255]});
+    let wide = json!({"all": vec![part; 42]});
+    m["regions"][1]["checks"][0]["rule"] = json!({"any": [wide, {"has": "rope"}]});
+    let w = world(&m);
+    let (reached, ..) = solve_opts(&w, 1, ALL, &["rope"]);
+    assert!(reached.contains(&"well".to_owned()), "{reached:?}");
+    let (reached, ..) = solve_opts(&w, 1, ALL, &["lamp"]);
+    assert!(reached.contains(&"well".to_owned()), "{reached:?}");
+    let (reached, ..) = solve_opts(&w, 2, ALL, &["lamp"]);
+    assert!(!reached.contains(&"well".to_owned()), "{reached:?}");
+}
+
 #[test]
 fn a_reset_state_solves_like_a_fresh_one() {
     let w = world(&manifest());
