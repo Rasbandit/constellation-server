@@ -25,7 +25,7 @@
     reason = "Python's float semantics are exact comparisons; a margin would be wrong here"
 )]
 
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::cmp::Ordering;
 use proto::KvOp;
 use serde_json::{Map, Number, Value};
@@ -172,8 +172,22 @@ fn cmp_num(a: Num, b: Num) -> Option<Ordering> {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Element comparisons made on this thread, so tests can bound an operation's work.
+    pub(crate) static COMPARISONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Count one element comparison (tests only; a no-op otherwise).
+#[allow(clippy::missing_const_for_fn, reason = "not const in tests, where it counts")]
+fn counted() {
+    #[cfg(test)]
+    COMPARISONS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Python's `==` on JSON values: `1 == 1.0 == true`, lists and objects compared deeply.
 pub(crate) fn py_eq(a: &Value, b: &Value) -> bool {
+    counted();
     match (a, b) {
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
@@ -185,6 +199,39 @@ pub(crate) fn py_eq(a: &Value, b: &Value) -> bool {
             (Ok(Some(x)), Ok(Some(y))) => cmp_num(x, y) == Some(Ordering::Equal),
             // Null, strings, mixed types, and integers above i64::MAX: plain equality.
             _ => a == b,
+        },
+    }
+}
+
+/// A value's identity under [`py_eq`], as an ordered key: numbers equal in Python share one
+/// form (`1`, `1.0` and `true` are `Int(1)`; `-0.0` is `Int(0)`), so a set of these finds an
+/// equal element in O(log n) instead of a scan.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Canon {
+    Null,
+    Int(i64),
+    /// A float that is not an integer inside `i64`, by its bits.
+    Float(u64),
+    /// An integer above `i64::MAX`, equal only to itself (as in `py_eq`).
+    Big(u64),
+    Str(String),
+    List(Vec<Self>),
+    Obj(Vec<(String, Self)>),
+}
+
+fn canon(v: &Value) -> Canon {
+    counted();
+    match v {
+        Value::Null => Canon::Null,
+        Value::String(s) => Canon::Str(s.clone()),
+        Value::Array(a) => Canon::List(a.iter().map(canon).collect()),
+        Value::Object(o) => Canon::Obj(o.iter().map(|(k, x)| (k.clone(), canon(x))).collect()),
+        Value::Bool(_) | Value::Number(_) => match num(v, KvOp::Update) {
+            Ok(Some(Num::Int(i))) => Canon::Int(i),
+            Ok(Some(Num::Float(f))) => {
+                exact_int(f).map_or_else(|| Canon::Float(f.to_bits()), Canon::Int)
+            }
+            _ => Canon::Big(v.as_u64().unwrap_or_default()),
         },
     }
 }
@@ -471,13 +518,10 @@ fn update(cur: Value, v: &Value) -> Result<Value, KvRefusal> {
                 _ => return Err(KvRefusal::Type(op)),
             };
             // Membership is tested against the list as it was, so repeats inside `v` are all
-            // appended (the reference builds its set once, `MultiServer.py:147-152`).
-            let before = a.len();
-            for e in entries {
-                if !a.iter().take(before).any(|x| py_eq(x, &e)) {
-                    a.push(e);
-                }
-            }
+            // appended; one set of the list, built once, keeps it linear (the reference does
+            // the same, `MultiServer.py:147-152`).
+            let before: BTreeSet<Canon> = a.iter().map(canon).collect();
+            a.extend(entries.into_iter().filter(|e| !before.contains(&canon(e))));
             Ok(Value::Array(a))
         }
         Value::Object(mut o) => {

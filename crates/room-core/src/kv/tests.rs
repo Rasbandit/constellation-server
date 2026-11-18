@@ -502,3 +502,19 @@ fn a_repetition_is_measured_before_it_is_built() {
     // A count whose byte total overflows is refused, whatever the cap.
     assert_eq!(rep(json!("abc"), i64::MAX, usize::MAX), Err(KvRefusal::ValueTooLarge));
 }
+
+/// Reference `MultiServer.py:147-152` builds a set of the list once, so `update` is linear;
+/// a scan per entry made one `Set` within the frame cap cost about 1e10 comparisons on the
+/// room task (adversarial review on PR 46). Bounded here by counting element comparisons.
+#[test]
+fn update_on_a_long_list_does_linear_work() {
+    let before: Vec<i64> = (0..2000).collect();
+    let entries: Vec<i64> = (1000..3000).collect();
+    let start = super::COMPARISONS.with(std::cell::Cell::get);
+    let got = run(&json!(before), Update, &json!(entries));
+    let spent = super::COMPARISONS.with(std::cell::Cell::get).saturating_sub(start);
+    assert_eq!(got, Ok(json!((0..3000).collect::<Vec<i64>>())));
+    // Each element is looked at about once: at least once (the count is real), and far fewer
+    // than one scan per entry (2000 * 2000 under the old code).
+    assert!((4000..=20 * 4000).contains(&spent), "{spent} comparisons for 4000 elements");
+}
