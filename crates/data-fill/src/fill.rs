@@ -532,8 +532,10 @@ mod tests {
     use serde_json::json;
 
     /// Duplicated items read with thresholds (`has n`, a floor division, a capped sum), one
-    /// item no rule reads, one item a rule can never be satisfied by alone, and a region whose
-    /// way in can be held up by an item found inside it (support that is not a derivation).
+    /// item no rule reads, one item a rule can never be satisfied by alone, a region whose
+    /// way in can be held up by an item found inside it (support that is not a derivation),
+    /// events of two regions lighting one counter that a check and an exit read, and a stay
+    /// rule that gates a later slice.
     fn world() -> (World, Instance) {
         world_with(false)
     }
@@ -554,7 +556,7 @@ mod tests {
             "locations": locs.iter().enumerate()
                 .map(|(i, k)| json!({"key": k, "id": i + 1})).collect::<Vec<_>>(),
             "start": "a",
-            "x.time": {"slices": 1, "start_mask": 1},
+            "x.time": {"slices": 2, "start_mask": 1},
             "defs": {"rich": {"ge": [{"int": ["div", {"count": "coin"}, 2]}, 1]}},
             "regions": [
                 {"key": "a", "can_stay": false,
@@ -570,15 +572,18 @@ mod tests {
                                     ("l10", json!({"ge": [{"int": ["+",
                                         {"int": ["min", {"count": "coin"}, 3]},
                                         {"count": "boot"}]}, 3]}))]),
-                 "exits": [{"to": "c", "rule": {"has": "boot"}}], "events": [], "stays": []},
-                {"key": "c", "can_stay": false,
+                 "exits": [{"to": "c", "rule": {"has": "boot"}}],
+                 "events": [{"event": "bell", "rule": {"has": "key", "n": 2}}], "stays": []},
+                {"key": "c", "can_stay": true,
                  "checks": checks(&[("l11", t.clone()), ("l12", t.clone()), ("l13", t.clone()),
-                                    ("l14", t.clone()), ("l15", t.clone()), ("l16", t)]),
-                 "exits": [], "events": [], "stays": []},
+                                    ("l14", t.clone()), ("l15", json!({"x.time_any": 2})),
+                                    ("l16", json!({"ge": [{"counter": "bell"}, 2]}))]),
+                 "exits": [], "events": [], "stays": [{"slice": 1, "rule": {"has": "rune"}}]},
                 {"key": "d", "can_stay": false,
                  "checks": checks(&[("l17", json!({"true": {}})), ("l18", json!({"true": {}})),
                                     ("l19", json!({"true": {}}))]),
-                 "exits": [], "events": [], "stays": []},
+                 "exits": [{"to": "e", "rule": {"ge": [{"counter": "bell"}, 2]}}],
+                 "events": [{"event": "bell", "rule": {"has": "charm"}}], "stays": []},
                 {"key": "e", "can_stay": false, "checks": checks(&[("l20", json!({"true": {}}))]),
                  "exits": [], "events": [], "stays": []}
             ],
@@ -623,6 +628,8 @@ mod tests {
         for clocks in [false, true] {
             let (w, inst) = world_with(clocks);
             let plan = Plan::new(&w, &inst).unwrap();
+            let (mut lit, mut waited) = (false, false);
+            let late = w.loc("l15").unwrap();
             for seed in 1u64..=100 {
                 let mut sb = [0u8; 32];
                 sb[..8].copy_from_slice(&seed.to_le_bytes());
@@ -639,6 +646,8 @@ mod tests {
                 }
                 let mut held = items[cut..].to_vec();
                 let mut r = plan.state(&w, &held, &placed);
+                lit |= r.counters.iter().any(|c| *c >= 2);
+                waited |= r.reached(late);
                 while let Some(i) = held.pop() {
                     r.remove(i);
                     let fresh = plan.state(&w, &held, &placed);
@@ -646,6 +655,7 @@ mod tests {
                     crate::reach::assert_same(&w, &r, &fresh, &what);
                 }
             }
+            assert!(lit && waited, "the counter and the stay rule were exercised");
         }
     }
 
