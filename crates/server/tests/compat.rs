@@ -300,6 +300,72 @@ mod scenarios {
         assert!(body.ends_with("ok"), "{body}");
     }
 
+    /// `GET path` on a fresh connection (as a WebSocket upgrade when `upgrade`); the response,
+    /// read up to its `content-length` (the server may keep the connection open).
+    async fn http_get(server: &Server, path: &str, upgrade: bool) -> String {
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let ws = if upgrade {
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        } else {
+            "Connection: close\r\n"
+        };
+        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{ws}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let text = String::from_utf8_lossy(&got).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_owned)
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                if len.is_some_and(|n| body.len() >= n) {
+                    return text;
+                }
+            }
+            let n = tokio::time::timeout(e2e::GUARD, tcp.read(&mut buf)).await.unwrap().unwrap();
+            if n == 0 {
+                return text;
+            }
+            got.extend_from_slice(buf.get(..n).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rooms_folder_starts_one_room_per_bundle_each_with_its_key() {
+        let dir = std::env::temp_dir().join(format!("e2e-rooms-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = std::fs::read_to_string(e2e::fixture_path()).unwrap();
+        for seed in ["alpha", "beta"] {
+            let mut v: Value = serde_json::from_str(&text).unwrap();
+            v["seed_name"] = json!(seed);
+            std::fs::write(dir.join(format!("{seed}.json")), v.to_string()).unwrap();
+        }
+        let server = Server::start_rooms(Path::new(BIN), &dir, &[]).unwrap();
+        let ready: Vec<String> =
+            server.log().into_iter().filter(|l| l.contains("room ready")).collect();
+        assert_eq!(ready.len(), 2, "{ready:?}");
+        for (line, seed) in ready.iter().zip(["alpha", "beta"]) {
+            assert!(line.contains(&format!("seed=\"{seed}\"")), "{line}");
+            let key = line.split("key=").nth(1).unwrap().split_whitespace().next().unwrap();
+            assert_eq!(key.len(), 10, "{line}");
+        }
+        assert!(server.log().iter().any(|l| l.contains("listening") && l.contains("rooms=2")));
+        let health = http_get(&server, "/healthz", false).await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        // Routing by room key is not built: with two rooms a connection is not guessed into one.
+        let ws = http_get(&server, "/", true).await;
+        assert!(ws.starts_with("HTTP/1.1 404"), "{ws}");
+        assert!(ws.contains("this server runs 2 rooms"), "{ws}");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
     #[tokio::test]
     async fn the_password_can_come_from_a_file_and_never_from_the_command_line() {
         let dir = std::env::temp_dir().join(format!("e2e-pw-{}", std::process::id()));

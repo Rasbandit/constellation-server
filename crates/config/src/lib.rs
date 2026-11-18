@@ -35,6 +35,8 @@ pub struct Limits {
     pub session_queue: usize,
     /// Largest seed bundle file the server will read.
     pub bundle_max_bytes: u64,
+    /// Most rooms one process loads from a rooms folder (`--rooms`); more is refused at start.
+    pub max_rooms: usize,
     /// Chat and bounce messages a session may send in a burst (one shared token bucket).
     pub fanout_burst: u32,
     /// Refill of that bucket, in thousandths of a message per second (2000 = 2 per second).
@@ -121,6 +123,7 @@ impl Limits {
         room_mailbox: 1024,
         session_queue: 256,
         bundle_max_bytes: 64 * 1024 * 1024,
+        max_rooms: 1000,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
         chat_max_bytes: 2048,
@@ -326,6 +329,7 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
+        assert_eq!(l.max_rooms, 1000);
     }
 
     #[test]

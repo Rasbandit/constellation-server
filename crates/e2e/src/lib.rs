@@ -61,8 +61,22 @@ impl Server {
     /// # Errors
     /// When the binary cannot be started or never logs its address.
     pub fn start(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Res<Self> {
-        let mut child =
-            command(bin, extra, env).spawn().map_err(|e| format!("spawn server: {e}"))?;
+        Self::spawn(command(bin, extra, env))
+    }
+
+    /// Like [`Server::start`], but with every seed bundle in the folder `rooms` (`--rooms`)
+    /// instead of the fixture.
+    ///
+    /// # Errors
+    /// When the binary cannot be started or never logs its address.
+    pub fn start_rooms(bin: &Path, rooms: &Path, env: &[(&str, &str)]) -> Res<Self> {
+        let mut c = base_command(bin, env);
+        c.arg("--rooms").arg(rooms).args(["--port", "0"]);
+        Self::spawn(c)
+    }
+
+    fn spawn(mut command: Command) -> Res<Self> {
+        let mut child = command.spawn().map_err(|e| format!("spawn server: {e}"))?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
         let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
@@ -171,14 +185,18 @@ impl Drop for Server {
 /// not wait for the server to listen.
 #[must_use]
 pub fn command(bin: &Path, extra: &[&str], env: &[(&str, &str)]) -> Command {
+    let mut c = base_command(bin, env);
+    c.arg("--bundle").arg(fixture_path()).args(["--port", "0"]).args(extra);
+    c
+}
+
+/// The server binary with only the database variables in `env` and stderr piped, no
+/// arguments yet.
+fn base_command(bin: &Path, env: &[(&str, &str)]) -> Command {
     let mut c = Command::new(bin);
-    c.arg("--bundle")
-        .arg(fixture_path())
-        .args(["--port", "0"])
-        .args(extra)
-        // A scenario says which database it uses; it never inherits one (CI sets the URL
-        // for the Postgres tests, and parallel servers must not share a room).
-        .env_remove("CONSTELLATION_DATABASE_URL")
+    // A scenario says which database it uses; it never inherits one (CI sets the URL
+    // for the Postgres tests, and parallel servers must not share a room).
+    c.env_remove("CONSTELLATION_DATABASE_URL")
         .env_remove("CONSTELLATION_DATABASE_URL_FILE")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
