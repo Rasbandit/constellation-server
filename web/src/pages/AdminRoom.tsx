@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { api } from '../api/client';
+import { api, liveRooms } from '../api/client';
 import type { GameCatalog, Room, RoomRules, Slot } from '../api/types';
 import { Phases, shortLink } from '../components/phases';
 import { Feed, HintBoard, LinkBadge, SlotTable } from '../components/room';
@@ -29,6 +29,8 @@ function useAdminKey(id: string): [string, (k: string) => void] {
 export function AdminRoom() {
   const { id = '' } = useParams();
   const [key, setKey] = useAdminKey(id);
+  // A live room is reached through the dev server, which holds the server's admin token.
+  if (liveRooms) return <AdminView id={id} adminKey="" onBadKey={() => undefined} />;
   if (!key) return <KeyPrompt onKey={setKey} />;
   return <AdminView id={id} adminKey={key} onBadKey={() => setKey('')} />;
 }
@@ -59,7 +61,7 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
   const [params] = useSearchParams();
   const { room, hints, feed, link } = useLiveRoom(id, adminKey);
   const admin = useMemo(() => api.admin(id, adminKey), [id, adminKey]);
-  const audit = useLoad(() => admin.audit(), [admin, feed.length]);
+  const audit = useLoad(() => (liveRooms ? Promise.resolve([]) : admin.audit()), [admin, feed.length]);
   const toast = useToast();
   const [acting, setActing] = useState<Slot | 'pick' | null>(null);
   const [confirmClose, setConfirmClose] = useState(false);
@@ -105,22 +107,22 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
           <Link className="btn btn-ghost" to={`/rooms/${r.id}`}>
             Player view
           </Link>
-          {r.state === 'running' && (
+          {!liveRooms && r.state === 'running' && (
             <button type="button" className="btn" onClick={() => run(admin.setState('paused'), 'Room paused')}>
               Pause
             </button>
           )}
-          {r.state === 'paused' && (
+          {!liveRooms && r.state === 'paused' && (
             <button type="button" className="btn" onClick={() => run(admin.setState('running'), 'Room resumed')}>
               Resume
             </button>
           )}
-          {r.state !== 'closed' && (
+          {!liveRooms && r.state !== 'closed' && (
             <button type="button" className="btn btn-danger" onClick={() => setConfirmClose(true)}>
               Close room
             </button>
           )}
-          {(r.state === 'running' || r.state === 'paused') && (
+          {!liveRooms && (r.state === 'running' || r.state === 'paused') && (
             <button type="button" className="btn btn-primary" onClick={() => setActing('pick')}>
               Send item / hint
             </button>
@@ -130,10 +132,18 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
 
       <Phases state={r.state} />
 
+      {liveRooms && (
+        <div className="callout">
+          <strong>Host controls are not available yet.</strong> The server cannot yet send items, give free hints, rename players,
+          set slot passwords, release, collect, disconnect, pause, start, close, broadcast, edit rules or keep a host action log,
+          so this page only shows the live room.
+        </div>
+      )}
+
       {params.get('created') && (
         <div className="callout ok">
-          <strong>Your room is set up.</strong> Send players the room code or link; it shows them the server address and their slot
-          name.
+          <strong>Your room is set up.</strong> Send players the {r.code ? 'room code or link' : 'player link'}; it shows them the server
+          address and their slot name.
           <div className="share-line">
             {r.code ? (
               <>
@@ -158,19 +168,19 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
           </p>
         </Card>
       )}
-      {r.state === 'lobby' && <LobbyCard room={r} onStart={() => run(admin.setState('running'), 'Game started')} />}
+      {!liveRooms && r.state === 'lobby' && <LobbyCard room={r} onStart={() => run(admin.setState('running'), 'Game started')} />}
 
       <div className="stats stats-row">
         <Stat label="Online" value={`${r.slotsOnline}/${r.slots}`} />
         <Stat label="Goals done" value={`${r.slotsDone}/${r.slots}`} />
         <Stat label="Checks" value={`${pct(done, total)}%`} sub={`${done} of ${total}`} />
-        <Stat label="Open hints" value={(hints.data ?? []).filter((h) => h.status !== 'found').length} />
+        {!liveRooms && <Stat label="Open hints" value={(hints.data ?? []).filter((h) => h.status !== 'found').length} />}
       </div>
 
-      <Card title="Players" actions={<span className="muted small">Actions per player: items, hints, rename, release, kick</span>}>
+      <Card title="Players" actions={liveRooms ? undefined : <span className="muted small">Actions per player: items, hints, rename, release, kick</span>}>
         <SlotTable
           slots={r.slotList}
-          actions={(s) => (
+          actions={liveRooms ? undefined : (s) => (
             <button type="button" className="btn btn-small" onClick={() => setActing(s)} disabled={r.state === 'closed' || r.state === 'generating'}>
               Manage
             </button>
@@ -180,7 +190,7 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
 
       <div className="room-cols">
         <Card
-          title={
+          title={liveRooms ? 'Activity' : (
             <div className="seg" role="group" aria-label="Show">
               <button type="button" className={side === 'feed' ? 'on' : ''} onClick={() => setSide('feed')}>
                 Activity
@@ -189,10 +199,10 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
                 Host actions
               </button>
             </div>
-          }
+          )}
         >
-          {side === 'feed' ? (
-            <Feed feed={feed} footer={r.state !== 'closed' ? <Broadcast onSend={(t) => run(admin.broadcast(t), 'Message sent')} /> : undefined} />
+          {liveRooms || side === 'feed' ? (
+            <Feed feed={feed} footer={!liveRooms && r.state !== 'closed' ? <Broadcast onSend={(t) => run(admin.broadcast(t), 'Message sent')} /> : undefined} />
           ) : (
             <ol className="audit">
               {(audit.data ?? []).length === 0 && <Empty>No host actions yet.</Empty>}
@@ -206,12 +216,14 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
             </ol>
           )}
         </Card>
-        <div className="stack">
-          <RulesCard room={r} onSave={(patch) => run(admin.updateRules(patch), 'Rules saved')} />
-          <Card title="All hints">
-            <HintBoard hints={hints.data ?? []} slots={r.slotList} me={null} />
-          </Card>
-        </div>
+        {!liveRooms && (
+          <div className="stack">
+            <RulesCard room={r} onSave={(patch) => run(admin.updateRules(patch), 'Rules saved')} />
+            <Card title="All hints">
+              <HintBoard hints={hints.data ?? []} slots={r.slotList} me={null} />
+            </Card>
+          </div>
+        )}
       </div>
 
       <Modal open={acting !== null} title={acting === 'pick' ? 'Send an item or hint' : acting ? `Manage ${acting.name}` : ''} onClose={() => setActing(null)}>

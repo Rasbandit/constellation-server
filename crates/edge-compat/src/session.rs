@@ -30,7 +30,7 @@ pub struct Closed;
 /// Fan-out bodies this edge puts on the room's non-durable channel. The room never reads them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "fan", rename_all = "snake_case")]
-enum Fanout {
+pub(crate) enum Fanout {
     /// A `PrintJSON` for every connected client (unless it asked for `NoText`).
     Print { print: PrintJson },
     /// A `Bounced` for the clients that match the targets.

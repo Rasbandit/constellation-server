@@ -12,6 +12,7 @@
 //! With `--data-dir` it also serves the admin API for uploads and seed generation
 //! ([`worlds`], run in [`sandbox`]).
 
+mod room_view;
 mod sandbox;
 mod worlds;
 
@@ -68,11 +69,15 @@ pub struct Args {
     pub admin_host: IpAddr,
     /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
     pub admin_port: u16,
+    /// The host name clients reach this server by; a room's join address is
+    /// `{room_key}.{public_host}:{port}` (default `localhost`).
+    pub public_host: String,
 }
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
-     --port <port> [--host <ip>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
+     --port <port> [--host <ip>] [--public-host <name>] \
+     [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
      needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
@@ -85,7 +90,7 @@ impl Args {
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
-        let (mut admin_host, mut admin_port) = (None, None);
+        let (mut admin_host, mut admin_port, mut public_host) = (None, None, None);
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -102,6 +107,7 @@ impl Args {
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--public-host" => public_host = Some(value()?),
                 "--admin-host" => {
                     admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
                 }
@@ -118,6 +124,7 @@ impl Args {
             data_dir,
             admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             admin_port: admin_port.unwrap_or(0),
+            public_host: public_host.unwrap_or_else(|| "localhost".to_owned()),
         })
     }
 }
@@ -200,7 +207,7 @@ fn worlds_api(
     token: Option<&str>,
     generation: Option<Generation>,
     limits: Limits,
-) -> Result<Option<Router>, String> {
+) -> Result<Option<worlds::Worlds>, String> {
     let Some(dir) = data_dir else { return Ok(None) };
     let token = token.ok_or(
         "--data-dir serves an admin API that runs uploaded code; set \
@@ -210,7 +217,7 @@ fn worlds_api(
         "--data-dir needs CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
          CONSTELLATION_AP_GEN_SCRIPT",
     )?;
-    worlds::router(dir, token, generation, limits).map(Some)
+    worlds::open(dir, token, generation, limits).map(Some)
 }
 
 /// SHA-256 of the bundle file's canonical JSON.
@@ -424,6 +431,11 @@ fn route(rooms: &Rooms, host: Option<&str>, any_host: bool) -> Result<Route, Str
             }
         },
     };
+    listed(rooms, key)
+}
+
+/// The listed room `key`: ready (counted as a visit) when in memory, else cold.
+fn listed(rooms: &Rooms, key: RoomKey) -> Result<Route, String> {
     let Some(listing) = rooms.get(&key) else {
         return Err(format!("no room with key {key} on this server"));
     };
@@ -448,13 +460,29 @@ async fn find(
     s: &AppState,
     host: Option<&str>,
 ) -> Result<(RoomKey, Arc<CompatRoom>, rooms::Visit), String> {
+    let found = route(&read(&s.rooms), host, s.any_host)?;
+    let key = match found {
+        Route::Ready(key, room, visit) => return Ok((key, room, visit)),
+        Route::Cold(key) => key,
+    };
+    let (room, visit) = enter(&s.rooms, &s.wake, key.clone()).await?;
+    Ok((key, room, visit))
+}
+
+/// The listed room `key`, woken first when it is cold, with a visit that keeps it in memory
+/// while held (connections, and the admin API's room view).
+pub(crate) async fn enter(
+    rooms: &RwLock<Rooms>,
+    wake: &host::Waker,
+    key: RoomKey,
+) -> Result<(Arc<CompatRoom>, rooms::Visit), String> {
     // Twice at most: a room can go cold again between its wake and the second lookup only if
     // it idled for the whole idle time in between.
     for _ in 0..2 {
-        let found = route(&read(&s.rooms), host, s.any_host)?;
+        let found = listed(&read(rooms), key.clone())?;
         match found {
-            Route::Ready(key, room, visit) => return Ok((key, room, visit)),
-            Route::Cold(key) => s.wake.wake(key).await?,
+            Route::Ready(_, room, visit) => return Ok((room, visit)),
+            Route::Cold(key) => wake.wake(key).await?,
         }
     }
     Err("the room could not be loaded; try again".to_owned())
@@ -606,7 +634,9 @@ pub async fn run(
         let (router, host) =
             app(&args.source, secrets.room_password, secrets.database_url.as_deref(), limits)
                 .await?;
-        let admin = match api {
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
+        let admin = match api.map(|w| w.router(host.folder().map(published))) {
             Some(api) => {
                 let at = SocketAddr::new(args.admin_host, args.admin_port);
                 let l = tokio::net::TcpListener::bind(at)
@@ -618,7 +648,6 @@ pub async fn run(
             }
             None => None,
         };
-        let addr = listener.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%addr, rooms = host.len(), "listening");
         Ok::<_, RunError>((listener, router, host, admin))
     };
@@ -704,6 +733,11 @@ mod tests {
         let a = parse("--port 38281 --host 0.0.0.0 --bundle x --data-dir /d").unwrap();
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
+        assert_eq!(a.public_host, "localhost");
+        assert_eq!(
+            parse("--bundle x --port 1 --public-host play.example").unwrap().public_host,
+            "play.example"
+        );
         let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
         assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
         let a = parse("--rooms seeds --port 1").unwrap();
@@ -820,18 +854,7 @@ mod tests {
     #[test]
     fn the_admin_api_is_off_without_a_data_dir_and_refused_without_its_token() {
         let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
-        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
-        let g = || {
-            Some(Generation {
-                ap_dir: root.join("ap"),
-                python: "/usr/bin/python3".into(),
-                sidecar: root.join("tools/ap-gen/ap_gen.py"),
-                private: vec![],
-            })
-        };
+        let g = || Some(fake_generation(&root));
         assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
         assert!(worlds_api(None, Some("t"), g(), Limits::DESIGN).unwrap().is_none());
         let dir = root.join("data");
@@ -844,6 +867,62 @@ mod tests {
         assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
         assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
         assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
+    }
+
+    /// A fake Archipelago checkout and sidecar path under `root`: enough for the sandbox to
+    /// accept the settings (nothing here is run).
+    fn fake_generation(root: &std::path::Path) -> Generation {
+        for d in ["ap/custom_worlds", "ap/worlds/generic", "tools/ap-gen"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("ap/worlds/__init__.py"), "").unwrap();
+        Generation {
+            ap_dir: root.join("ap"),
+            python: "/usr/bin/python3".into(),
+            sidecar: root.join("tools/ap-gen/ap_gen.py"),
+            private: vec![],
+        }
+    }
+
+    /// The status code of one HTTP/1.1 GET to `addr`.
+    async fn status_of(addr: SocketAddr, path: &str, token: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let head =
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut first = [0_u8; 12];
+        s.read_exact(&mut first).await.unwrap();
+        String::from_utf8_lossy(&first[9..12]).parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_room_view_routes_need_the_admin_token() {
+        let root = std::env::temp_dir().join(format!("server-view-auth-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        let (_, host) =
+            app(&Source::Rooms(root.join("rooms")), None, None, Limits::DESIGN).await.unwrap();
+        let worlds = worlds_api(
+            Some(&root.join("data")),
+            Some("s3cret"),
+            Some(fake_generation(&root)),
+            Limits::DESIGN,
+        )
+        .unwrap()
+        .unwrap();
+        let api = worlds.router(host.folder().map(|f| (f, "localhost:1".to_owned())));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, api).await });
+        let id = "a".repeat(64);
+        for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
+            assert_eq!(status_of(addr, &path, None).await, 401, "{path} without the token");
+            assert_eq!(status_of(addr, &path, Some("wrong")).await, 401, "{path}, wrong token");
+            assert_eq!(status_of(addr, &path, Some("s3cret")).await, 404, "{path}: no such world");
+        }
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]

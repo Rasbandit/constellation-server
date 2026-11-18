@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, HttpError } from '../api/client';
+import { api, liveRooms, HttpError } from '../api/client';
 import type { ApWorld, CollectMode, PlayerFile, ReadinessCheck, ReleaseMode, RoomRules } from '../api/types';
 import { Phases } from '../components/phases';
 import { Card, Dropzone, Empty, Modal, useToast } from '../components/ui';
@@ -38,7 +38,8 @@ export function CreateRoom() {
   }, []);
 
   const readiness = useMemo(
-    () => checkReadiness({ roomName: name, apworlds: worlds, players, builtinGames: builtin }),
+    // A live room is named by its key; the name field is not shown then.
+    () => checkReadiness({ roomName: liveRooms ? 'live' : name, apworlds: worlds, players, builtinGames: builtin }),
     [name, worlds, players, builtin],
   );
   const neededGames = useMemo(() => [...new Set(players.flatMap((p) => gamesOf(p.game)))].sort(), [players]);
@@ -104,9 +105,12 @@ export function CreateRoom() {
           <h1>Create a room</h1>
           <p className="muted">Add files in any order. The checklist on the right shows what is left.</p>
         </div>
-        <button type="button" className="btn btn-ghost" onClick={loadSample}>
-          Try with sample files
-        </button>
+        {/* The sample files exist only in the stub; the server would refuse them. */}
+        {!liveRooms && (
+          <button type="button" className="btn btn-ghost" onClick={loadSample}>
+            Try with sample files
+          </button>
+        )}
       </div>
 
       <Phases state="create" />
@@ -114,15 +118,25 @@ export function CreateRoom() {
       <div className="create-grid">
         <div className="create-main">
           <Card title={<StepTitle n={1} text="Room" />}>
-            <label className="field">
-              <span>Room name</span>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Friday Night Multiworld" maxLength={60} />
-            </label>
-            <button type="button" className="disclosure" aria-expanded={showRules} onClick={() => setShowRules((s) => !s)}>
-              {showRules ? '▾' : '▸'} Rules: hint cost {rules.hintCostPct}%, release {rules.releaseMode}, collect {rules.collectMode}
-              {rules.password ? ', password set' : ''}
-            </button>
-            {showRules && <RulesForm rules={rules} onChange={setRules} />}
+            {liveRooms ? (
+              // The server cannot take a name, password or rules from this page yet, so none are asked for.
+              <p className="muted">
+                Not available yet: room name, password and rules. The room gets a key as its name; hint cost, release and collect
+                come from the generated world, and a password from the server (CONSTELLATION_ROOM_PASSWORD).
+              </p>
+            ) : (
+              <>
+                <label className="field">
+                  <span>Room name</span>
+                  <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Friday Night Multiworld" maxLength={60} />
+                </label>
+                <button type="button" className="disclosure" aria-expanded={showRules} onClick={() => setShowRules((s) => !s)}>
+                  {showRules ? '▾' : '▸'} Rules: hint cost {rules.hintCostPct}%, release {rules.releaseMode}, collect {rules.collectMode}
+                  {rules.password ? ', password set' : ''}
+                </button>
+                {showRules && <RulesForm rules={rules} onChange={setRules} />}
+              </>
+            )}
           </Card>
 
           <Card

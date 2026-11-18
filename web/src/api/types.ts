@@ -58,6 +58,15 @@ export interface CreateRoomRequest {
   rules: RoomRules;
 }
 
+/** A generated world the server runs as a room (`GET /api/worlds/:id` once it has `room_key`). */
+export interface GeneratedWorld {
+  id: string;
+  seed: string;
+  roomKey: string;
+  /** `{room_key}.{host}:{port}`: what a player types into their client. */
+  address: string;
+}
+
 export interface Slot {
   slot: SlotNo;
   name: string;
@@ -66,9 +75,10 @@ export interface Slot {
   checksDone: number;
   checksTotal: number;
   itemsReceived: number;
-  hintPoints: number;
-  /** ISO time of the last packet from this slot, or null if it never connected. */
-  lastSeen: string | null;
+  /** Null where the server does not track them (the real room view). */
+  hintPoints: number | null;
+  /** ISO time of the last packet from this slot, null if it never connected, undefined where not tracked. */
+  lastSeen?: string | null;
   clients: number;
 }
 

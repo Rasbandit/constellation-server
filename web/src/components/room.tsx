@@ -5,7 +5,7 @@ import type { LinkState } from '../lib/live';
 import { Empty, FlagTag, HintTag, Progress, StatusPill } from './ui';
 
 export function LinkBadge({ link }: { link: LinkState }) {
-  const text = { connecting: 'Connecting', live: 'Live', retrying: 'Reconnecting' }[link];
+  const text = { connecting: 'Connecting', live: 'Live', retrying: 'Reconnecting', closed: 'Disconnected: reload the page' }[link];
   return <span className={`link link-${link}`}>{text}</span>;
 }
 
@@ -59,7 +59,7 @@ export function SlotTable({ slots, me, actions }: { slots: Slot[]; me?: SlotNo |
                 <Progress done={s.checksDone} total={s.checksTotal} label={`${s.name} checks`} />
               </td>
               <td>{s.itemsReceived}</td>
-              <td className="muted">{s.status === 'offline' ? ago(s.lastSeen) : 'now'}</td>
+              <td className="muted">{s.status !== 'offline' ? 'now' : s.lastSeen === undefined ? '' : ago(s.lastSeen)}</td>
               {actions && <td className="col-actions">{actions(s)}</td>}
             </tr>
           ))}
@@ -108,7 +108,7 @@ export function Feed({ feed, me, footer }: { feed: FeedItem[]; me?: SlotNo | nul
         {shown.length === 0 && <Empty>Nothing here yet.</Empty>}
         {shown.map((f) => (
           <li key={f.seq} className={`feed-row kind-${f.kind} ${me != null && f.item?.to === me ? 'to-me' : ''}`}>
-            <time dateTime={f.at}>{clock(f.at)}</time>
+            {f.at ? <time dateTime={f.at}>{clock(f.at)}</time> : <span aria-hidden />}
             <span className="feed-text">{f.text}</span>
             {f.item && <FlagTag flag={f.item.flag} />}
           </li>

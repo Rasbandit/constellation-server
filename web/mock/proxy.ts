@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { ProxyOptions } from 'vite';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Plugin, ProxyOptions } from 'vite';
 
 // Sends the upload routes to the server's admin API instead of the stub, when configured:
 //   CONSTELLATION_ADMIN_URL    the admin listener, e.g. http://127.0.0.1:8081 (see the server's
@@ -38,5 +39,52 @@ export function adminProxy(env: Record<string, string | undefined>): AdminProxy 
     },
     passthrough: ADMIN_PATHS,
     summary: `uploads: ${target} (admin API)`,
+  };
+}
+
+/** The host names the dev server answers the proxy on: this machine only. */
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * Why a request must not reach the token-adding proxy, or null when it may. Only the dev
+ * server's own pages may use it: the Host must be a loopback name (no DNS rebinding), and a
+ * request a browser marks as coming from another page (Origin, Sec-Fetch-Site) must come from
+ * this same origin. Without this, any website open in the browser could use the admin API
+ * through the proxy (it adds the token; GHSA-vg6x-rcgg-rjx6 is the same class of hole in Vite).
+ */
+export function refusal(h: { host?: string; origin?: string; 'sec-fetch-site'?: string }): string | null {
+  let host: URL;
+  try {
+    host = new URL(`http://${h.host ?? ''}`);
+  } catch {
+    return 'bad host';
+  }
+  if (!h.host || !LOOPBACK.has(host.hostname)) return `host ${h.host ?? '(none)'} is not this machine`;
+  if (h.origin !== undefined) {
+    let from: string;
+    try {
+      from = new URL(h.origin).host;
+    } catch {
+      from = '';
+    }
+    if (from !== host.host) return `origin ${h.origin} is not this dev server`;
+  }
+  const site = h['sec-fetch-site'];
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') return `sec-fetch-site ${site}`;
+  return null;
+}
+
+/** Answers 403 to a request for the proxied `paths` that `refusal` turns away. Runs before Vite's proxy. */
+export function adminGuard(paths: RegExp): Plugin {
+  return {
+    name: 'constellation-admin-guard',
+    configureServer(server) {
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
+        const why = paths.test(new URL(req.url ?? '/', 'http://localhost').pathname) ? refusal(req.headers as Parameters<typeof refusal>[0]) : null;
+        if (!why) return next();
+        res.statusCode = 403;
+        res.end(`refused: ${why}`);
+      });
+    },
   };
 }

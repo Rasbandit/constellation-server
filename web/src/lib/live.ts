@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api/client';
+import { api, liveRooms } from '../api/client';
+import { applyEvent, FEED_LINES, type RoomEvent } from '../api/roomView';
 import type { FeedItem, Hint, Room } from '../api/types';
 
 /** Loads a value once and on demand; keeps the last good value while reloading. */
@@ -22,7 +23,8 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[]) {
   return { data, error, reload, setData };
 }
 
-export type LinkState = 'connecting' | 'live' | 'retrying';
+/** `closed`: the browser gave up on the stream (the server refused it); a reload starts over. */
+export type LinkState = 'connecting' | 'live' | 'retrying' | 'closed';
 
 /**
  * A room kept current: the room, its feed and its hints, refreshed when the server pushes a feed
@@ -43,7 +45,7 @@ export function useLiveRoom(id: string, adminKey?: string) {
       const fresh = items.filter((i) => i.seq > lastSeq.current);
       if (fresh.length === 0) return;
       lastSeq.current = fresh[fresh.length - 1].seq;
-      setFeed((f) => [...f, ...fresh].slice(-400));
+      setFeed((f) => [...f, ...fresh].slice(-FEED_LINES));
     };
     api.feed(id).then((items) => !cancelled && add(items), () => undefined);
 
@@ -60,9 +62,12 @@ export function useLiveRoom(id: string, adminKey?: string) {
       setLink('live');
       api.feed(id, lastSeq.current).then((items) => !cancelled && add(items), () => undefined);
     };
-    es.onerror = () => setLink('retrying');
-    es.addEventListener('feed', (e) => {
-      add([JSON.parse((e as MessageEvent).data) as FeedItem]);
+    es.onerror = () => setLink(es.readyState === EventSource.CLOSED ? 'closed' : 'retrying');
+    es.addEventListener(api.streamEvent, (e) => {
+      const data: unknown = JSON.parse((e as MessageEvent).data);
+      // A live room's stream resumes by itself (Last-Event-ID) and says when to start over.
+      if (liveRooms) setFeed((f) => applyEvent(f, data as RoomEvent));
+      else add([data as FeedItem]);
       refresh();
     });
     return () => {

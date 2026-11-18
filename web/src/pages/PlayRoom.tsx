@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api } from '../api/client';
+import { api, liveRooms } from '../api/client';
 import type { Hint, HintStatus, Room, Slot } from '../api/types';
 import { Feed, HintBoard, LinkBadge, SlotTable } from '../components/room';
 import { shortLink } from '../components/phases';
@@ -86,10 +86,15 @@ export function PlayRoom() {
 
       <div className="room-cols">
         <Card title="Activity">
-          <Feed feed={feed} me={me} footer={mine && r.state !== 'closed' ? <ChatBox roomId={id} slot={mine} /> : undefined} />
+          {/* Chat from the page needs a server endpoint; live rooms show their players' chat only. */}
+          <Feed feed={feed} me={me} footer={mine && r.state !== 'closed' && !liveRooms ? <ChatBox roomId={id} slot={mine} /> : undefined} />
         </Card>
         <Card title="Hints">
-          <HintBoard hints={hints.data ?? []} slots={r.slotList} me={me} onStatus={onHintStatus} />
+          {liveRooms ? (
+            <p className="muted">Not available yet: the server does not keep hints.</p>
+          ) : (
+            <HintBoard hints={hints.data ?? []} slots={r.slotList} me={me} onStatus={onHintStatus} />
+          )}
         </Card>
       </div>
     </div>
@@ -101,7 +106,8 @@ function ConnectCard({ room: r, me }: { room: Room; me: Slot | null }) {
   return (
     <Card title="How to connect" className="connect">
       <div className="join-ways">
-        <div className="join-way">
+        {/* Live rooms have no short codes yet; the page link is the way to share. */}
+        {!liveRooms && <div className="join-way">
           <span className="small muted">Room code (open the site, or share it)</span>
           {r.code ? (
             <>
@@ -114,7 +120,7 @@ function ConnectCard({ room: r, me }: { room: Room; me: Slot | null }) {
           ) : (
             <span className="muted">The room is closed, so its code was released.</span>
           )}
-        </div>
+        </div>}
         <div className="join-way">
           <span className="small muted">Server (type into your game's client)</span>
           <code>{addr}</code>
@@ -163,8 +169,8 @@ function MyProgress({ slot, hints }: { slot: Slot; hints: Hint[] }) {
       <div className="stats">
         <Stat label="Checks" value={`${pct(slot.checksDone, slot.checksTotal)}%`} sub={`${slot.checksDone} of ${slot.checksTotal}`} />
         <Stat label="Items received" value={slot.itemsReceived} />
-        <Stat label="Hint points" value={slot.hintPoints} />
-        <Stat label="Hints open" value={looking} sub={`${owed} for others in your world`} />
+        {slot.hintPoints !== null && <Stat label="Hint points" value={slot.hintPoints} />}
+        {!liveRooms && <Stat label="Hints open" value={looking} sub={`${owed} for others in your world`} />}
       </div>
     </Card>
   );

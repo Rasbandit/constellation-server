@@ -1669,3 +1669,118 @@ async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
     let text = send(&mut a, &p).await[0]["text"].as_str().unwrap().to_owned();
     assert!(text.contains("room.storage_full") && text.contains("3003"), "{text}");
 }
+
+// The host's room view (view.rs): numbers from the room and its sessions, events as shown.
+
+fn slot(summary: &Value, id: u64) -> &Value {
+    summary["slots"].as_array().unwrap().iter().find(|s| s["slot"] == id).unwrap()
+}
+
+#[tokio::test]
+async fn the_summary_counts_real_sessions_checks_and_items() {
+    let room = room();
+    let fresh = room.summary().await.unwrap();
+    assert_eq!(fresh["seed"], "seed-1");
+    assert_eq!(
+        fresh["options"],
+        json!({"password": false, "hint_cost": 10,
+        "release_mode": "auto", "collect_mode": "auto"})
+    );
+    assert_eq!(
+        *slot(&fresh, 1),
+        json!({"slot": 1, "team": 0, "name": "A", "game": GAME, "connected": false, "clients": 0,
+               "checked": 0, "locations": 2, "items_received": 0, "goal": false})
+    );
+    let mut a = joined(&room, "A").await;
+    let mut a2 = joined(&room, "A").await;
+    let now = room.summary().await.unwrap();
+    assert_eq!((&slot(&now, 1)["connected"], &slot(&now, 1)["clients"]), (&json!(true), &json!(2)));
+    assert_eq!(slot(&now, 2)["connected"], false, "B has no session");
+    check(&mut a, &[100]).await;
+    let now = room.summary().await.unwrap();
+    assert_eq!(
+        (&slot(&now, 1)["checked"], &slot(&now, 2)["items_received"]),
+        (&json!(1), &json!(1))
+    );
+    assert_eq!(slot(&now, 1)["items_received"], 0, "the item went to B");
+    a.leave().await;
+    assert_eq!(slot(&room.summary().await.unwrap(), 1)["clients"], 1);
+    a2.leave().await;
+    assert_eq!(slot(&room.summary().await.unwrap(), 1)["connected"], false);
+}
+
+#[tokio::test]
+async fn the_summary_says_only_whether_a_password_is_set() {
+    let s = room_with(&json!("hunter2"), None).summary().await.unwrap();
+    assert_eq!(s["options"]["password"], true);
+    assert!(!s.to_string().contains("hunter2"));
+}
+
+#[tokio::test]
+async fn durable_events_are_described_with_names_and_data_writes_are_hidden() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    check(&mut a, &[100, 101]).await;
+    send(&mut a, &json!([{"cmd": "Set", "key": "k", "default": 0, "operations": []}])).await;
+    let history = room.watch(proto::Seq(0), 400).await.unwrap().0.history;
+    let shown: Vec<Value> = history.iter().filter_map(|e| room.describe_event(e)).collect();
+    assert_eq!(history.len(), 5, "two checks, two items, one write: {history:?}");
+    assert_eq!(
+        shown,
+        [
+            json!({"kind": "checked", "seq": 1, "slot": 1, "name": "A", "location": 100,
+                   "location_name": "L100"}),
+            json!({"kind": "item", "seq": 2, "from": 1, "from_name": "A", "to": 2, "to_name": "B",
+                   "item": 7, "item_name": "Seven", "location": 100, "location_name": "L100",
+                   "flags": 1}),
+            json!({"kind": "checked", "seq": 3, "slot": 1, "name": "A", "location": 101,
+                   "location_name": "L101"}),
+            json!({"kind": "item", "seq": 4, "from": 1, "from_name": "A", "to": 1, "to_name": "A",
+                   "item": 8, "item_name": "Eight", "location": 101, "location_name": "L101",
+                   "flags": 0}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn joins_chat_and_leaves_are_described_from_the_live_stream() {
+    let room = room();
+    let (sub, _, _) = room.watch(proto::Seq(0), 400).await.unwrap();
+    let mut live = sub.live;
+    let mut a = joined(&room, "A").await;
+    send(&mut a, &json!([{"cmd": "Say", "text": "hello"}])).await;
+    a.leave().await;
+    let mut seen = Vec::new();
+    while let Ok(p) = live.try_recv() {
+        seen.extend(room.describe(&p));
+    }
+    let kinds: Vec<(&str, &Value)> =
+        seen.iter().map(|e| (e["kind"].as_str().unwrap(), &e["text"])).collect();
+    assert_eq!(
+        kinds,
+        [("join", &Value::Null), ("chat", &json!("hello")), ("leave", &Value::Null)],
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|e| e["slot"] == 1 && e["name"] == "A"), "{seen:?}");
+}
+
+#[test]
+fn a_view_starts_after_its_cursor_unless_it_is_past_the_head_or_too_far_behind() {
+    use proto::Seq;
+    // (after, head, cap) -> (start, reset)
+    for ((after, head, cap), want) in [
+        ((0, 0, 400), (0, false)),
+        ((0, 50, 400), (0, false)),
+        ((0, 1000, 400), (600, false)),
+        ((40, 50, 400), (40, false)),
+        ((50, 50, 400), (50, false)),
+        ((57, 50, 400), (0, true)),
+        ((1057, 1000, 400), (600, true)),
+        ((100, 1000, 400), (600, true)),
+        ((600, 1000, 400), (600, false)),
+        ((5, 9, 0), (9, true)),
+    ] {
+        let got = crate::view::view_start(Seq(after), Seq(head), cap);
+        assert_eq!((got.0.0, got.1), want, "after {after}, head {head}, cap {cap}");
+    }
+}

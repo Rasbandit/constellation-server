@@ -49,6 +49,12 @@ pub(crate) struct Who {
 }
 
 impl Presence {
+    /// How many connections are on each slot that has any.
+    pub(crate) async fn connections(&self) -> BTreeMap<u32, usize> {
+        let slots = self.slots.lock().await;
+        slots.iter().filter(|(_, s)| s.connections > 0).map(|(k, s)| (*k, s.connections)).collect()
+    }
+
     /// The status a slot's connections set (0 when none did).
     pub(crate) async fn status(&self, slot: u32) -> i64 {
         self.slots.lock().await.get(&slot).map_or(CLIENT_UNKNOWN, |s| s.status)
