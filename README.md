@@ -19,6 +19,7 @@ Status: first milestone (D-100). One process hosts one room from a seed bundle a
 - `crates/e2e`: end-to-end helpers (start the real binary, a yawc client, the fixture) and the fixture itself. The scenarios are integration tests of `server` (`crates/server/tests/compat.rs`), so cargo builds the binary and hands its path over (`CARGO_BIN_EXE_constellation-server`).
 - `crates/e2e-ap`: the interop test with `archipelago_rs` (MIT), used as a path dependency from the sibling `Archipela-Go` checkout; no source of it is in this repo. Its own workspace, excluded from the main one, because cargo resolves every path dependency (even an optional one); CI does not have that checkout, so CI does not run it (run `just e2e-ap` locally before merging edge changes). Its lint table is a copy of the workspace's, kept equal by a test in `crates/e2e`.
 - `tools/ap-import`: Python importer from a seed made by Archipelago's generator to our bundle.
+- `tools/ap-client-check`: drives the real server with Archipelago's own `CommonClient` from the sibling checkout (connect, `SetNotify`, `Set`, `Get`, start items, client status). Local only: `just ap-client-check`.
 
 Next crates, in doc 05 section 20 order: `edge-native`.
 
@@ -78,6 +79,7 @@ Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
 - `just bench-pg`: the gate G-DB throughput benchmark (the manual `nightly` workflow; not for a shared developer box).
 - `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
 - `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
+- `just ap-client-check`: Archipelago's `CommonClient` against the real server; needs `../Archipela-Go` and its `apworld/.venv`. Run it before merging edge changes, like `just e2e-ap`.
 
 ## Dev setup
 Run `just setup` once. It enables the hooks in `.githooks/`: pre-commit (fmt, clippy, typos, unit tests), commit-msg (conventional commits, subject at most 50 chars), pre-push (`just check`, a superset of CI). Needs `just`, `cargo-deny`, `typos`.

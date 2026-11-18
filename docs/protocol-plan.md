@@ -7,7 +7,14 @@ Internal working note, started 2026-11-16, kept current as the features land. Ou
 
 This note is our own writing, with citations; it holds no Archipelago source code, text or assets. "Read from code" means we traced it by reading, not by running it. Every limit we propose is an estimate, labeled as such, and belongs in `crates/config`.
 
-Status: build order steps 1 to 3 (section 7) are in progress on `feat/data-storage`.
+## Status (2026-11-17)
+
+Build order steps 1 to 3 (section 7) are implemented on `feat/data-storage`; `docs/compat-status.md` lists what is supported and the test that proves each part. Choices made while building, beyond what is written below:
+- Step 1 imports only what delivery and data storage need now: starting inventory, item and location name groups, and the generic `Archipelago` package. Start hints, entrances, spheres and hint blacklists come with hints (step 4).
+- `room-core` has no float math library (`no_std`), so the host supplies float power in `Ctx::powf`, like the clock; the result is recorded in the event, so replay never needs it.
+- Section 0.6 (a connection id) was not needed: the room's reply to a `Set` carries the event's `seq`, and the writing session skips that `seq` when the event reaches it, live or after a resync. Notes (section 0.5) are `runtime::Note { seq, reply, extra }`.
+- Client status presence lives in `edge-compat` (`presence.rs`) under a lock held while each change is published, so watchers see changes in order.
+- Found by running Archipelago's own `CommonClient` against the server: the reference tags `NetworkItem`, `NetworkPlayer` and `NetworkSlot` with `"class"` (`NetUtils.py:98-107`) and its client only builds them from tagged objects; we tag them now.
 ---
 
 ## 0. Cross-cutting changes (do these first, every feature below needs them)
