@@ -55,6 +55,8 @@ pub struct CompatRoom {
     connects: RateTable<IpAddr>,
     /// `Set` packets, per slot (their own bucket, so shared-value writes never use up chat).
     kv_sets: RateTable<u32>,
+    /// Bytes `Set` packets logged, per slot (every write is logged in full).
+    kv_bytes: RateTable<u32>,
     /// Who is connected to each slot, and the client statuses they set.
     presence: presence::Presence,
 }
@@ -118,6 +120,11 @@ impl CompatRoom {
             ),
             connects: RateTable::new(l.connect_burst, l.connect_refill_milli_per_sec, keys),
             kv_sets: RateTable::new(l.kv_set_burst, l.kv_set_refill_milli_per_sec, keys),
+            kv_bytes: RateTable::new(
+                l.kv_write_bytes_burst,
+                l.kv_write_bytes_refill_milli_per_sec,
+                keys,
+            ),
             presence: presence::Presence::default(),
         })
     }

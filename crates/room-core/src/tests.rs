@@ -905,6 +905,25 @@ mod key_value {
         apply(&mut room(), &ctx, replace("_readme", json!(1))).unwrap();
     }
 
+    /// Every write is logged in full, so the room caps the bytes it has ever logged for keys,
+    /// not only what is stored now; the count is rebuilt by a fold, so a restart keeps it.
+    #[test]
+    fn the_logged_bytes_of_a_room_are_capped_and_the_count_survives_a_fold() {
+        let lim = Limits { kv_max_room_log_bytes: 20, ..LIM };
+        let ctx = Ctx { now: Timestamp(0), limits: &lim, powf: f64::powf };
+        let write = || set(1, "k", None, vec![(KvOp::Replace, json!("12345"))]); // 8 bytes
+        let mut s = room();
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            events.extend(apply(&mut s, &ctx, write()).unwrap().events);
+        }
+        assert_eq!(apply(&mut s, &ctx, write()), Err(CoreError::Kv(KvRefusal::LogFull)));
+        let mut folded = fold(room(), &lim, events).unwrap();
+        assert_eq!(apply(&mut folded, &ctx, write()), Err(CoreError::Kv(KvRefusal::LogFull)));
+        let small = set(1, "k", None, vec![(KvOp::Replace, json!(1))]); // 2 bytes: 18 + 2 = 20
+        assert!(apply(&mut folded, &ctx, small).is_ok(), "exactly at the cap is allowed");
+    }
+
     #[test]
     fn a_key_write_for_an_unknown_slot_is_refused() {
         let mut s = room();

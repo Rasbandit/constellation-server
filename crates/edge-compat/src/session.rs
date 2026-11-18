@@ -10,7 +10,7 @@ use crate::wire::{
     StatusUpdate, TextPart,
 };
 use crate::{CompatRoom, NO_GAME_MIN_VERSION, NO_GAME_TAGS, PROTOCOL_VERSION, check_cid};
-use proto::{Command, Event, EventKind, Seq, SlotNo};
+use proto::{Command, ErrorCode, Event, EventKind, Seq, SlotNo};
 use room_core::{CoreError, RESERVED_KEY_PREFIX, Reply};
 use runtime::{Note, Published, Subscription};
 use seed_bundle::{Slot, SlotKind};
@@ -676,6 +676,11 @@ impl Session {
         let req = storage::parse_set(slot, &packet)
             .map_err(|text| Step::from(invalid("arguments", Some("Set"), text)))?;
         Self::rate(&self.room.kv_sets, slot, "Set")?;
+        if !self.room.kv_bytes.ready(slot, Instant::now()) {
+            let what = "this slot wrote too many bytes; slow down";
+            let text = format!("Set: {}", storage::registered(ErrorCode::RoomWriteRate, what));
+            return Err(Step::from(invalid("arguments", Some("Set"), text)));
+        }
         let key = req.write.key.clone();
         let packet = Arc::new(Value::Object(packet));
         let cmd = Command::KvSet(Box::new(req.write));
@@ -695,6 +700,8 @@ impl Session {
         let j = self.joined.as_mut().ok_or(Step::Closed)?;
         // The published copy of this write reaches this session later; it is skipped then.
         j.own_writes.insert(seq);
+        let logged = key.len().saturating_add(value.to_string().len());
+        self.room.kv_bytes.charge(slot, u64::try_from(logged).unwrap_or(u64::MAX), Instant::now());
         if !(req.want_reply || j.watch.contains(&key)) {
             return Ok(Vec::new());
         }

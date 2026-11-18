@@ -101,7 +101,7 @@ Targets = every connection that sent `SetNotify` for exactly this key, plus the 
 - Note to publish: `{ origin: ConnId, original, extras }`. The session that owns `origin` skips the event-driven copy (it already answered from the reply). On resync without notes: subscribers get `SetReply` with `value` and `slot`, `original_value: null`, no extras (deviation, only after a queue overflow).
 - room-core needs `serde_json` with `default-features = false, features = ["alloc"]` (no_std stays intact).
 - **SetNotify watch set** lives in the session (`Joined.watch: BTreeSet<String>`). Not durable.
-- Cost: every KV write is one log append and is published to every session (each session filters by its watch set). Name it: EnergyLink-style keys can be written several times a second per player. Batching in the runtime already folds a mailbox message into one append; no per-key coalescing.
+- Cost: every KV write is one log append carrying its whole value (up to 64 KiB), and is published to every session (each session filters by its watch set). Name it: EnergyLink-style keys can be written several times a second per player. Batching in the runtime already folds a mailbox message into one append; no per-key coalescing. Since the log is not compacted yet (#47), log growth is bounded by bytes, not counts: a per-slot byte bucket and a per-room cap on logged data storage bytes (section 1.5).
 
 ### 1.5 Limits (estimates, all to `crates/config`)
 
@@ -110,6 +110,7 @@ Targets = every connection that sent `SetNotify` for exactly this key, plus the 
 - operations per `Set` <= 64; keys per `Get` and per `SetNotify` <= 1 024; watched keys per session <= 4 096.
 - JSON nesting depth: the reference rejects any frame nested deeper than 16 (`NetUtils.py:179-205`). Apply the same depth cap to `Set` values (serde_json alone allows 128).
 - `Set` rate per slot: own `RateTable` bucket (estimate burst 50, 20 per second), separate from chat so EnergyLink traffic does not mute chat.
+- Logged bytes per slot: a byte bucket (estimate burst 256 KiB, 4 KiB per second), charged with each write's key plus value; it may run into debt by one write and then refuses until refilled (`room.write_rate`, 3004). Logged bytes per room: at most 512 MiB in total until compaction (`room.storage_full`, 3003). Worst case, estimated: about 354 MB per day per slot until the room cap.
 - `mul`/`left_shift`/`pow` checked before allocating (a list times 10^9 must be refused, not built).
 
 ### 1.6 Edge cases

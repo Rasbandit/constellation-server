@@ -45,6 +45,8 @@ pub enum KvRefusal {
     ValueTooLarge,
     /// The room's store would pass `Limits::kv_max_room_bytes`.
     RoomFull,
+    /// The room has logged `Limits::kv_max_room_log_bytes` of key writes.
+    LogFull,
     /// The operation does not apply to these value types.
     Type(KvOp),
     /// Division or modulo by zero, or zero to a negative power.

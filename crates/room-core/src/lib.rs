@@ -92,6 +92,10 @@ pub struct RoomState {
     /// `KvSet` events folded so far (one per write, so the head can be checked).
     #[serde(default)]
     kv_writes: u64,
+    /// Bytes of every key write ever logged (key plus value as JSON), for
+    /// `Limits::kv_max_room_log_bytes`: the log keeps each write in full.
+    #[serde(default)]
+    kv_log_bytes: u64,
 }
 
 /// The reply to the caller (a `result` frame), sent only after the events commit.
@@ -242,6 +246,7 @@ impl RoomState {
             kv: BTreeMap::new(),
             kv_bytes: 0,
             kv_writes: 0,
+            kv_log_bytes: 0,
         })
     }
 
@@ -425,8 +430,9 @@ impl RoomState {
                 }
                 let writes = self.kv_writes.checked_add(1).ok_or(CoreError::SeqOverflow)?;
                 let old = self.kv.get(key).map_or(0, |v| entry_bytes(key, v));
-                self.kv_bytes =
-                    self.kv_bytes.saturating_sub(old).saturating_add(entry_bytes(key, value));
+                let new = entry_bytes(key, value);
+                self.kv_bytes = self.kv_bytes.saturating_sub(old).saturating_add(new);
+                self.kv_log_bytes = self.kv_log_bytes.saturating_add(new);
                 self.kv.insert(key.clone(), (**value).clone());
                 self.kv_writes = writes;
             }
@@ -503,9 +509,12 @@ fn kv_write(state: &RoomState, ctx: &Ctx<'_>, w: &KvWrite) -> Result<(Value, Val
         return Err(KvRefusal::ValueTooLarge);
     }
     let old = state.kv.get(&w.key).map_or(0, |v| entry_bytes(&w.key, v));
-    let total = state.kv_bytes.saturating_sub(old).saturating_add(entry_bytes(&w.key, &value));
-    if total > l.kv_max_room_bytes {
+    let new = entry_bytes(&w.key, &value);
+    if state.kv_bytes.saturating_sub(old).saturating_add(new) > l.kv_max_room_bytes {
         return Err(KvRefusal::RoomFull);
+    }
+    if state.kv_log_bytes.saturating_add(new) > l.kv_max_room_log_bytes {
+        return Err(KvRefusal::LogFull);
     }
     Ok((original, value))
 }

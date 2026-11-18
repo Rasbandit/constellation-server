@@ -9,7 +9,7 @@
 
 use crate::CompatRoom;
 use crate::wire::CLIENT_GOAL;
-use proto::{KvOp, KvWrite, SlotNo};
+use proto::{ErrorCode, KvOp, KvWrite, SlotNo};
 use room_core::{KvRefusal, RESERVED_KEY_PREFIX};
 use seed_bundle::{Slot, SlotKind};
 use serde_json::{Map, Value, json};
@@ -101,12 +101,21 @@ pub(crate) fn refusal_text(r: KvRefusal) -> String {
         KvRefusal::TooDeep => "a value is nested too deeply".to_owned(),
         KvRefusal::ValueTooLarge => "the value would be too large".to_owned(),
         KvRefusal::RoomFull => "the room's data storage is full".to_owned(),
+        KvRefusal::LogFull => {
+            registered(ErrorCode::RoomStorageFull, "the room may store no more writes")
+        }
         KvRefusal::Type(op) => format!("{op:?} does not apply to these values"),
         KvRefusal::ZeroDivision(op) => format!("{op:?} divides by zero"),
         KvRefusal::Overflow(op) => format!("{op:?} gives a number out of range"),
         KvRefusal::Range(op) => format!("{op:?} with an index or shift out of range"),
     };
     format!("Set: {what}; nothing was stored")
+}
+
+/// A refusal carrying a code from the error registry, written into the text: the compatible
+/// protocol's `InvalidPacket` has no code field.
+pub(crate) fn registered(code: ErrorCode, what: &str) -> String {
+    format!("{} ({}): {what}", code.key(), code.code())
 }
 
 /// The `SetReply` body (without `cmd`, which the packet type adds) for a write: every field of

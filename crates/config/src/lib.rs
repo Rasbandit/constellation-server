@@ -96,6 +96,14 @@ pub struct Limits {
     pub kv_set_burst: u32,
     /// Refill of that bucket, thousandths per second (20000 = 20 per second).
     pub kv_set_refill_milli_per_sec: u32,
+    /// Stored bytes (key plus value as JSON) a slot's data storage writes may log in a burst.
+    /// Every write is logged in full, so this, not the write count, bounds log growth (estimate).
+    pub kv_write_bytes_burst: u32,
+    /// Refill of that byte bucket, thousandths of a byte per second (4096000 = 4 KiB/s).
+    pub kv_write_bytes_refill_milli_per_sec: u32,
+    /// Most data storage bytes a room may ever log (the log is not compacted yet), bytes
+    /// (estimate; a room past it refuses writes with `room.storage_full`).
+    pub kv_max_room_log_bytes: u64,
 }
 
 impl Limits {
@@ -139,6 +147,9 @@ impl Limits {
         kv_max_watched_keys: 4096,
         kv_set_burst: 50,
         kv_set_refill_milli_per_sec: 20_000,
+        kv_write_bytes_burst: 256 * 1024,
+        kv_write_bytes_refill_milli_per_sec: 4096 * 1000,
+        kv_max_room_log_bytes: 512 * 1024 * 1024,
     };
 }
 
@@ -482,6 +493,11 @@ mod tests {
         assert_eq!((l.kv_max_ops, l.kv_max_depth), (64, 16));
         assert_eq!((l.kv_max_keys_per_request, l.kv_max_watched_keys), (1024, 4096));
         assert_eq!((l.kv_set_burst, l.kv_set_refill_milli_per_sec), (50, 20_000));
+        assert_eq!(
+            (l.kv_write_bytes_burst, l.kv_write_bytes_refill_milli_per_sec),
+            (262_144, 4_096_000)
+        );
+        assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
     }
 
     #[test]

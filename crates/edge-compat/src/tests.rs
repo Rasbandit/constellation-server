@@ -595,6 +595,25 @@ fn a_bucket_refills_at_its_rate_and_never_above_its_burst() {
     assert!(!never.take(later));
 }
 
+/// A byte bucket may go into debt by one charge, and nothing is ready until the debt is
+/// repaid by refill: the long-run rate is the refill rate, whatever each charge costs.
+#[test]
+fn a_charged_bucket_runs_into_debt_and_refills_it_before_the_next_charge() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut b = limit::Bucket::new(100, 10_000, t0); // 100 bytes, 10 per second
+    assert!(b.ready(t0));
+    b.charge(60, t0);
+    assert!(b.ready(t0), "40 bytes left");
+    b.charge(70, t0); // 30 in debt
+    assert!(!b.ready(t0));
+    assert!(!b.ready(t0 + Duration::from_secs(3)), "the debt is repaid, no byte to spend yet");
+    assert!(b.ready(t0 + Duration::from_millis(3100)));
+    let mut b = limit::Bucket::new(100, 10_000, t0);
+    b.charge(u64::MAX, t0);
+    assert!(!b.ready(t0 + Duration::from_hours(24)), "a huge debt stays a debt");
+}
+
 /// The test bundle with an edit applied.
 fn room_edit(edit: impl FnOnce(&mut Value)) -> Arc<CompatRoom> {
     let mut v: Value = serde_json::to_value(&*bundle(&Value::Null)).unwrap();
@@ -1613,4 +1632,40 @@ async fn a_spectator_publishes_no_status_and_reads_as_done() {
     b.leave().await;
     assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
     assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}
+
+/// Data storage writes cost their stored bytes from a per-slot bucket (adversarial review on
+/// PR 46: every write logs its whole value). A slot past its budget is refused with the
+/// registry's code; other slots and chat are not affected.
+#[tokio::test]
+async fn set_bytes_are_budgeted_per_slot_with_the_registry_code() {
+    let room = limited(&Limits {
+        kv_write_bytes_burst: 100,
+        kv_write_bytes_refill_milli_per_sec: 0,
+        ..Limits::DESIGN
+    });
+    let mut a = joined(&room, "A").await;
+    // "k" plus a 50-character string with its quotes: 53 bytes per write.
+    let p = set("k", &json!([{"operation": "replace", "value": "x".repeat(50)}]));
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new(), "47 bytes left: allowed, in debt");
+    let refused = send(&mut a, &p).await;
+    let text = refused[0]["text"].as_str().unwrap();
+    assert!(text.contains("room.write_rate") && text.contains("3004"), "{text}");
+    assert_eq!(send(&mut a, &json!([{"cmd": "Say", "text": "hi"}])).await, Vec::<Value>::new());
+    let mut b = joined(&room, "B").await;
+    assert_eq!(send(&mut b, &p).await, Vec::<Value>::new());
+}
+
+/// The room's total of logged data storage bytes is capped (until the log is compacted):
+/// past it a write is refused with `room.storage_full`.
+#[tokio::test]
+async fn the_rooms_logged_storage_bytes_are_capped_with_the_registry_code() {
+    let room = limited(&Limits { kv_max_room_log_bytes: 20, ..Limits::DESIGN });
+    let mut a = joined(&room, "A").await;
+    let p = set("k", &json!([{"operation": "replace", "value": "12345"}])); // 8 bytes
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    assert_eq!(send(&mut a, &p).await, Vec::<Value>::new());
+    let text = send(&mut a, &p).await[0]["text"].as_str().unwrap().to_owned();
+    assert!(text.contains("room.storage_full") && text.contains("3003"), "{text}");
 }

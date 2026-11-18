@@ -29,17 +29,23 @@ pub enum ErrorCode {
     ResumeTooOld,
     /// `room.unavailable`
     RoomUnavailable,
+    /// `room.storage_full`: the room's data storage may log no more bytes.
+    RoomStorageFull,
+    /// `room.write_rate`: the slot used up its data storage byte budget for now.
+    RoomWriteRate,
 }
 
 impl ErrorCode {
     /// Every registered code, for registry tests and docs generation.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::CapabilityMissing,
         Self::AuthTokenRevoked,
         Self::AuthStepUpRequired,
         Self::RoomRolledBack,
         Self::ResumeTooOld,
         Self::RoomUnavailable,
+        Self::RoomStorageFull,
+        Self::RoomWriteRate,
     ];
 
     /// Numeric code (provisional, see module docs).
@@ -52,6 +58,8 @@ impl ErrorCode {
             Self::RoomRolledBack => 3001,
             Self::ResumeTooOld => 3002,
             Self::RoomUnavailable => 5001,
+            Self::RoomStorageFull => 3003,
+            Self::RoomWriteRate => 3004,
         }
     }
 
@@ -65,6 +73,8 @@ impl ErrorCode {
             Self::RoomRolledBack => "room.rolled_back",
             Self::ResumeTooOld => "resume.too_old",
             Self::RoomUnavailable => "room.unavailable",
+            Self::RoomStorageFull => "room.storage_full",
+            Self::RoomWriteRate => "room.write_rate",
         }
     }
 
@@ -72,8 +82,9 @@ impl ErrorCode {
     #[must_use]
     pub const fn retry(self) -> Retry {
         match self {
-            Self::RoomUnavailable => Retry::Backoff,
-            Self::CapabilityMissing
+            Self::RoomUnavailable | Self::RoomWriteRate => Retry::Backoff,
+            Self::RoomStorageFull
+            | Self::CapabilityMissing
             | Self::AuthTokenRevoked
             | Self::AuthStepUpRequired
             | Self::RoomRolledBack
@@ -115,6 +126,20 @@ mod tests {
             };
             assert_eq!(e.code() / 1000, area, "{}", e.key());
         }
+    }
+
+    #[test]
+    fn data_storage_refusals_are_registered_room_errors() {
+        assert_eq!(
+            (ErrorCode::RoomStorageFull.code(), ErrorCode::RoomStorageFull.key()),
+            (3003, "room.storage_full")
+        );
+        assert_eq!(
+            (ErrorCode::RoomWriteRate.code(), ErrorCode::RoomWriteRate.key()),
+            (3004, "room.write_rate")
+        );
+        assert_eq!(ErrorCode::RoomStorageFull.retry(), Retry::Never);
+        assert_eq!(ErrorCode::RoomWriteRate.retry(), Retry::Backoff);
     }
 
     #[test]
