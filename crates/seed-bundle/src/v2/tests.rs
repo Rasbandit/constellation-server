@@ -496,7 +496,16 @@ fn a_hostile_hint_block_is_an_error_not_a_panic() {
         rehash(&mut b);
         assert!(reopen(b, &text).is_err(), "{name}");
     }
-    assert!(reopen(good, &text).is_ok());
+    assert!(reopen(good.clone(), &text).is_ok());
+    // The entrance name table is sorted by name, as the format says: swapping its two
+    // references ("Back Door", "Cave") is refused.
+    let mut b = good;
+    let names = u32::from_le_bytes(b[at + 16..at + 20].try_into().unwrap()) as usize;
+    let (first, second) = (b[names..names + 8].to_vec(), b[names + 8..names + 16].to_vec());
+    b[names..names + 8].copy_from_slice(&second);
+    b[names + 8..names + 16].copy_from_slice(&first);
+    rehash(&mut b);
+    assert!(reopen(b, &text).unwrap_err().to_string().contains("entrance names"));
 }
 
 /// Review finding: the encoder expanded every slot's spheres to one value per location of its

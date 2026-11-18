@@ -1019,6 +1019,9 @@ impl Seed {
         {
             return Err(bad("entrance names out of range or not UTF-8"));
         }
+        if (1..names).any(|e| self.entrance_name(e - 1) >= self.entrance_name(e)) {
+            return Err(bad("entrance names are not sorted and distinct"));
+        }
         let w_hint = usize::from(wp + wl + STATUS_BITS);
         if !in_data(r.u32(at + 8) as usize, bits::bytes_for(r.u32(at + 4) as usize, w_hint)) {
             return Err(bad("start hints out of range"));
