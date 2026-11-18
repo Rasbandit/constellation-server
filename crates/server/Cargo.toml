@@ -19,10 +19,17 @@ path = "src/main.rs"
 name = "restart"
 required-features = ["pg-tests"]
 
+[[test]]
+name = "worlds"
+required-features = ["sandbox-tests"]
+
 [features]
 # The Postgres restart scenarios (`tests/restart.rs`). Need CONSTELLATION_DATABASE_URL and fail
 # loudly without it (docs/TESTING.md rule 5).
 pg-tests = ["log/pg-tests"]
+# The upload and generation API through the real sandbox (`tests/worlds.rs`). Need `bwrap` and
+# `python3` and fail loudly without them (docs/TESTING.md rule 5).
+sandbox-tests = []
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -34,9 +41,10 @@ proto = { path = "../proto" }
 room-core = { path = "../room-core" }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
-serde_json = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std", "raw_value"] }
 sha2 = { version = "0.11", default-features = false }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "process", "time", "io-util"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 yawc.workspace = true

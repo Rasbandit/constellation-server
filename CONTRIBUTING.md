@@ -13,7 +13,7 @@ By opening a pull request you agree that:
 ## Setup
 - Rust from `rust-toolchain.toml` (rustup picks it up), `just`, `cargo-deny`, `typos`.
 - `just setup` once: it turns on the git hooks (a fmt check before a commit, the commit message format).
-- Postgres is optional locally. CI runs the Postgres tests. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
+- Postgres is optional locally. CI runs only the unit tests; the Postgres and end-to-end tests run from the manual `nightly` workflow. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
 - The design docs live in the sibling `constellation` repo. Clone it next to this one.
 
 ## Workflow
