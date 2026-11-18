@@ -121,9 +121,25 @@ pub struct Limits {
     /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
     /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
     pub gen_memory_bytes: u64,
-    /// Most bytes of the sidecar's error output kept in a failed job's status (design value).
+    /// Most bytes of the sidecar's error output kept in a failed job's status; the rest is
+    /// read and dropped, never held (design value).
     pub gen_error_max_bytes: usize,
+    /// Most bytes the sidecar may print as its result (the bundle travels this way); more
+    /// fails the call (design value: the bundle cap plus room for the report).
+    pub gen_stdout_max_bytes: usize,
+    /// Size of each writable tmpfs in the sandbox (`/tmp`, the generator's scratch output),
+    /// bytes (design value).
+    pub gen_tmpfs_bytes: u64,
+    /// Largest file the sandboxed process may write (`prlimit --fsize`), bytes (design value).
+    pub gen_file_max_bytes: u64,
+    /// Most processes and threads in the sandbox (`prlimit --nproc`, counted per sandbox
+    /// because each has its own user namespace; design value).
+    pub gen_max_processes: u64,
 }
+
+/// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
+/// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
+pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
 
 impl Limits {
     /// The design values (see each field).
@@ -177,6 +193,10 @@ impl Limits {
         gen_timeout_ms: 15 * 60 * 1000,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
         gen_error_max_bytes: 16 * 1024,
+        gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
+        gen_tmpfs_bytes: 256 * 1024 * 1024,
+        gen_file_max_bytes: 256 * 1024 * 1024,
+        gen_max_processes: 64,
     };
 }
 
@@ -291,8 +311,18 @@ fn secrets_from(
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
-        admin_token: var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?,
+        admin_token: admin_token(var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?)?,
     })
+}
+
+#[cfg(feature = "std")]
+fn admin_token(token: Option<String>) -> Result<Option<String>, String> {
+    match token {
+        Some(t) if t.len() < ADMIN_TOKEN_MIN_BYTES => Err(format!(
+            "CONSTELLATION_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_BYTES} bytes (not shown)"
+        )),
+        t => Ok(t),
+    }
 }
 
 /// Where seed generation finds Archipelago and our sidecar. All three are needed for the
@@ -595,6 +625,12 @@ mod tests {
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
         assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
+        assert_eq!(l.gen_stdout_max_bytes, (64 << 20) + (1 << 20));
+        assert!(l.gen_stdout_max_bytes as u64 > l.bundle_max_bytes, "a full bundle fits");
+        assert_eq!(
+            (l.gen_tmpfs_bytes, l.gen_file_max_bytes, l.gen_max_processes),
+            (256 << 20, 256 << 20, 64)
+        );
     }
 
     #[test]
@@ -602,12 +638,20 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
         };
-        let file = |_: &std::path::Path| Ok("t0ken-from-file\n".to_owned());
-        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", "t0ken")]), file).unwrap();
-        assert_eq!(direct.admin_token.as_deref(), Some("t0ken"));
+        const T32: &str = "t0ken-t0ken-t0ken-t0ken-t0ken-32";
+        let file = |_: &std::path::Path| Ok("t0ken-from-file-t0ken-from-file-\n".to_owned());
+        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", T32)]), file).unwrap();
+        assert_eq!(direct.admin_token.as_deref(), Some(T32));
         assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
         let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
-        assert_eq!(from_file.unwrap().admin_token.as_deref(), Some("t0ken-from-file"));
+        assert_eq!(
+            from_file.unwrap().admin_token.as_deref(),
+            Some("t0ken-from-file-t0ken-from-file-")
+        );
+        const T31: &[(&str, &str)] = &[("CONSTELLATION_ADMIN_TOKEN", T32.split_at(1).1)];
+        let short = secrets_from(env(T31), file);
+        let e = short.unwrap_err();
+        assert!(e.contains("shorter than 32") && !e.contains("t0ken"), "{e}");
         let both: &'static [(&str, &str)] =
             &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
         assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
