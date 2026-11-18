@@ -134,6 +134,46 @@ struct Dedupe {
     at: Timestamp,
 }
 
+/// One slot's dedupe entries, sorted by cid: 24 bytes an entry, about a third of a map's. A
+/// snapshot keeps them as a cid-keyed map, as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "BTreeMap<Cid, Dedupe>", into = "BTreeMap<Cid, Dedupe>")]
+struct Dedupes(Vec<(Cid, Dedupe)>);
+
+impl From<BTreeMap<Cid, Dedupe>> for Dedupes {
+    fn from(m: BTreeMap<Cid, Dedupe>) -> Self {
+        Self(m.into_iter().collect())
+    }
+}
+
+impl From<Dedupes> for BTreeMap<Cid, Dedupe> {
+    fn from(d: Dedupes) -> Self {
+        d.0.into_iter().collect()
+    }
+}
+
+impl Dedupes {
+    fn get(&self, cid: &Cid) -> Option<&Dedupe> {
+        let i = self.0.binary_search_by_key(cid, |e| e.0).ok()?;
+        self.0.get(i).map(|e| &e.1)
+    }
+
+    fn insert(&mut self, cid: Cid, d: Dedupe) {
+        match self.0.binary_search_by_key(&cid, |e| e.0) {
+            Ok(i) => {
+                if let Some(e) = self.0.get_mut(i) {
+                    e.1 = d;
+                }
+            }
+            Err(i) => self.0.insert(i, (cid, d)),
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Dedupe> {
+        self.0.iter().map(|e| &e.1)
+    }
+}
+
 /// Everything the room remembers. Serializable as a snapshot, which leaves the world out (read
 /// one back with [`RoomState::from_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,7 +195,7 @@ pub struct RoomState {
     goals: BTreeMap<SlotNo, Seq>,
     slots: BTreeMap<SlotNo, SlotCursor>,
     /// `(slot, cid)` index, expiring after `dedupe_window_secs` (D-13).
-    dedupe: BTreeMap<SlotNo, BTreeMap<Cid, Dedupe>>,
+    dedupe: BTreeMap<SlotNo, Dedupes>,
     /// The key-value store.
     #[serde(default)]
     kv: BTreeMap<String, Value>,
@@ -412,7 +452,7 @@ impl RoomState {
         }
         // A dedupe entry and a check record the `Checked` event, which its `Item` event always
         // follows, so in a valid snapshot both sit below the head.
-        if self.dedupe.values().flat_map(BTreeMap::values).any(|d| d.seq >= self.head) {
+        if self.dedupe.values().flat_map(Dedupes::values).any(|d| d.seq >= self.head) {
             return bad("dedupe entry at or beyond the head");
         }
         if self.goals.iter().any(|(slot, s)| !self.slots.contains_key(slot) || *s > self.head) {
@@ -501,7 +541,7 @@ impl RoomState {
     /// Number of `(slot, cid)` dedupe entries held, for tests and metrics.
     #[must_use]
     pub fn dedupe_len(&self) -> usize {
-        self.dedupe.values().map(BTreeMap::len).sum()
+        self.dedupe.values().map(|d| d.0.len()).sum()
     }
 
     /// Record that the log holds everything up to `seq` (the caller's append committed). Lower
@@ -620,7 +660,7 @@ impl RoomState {
                 let index = self.dedupe.entry(slot).or_default();
                 // shortcut: prunes this slot's whole index on each new check, O(entries);
                 // upgrade to a time-ordered index when a room's 24 h window gets large.
-                index.retain(|_, d| live(d.at, at, limits.dedupe_window_secs));
+                index.0.retain(|(_, d)| live(d.at, at, limits.dedupe_window_secs));
                 index.insert(cid, Dedupe { seq: ev.seq, at });
             }
         }
