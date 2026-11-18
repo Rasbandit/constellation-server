@@ -1573,3 +1573,44 @@ async fn want_reply_is_read_with_python_truthiness() {
         assert_eq!(set_reply_of(&send(&mut a, &p).await).len(), replies, "{flag}");
     }
 }
+
+/// The goal (30) is terminal for watchers even when another connection of the same slot sends
+/// a status at the same moment: its goal check and its publish must not straddle the goal
+/// (adversarial review on PR 46). `join!` polls the status first, so under the old code it
+/// read "no goal" before the goal landed and published 20 after the 30.
+#[tokio::test]
+async fn a_status_racing_the_goal_from_another_connection_never_follows_it() {
+    let room = room();
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["_read_client_status_0_2"]).await;
+    let mut b1 = joined(&room, "B").await;
+    let mut b2 = joined(&room, "B").await;
+    pump(&mut a).await;
+    let late = json!([{"cmd": "StatusUpdate", "status": 20}]);
+    let goal = json!([{"cmd": "StatusUpdate", "status": 30}]);
+    tokio::join!(send(&mut b2, &late), send(&mut b1, &goal));
+    let values: Vec<Value> =
+        set_reply_of(&pump(&mut a).await).iter().map(|r| r["value"].clone()).collect();
+    assert_eq!(values.last(), Some(&json!(30)), "{values:?}");
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+    // And nothing after it, from any connection of the slot.
+    send(&mut b2, &late).await;
+    b1.leave().await;
+    b2.leave().await;
+    assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
+}
+
+/// Spectators count as done from the start and never change (reference `MultiServer.py:594-598`
+/// sets them to the goal, and `update_client_status` never changes a goal, `2316-2317`): their
+/// watchers hear nothing when they join or leave, and `Get` reads 30.
+#[tokio::test]
+async fn a_spectator_publishes_no_status_and_reads_as_done() {
+    let room = room_edit(|v| v["slots"][1]["kind"] = json!("spectator"));
+    let mut a = joined(&room, "A").await;
+    watch(&mut a, &["_read_client_status_0_2"]).await;
+    let mut b = joined(&room, "B").await;
+    send(&mut b, &json!([{"cmd": "StatusUpdate", "status": 20}])).await;
+    b.leave().await;
+    assert_eq!(set_reply_of(&pump(&mut a).await), Vec::<&Value>::new());
+    assert_eq!(get(&mut a, &["_read_client_status_0_2"]).await["_read_client_status_0_2"], 30);
+}

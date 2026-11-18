@@ -375,7 +375,11 @@ pub struct Get {
     pub keys: Vec<String>,
 }
 
-/// `ClientStatus` goal value.
+/// `ClientStatus` unknown: no connection on the slot (protocol doc, "`ClientStatus`").
+pub const CLIENT_UNKNOWN: i64 = 0;
+/// `ClientStatus` connected.
+pub const CLIENT_CONNECTED: i64 = 5;
+/// `ClientStatus` goal.
 pub const CLIENT_GOAL: i64 = 30;
 
 /// Encode packets as one frame (a JSON list).

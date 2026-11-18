@@ -8,17 +8,11 @@
 )]
 
 use crate::CompatRoom;
+use crate::wire::CLIENT_GOAL;
 use proto::{KvOp, KvWrite, SlotNo};
 use room_core::{KvRefusal, RESERVED_KEY_PREFIX};
 use seed_bundle::{Slot, SlotKind};
 use serde_json::{Map, Value, json};
-
-/// `ClientStatus` values (protocol doc, "`ClientStatus`").
-pub(crate) const CLIENT_UNKNOWN: i64 = 0;
-/// Connected.
-pub(crate) const CLIENT_CONNECTED: i64 = 5;
-/// Goal.
-pub(crate) const CLIENT_GOAL: i64 = 30;
 
 /// The wire name of each operation (protocol doc, "`DataStorageOperation`").
 fn op_named(name: &str) -> Option<KvOp> {
@@ -158,11 +152,16 @@ fn slot_of<'a>(room: &'a CompatRoom, rest: &str) -> Option<&'a Slot> {
     (team == s.team.to_string() && slot == s.id.to_string()).then_some(s)
 }
 
-/// A slot's client status: 30 for a slot whose goal is reached and for slots that are not
-/// players (the reference counts spectators and groups as done, `MultiServer.py:594-598`), else
-/// what its connections set.
+/// Whether a slot's client status is final (30): its goal is reached, or it is not a player.
+/// The reference sets spectators and groups to the goal at load (`MultiServer.py:594-598`) and
+/// never changes a goal (`update_client_status`, `MultiServer.py:2316-2317`).
+pub(crate) fn done(s: &Slot, goal: bool) -> bool {
+    goal || s.kind != SlotKind::Player
+}
+
+/// A slot's client status: 30 when [`done`], else what its connections set.
 pub(crate) fn status_value(s: &Slot, goal: bool, presence: i64) -> i64 {
-    if goal || s.kind != SlotKind::Player { CLIENT_GOAL } else { presence }
+    if done(s, goal) { CLIENT_GOAL } else { presence }
 }
 
 /// What a `_read_` key needs from outside the bundle: the slot whose client status it names.

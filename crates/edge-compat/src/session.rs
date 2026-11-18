@@ -311,8 +311,7 @@ impl Session {
                 self.presence_part(old_team, old).await?;
                 self.fan(old, &Fanout::Print { print: part_print(old_team, old) }).await?;
             }
-            let goal = self.goal(slot.id).await?;
-            let who = Who { team, slot: slot.id, goal };
+            let who = self.who(team, slot.id).await?;
             self.room.presence.join(who, async |c| self.publish_change(slot.id, c).await).await;
             let print = PrintJson {
                 kind: "Join".to_owned(),
@@ -435,13 +434,17 @@ impl Session {
         drop(self.room.room.ext(SlotNo(j.slot), Arc::new(body)).await);
     }
 
-    /// Whether `slot` reached its goal, from the room.
-    async fn goal(&self, slot: u32) -> Result<bool, Step> {
-        self.room.room.read(move |s| s.has_goal(SlotNo(slot))).await.map_err(|_| Step::Closed)
+    /// A presence change for `slot`, final when its goal is reached in the room or it is not a
+    /// player (`storage::done`).
+    async fn who(&self, team: u32, slot: u32) -> Result<Who, Step> {
+        let goal = self.room.room.read(move |s| s.has_goal(SlotNo(slot))).await;
+        let goal = goal.map_err(|_| Step::Closed)?;
+        let done = self.room.bundle.slot(slot).is_some_and(|s| storage::done(s, goal));
+        Ok(Who { team, slot, done })
     }
 
     async fn presence_part(&self, team: u32, slot: u32) -> Result<(), Step> {
-        let who = Who { team, slot, goal: self.goal(slot).await? };
+        let who = self.who(team, slot).await?;
         self.room.presence.part(who, async |c| self.publish_change(slot, c).await).await;
         Ok(())
     }
@@ -535,14 +538,18 @@ impl Session {
             )));
         }
         if req.status == CLIENT_GOAL {
-            let out = self.room.room.command(Command::Goal { slot: SlotNo(slot) });
-            out.await.map_err(|_| Step::Closed)?.map_err(|_| Step::Closed)?;
             // Watchers learn it from the durable `Goal` event.
+            let room = &self.room.room;
+            let goal = async || match room.command(Command::Goal { slot: SlotNo(slot) }).await {
+                Ok(Ok(_)) => Ok(()),
+                _ => Err(Step::Closed),
+            };
+            self.room.presence.reach_goal(slot, goal).await?;
             return Ok(Vec::new());
         }
         // Any other value is kept as the slot's status until the goal, like the reference
         // (`MultiServer.py:2203-2210`); not durable.
-        let who = Who { team: j.team, slot, goal: self.goal(slot).await? };
+        let who = self.who(j.team, slot).await?;
         let status = req.status;
         self.room.presence.set(who, status, async |c| self.publish_change(slot, c).await).await;
         Ok(Vec::new())

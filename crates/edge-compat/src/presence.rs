@@ -11,7 +11,8 @@
     reason = "rustc's unreachable_pub (denied) needs crate visibility in this private module"
 )]
 
-use crate::storage::{CLIENT_CONNECTED, CLIENT_UNKNOWN, status_key};
+use crate::storage::status_key;
+use crate::wire::{CLIENT_CONNECTED, CLIENT_UNKNOWN};
 use std::collections::BTreeMap;
 use tokio::sync::Mutex;
 
@@ -19,6 +20,9 @@ use tokio::sync::Mutex;
 struct Slot {
     connections: usize,
     status: i64,
+    /// The status is final (30): set under the lock when the goal is reached, so a change that
+    /// read "no goal" before it can never publish after it.
+    done: bool,
 }
 
 /// Per-slot connection counts and statuses for one room.
@@ -39,8 +43,9 @@ pub(crate) struct Changed {
 pub(crate) struct Who {
     pub(crate) team: u32,
     pub(crate) slot: u32,
-    /// The slot's goal is reached: its status stays 30 and nothing is published.
-    pub(crate) goal: bool,
+    /// The slot's status is final as far as the caller knows (`storage::done`): it stays 30
+    /// and nothing is published.
+    pub(crate) done: bool,
 }
 
 impl Presence {
@@ -58,10 +63,26 @@ impl Presence {
     ) {
         let mut slots = self.slots.lock().await;
         let s = slots.entry(who.slot).or_default();
-        if change(s) && !who.goal {
+        s.done |= who.done;
+        if change(s) && !s.done {
             publish(Changed { key: status_key(who.team, who.slot), value: s.status }).await;
         }
         drop(slots);
+    }
+
+    /// Reach the slot's goal with `act` (the durable goal command) while holding the lock, then
+    /// mark the status final. A status change waiting for the lock sees it and publishes
+    /// nothing, so 30 is the last value watchers hear.
+    pub(crate) async fn reach_goal<E>(
+        &self,
+        slot: u32,
+        act: impl AsyncFnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut slots = self.slots.lock().await;
+        act().await?;
+        slots.entry(slot).or_default().done = true;
+        drop(slots);
+        Ok(())
     }
 
     /// A connection joined: unknown becomes connected.
