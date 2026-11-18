@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct Seq(pub u64);
+pub struct Seq(#[cfg_attr(test, schemars(range(max = 9_007_199_254_740_991_u64)))] pub u64);
 
 /// Per-slot delivery index (doc 05 7.1, D-02).
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct ItemSeq(pub u64);
+pub struct ItemSeq(#[cfg_attr(test, schemars(range(max = 9_007_199_254_740_991_u64)))] pub u64);
 
 /// Slot number within a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -34,7 +34,7 @@ pub struct RoomId(pub u64);
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct Epoch(pub u64);
+pub struct Epoch(#[cfg_attr(test, schemars(range(max = 9_007_199_254_740_991_u64)))] pub u64);
 
 /// Seconds since the Unix epoch. Supplied by the runtime; core crates never read a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

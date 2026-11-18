@@ -1,12 +1,18 @@
-{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_token_for_slot_one","want":{"items":{"from_others":true,"own":true,"starting":true},"slot_data":false}}}
-{"dir":"s2c","frame":{"op":"welcome","proto":1,"exts":{},"limits":{"hb_ms":30000,"max_frame":65536},"epoch":1,"head":0,"slot":1,"role":"play","names":{"Moss Cave":"5f1c0a"}}}
-{"dir":"c2s","frame":{"op":"cmd","cid":"c-1","type":"check","data":{"location":104}}}
-{"dir":"s2c","frame":{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":104}}}
-{"dir":"s2c","frame":{"op":"event","seq":2,"type":"item.grant","slot":1,"data":{"from":1,"location":104,"item":7,"item_seq":1}}}
-{"dir":"s2c","frame":{"op":"result","cid":"c-1","ok":{}}}
+{"dir":"c2s","frame":{"op":"hello","proto":[1],"token":"cst1_golden_slot_one","client":{"kind":"game","name":"Moss Cave","version":"1.5.0"},"game":{"id":"dev.example.mosscave","version":"1.5.0"}}}
+{"dir":"s2c","frame":{"op":"welcome","proto":{"major":1,"minor":0},"session":"s_golden_1","caller":{"kind":"slot","slot":1,"scopes":["play"],"roles":[]},"slot":{"index":1,"name":"Rowan","game":"dev.example.mosscave"},"limits":{"max_frame_bytes":65536,"hb_ms":30000,"hb_slack":2.5,"cmds_per_sec":20,"max_watches":64,"max_paths_per_watch":16},"epoch":1,"head":0,"applied":0,"resume":{"status":"ok"},"names":{"dev.example.mosscave":"sha256:5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c0a5f1c"},"server_time_ms":1790000000000}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"loc104","type":"check","data":{"location":104}}}
+{"dir":"s2c","frame":[{"op":"event","seq":1,"type":"location.checked","slot":1,"data":{"location":104}},{"op":"event","seq":2,"type":"item.grant","slot":1,"t":1790000000100,"data":{"source":"check","from":1,"location":104,"item":7,"item_seq":1,"item_uid":"iu_7QK2M4XH","flags":["progression"]}}]}
+{"dir":"s2c","frame":{"op":"result","cid":"loc104","seq":2,"epoch":1,"ok":{"items":[{"to":1,"item":7,"flags":["progression"]}]}}}
 {"dir":"c2s","frame":{"op":"ack","applied":1}}
-{"dir":"c2s","frame":{"op":"cmd","cid":"c-2","type":"goal","data":{}}}
-{"dir":"s2c","frame":{"op":"event","seq":3,"type":"slot.goal","slot":1,"data":{}}}
-{"dir":"s2c","frame":{"op":"result","cid":"c-2","ok":{}}}
-{"dir":"c2s","frame":{"op":"ping"}}
-{"dir":"s2c","frame":{"op":"pong"}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"loc105","type":"check","data":{"location":105}}}
+{"dir":"s2c","frame":{"op":"event","seq":3,"type":"location.checked","slot":1,"data":{"location":105}}}
+{"dir":"s2c","frame":{"op":"result","cid":"loc105","seq":4,"epoch":1,"ok":{"items":[{"to":2,"item":3,"flags":[]}]}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"loc104","type":"check","data":{"location":104}}}
+{"dir":"s2c","frame":{"op":"result","cid":"loc104","seq":2,"epoch":1,"ok":{"items":[{"to":1,"item":7,"flags":["progression"]}]}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"st-1","type":"status.set","data":{"client_state":"playing"}}}
+{"dir":"s2c","frame":{"op":"result","cid":"st-1","ok":{}}}
+{"dir":"c2s","frame":{"op":"cmd","cid":"goal","type":"goal"}}
+{"dir":"s2c","frame":{"op":"event","seq":5,"type":"slot.goal","slot":1,"data":{}}}
+{"dir":"s2c","frame":{"op":"result","cid":"goal","seq":5,"epoch":1,"ok":{}}}
+{"dir":"c2s","frame":{"op":"ping","n":7}}
+{"dir":"s2c","frame":{"op":"pong","n":7}}
