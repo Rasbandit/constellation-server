@@ -279,8 +279,17 @@ pub fn sample(
 /// The fairness report for a [`Sampled`] run.
 #[must_use]
 pub fn report(w: &crate::World, s: &Sampled) -> Value {
-    let name = |i: u16| w.item_key(i).to_owned();
-    let loc = |l: u32| w.loc_key(l).to_owned();
+    report_named(&|i| w.item_key(i).to_owned(), &|l| w.loc_key(l).to_owned(), s)
+}
+
+/// [`report`] with the names of items and locations given by the caller (a room names them
+/// with the player).
+#[must_use]
+pub fn report_named(
+    name: &dyn Fn(u16) -> String,
+    loc: &dyn Fn(u32) -> String,
+    s: &Sampled,
+) -> Value {
     let spread: Vec<Value> = s
         .fill
         .items()
@@ -317,4 +326,137 @@ pub fn report(w: &crate::World, s: &Sampled) -> Value {
                                "note": "no beatable uniform placement found; bias not measured"});
     }
     v
+}
+
+/// A room's placements as one flat placement, so the statistics above (one item per location
+/// index) serve a room unchanged: location `l` of player `p` is `loc_off[p] + l`, item `i` of
+/// owner `o` is `item_off[o] + i`.
+#[derive(Debug, Clone)]
+pub struct Flat {
+    item_off: Vec<usize>,
+    loc_off: Vec<usize>,
+    item_names: Vec<String>,
+    loc_names: Vec<String>,
+}
+
+impl Flat {
+    /// The flat numbering of a room.
+    ///
+    /// # Errors
+    /// When the room has more items than a flat item number holds (16 bits).
+    pub fn new(seats: &[crate::Seat<'_>]) -> Result<Self, String> {
+        let (mut item_off, mut loc_off) = (Vec::new(), Vec::new());
+        let (mut item_names, mut loc_names) = (Vec::new(), Vec::new());
+        for (p, s) in seats.iter().enumerate() {
+            item_off.push(item_names.len());
+            loc_off.push(loc_names.len());
+            let p = p + 1;
+            item_names.extend(
+                (0..s.w.items())
+                    .map(|i| format!("p{p}:{}", s.w.item_key(u16::try_from(i).unwrap_or(0)))),
+            );
+            loc_names.extend(
+                (0..s.w.locations())
+                    .map(|l| format!("p{p}:{}", s.w.loc_key(u32::try_from(l).unwrap_or(0)))),
+            );
+        }
+        if item_names.len() > usize::from(u16::MAX) {
+            return Err(format!(
+                "{} items in the room: more than a flat item number holds",
+                item_names.len()
+            ));
+        }
+        Ok(Flat { item_off, loc_off, item_names, loc_names })
+    }
+
+    /// The room's placements, flat.
+    #[must_use]
+    pub fn placed(&self, placed: &[Vec<Option<crate::Given>>]) -> Vec<Option<u16>> {
+        let mut out = vec![None; self.loc_names.len()];
+        for (p, row) in placed.iter().enumerate() {
+            for (l, g) in row.iter().enumerate() {
+                if let Some(g) = g {
+                    let item = self.item_off[usize::from(g.to)] + usize::from(g.item);
+                    out[self.loc_off[p] + l] = u16::try_from(item).ok();
+                }
+            }
+        }
+        out
+    }
+
+    /// Name of a flat item (`p<player>:<key>`).
+    #[must_use]
+    pub fn item(&self, i: u16) -> String {
+        self.item_names[usize::from(i)].clone()
+    }
+
+    /// Name of a flat location (`p<player>:<key>`).
+    #[must_use]
+    pub fn loc(&self, l: u32) -> String {
+        self.loc_names[l as usize].clone()
+    }
+}
+
+/// [`sample`] for a room: `seeds` room fills, and up to `baseline` accepted uniform placements
+/// of every player's pool over every player's free locations (kept only if the placement
+/// rules hold, every goal is reachable and every progression item can be collected).
+#[must_use]
+pub fn sample_room(
+    seats: &[crate::Seat<'_>],
+    flat: &Flat,
+    seeds: u64,
+    baseline: u64,
+    max_attempts: u64,
+) -> Sampled {
+    use crate::room::{Given, fill_room, locked_placed, permits};
+    let mut out = Sampled::default();
+    for s in 1..=seeds {
+        match fill_room(seats, &mut seeded(s, b"fill\0\0\0\0"), config::FILL_MAX_ATTEMPTS) {
+            Ok(filled) => {
+                let f = flat.placed(&filled.placed);
+                out.fill.add(&f, |_| true);
+                out.fills.push(f);
+            }
+            Err(_) => out.failed += 1,
+        }
+    }
+    let base = locked_placed(seats);
+    let mut free: Vec<(u16, u32)> = Vec::new();
+    let mut items: Vec<Given> = Vec::new();
+    for (p, s) in seats.iter().enumerate() {
+        let p = u16::try_from(p).unwrap_or(0);
+        free.extend(
+            s.plan
+                .included
+                .iter()
+                .filter(|l| base[usize::from(p)][**l as usize].is_none())
+                .map(|l| (p, *l)),
+        );
+        let pool = s.plan.progression.iter().chain(&s.plan.rest);
+        items.extend(pool.map(|i| Given { to: p, item: *i }));
+    }
+    let mut rng = seeded(0, b"baseline");
+    while out.accepted < baseline && out.attempts < max_attempts {
+        out.attempts += 1;
+        rng.shuffle(&mut items);
+        let mut placed = base.clone();
+        let mut ok = items.len() == free.len();
+        for ((p, l), g) in free.iter().zip(&items) {
+            ok &= permits(seats, *g, *p, *l);
+            placed[usize::from(*p)][*l as usize] = Some(*g);
+        }
+        if !ok {
+            continue;
+        }
+        let s = crate::spheres::room_spheres(seats, &placed);
+        let stranded = s.unreachable.iter().any(|(p, l)| {
+            placed[usize::from(*p)][*l as usize]
+                .is_some_and(|g| seats[usize::from(g.to)].progression[usize::from(g.item)])
+        });
+        if s.all_beatable() && !stranded {
+            out.accepted += 1;
+            out.baseline.add(&flat.placed(&placed), |_| true);
+        }
+    }
+    out
 }

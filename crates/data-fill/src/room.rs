@@ -183,6 +183,61 @@ pub fn locked_placed(seats: &[Seat<'_>]) -> Vec<Vec<Option<Given>>> {
         .collect()
 }
 
+/// The room as seed-bundle placements, one list per slot (player order, locations ascending):
+/// `receiver` is the owner's slot (from 1), `item` an id in the owner's world, `sphere` the
+/// round of `spheres` that reached the location (from 0) when given.
+#[must_use]
+pub fn placements(
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<Given>>],
+    spheres: Option<&RoomSpheres>,
+) -> Vec<Vec<seed_bundle::Placed>> {
+    let mut round = std::collections::HashMap::new();
+    for (k, s) in spheres.iter().flat_map(|s| s.spheres.iter()).enumerate() {
+        round.extend(s.iter().map(|x| (*x, u32::try_from(k).unwrap_or(u32::MAX))));
+    }
+    placed
+        .iter()
+        .enumerate()
+        .map(|(p, row)| {
+            row.iter()
+                .enumerate()
+                .filter_map(|(l, g)| {
+                    let g = (*g)?;
+                    let (l, p) = (u32::try_from(l).unwrap_or(0), u16::try_from(p).unwrap_or(0));
+                    let owner = &seats[usize::from(g.to)];
+                    let progression = owner.progression.get(usize::from(g.item)).copied();
+                    Some(seed_bundle::Placed {
+                        location: seats[usize::from(p)].w.loc_id(l),
+                        item: owner.w.item_id(g.item),
+                        receiver: u32::from(g.to) + 1,
+                        flags: u8::from(progression.unwrap_or(false)),
+                        sphere: round.get(&(p, l)).copied(),
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Per owner: progression items lying in other players' worlds, and all their progression
+/// items placed (locked ones included).
+#[must_use]
+pub fn cross_world_share(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> Vec<(usize, usize)> {
+    let mut out = vec![(0, 0); seats.len()];
+    for (p, row) in placed.iter().enumerate() {
+        for g in row.iter().flatten() {
+            if seats[usize::from(g.to)].progression.get(usize::from(g.item)).copied() == Some(true)
+            {
+                let o = &mut out[usize::from(g.to)];
+                o.0 += usize::from(usize::from(g.to) != p);
+                o.1 += 1;
+            }
+        }
+    }
+    out
+}
+
 fn check(seats: &[Seat<'_>]) -> Result<(), FillError> {
     if seats.is_empty() || seats.len() > config::ROOM_MAX_PLAYERS {
         return Err(FillError::Instance(format!(

@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::fairness::{report, sample};
+use data_fill::fairness::{Flat, report, report_named, sample, sample_room};
+use data_fill::room::{self, Seat};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 
@@ -30,8 +31,16 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     let num = |k: &str, d: u64| {
         m.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|e| format!("{k}: {e}")))
     };
-    let real =
-        |k: &str| m.get(k).map(|v| v.parse::<f64>().map_err(|e| format!("{k}: {e}"))).transpose();
+    // A room: `--world` with an `instances` list is one world played by several players.
+    if let Some(w) = m.get("--world") {
+        let v = read(w)?;
+        if let Some(list) = v["instances"].as_array() {
+            let (seeds, baseline) =
+                (num("--seeds", 2000)?, num("--baseline", num("--seeds", 2000)?)?);
+            let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
+            return room_report(&v["manifest"], list, (seeds, baseline, max_attempts), &m);
+        }
+    }
     let (manifest, inst_raw) = match (m.get("--world"), m.get("--manifest"), m.get("--instance")) {
         (Some(w), _, _) => {
             let v = read(w)?;
@@ -50,9 +59,44 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     let prog = inst.progression(&w);
     let t = Instant::now();
     let s = sample(&w, &plan, &pool, &prog, seeds, baseline, max_attempts);
-    let mut r = report(&w, &s);
+    finish(report(&w, &s), s.failed == 0, t, &m)
+}
+
+/// The fairness run of one room: the same report, over every player's world.
+fn room_report(
+    manifest: &Value,
+    list: &[Value],
+    (seeds, baseline, max_attempts): (u64, u64, u64),
+    m: &HashMap<&str, &str>,
+) -> Result<(Value, bool), String> {
+    let workers = config::FILL_SETUP_WORKERS;
+    let worlds = room::worlds(&vec![manifest; list.len()], workers)?;
+    let insts = room::instances(list)?;
+    let pairs: Vec<_> = worlds.iter().zip(&insts).collect();
+    let plans = room::plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
+    let progression: Vec<Vec<bool>> =
+        worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
+    let seats: Vec<Seat<'_>> = (0..plans.len())
+        .map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &progression[p] })
+        .collect();
+    let flat = Flat::new(&seats)?;
+    let t = Instant::now();
+    let s = sample_room(&seats, &flat, seeds, baseline, max_attempts);
+    let mut r = report_named(&|i| flat.item(i), &|l| flat.loc(l), &s);
+    r["players"] = json!(seats.len());
+    finish(r, s.failed == 0, t, m)
+}
+
+/// Add timing and the gates, write `--out`.
+fn finish(
+    mut r: Value,
+    mut ok: bool,
+    t: Instant,
+    m: &HashMap<&str, &str>,
+) -> Result<(Value, bool), String> {
+    let real =
+        |k: &str| m.get(k).map(|v| v.parse::<f64>().map_err(|e| format!("{k}: {e}"))).transpose();
     r["seconds"] = json!(t.elapsed().as_secs_f64());
-    let mut ok = s.failed == 0;
     if let Some(p) = real("--fail-p")? {
         ok &= r["baseline"]["p_value"].as_f64().is_none_or(|x| x >= p);
     }

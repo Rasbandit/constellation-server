@@ -302,3 +302,27 @@ fn shared_data_is_send_and_sync_and_a_state_can_move_to_a_task() {
     shared::<Instance>();
     owned::<data_fill::Reach<'static>>();
 }
+
+#[test]
+fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
+    let r = Room::new(3, 1);
+    let seats = r.seats();
+    let placed = hand(&seats, CHAIN);
+    let sp = room_spheres(&seats, &placed);
+    let out = room::placements(&seats, &placed, Some(&sp));
+    assert_eq!(out.iter().map(Vec::len).collect::<Vec<_>>(), [6, 6, 5], "one list per slot");
+    // Slot 1, location l1 (id 1) holds player 2's key_a (id 1): receiver 2, progression,
+    // found in the first round.
+    let first = out[0][0];
+    assert_eq!((first.location, first.item, first.receiver, first.flags), (1, 1, 2, 1));
+    assert_eq!(first.sphere, Some(0));
+    // Slot 2, location l6 (id 6) holds player 3's coin (id 4): receiver 3, not progression,
+    // found in the second round (the lamp found in round 1 opens it).
+    let coin = out[1][5];
+    assert_eq!((coin.location, coin.item, coin.receiver, coin.flags), (6, 4, 3, 0));
+    assert_eq!(coin.sphere, Some(1));
+    // Without spheres none is recorded.
+    assert!(room::placements(&seats, &placed, None).iter().flatten().all(|p| p.sphere.is_none()));
+    // Progression of each owner lying in other worlds, over all they own.
+    assert_eq!(room::cross_world_share(&seats, &placed), [(1, 3), (2, 3), (1, 3)]);
+}
