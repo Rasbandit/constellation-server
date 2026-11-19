@@ -65,13 +65,13 @@ pub struct Plan {
     start: Vec<(u16, i64)>,
     /// Locations that exist (index into the world).
     pub included: Vec<u32>,
-    excluded: Vec<bool>,
-    locked: Vec<(u32, u16)>,
+    pub(crate) excluded: Vec<bool>,
+    pub(crate) locked: Vec<(u32, u16)>,
     /// Option-disabled locations with a vanilla item: reaching them grants it.
     self_grants: Vec<(u32, u16)>,
-    progression: Vec<u16>,
-    rest: Vec<u16>,
-    item_group: HashMap<u16, u32>,
+    pub(crate) progression: Vec<u16>,
+    pub(crate) rest: Vec<u16>,
+    pub(crate) item_group: HashMap<u16, u32>,
     loc_group: Vec<Option<u32>>,
     /// Per item: held count past which no rule reads more copies (see [`Plan::saturated_at`]).
     saturated: Vec<i64>,
@@ -264,7 +264,7 @@ impl Plan {
         r.run();
     }
 
-    fn prime(&self, r: &mut Reach<'_>, extra: &[u16]) {
+    pub(crate) fn prime(&self, r: &mut Reach<'_>, extra: &[u16]) {
         for (i, n) in &self.start {
             r.add(*i, *n);
         }
@@ -315,7 +315,7 @@ impl Plan {
         v
     }
 
-    fn allowed(&self, item: u16, loc: u32) -> bool {
+    pub(crate) fn allowed(&self, item: u16, loc: u32) -> bool {
         self.item_group.get(&item).is_none_or(|g| self.loc_group[loc as usize] == Some(*g))
     }
 }
@@ -535,7 +535,7 @@ pub fn validate(w: &World, plan: &Plan, placed: &[Option<u16>]) -> (bool, usize)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -550,7 +550,7 @@ mod tests {
 
     /// With `clocks`, a later slice of the day is owned only with `charm`, and a region opens in
     /// that slice.
-    fn world_with(clocks: bool) -> (World, Instance) {
+    pub(crate) fn world_with(clocks: bool) -> (World, Instance) {
         let checks = |ls: &[(&str, serde_json::Value)]| -> Vec<serde_json::Value> {
             ls.iter().map(|(l, r)| json!({"loc": l, "rule": r})).collect()
         };

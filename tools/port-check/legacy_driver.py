@@ -12,6 +12,11 @@ The adapter file defines `make(args: list[str]) -> adapter`, where the adapter h
   solve(seed: int, inventory: list[str]) -> dict
   generate(seed: int) -> dict
   spheres(seed: int, placements: dict[str, str]) -> dict
+
+A room of several players adds (see docs/port-check.md, "Several players"):
+  hello() also reports "players"; instance and solve take a `player` (1 based);
+  room_generate(seed: int) -> dict
+  room_spheres(seed: int, placements: dict[str, dict[str, dict]]) -> dict
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import json
 import sys
 import traceback
 
-OPS = ("hello", "instance", "solve", "generate", "spheres")
+OPS = ("hello", "instance", "solve", "generate", "spheres", "room_generate", "room_spheres")
 
 
 def load(path: str, args: list[str]):
