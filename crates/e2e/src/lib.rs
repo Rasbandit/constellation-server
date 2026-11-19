@@ -415,6 +415,47 @@ pub async fn join(url: &str, name: &str) -> Res<(Client, Value, Vec<Value>)> {
     join_client(Client::connect(url).await?, name).await
 }
 
+/// `GET path` with this `Host` header on a fresh connection (as a WebSocket upgrade when
+/// `upgrade`); the whole response, read up to its `content-length` (the server may keep the
+/// connection open).
+///
+/// # Panics
+/// When the connection fails or the response takes longer than [`GUARD`].
+pub async fn http_get(addr: SocketAddr, host: &str, path: &str, upgrade: bool) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let ws = if upgrade {
+        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    } else {
+        "Connection: close\r\n"
+    };
+    tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{ws}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0_u8; 1024];
+    loop {
+        let text = String::from_utf8_lossy(&got).into_owned();
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_owned)
+                })
+                .and_then(|v| v.trim().parse::<usize>().ok());
+            if len.is_some_and(|n| body.len() >= n) {
+                return text;
+            }
+        }
+        let n = tokio::time::timeout(GUARD, tcp.read(&mut buf)).await.unwrap().unwrap();
+        if n == 0 {
+            return text;
+        }
+        got.extend_from_slice(buf.get(..n).unwrap());
+    }
+}
+
 /// [`join`] through [`Client::connect_via`]: TCP to `addr`, handshake for `url`.
 ///
 /// # Errors

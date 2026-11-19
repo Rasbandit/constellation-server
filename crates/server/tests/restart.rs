@@ -411,7 +411,8 @@ mod restart {
     }
 
     /// A package row whose bytes do not hash to its key is refused when the room loads after a
-    /// restart: the room does not open, nothing wrong is served.
+    /// restart: the room does not open, nothing wrong is served, and the client gets a generic
+    /// 503 without the error text (#63).
     #[tokio::test]
     async fn a_tampered_package_row_is_refused_when_the_room_loads() {
         let db = database().await;
@@ -426,6 +427,10 @@ mod restart {
         let url = format!("ws://{a}.example:{}", server.addr.port());
         assert!(e2e::join_via(server.addr, &url, "Alice").await.is_err());
         server.wait_for_log("does not match its key").unwrap();
+        // The client is told only that the room did not load; the detail stays in the log.
+        let reply = e2e::http_get(server.addr, &format!("{a}.example"), "/", true).await;
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+        assert!(reply.ends_with("\r\n\r\nthe room could not be loaded; try again"), "{reply}");
         drop(std::fs::remove_dir_all(&dir));
     }
 
