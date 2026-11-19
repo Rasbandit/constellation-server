@@ -318,42 +318,6 @@ mod scenarios {
         assert!(body.ends_with("ok"), "{body}");
     }
 
-    /// `GET path` on a fresh connection (as a WebSocket upgrade when `upgrade`); the response,
-    /// read up to its `content-length` (the server may keep the connection open).
-    async fn http_get(server: &Server, path: &str, upgrade: bool) -> String {
-        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
-        let ws = if upgrade {
-            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
-             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        } else {
-            "Connection: close\r\n"
-        };
-        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{ws}\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0_u8; 1024];
-        loop {
-            let text = String::from_utf8_lossy(&got).into_owned();
-            if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                let len = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_owned)
-                    })
-                    .and_then(|v| v.trim().parse::<usize>().ok());
-                if len.is_some_and(|n| body.len() >= n) {
-                    return text;
-                }
-            }
-            let n = tokio::time::timeout(e2e::GUARD, tcp.read(&mut buf)).await.unwrap().unwrap();
-            if n == 0 {
-                return text;
-            }
-            got.extend_from_slice(buf.get(..n).unwrap());
-        }
-    }
-
     /// A rooms folder with the fixture under each seed name, and the server on it.
     fn rooms_server(name: &str, seeds: &[&str]) -> (Server, std::path::PathBuf) {
         rooms_server_env(name, seeds, &[])
@@ -409,7 +373,7 @@ mod scenarios {
             assert!(key.bytes().all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7')), "{key}");
         }
         assert!(server.log().iter().any(|l| l.contains("listening") && l.contains("rooms=2")));
-        let health = http_get(&server, "/healthz", false).await;
+        let health = e2e::http_get(server.addr, "x", "/healthz", false).await;
         assert!(health.starts_with("HTTP/1.1 200"), "{health}");
         // In memory, a restart draws new keys (the rooms are lost anyway).
         drop(server);
@@ -453,7 +417,7 @@ mod scenarios {
         // No key in the host at all: with two rooms the server does not guess.
         let none = e2e::Client::connect(&server.url()).await;
         assert!(none.unwrap_err().contains("404"));
-        let ws = http_get(&server, "/", true).await;
+        let ws = e2e::http_get(server.addr, "x", "/", true).await;
         assert!(ws.contains("this server runs 2 rooms"), "{ws}");
         drop(std::fs::remove_dir_all(&dir));
     }

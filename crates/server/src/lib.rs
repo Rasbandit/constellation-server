@@ -467,12 +467,48 @@ enum Route {
     Cold(RoomKey),
 }
 
+/// Why a connection or a room view got no room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoRoom {
+    /// No listed room for this address: the text is safe to send to the client.
+    Unknown(String),
+    /// The listed room did not load: the text is for the log only, as it can hold database
+    /// or store errors.
+    Failed(String),
+}
+
+impl core::fmt::Display for NoRoom {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// What a client is told when its room did not load; the detail goes to the log.
+const NOT_LOADED: &str = "the room could not be loaded; try again";
+
+/// The answer to a connection that got no room. A room that did not load is the server's
+/// fault and may work on a retry, so it is a 503 with a generic body, never the error text.
+fn refused(host: Option<&str>, no: NoRoom) -> Response {
+    match no {
+        NoRoom::Unknown(why) => {
+            tracing::info!(host, "{why}");
+            (StatusCode::NOT_FOUND, why).into_response()
+        }
+        NoRoom::Failed(why) => {
+            tracing::warn!(host, %why, "room did not load");
+            (StatusCode::SERVICE_UNAVAILABLE, NOT_LOADED).into_response()
+        }
+    }
+}
+
 /// The room a connection with this `Host` header joins, woken first when it is cold.
 async fn find(
     s: &AppState,
     host: Option<&str>,
-) -> Result<(RoomKey, Arc<CompatRoom>, rooms::Visit), String> {
-    let found = route(&read(&s.rooms), host, s.any_host)?;
+) -> Result<(RoomKey, Arc<CompatRoom>, rooms::Visit), NoRoom> {
+    let found = route(&read(&s.rooms), host, s.any_host).map_err(NoRoom::Unknown)?;
     let key = match found {
         Route::Ready(key, room, visit) => return Ok((key, room, visit)),
         Route::Cold(key) => key,
@@ -487,17 +523,17 @@ pub(crate) async fn enter(
     rooms: &RwLock<Rooms>,
     wake: &host::Waker,
     key: RoomKey,
-) -> Result<(Arc<CompatRoom>, rooms::Visit), String> {
+) -> Result<(Arc<CompatRoom>, rooms::Visit), NoRoom> {
     // Twice at most: a room can go cold again between its wake and the second lookup only if
     // it idled for the whole idle time in between.
     for _ in 0..2 {
-        let found = listed(&read(rooms), key.clone())?;
+        let found = listed(&read(rooms), key.clone()).map_err(NoRoom::Unknown)?;
         match found {
             Route::Ready(_, room, visit) => return Ok((room, visit)),
-            Route::Cold(key) => wake.wake(key).await?,
+            Route::Cold(key) => wake.wake(key).await.map_err(NoRoom::Failed)?,
         }
     }
-    Err("the room could not be loaded; try again".to_owned())
+    Err(NoRoom::Failed(format!("room {key} went cold again right after it loaded")))
 }
 
 async fn upgrade(
@@ -513,10 +549,7 @@ async fn upgrade(
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let (key, room, visit) = match find(&s, host).await {
         Ok(found) => found,
-        Err(why) => {
-            tracing::info!(host, "{why}");
-            return (StatusCode::NOT_FOUND, why).into_response();
-        }
+        Err(no) => return refused(host, no),
     };
     let (response, fut) = match ws.upgrade(s.options) {
         Ok(pair) => pair,
@@ -950,6 +983,25 @@ mod tests {
             assert_eq!(status_of(addr, &path, Some("s3cret")).await, 404, "{path}: no such world");
         }
         drop(std::fs::remove_dir_all(&root));
+    }
+
+    async fn reply(r: Response) -> (StatusCode, String) {
+        let status = r.status();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// A room that did not load answers 503 with a generic body: its error text (database,
+    /// store) goes to the log only. An unknown room keeps its 404 and its reason (#63).
+    #[tokio::test]
+    async fn a_failed_load_hides_its_error_text_and_an_unknown_room_keeps_its_reason() {
+        let failed = refused(Some("k.x"), NoRoom::Failed("postgres: secret detail".to_owned()));
+        assert_eq!(
+            reply(failed).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "the room could not be loaded; try again".to_owned())
+        );
+        let unknown = refused(None, NoRoom::Unknown("no room with key k".to_owned()));
+        assert_eq!(reply(unknown).await, (StatusCode::NOT_FOUND, "no room with key k".to_owned()));
     }
 
     #[test]

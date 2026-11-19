@@ -923,7 +923,7 @@ impl RoomsFolder {
     pub(crate) async fn enter(
         &self,
         key: RoomKey,
-    ) -> Result<(Arc<edge_compat::CompatRoom>, crate::rooms::Visit), String> {
+    ) -> Result<(Arc<edge_compat::CompatRoom>, crate::rooms::Visit), crate::NoRoom> {
         crate::enter(&self.rooms, &self.wake, key).await
     }
 }
