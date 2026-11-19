@@ -13,6 +13,11 @@
 //! kept. Retention after that (doc 02 sections 4.3 and 5.4) and the other ends of a room (all
 //! goals, the host closes it) are #56.
 //!
+//! At most `max_resident_rooms` rooms are resident at once. A cold room that must load past
+//! the cap puts the resident room unused for the longest to sleep first, as the idle check
+//! would later (memory-pressure eviction, doc 02 D5). A room with a connection open is never
+//! put to sleep: when every resident room has one, the load is refused until one frees.
+//!
 //! No room ever runs without a connection (there are no room timers yet), so "no connection"
 //! here is also "no event", as D-30 asks.
 //!
@@ -542,6 +547,7 @@ impl Host {
     pub(crate) async fn wake(&mut self, key: &RoomKey) -> Result<(), String> {
         match self.load(key)? {
             Some(load) => {
+                self.make_space()?;
                 let loaded = load.await;
                 self.install(key, loaded)
             }
@@ -640,6 +646,47 @@ impl Host {
         Ok(())
     }
 
+    /// Make space under `max_resident_rooms` for one more room, before its load starts. Loads
+    /// under way count, as each ends resident. At the cap, the resident room unused for the
+    /// longest leaves memory, as [`Host::unload_idle`] would unload it later; a room with a
+    /// connection open never does, nor a room still loading, so when none can leave this refuses. The one room of
+    /// `--bundle` needs no space.
+    ///
+    /// # Errors
+    /// When no room can leave memory now.
+    fn make_space(&mut self) -> Result<(), String> {
+        if self.folder.is_none() {
+            return Ok(());
+        }
+        let cap = self.limits.max_resident_rooms.max(1);
+        // The write lock keeps connections out: none can enter a room while it is chosen.
+        let mut rooms = write(&self.rooms);
+        while self.running.len() + self.waiting.len() >= cap {
+            let quietest = self
+                .running
+                .keys()
+                .filter_map(|key| Some((key, rooms.get(key)?.activity.idle_for()?)))
+                .max_by_key(|(_, idle)| *idle)
+                .map(|(key, idle)| (key.clone(), idle));
+            let Some((key, idle)) = quietest else {
+                return Err(format!(
+                    "the server holds {cap} rooms in memory, its most, and none can leave \
+                     memory now (each has a connection open or is still loading)"
+                ));
+            };
+            if let Some(listing) = rooms.get_mut(&key) {
+                listing.room = None;
+            }
+            self.running.remove(&key);
+            tracing::info!(
+                %key,
+                idle_secs = idle.as_secs(),
+                "room unused the longest; left memory to make space"
+            );
+        }
+        Ok(())
+    }
+
     /// A wake request from the router: start the room's load, or join the one running.
     fn request(&mut self, key: RoomKey, done: oneshot::Sender<Result<(), String>>) {
         if let Some(waiting) = self.waiting.get_mut(&key) {
@@ -648,6 +695,11 @@ impl Host {
         }
         match self.load(&key) {
             Ok(Some(load)) => {
+                if let Err(why) = self.make_space() {
+                    tracing::warn!(%key, "room not loaded: {why}");
+                    drop(done.send(Err(why)));
+                    return;
+                }
                 self.waiting.insert(key.clone(), vec![done]);
                 self.loads.spawn(async move {
                     // Its own task, so a panic in the load still answers the waiting wakes.
@@ -1435,6 +1487,75 @@ mod tests {
         drop(open);
         host.unload_idle();
         assert!(!in_memory(&host, &key));
+    }
+
+    fn age(host: &Host, key: &RoomKey, by: Duration) {
+        read(&host.rooms).get(key).unwrap().activity.age(by);
+    }
+
+    /// At the cap, a load puts the resident room unused for the longest to sleep; it is still
+    /// listed and loads again under its key (#66).
+    #[tokio::test]
+    async fn at_the_resident_cap_the_room_unused_longest_leaves_memory_for_a_new_load() {
+        let dir = TempDir::new("cap-evict");
+        for seed in ["alpha", "beta", "gamma"] {
+            dir.bundle(&format!("{seed}.json"), seed);
+        }
+        let mut host = host(&dir, Limits { max_resident_rooms: 2, ..Limits::DESIGN }).await;
+        let [a, b, c] = ["alpha", "beta", "gamma"].map(|s| key_of(&host, s));
+        host.wake(&a).await.unwrap();
+        host.wake(&b).await.unwrap();
+        age(&host, &a, Duration::from_secs(120));
+        age(&host, &b, Duration::from_secs(60));
+        host.wake(&c).await.unwrap();
+        assert_eq!(host.resident(), 2);
+        assert!(!in_memory(&host, &a), "unused the longest");
+        assert!(in_memory(&host, &b) && in_memory(&host, &c));
+        assert_eq!(seeds(&host), ["alpha", "beta", "gamma"], "still listed");
+        // Waking a room already resident needs no space.
+        host.wake(&b).await.unwrap();
+        assert!(in_memory(&host, &c));
+        host.wake(&a).await.unwrap();
+        assert!(in_memory(&host, &a) && host.resident() == 2);
+    }
+
+    /// A room with a connection open is never put to sleep for the cap: when every resident
+    /// room has one, the load is refused, and it goes ahead once a connection ends (#66).
+    #[tokio::test]
+    async fn at_the_resident_cap_a_room_in_use_stays_and_the_load_is_refused() {
+        let dir = TempDir::new("cap-busy");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let mut host = host(&dir, Limits { max_resident_rooms: 1, ..Limits::DESIGN }).await;
+        let (a, b) = (key_of(&host, "alpha"), key_of(&host, "beta"));
+        host.wake(&a).await.unwrap();
+        let open = visit(&host, &a);
+        let why = host.wake(&b).await.unwrap_err();
+        assert!(why.contains("none can leave memory now"), "{why}");
+        assert!(in_memory(&host, &a) && !in_memory(&host, &b));
+        drop(open);
+        host.wake(&b).await.unwrap();
+        assert!(!in_memory(&host, &a) && in_memory(&host, &b));
+    }
+
+    /// Loads under way count toward the cap: two wakes of different cold rooms at a cap of
+    /// one load the first and refuse the second, never both (#66).
+    #[tokio::test]
+    async fn a_load_under_way_counts_toward_the_resident_cap() {
+        let dir = TempDir::new("cap-loading");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let mut host = host(&dir, Limits { max_resident_rooms: 1, ..Limits::DESIGN }).await;
+        let (a, b) = (key_of(&host, "alpha"), key_of(&host, "beta"));
+        let (first, second) = (ask(&host, &a), ask(&host, &b));
+        let both = async { (first.await.unwrap(), second.await.unwrap()) };
+        let (first, second) = tokio::select! {
+            fatal = host.supervise() => panic!("the host ended: {}", fatal.exit_code()),
+            woke = both => woke,
+        };
+        assert_eq!(first, Ok(()));
+        assert!(second.unwrap_err().contains("none can leave memory now"));
+        assert!(in_memory(&host, &a) && host.resident() == 1);
     }
 
     #[tokio::test]
