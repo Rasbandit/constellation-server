@@ -38,6 +38,13 @@ pub struct Limits {
     /// Most rooms one process lists (in memory or not); further bundles are skipped with a
     /// warning.
     pub max_rooms: usize,
+    /// Most rooms one process holds in memory at once (`CONSTELLATION_MAX_RESIDENT_ROOMS`).
+    /// A cold room that must load past it puts the resident room unused for the longest to
+    /// sleep first; a room with a connection open is never put to sleep, so when every one
+    /// has one the load is refused. Doc 02 section 5.0 assumes 15% of rooms resident
+    /// (`r = 0.15`, 150 of `max_rooms`); this allows 250. A cost trade, not a design value,
+    /// until #38 measures memory per room.
+    pub max_resident_rooms: usize,
     /// How often the server looks in the rooms folder for new seed bundles and checks for idle
     /// and abandoned rooms (`CONSTELLATION_ROOMS_SCAN_MS`).
     pub rooms_scan_ms: u64,
@@ -208,6 +215,7 @@ impl Limits {
         session_queue: 256,
         bundle_max_bytes: 64 * 1024 * 1024,
         max_rooms: 1000,
+        max_resident_rooms: 250,
         rooms_scan_ms: 2_000,
         room_idle_secs: 15 * 60,
         room_abandon_secs: 30 * 24 * 60 * 60,
@@ -285,8 +293,13 @@ pub fn load() -> Limits {
         l.sim_seeds = v;
     }
     l.sim_replay_seed = num("SIM_SEED");
-    if let Some(v) = num("CONSTELLATION_MAX_CONNECTIONS").and_then(|v| usize::try_from(v).ok()) {
-        l.max_connections = v;
+    for (key, field) in [
+        ("CONSTELLATION_MAX_CONNECTIONS", &mut l.max_connections),
+        ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
+    ] {
+        if let Some(v) = num(key).and_then(|v| usize::try_from(v).ok()) {
+            *field = v;
+        }
     }
     for (key, field) in [
         ("CONSTELLATION_CONNECT_TIMEOUT_MS", &mut l.connect_timeout_ms),
@@ -525,7 +538,7 @@ mod tests {
         assert_eq!((l.compat_max_frame_bytes, l.compat_max_message_bytes), (1 << 20, 1 << 20));
         assert_eq!((l.room_mailbox, l.session_queue, l.ws_deflate_pool), (1024, 256, 256));
         assert_eq!(l.bundle_max_bytes, 64 << 20);
-        assert_eq!(l.max_rooms, 1000);
+        assert_eq!((l.max_rooms, l.max_resident_rooms), (1000, 250));
         assert_eq!(l.rooms_scan_ms, 2_000);
         assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
         assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
@@ -627,6 +640,7 @@ mod tests {
             .env("SIM_SEEDS", "5")
             .env("SIM_SEED", "9")
             .env("CONSTELLATION_MAX_CONNECTIONS", "3")
+            .env("CONSTELLATION_MAX_RESIDENT_ROOMS", "7")
             .env("CONSTELLATION_CONNECT_TIMEOUT_MS", "11")
             .env("CONSTELLATION_IDLE_TIMEOUT_MS", "not-a-number")
             .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
@@ -646,7 +660,7 @@ mod tests {
         let d = Limits::DESIGN;
         // Bad numbers keep the design value.
         let want = format!(
-            "probe limits 77 5 Some(9) 3 11 {} {} 1234 5678",
+            "probe limits 77 5 Some(9) 3 11 {} {} 1234 5678 7",
             d.idle_timeout_ms, d.ping_interval_ms
         );
         assert!(text.contains(&want), "want {want:?} in {text}");
@@ -668,7 +682,7 @@ mod tests {
         }
         let l = load();
         println!(
-            "probe limits {} {} {:?} {} {} {} {} {} {}",
+            "probe limits {} {} {:?} {} {} {} {} {} {} {}",
             l.dedupe_window_secs,
             l.sim_seeds,
             l.sim_replay_seed,
@@ -677,7 +691,8 @@ mod tests {
             l.idle_timeout_ms,
             l.ping_interval_ms,
             l.gen_timeout_ms,
-            l.gen_memory_bytes
+            l.gen_memory_bytes,
+            l.max_resident_rooms
         );
         let s = load_secrets().unwrap();
         println!("probe secrets {:?} {:?}", s.room_password, s.database_url);
