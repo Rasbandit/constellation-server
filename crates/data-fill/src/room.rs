@@ -18,7 +18,7 @@
 //! (see `docs/world-rules-section.md`): one shared pool and one shuffled list of locations
 //! over all players; an item with a placement group stays in its owner's world; progression
 //! never goes on an excluded location; every player's goal must hold (accessibility is not
-//! required beyond that); no local-item or progression-balancing options (issues #101, #102).
+//! required beyond that); no local-item option (#91), no accessibility modes or progression balancing (#92).
 
 use serde::Deserialize;
 use spec_rng::SpecRng;
@@ -321,10 +321,10 @@ impl<'a, 'w> Linked<'a, 'w> {
     fn solve(&mut self, extra: &[Vec<u16>], placed: &[Vec<Option<Given>>]) {
         // Rank 1 is the first fact of the first state: the room's sequence starts over.
         self.seq = 1;
-        for p in 0..self.models.len() {
+        for (p, held) in extra.iter().enumerate() {
             let seq = self.seq;
             self.with(p, |m| m.reset_from(seq));
-            self.seats[p].plan.prime(&mut self.models[p], &extra[p]);
+            self.seats[p].plan.prime(&mut self.models[p], held);
         }
         for (p, row) in placed.iter().enumerate() {
             for (l, g) in row.iter().enumerate() {
@@ -716,12 +716,12 @@ mod tests {
                 room.take_back(g.to, g.item);
                 let mut fresh = Linked::new(&seats);
                 fresh.solve(&held, &placed);
-                for p in 0..3 {
+                for (p, seat) in seats.iter().enumerate() {
                     let what = format!(
                         "seed {seed}, player {p}, {} left",
                         held.iter().map(Vec::len).sum::<usize>()
                     );
-                    assert_same(seats[p].w, &room.models[p], &fresh.models[p], &what);
+                    assert_same(seat.w, &room.models[p], &fresh.models[p], &what);
                 }
                 lit |= room.models.iter().any(|m| m.counters.iter().any(|c| *c >= 2));
                 crossed_back |= room.models.iter().any(|m| m.stats.retractions > 0)

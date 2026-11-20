@@ -17,6 +17,9 @@ use data_fill::check::{
 use data_fill::fairness::{histogram, sample, uniform_distinct};
 use data_fill::spheres::{Spheres, spheres};
 use data_fill::{Instance, Plan, Stats, World, fill_spheres};
+
+#[path = "port-check/room.rs"]
+mod room;
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
@@ -212,7 +215,7 @@ fn sphere_lists(v: &Value) -> Vec<Vec<String>> {
         .collect()
 }
 
-struct Ctx {
+pub(crate) struct Ctx {
     rules: Rules,
     scope_all: bool,
     has_regions: bool,
@@ -288,12 +291,31 @@ impl Ctx {
     }
 }
 
+/// A request for one player of a room (`player` from 1); a single-player world sends none.
+fn for_player(mut req: Value, player: Option<u64>) -> Value {
+    if let (Some(p), Some(o)) = (player, req.as_object_mut()) {
+        o.insert("player".to_owned(), json!(p));
+    }
+    req
+}
+
+/// Fetch one seed's instance (of one player of a room) from the legacy side, without compiling.
+fn fetch_instance(legacy: &mut Legacy, out: &Path, seed: u64, player: Option<u64>) -> R<Instance> {
+    let raw = legacy.call(&for_player(json!({"op": "instance", "seed": seed}), player))?;
+    let name = player.map_or(String::new(), |p| format!("_p{p}"));
+    write(&out.join(format!("legacy/instance_{seed}{name}.json")), raw.to_string().as_bytes())?;
+    serde_json::from_value(raw).map_err(|e| format!("instance {seed}{name}: {e}"))
+}
+
 /// Fetch one seed's instance from the legacy side and compile it.
-fn load_seed<'w>(legacy: &mut Legacy, w: &'w World, out: &Path, seed: u64) -> R<Seed<'w>> {
-    let inst_raw = legacy.call(&json!({"op": "instance", "seed": seed}))?;
-    write(&out.join(format!("legacy/instance_{seed}.json")), inst_raw.to_string().as_bytes())?;
-    let inst: Instance =
-        serde_json::from_value(inst_raw).map_err(|e| format!("instance {seed}: {e}"))?;
+fn load_seed<'w>(
+    legacy: &mut Legacy,
+    w: &'w World,
+    out: &Path,
+    seed: u64,
+    player: Option<u64>,
+) -> R<Seed<'w>> {
+    let inst = fetch_instance(legacy, out, seed, player)?;
     let plan = Plan::new(w, &inst).map_err(|e| format!("{e:?}"))?;
     let progression = inst.progression(w);
     Ok(Seed { seed, inst, w, plan, progression })
@@ -379,6 +401,66 @@ fn sanity(s: &Seed, rules: &Rules, n: u64) -> Value {
     })
 }
 
+/// (1) Reachability differential for one instance (of one player of a room): no items, all
+/// items, and `share` random inventories.
+fn reachability(
+    legacy: &mut Legacy,
+    cx: &mut Ctx,
+    reach: &mut Tally,
+    s: &Seed,
+    share: usize,
+    player: Option<u64>,
+) -> R<()> {
+    let seed = s.seed;
+    let scope: Option<BTreeSet<String>> =
+        (!cx.scope_all).then(|| s.inst.locations.iter().cloned().collect());
+    let all = s.progression_items();
+    let mut rng = SpecRng::from_seed({
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&seed.to_le_bytes());
+        b[8..16].copy_from_slice(b"inventor");
+        b[16..24].copy_from_slice(&player.unwrap_or(0).to_le_bytes());
+        b
+    });
+    let mut invs: Vec<(String, Vec<String>)> =
+        vec![("no items".into(), Vec::new()), ("all items".into(), all.clone())];
+    for j in 0..share {
+        // Sweep the share of items held from 0 to 1 so early, middle and late states all appear.
+        let frac = if share > 1 { j as f64 / (share - 1) as f64 } else { 0.5 };
+        let cut = (frac * f64::from(u32::MAX)) as u64;
+        let pick: Vec<String> =
+            all.iter().filter(|_| rng.next_u64() >> 32 <= cut).cloned().collect();
+        invs.push((format!("random {j} ({:.0}% held)", frac * 100.0), pick));
+    }
+    for (label, inv) in invs {
+        let req = for_player(json!({"op": "solve", "seed": seed, "inventory": inv}), player);
+        let lv = SolveView::legacy(&legacy.call(&req)?);
+        let t = Instant::now();
+        let extra = inv.iter().map(|k| s.w.item(k)).collect::<R<Vec<_>>>()?;
+        let r = s.plan.solve(s.w, &extra);
+        let ov = SolveView::engine(
+            s.w,
+            &r,
+            scope.as_ref(),
+            cx.has_regions && lv.regions.is_some(),
+            cx.has_events && lv.events.is_some(),
+        );
+        cx.engine_seconds += t.elapsed().as_secs_f64();
+        let d = diff_solve(&lv, &ov, &cx.rules);
+        reach.record(d.is_none(), || {
+            let mut d = d.clone().unwrap_or_default();
+            d["seed"] = json!(seed);
+            if let Some(p) = player {
+                d["player"] = json!(p);
+            }
+            d["inventory_label"] = json!(label);
+            d["inventory"] = json!(inv);
+            d
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // the run is one sequence of checks
 fn run(a: &Args) -> R<Value> {
     let t_all = Instant::now();
@@ -395,6 +477,10 @@ fn run(a: &Args) -> R<Value> {
         engine_seconds: 0.0,
         work: (Stats::default(), 0, 0),
     };
+    let players = hello["players"].as_u64().unwrap_or(1);
+    if players > 1 {
+        return room::run(a, &world, &mut legacy, &mut cx, hello, players, t_all);
+    }
     let version =
         json!({"engine": format!("data-fill {}", env!("CARGO_PKG_VERSION")), "format": FORMAT});
     let (mut reach, mut replay, mut judged, mut determinism) =
@@ -408,55 +494,11 @@ fn run(a: &Args) -> R<Value> {
         let seed = a.first_seed + n;
         eprintln!("port-check: seed {seed} ({}/{k})", n + 1);
         let t = Instant::now();
-        let s = load_seed(&mut legacy, &world, &a.out, seed)?;
+        let s = load_seed(&mut legacy, &world, &a.out, seed, None)?;
         cx.engine_seconds += t.elapsed().as_secs_f64();
-        let scope: Option<BTreeSet<String>> =
-            (!cx.scope_all).then(|| s.inst.locations.iter().cloned().collect());
-
-        // (1) Reachability differential: no items, all items, and this seed's share of N.
-        let all = s.progression_items();
         let share = a.inventories / usize::try_from(k).unwrap_or(1)
             + usize::from((n as usize) < a.inventories % usize::try_from(k).unwrap_or(1));
-        let mut rng = SpecRng::from_seed({
-            let mut b = [0u8; 32];
-            b[..8].copy_from_slice(&seed.to_le_bytes());
-            b[8..16].copy_from_slice(b"inventor");
-            b
-        });
-        let mut invs: Vec<(String, Vec<String>)> =
-            vec![("no items".into(), Vec::new()), ("all items".into(), all.clone())];
-        for j in 0..share {
-            // Sweep the share of items held from 0 to 1 so early, middle and late states all appear.
-            let frac = if share > 1 { j as f64 / (share - 1) as f64 } else { 0.5 };
-            let cut = (frac * f64::from(u32::MAX)) as u64;
-            let pick: Vec<String> =
-                all.iter().filter(|_| rng.next_u64() >> 32 <= cut).cloned().collect();
-            invs.push((format!("random {j} ({:.0}% held)", frac * 100.0), pick));
-        }
-        for (label, inv) in invs {
-            let lv = SolveView::legacy(
-                &legacy.call(&json!({"op": "solve", "seed": seed, "inventory": inv}))?,
-            );
-            let t = Instant::now();
-            let extra = inv.iter().map(|k| s.w.item(k)).collect::<R<Vec<_>>>()?;
-            let r = s.plan.solve(s.w, &extra);
-            let ov = SolveView::engine(
-                s.w,
-                &r,
-                scope.as_ref(),
-                cx.has_regions && lv.regions.is_some(),
-                cx.has_events && lv.events.is_some(),
-            );
-            cx.engine_seconds += t.elapsed().as_secs_f64();
-            let d = diff_solve(&lv, &ov, &cx.rules);
-            reach.record(d.is_none(), || {
-                let mut d = d.clone().unwrap_or_default();
-                d["seed"] = json!(seed);
-                d["inventory_label"] = json!(label);
-                d["inventory"] = json!(inv);
-                d
-            });
-        }
+        reachability(&mut legacy, &mut cx, &mut reach, &s, share, None)?;
 
         // (2) The legacy generator's own seed, replayed in our engine.
         let generated = match legacy.call(&json!({"op": "generate", "seed": seed})) {
@@ -547,7 +589,7 @@ fn run(a: &Args) -> R<Value> {
         }
     }
     let tier1 = if a.sanity_seeds > 0 {
-        let s = load_seed(&mut legacy, &world, &a.out, a.first_seed)?;
+        let s = load_seed(&mut legacy, &world, &a.out, a.first_seed, None)?;
         sanity(&s, &cx.rules, a.sanity_seeds)
     } else {
         Value::Null

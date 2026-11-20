@@ -19,6 +19,10 @@ required-features = ["memory-harness"]
 name = "measure"
 required-features = ["memory-harness"]
 
+[[example]]
+name = "measure_room"
+required-features = ["memory-harness"]
+
 [features]
 # The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
 memory-harness = ["dep:allocation-counter"]

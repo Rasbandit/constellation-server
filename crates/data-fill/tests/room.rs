@@ -173,6 +173,7 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
         let (f, sp) = fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS)
             .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
         assert!(f.all_beatable(), "seed {seed}");
+        assert_eq!(f.solves, 1, "seed {seed}: one full solve, then every step is incremental");
         assert!(sp.all_beatable(), "seed {seed}");
         assert!(sp.unreachable.is_empty(), "seed {seed}: every placed item is reachable");
         // The report read off the fill's states is a fresh sweep's.
@@ -200,15 +201,10 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
         }
         assert_eq!(per_owner, [6, 6, 5], "seed {seed}");
     }
-    for a in 0..3 {
-        for b in 0..3 {
+    for (a, row) in crossed.iter().enumerate() {
+        for (b, seen) in row.iter().enumerate() {
             if a != b {
-                assert!(
-                    crossed[a][b],
-                    "no seed put player {}'s progression in world {}",
-                    a + 1,
-                    b + 1
-                );
+                assert!(*seen, "no seed put player {}'s progression in world {}", a + 1, b + 1);
             }
         }
     }
