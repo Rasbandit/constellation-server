@@ -72,7 +72,8 @@ jobs:
           js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
           curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'
       # Token mode (the switch for later): the same image with the token override answers 401
-      # without the token, 429 after a burst of wrong ones, and 200 with it. Masked, never echoed.
+      # without the token and 200 with it (the 429 limiter is covered by the server's own tests).
+      # The token is masked, never echoed.
       - run: |
           openssl rand -hex 16 > secrets/admin_token
           chmod 400 secrets/admin_token

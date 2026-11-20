@@ -351,7 +351,7 @@ pub struct Secrets {
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
     /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. That API is refused without it.
+    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
     pub admin_token: Option<String>,
 }
 
