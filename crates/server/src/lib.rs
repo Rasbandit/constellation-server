@@ -88,21 +88,32 @@ pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms 
      CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; CONSTELLATION_ADMIN_TOKEN or \
      CONSTELLATION_ADMIN_TOKEN_FILE requires a token on /api, else it is open)";
 
-/// Check a `--public-host` value: a bare host name, or a `ws://` / `wss://` URL with only an
-/// authority (an optional trailing `/` is allowed).
+/// Check a `--public-host` value: a bare host name, or a `ws://` / `wss://` URL that is only
+/// `host:port` (a port is required: Archipelago clients use 38281 when none is typed; an
+/// optional trailing `/` is allowed; no user info, path, query or spaces).
 fn public_host_value(v: String) -> Result<String, String> {
-    if let Some((scheme, rest)) = v.split_once("://") {
-        let authority = rest.strip_suffix('/').unwrap_or(rest);
-        let bad = !matches!(scheme, "ws" | "wss")
-            || authority.is_empty()
-            || authority.contains(['/', '?', '#']);
-        if bad {
-            return Err(
-                "--public-host needs a host name or a ws:// or wss:// URL with no path".to_owned()
-            );
+    const MSG: &str = "--public-host needs a host name or a URL like wss://host:443";
+    let plain = |s: &str| {
+        !s.is_empty() && !s.contains(['/', '?', '#', '@']) && !s.contains(char::is_whitespace)
+    };
+    match v.split_once("://") {
+        None if plain(&v) => Ok(v),
+        Some(("ws" | "wss", rest)) => {
+            let authority = rest.strip_suffix('/').unwrap_or(rest);
+            let port_ok = |p: &str| {
+                !p.is_empty()
+                    && p.bytes().all(|b| b.is_ascii_digit())
+                    && p.parse::<u16>().is_ok_and(|n| n > 0)
+            };
+            match authority.rsplit_once(':') {
+                Some((host, port)) if plain(authority) && !host.is_empty() && port_ok(port) => {
+                    Ok(v)
+                }
+                _ => Err(MSG.to_owned()),
+            }
         }
+        _ => Err(MSG.to_owned()),
     }
-    Ok(v)
 }
 
 /// The base of a room's join address: a `ws(s)://` URL as given (no trailing `/`), else
@@ -1566,13 +1577,33 @@ mod tests {
         assert_eq!(join_base("play.example", 38281), "play.example:38281");
         assert_eq!(join_base("wss://play.example:443", 38281), "wss://play.example:443");
         assert_eq!(join_base("wss://play.example:443/", 38281), "wss://play.example:443");
+        assert_eq!(join_base("wss://[::1]:443", 1), "wss://[::1]:443");
     }
 
     #[test]
-    fn a_public_host_url_must_be_ws_or_wss_with_no_path() {
-        for bad in ["https://x:443", "wss://x:443/room", "wss://", "ws://x?a=1"] {
+    fn a_public_host_url_must_be_ws_or_wss_with_a_port_and_nothing_else() {
+        for bad in [
+            "https://x:443",
+            "wss://x:443/room",
+            "wss://",
+            "ws://x?a=1",
+            "wss://x",
+            "ws://x:",
+            "ws://x:0",
+            "ws://x:99999",
+            "ws://x:+443",
+            "wss://u:p@x:443",
+            "wss://x :443",
+            "WSS://x:443",
+            "wss:/x:443",
+            "play example",
+            "x/y",
+            "wss://[::1]",
+        ] {
             assert!(parse(&format!("--bundle x --port 1 --public-host {bad}")).is_err(), "{bad}");
         }
-        assert!(parse("--bundle x --port 1 --public-host ws://x:80").is_ok());
+        for ok in ["ws://x:80", "wss://play.example:443/", "wss://[::1]:443", "play.example"] {
+            assert!(parse(&format!("--bundle x --port 1 --public-host {ok}")).is_ok(), "{ok}");
+        }
     }
 }
