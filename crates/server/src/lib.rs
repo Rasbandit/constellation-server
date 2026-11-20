@@ -2,7 +2,7 @@
 //! bundle in a folder (`--rooms`, watched for new ones while the server runs: [`host`]),
 //! starts a room for each on `room-core` and the log (Postgres when
 //! `CONSTELLATION_DATABASE_URL` is set, D-98, else in memory), and serves the
-//! Archipelago-compatible edge over HTTP: a WebSocket at `/` (yawc, D-97) and `GET /healthz`
+//! Archipelago-compatible edge over HTTP: a WebSocket at `/{room_key}` (yawc, D-97) and `GET /healthz`
 //! (axum). Each room has a room key ([`rooms::RoomKey`]).
 //!
 //! With Postgres every room survives a restart: the server claims each room (fencing any older
@@ -896,7 +896,17 @@ mod tests {
         assert_eq!(key("/abcdefgh23"), Some("abcdefgh23".to_owned()));
         assert_eq!(key("/ABCDEFGH23"), Some("abcdefgh23".to_owned()));
         assert_eq!(key("/abcdefgh23/"), Some("abcdefgh23".to_owned()));
-        for none in ["/", "", "/healthz", "/abcdefgh1x", "/abcdefgh23/more", "abcdefgh23.x"] {
+        for none in [
+            "/",
+            "//",
+            "/abcdefgh23//",
+            "/abcdefgh23/x",
+            "",
+            "/healthz",
+            "/abcdefgh1x",
+            "/abcdefgh23/more",
+            "abcdefgh23.x",
+        ] {
             assert_eq!(key(none), None, "{none:?}");
         }
     }

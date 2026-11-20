@@ -259,7 +259,8 @@ impl Client {
     }
 
     /// Open TCP to `addr` and do the WebSocket handshake for `url`, so the request's `Host`
-    /// header is `url`'s host without that name resolving anywhere.
+    /// header is `url`'s host without that name resolving anywhere (for a test that a `Host`
+    /// naming a key no longer routes).
     ///
     /// # Errors
     /// When the connection or the handshake fails.

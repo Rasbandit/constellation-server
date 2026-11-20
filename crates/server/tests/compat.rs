@@ -415,9 +415,9 @@ mod scenarios {
         let unknown = e2e::Client::connect_via(server.addr, &room_url(&server, "zzzzzzzzzz")).await;
         assert!(unknown.unwrap_err().contains("404"));
         // The old hostname form names no room any more.
-        let (a, _) = (key_of(&server, "alpha"), ());
-        let old = format!("ws://{a}.example:{}/", server.addr.port());
-        assert!(e2e::Client::connect_via(server.addr, &old).await.unwrap_err().contains("404"));
+        let a = key_of(&server, "alpha");
+        let old = e2e::http_get(server.addr, &format!("{a}.example"), "/", true).await;
+        assert!(old.starts_with("HTTP/1.1 404"), "{old}");
         // No key in the path at all: with two rooms the server does not guess.
         let none = e2e::Client::connect(&server.url()).await;
         assert!(none.unwrap_err().contains("404"));
