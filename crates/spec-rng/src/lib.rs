@@ -28,6 +28,24 @@ impl SpecRng {
         Self(ChaCha8Rng::from_seed(seed))
     }
 
+    /// Start a stream from a number: its 8 little-endian bytes, then zeros.
+    #[must_use]
+    pub fn from_u64(seed: u64) -> Self {
+        Self::from_u64_tagged(seed, &[0; 8], 0)
+    }
+
+    /// [`SpecRng::from_u64`] in a named stream: `tag` at bytes 8 to 16 and `index` (little
+    /// endian) at 16 to 24, so fills, baselines and per-player draws of one seed never share
+    /// draws.
+    #[must_use]
+    pub fn from_u64_tagged(seed: u64, tag: &[u8; 8], index: u64) -> Self {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&seed.to_le_bytes());
+        b[8..16].copy_from_slice(tag);
+        b[16..24].copy_from_slice(&index.to_le_bytes());
+        Self::from_seed(b)
+    }
+
     /// Next 64 bits of the stream.
     pub fn next_u64(&mut self) -> u64 {
         self.0.next_u64()

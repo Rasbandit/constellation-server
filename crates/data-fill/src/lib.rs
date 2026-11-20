@@ -6,14 +6,17 @@ pub mod decode;
 pub mod fairness;
 pub mod fill;
 mod fold;
+pub mod par;
 pub mod parity_rng;
 pub mod reach;
+pub mod room;
 pub mod section;
 pub mod spheres;
 pub mod world;
 
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};
 pub use reach::{Reach, Stats};
+pub use room::{Given, RoomFilled, Seat, fill_room, fill_room_spheres};
 pub use world::World;
 
 /// The fill as seed-bundle placements for one slot (receiver 1, single player).

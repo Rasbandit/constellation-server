@@ -111,6 +111,75 @@ Same instance, same fill seed and same engine version give the same bytes. Every
 
 Our fills will not match the legacy generator seed for seed (different RNG and order), so the report compares distributions instead, over the K legacy seeds and the K of ours: number of spheres, progression items per sphere, the sphere where key items (progression items with at most two copies) land, and each region's share of progression. Large gaps are listed under `flags`. Nothing here fails the run; a flag is a prompt to look, not a verdict.
 
+## Several players
+
+A room is one or more players of one world, each with their own settings, filled together; items cross between worlds (design in `docs/world-rules-section.md`, "Several players"). `port-check` runs the room mode when the adapter's `hello()` reports `"players": N` with N above 1; everything above stays as is for one player.
+
+The adapter gains these (every player number is 1 based; the keys are manifest keys):
+
+| Method | Returns |
+|---|---|
+| `hello()` | also `"players": N` |
+| `instance(seed, player)` | the player's instance (their options, the pool they own, their start inventory, their locked items; an item they own may lie in another world) |
+| `solve(seed, inventory, player)` | what that player's legacy logic reaches, as above |
+| `room_generate(seed)` | `{"placements": {"1": {location: {"item": key, "owner": 2}, ...}, "2": {...}}}`: for each player's world, every filled location, the item there and the player it belongs to |
+| `room_spheres(seed, placements)` | `{"spheres": [[[player, location], ...], ...], "beatable": bool, "unreachable": [[player, location], ...], "violations": [...]}`: the placements loaded into a fresh room and collected round by round over the whole room (round 1 is every filled location of every world reachable from the start states; then everything found is collected). `beatable` means every player's goal. `violations` as above, plus an item with a placement group outside its owner's world |
+
+`tools/port-check/legacy_driver.py` forwards the new methods. The checks are the same four, over rooms: `reachability` (per player: every inventory, one request per player), `legacy_seeds_replayed` (our engine finds the same spheres over the whole room and the same beatability for the legacy room), `port_seeds_judged_by_legacy` (the legacy side judges our room), `determinism` (three fills of the same seed write byte-identical room files). `--inventories` is spread over seeds and players.
+
+The seed-shape column gains `cross_world_progression_share`: per player, the share of their progression items that lie in other players' worlds, for the legacy rooms and ours (a flag when a player's mean differs by more than 0.15). The tier 1 sanity fills are not run for rooms; `fill-fairness` measures a room (below).
+
+Run (K = 5, three players of the 1516-location test world: clock shuffle off, on, off; two further logic-affecting options each; the settings are in the adapter's yaml files, kept next to it):
+
+```sh
+target/release/port-check --manifest my_world.manifest.json \
+  --legacy "python -I tools/port-check/legacy_driver.py /path/to/my_room_adapter.py <adapter args>" \
+  --out port-check-room --seeds 5 --ours 5 --inventories 150 --sanity-seeds 0
+```
+
+Result (K = 5 legacy rooms, 5 of ours, 150 inventories; the legacy generation takes 64 to 96 s per room, so the run is about 7 minutes; our engine's share of it is 4 s):
+
+| Check | Result |
+|---|---|
+| `reachability` | 180 of 180 inventories identical (per player: locations, regions with time masks, events) |
+| `legacy_seeds_replayed` | 5 of 5: same spheres over the whole room (20 to 34 spheres), all beatable |
+| `port_seeds_judged_by_legacy` | 5 of 5: no violations, same spheres, all beatable |
+| `determinism` | 5 of 5 seeds, three fills each, byte-identical |
+
+Seed shape (informational), legacy rooms against ours, 5 and 5 rooms, player 1 / 2 / 3:
+
+| | Legacy | Ours |
+|---|---|---|
+| Spheres per room, mean (min to max) | 25.4 (20 to 34) | 25.6 (20 to 33) |
+| Progression items per sphere, mean | 34.8 | 34.5 |
+| Key item depth, mean fraction of the room's spheres | 0.43 | 0.51 |
+| Share of a player's progression in other worlds | 0.632 / 0.640 / 0.633 | 0.637 / 0.652 / 0.648 |
+| Share if placed uniformly over three worlds | 0.667 | 0.667 |
+
+The 178 per-item and per-region flags the report lists are single-item means over five rooms and are noise at this sample size; the sphere counts and shares above are the numbers to watch. Before the rounds below, the same run had 30.8 spheres and a key item depth of 0.47 (rooms that were longer than the legacy ones); a fill of one item at a time is the more accurate assumed fill, and the legacy default of one item per player at a time is biased towards earlier locations by design.
+
+Two things this run found. The start inventory of the player with shuffled clocks was a night clock, and the engine owned the first time slice with it (the solver does not): fixed, with a unit test, in this PR (a related case, issue #94, stays open). And the first run of ours was one item at a time; the rounds of one item per player come from reading the legacy fill.
+
+
+### Scaling with players
+
+`measure_room` (feature `memory-harness`) fills a room of N players of the test world (the two instances in turn, so the 10 and 20 player rooms repeat settings), release build, one fill of seed 1, `systemd-run -p CPUQuota=200%`; the world is loaded once and shared; fill time is the median of five fills; engine peak heap is the counting allocator's peak, world load included.
+
+| Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 22.1 | 19.3 | 19.3 | 0.096 | 252 | 14 | 0.00 | 0.71 |
+| 2 | 40.5 | 70.5 | 35.3 | 0.227 | 309 | 14 | 0.51 | 1.01 |
+| 3 | 60.0 | 130.0 | 43.3 | 0.456 | 429 | 19 | 0.66 | 1.37 |
+| 10 | 203.5 | 1 060 | 106 | 3.78 | 1 083 | 49 | 0.87 | 3.83 |
+| 20 (extra) | 386.6 | 3 597 | 180 | 10.6 | 1 551 | 77 | 0.92 | 7.37 |
+
+- **Memory per added player: about 350 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.37 MB, linear: 291 KB for the second player, then 346 to 351 KB each.
+- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and it runs on `config::FILL_SETUP_WORKERS` threads in the product.
+- **Fill time per added player grows with the room**: 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
+- The cheap changes (a min-heap of suspects over players, a worklist of players with something to run, piles indexed by owner) are in: placements are byte-identical to before them (61 fills over 1, 2, 3 and 10 players, clock on and off, and the three-player fixture) and the time dropped 10 to 12 percent at 10 and 20 players. What is left is rule evaluation (the evaluations column is unchanged), not bookkeeping.
+- Every fill is one full solve, then incremental steps (`solves` 1 in all rows).
+
+
 ## Fairness
 
 ### Tier 1: port sanity (part of `port-check`)
@@ -143,9 +212,22 @@ target/release/fill-fairness --world crates/data-fill/tests/fixtures/fairness_wo
   --seeds 10000 --baseline 10000 --fail-deviation 0.10 --out fairness.json
 ```
 
+### Fairness of a room
+
+`fill-fairness --world crates/data-fill/tests/fixtures/room_world.json` (a world file with an `instances` list is a room: three players of the small fixture world, one a harder hall door, one a goal that stops at the hall and one location fewer) measures the room fill against uniform random rooms that are beatable for every player, the same two tests as for one player:
+
+| World | Fill | Baseline | Max gap (item, location) | Coverage gaps | Chi-square (dof), p | Seed independence |
+|---|---|---|---|---|---|---|
+| single player fixture (10 000 fills, 10 000 baseline of 40 091 candidates) | one item at a time | uniform, beatable | 0.074 (coin, l6) | 0 | 277.6 (15), 1e-42 | z = -0.13, not flagged |
+| room, three players (10 000, 10 000 of 54 388) | rounds | uniform, beatable for all | 0.136 (player 1's coin, player 2's vault) | 6, all player 2's vault | 9 218 (176), 0 | z = 1.18, not flagged |
+| room, three players (4 000, 4 000 of 21 897), one item at a time | one item at a time | same | 0.044 (player 1's coin, player 2's vault) | 0 | 519 (176), 9e-35 | z = -1.53, not flagged |
+
+As for one player, a small p-value on its own is expected: assumed fill is not uniform over beatable rooms. The room numbers to watch are the largest gap and the coverage map. The six gaps are one location: player 2's vault needs all three of player 2's progression items (hall door with the lamp, then the vault door), and in a round every player's last item is taken out of the state, so while each of the three players still has an item to place that location is unreachable for every item. The baseline puts another player's item there in 4 to 8 percent of rooms; the fill never does. That is the bias towards earlier locations the rounds are meant to have, magnified by a fixture whose players have only three progression items each; on the test world (hundreds of items per player) the sphere counts and shares above match the legacy rooms.
+
+
 ## Limits
 
 - The checks compare behaviour on the seeds and inventories drawn. They do not prove equivalence for every state; more seeds and inventories make a miss less likely.
 - Spheres compare which locations open in which round, not the order inside a round.
 - `progression` in `pool_class` is what both sides count as held. An item the legacy logic reads but classifies as non-progression is never held on either side, matching the legacy generator.
-- Multiworld: not yet supported. Both tools check one player's world at a time.
+- A room is checked for the players the legacy side reports. Reachability is per player, with the other players' items not taken into account (the legacy solver is per world); the cross-world effects are checked through the room's spheres.

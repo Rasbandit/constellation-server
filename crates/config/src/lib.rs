@@ -199,6 +199,18 @@ pub const RULES_MAX_DEPTH: u32 = 256;
 /// the next draws of the seed's random stream; a design value).
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
 
+/// Worker threads that compile worlds and resolve instances of a room's players in parallel
+/// before a multiworld fill (a design value; the fill itself is sequential, and results never
+/// depend on this number).
+pub const FILL_SETUP_WORKERS: usize = 4;
+
+/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
+/// value).
+pub const FILL_MAX_WORKERS: usize = 64;
+
+/// Most players one room's fill takes (a design value; player numbers are 16 bits).
+pub const ROOM_MAX_PLAYERS: usize = 1024;
+
 impl Limits {
     /// The design values (see each field).
     pub const DESIGN: Self = Self {

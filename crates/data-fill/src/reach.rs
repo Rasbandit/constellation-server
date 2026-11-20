@@ -467,6 +467,16 @@ impl Stats {
 
 /// Rank of a fact that does not hold.
 const NONE: u32 = u32::MAX;
+
+/// What one player's state tells another's (see [`crate::room`]): a location of this state holds
+/// an item that belongs to the other player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Msg {
+    /// The location was reached at `rank`: its item is a new copy for `to`, found at that rank.
+    Give { to: u16, item: u16, rank: u32 },
+    /// The copy found at rank `from` was found at `rank` instead (`NONE`: not found any more).
+    Move { to: u16, item: u16, from: u32, rank: u32 },
+}
 /// Support of a slice of the start region: the start mask (with clocks, the owned clocks).
 const BY_START: u32 = u32::MAX;
 /// Support of a slice reached by waiting from the slice before it.
@@ -500,6 +510,11 @@ pub struct Reach<'w> {
     reached: BitSet,
     /// Item to collect when a location is reached (placed, locked or a self-granting check).
     holds: Vec<Option<u16>>,
+    /// Per location: the item (and the player it belongs to) that goes to another player's
+    /// state when the location is reached.
+    away: Vec<Option<(u16, u16)>>,
+    /// Messages for other players' states, in order; the room drains it after every step.
+    pub(crate) outbox: Vec<Msg>,
     can_stay: Vec<bool>,
     seen: BitSet,
     done: BitSet,
@@ -587,6 +602,8 @@ impl<'w> Reach<'w> {
             masks: vec![0; n],
             reached: BitSet::new(w.locations()),
             holds: vec![None; w.locations()],
+            away: vec![None; w.locations()],
+            outbox: Vec::new(),
             // The start region never waits (the solver's initial time state).
             can_stay: (0..n).map(|r| r != w.start as usize && w.can_stay(r)).collect(),
             seen: BitSet::new(n),
@@ -630,12 +647,19 @@ impl<'w> Reach<'w> {
 
     /// Back to the empty state, keeping every buffer.
     pub fn reset(&mut self) {
+        self.reset_from(1);
+    }
+
+    /// [`Reach::reset`], handing out ranks from `seq` on.
+    pub(crate) fn reset_from(&mut self, seq: u32) {
         self.counts.fill(0);
         self.counters.fill(0);
         self.groups.fill(0);
         self.masks.fill(0);
         self.reached.clear();
         self.holds.fill(None);
+        self.away.fill(None);
+        self.outbox.clear();
         self.seen.clear();
         self.done.clear();
         self.queued.fill(false);
@@ -648,7 +672,7 @@ impl<'w> Reach<'w> {
         self.stats = Stats::default();
         self.def_cache.iter().for_each(|c| c.set(0));
         self.epoch = 1;
-        self.seq = 1;
+        self.seq = seq;
         self.fired.fill(NONE);
         self.half_rank.fill(NONE);
         self.grows.iter_mut().for_each(Vec::clear);
@@ -661,7 +685,8 @@ impl<'w> Reach<'w> {
 
     fn start(&mut self) {
         let start_mask = if self.plan.clocks {
-            self.owned = self.compute_owned();
+            // The clocks the start inventory owns (not the assumed items): they hold from rank 0.
+            self.owned = self.plan.owned_start;
             self.owned0 = self.owned;
             self.owned
         } else {
@@ -702,6 +727,52 @@ impl<'w> Reach<'w> {
                 self.hold(u32::try_from(l).unwrap_or(0), *i);
             }
         }
+    }
+
+    /// Like [`Reach::hold`] for an item that belongs to player `to` (not this state's): reaching
+    /// the location sends it to the room as a [`Msg::Give`] instead of collecting it here.
+    pub(crate) fn hold_away(&mut self, loc: u32, to: u16, item: u16) {
+        let l = loc as usize;
+        if self.away[l] == Some((to, item)) {
+            return;
+        }
+        debug_assert!(self.away[l].is_none() && self.holds[l].is_none(), "one item per location");
+        self.away[l] = Some((to, item));
+        if self.reached.contains(l) {
+            self.outbox.push(Msg::Give { to, item, rank: self.loc_rank[l] });
+        }
+    }
+
+    /// The next rank this state hands out. Several states in one room take ranks from one
+    /// sequence, so ranks order every derivation of the room: the room passes the sequence
+    /// from state to state ([`Reach::set_seq`]).
+    pub(crate) fn seq(&self) -> u32 {
+        self.seq
+    }
+
+    pub(crate) fn set_seq(&mut self, seq: u32) {
+        self.seq = seq;
+    }
+
+    /// Whether there is nothing left to run.
+    pub(crate) fn idle(&self) -> bool {
+        self.regions_q.is_empty() && self.sites_q.is_empty()
+    }
+
+    /// A copy of `item` for this player, found elsewhere at rank `rank`.
+    pub(crate) fn give(&mut self, item: u16, rank: u32) {
+        self.collect(item, rank);
+    }
+
+    /// The copy of `item` found at rank `from` was found at `rank` (`NONE`: not found any more):
+    /// the facts that read it between the two ranks are checked in the next cascade.
+    pub(crate) fn shift(&mut self, item: u16, from: u32, rank: u32) {
+        self.uncollect(item, from);
+        if rank != NONE {
+            self.collect_quiet(item, rank);
+        }
+        let w = self.w;
+        self.suspect_readers(w.item_sites(usize::from(item)), from, rank);
     }
 
     /// Add `n` copies of an item (rules that read it are rechecked on the next [`Reach::run`]).
@@ -764,15 +835,7 @@ impl<'w> Reach<'w> {
 
     /// Run to the fixed point.
     pub fn run(&mut self) {
-        if !self.ran {
-            self.ran = true;
-            self.adjust.copy_from_slice(&self.counts);
-            // Items added before the first run skipped their rechecks; the clock rules are the
-            // one place that reads them before any region is visited.
-            if self.plan.clocks {
-                self.site(self.w.site_count());
-            }
-        }
+        self.begin();
         loop {
             if let Some(r) = self.regions_q.pop() {
                 self.queued[r as usize] = false;
@@ -786,6 +849,20 @@ impl<'w> Reach<'w> {
         }
     }
 
+    /// Start the run: what is held now is the start inventory. Copies that arrive later, from
+    /// other players or from reached locations, are facts of their own.
+    pub(crate) fn begin(&mut self) {
+        if !self.ran {
+            self.ran = true;
+            self.adjust.copy_from_slice(&self.counts);
+            // Items added before the first run skipped their rechecks; the clock rules are the
+            // one place that reads them before any region is visited.
+            if self.plan.clocks {
+                self.site(self.w.site_count());
+            }
+        }
+    }
+
     /// Take one start copy of `item` back and bring the fixed point down to that of the smaller
     /// inventory, after a [`Reach::run`]. With as many copies left as the plan's saturation
     /// count, no rule changes. Otherwise the facts that read the item are checked, lowest rank
@@ -795,21 +872,38 @@ impl<'w> Reach<'w> {
     /// get new ranks); nothing that did not hold before is evaluated, since the new fixed point
     /// is inside the old one.
     pub fn remove(&mut self, item: u16) {
+        let Some(before) = self.start_removal(item) else { return };
+        self.cascade();
+        self.end_cascade(before);
+        self.rederive();
+    }
+
+    /// The first half of [`Reach::remove`]: the copy goes and its readers are queued for a
+    /// support check. `None` when nothing can change (saturated); else the retraction count
+    /// to hand to [`Reach::end_cascade`].
+    pub(crate) fn start_removal(&mut self, item: u16) -> Option<u64> {
         let i = usize::from(item);
         self.adjust[i] -= 1;
         self.count_change(item, -1);
         if self.adjust[i] >= self.plan.saturated_at(item) {
-            return;
+            return None;
         }
         self.forget_defs();
         self.stats.removals += 1;
         let before = self.stats.retractions;
         let w = self.w;
         self.suspect_readers(w.item_sites(i), 0, NONE);
-        self.cascade();
+        Some(before)
+    }
+
+    pub(crate) fn end_cascade(&mut self, before: u64) {
         let n = self.stats.retractions - before;
         self.stats.max_retractions = self.stats.max_retractions.max(n);
-        self.rederive();
+    }
+
+    /// The lowest rank among the facts waiting for a support check.
+    pub(crate) fn next_suspect(&self) -> Option<u32> {
+        self.tm.heap.peek().map(|Reverse((k, _))| *k)
     }
 
     fn forget_defs(&mut self) {
@@ -869,18 +963,23 @@ impl<'w> Reach<'w> {
     }
 
     fn cascade(&mut self) {
+        while self.cascade_one() {}
+    }
+
+    /// Check the lowest-ranked suspect; `false` when there is none.
+    pub(crate) fn cascade_one(&mut self) -> bool {
         let hb = self.w.site_count() + self.half_rank.len();
-        while let Some(Reverse((k, f))) = self.tm.heap.pop() {
-            let f = f as usize;
-            if f >= hb {
-                self.check_grow(f - hb, k);
-                continue;
-            }
-            self.tm.queued.remove(f);
-            if self.rank_of(f) == k && !self.supported(f, k) {
-                self.retract(f, k);
-            }
+        let Some(Reverse((k, f))) = self.tm.heap.pop() else { return false };
+        let f = f as usize;
+        if f >= hb {
+            self.check_grow(f - hb, k);
+            return true;
         }
+        self.tm.queued.remove(f);
+        if self.rank_of(f) == k && !self.supported(f, k) {
+            self.retract(f, k);
+        }
+        true
     }
 
     /// Check the growth of region `r` at rank `k`: keep the slices still supported, retract
@@ -1033,6 +1132,9 @@ impl<'w> Reach<'w> {
                 if next == NONE {
                     self.reached.remove(t);
                 }
+                if let Some((to, item)) = self.away[t] {
+                    self.outbox.push(Msg::Move { to, item, from: k, rank: next });
+                }
                 if let Some(z) = self.holds[t] {
                     self.uncollect(z, k);
                     if next != NONE {
@@ -1126,6 +1228,13 @@ impl<'w> Reach<'w> {
 
     /// After the retractions of a removal: derive again what the smaller state supports.
     fn rederive(&mut self) {
+        self.begin_rederive();
+        self.run();
+        self.end_rederive();
+    }
+
+    /// Gate [`Reach::run`] to the retracted sites and queue them.
+    pub(crate) fn begin_rederive(&mut self) {
         self.forget_defs();
         self.tm.active = true;
         for k in 0..self.tm.out_list.len() {
@@ -1136,7 +1245,15 @@ impl<'w> Reach<'w> {
             let r = self.tm.lost[k] as usize;
             self.pull(r);
         }
-        self.run();
+    }
+
+    /// Gate to the sites that were retracted by earlier removals only, without queueing
+    /// anything (a state that lost nothing itself but is handed copies back).
+    pub(crate) fn gate(&mut self) {
+        self.tm.active = true;
+    }
+
+    pub(crate) fn end_rederive(&mut self) {
         self.tm.active = false;
         for s in self.tm.out_list.drain(..) {
             self.tm.out.remove(s as usize);
@@ -1310,6 +1427,8 @@ impl<'w> Reach<'w> {
                     self.loc_rank[l] = k;
                     if let Some(item) = self.holds[l] {
                         self.collect(item, k);
+                    } else if let Some((to, item)) = self.away[l] {
+                        self.outbox.push(Msg::Give { to, item, rank: k });
                     }
                 }
             }
@@ -1382,7 +1501,8 @@ impl<'w> Reach<'w> {
         out
     }
 
-    fn compute_owned(&self) -> u64 {
+    /// The clocks owned with the start inventory held (see [`Plan::owned_start`]).
+    pub(crate) fn compute_owned(&self) -> u64 {
         let w = self.w;
         let Some(o) = w.time.owned.filter(|_| self.plan.clocks) else { return w.time.all };
         let env = self.env();
@@ -1412,6 +1532,51 @@ mod tests {
     use super::*;
     use crate::fill::Instance;
     use serde_json::json;
+
+    /// A clock world of two slices where `dawn` owns the first and `dusk` the second (none
+    /// owned: the first, as the solver starts).
+    fn clock_world(start: &[&str]) -> (World, Instance) {
+        let m = json!({
+            "options": [],
+            "items": [{"key": "dawn", "id": 1}, {"key": "dusk", "id": 2}],
+            "locations": [{"key": "l", "id": 1}],
+            "start": "a",
+            "x.time": {"slices": 2, "start_mask": 1, "owned": {
+                "when": {"true": {}}, "none_owned_mask": 1,
+                "half_days": [{"first": 0, "last": 0, "rule": {"has": "dawn"}},
+                              {"first": 1, "last": 1, "rule": {"has": "dusk"}}]}},
+            "defs": {},
+            "regions": [{"key": "a", "can_stay": false,
+                         "checks": [{"loc": "l", "rule": {"true": {}}}],
+                         "exits": [], "events": [], "stays": []}],
+            "goal": {"reach": "region:a"}
+        });
+        let inst = Instance {
+            locations: vec!["l".to_owned()],
+            start_inventory: start.iter().map(|k| (*k).to_owned()).collect(),
+            ..Instance::default()
+        };
+        (World::load(&m).unwrap(), inst)
+    }
+
+    /// The solver's start state owns the union of the owned half-days, or the first slice only
+    /// when none is owned: a start item that owns only the later slice leaves the first one out.
+    #[test]
+    fn a_start_clock_that_leaves_out_the_first_slice_does_not_own_it() {
+        for (start, extra, want) in [
+            (&[][..], &[][..], 0b01u64),
+            (&["dawn"][..], &[][..], 0b01),
+            (&["dusk"][..], &[][..], 0b10),
+            (&["dusk"][..], &["dawn"][..], 0b11),
+            (&[][..], &["dawn", "dusk"][..], 0b11),
+        ] {
+            let (w, inst) = clock_world(start);
+            let plan = Plan::new(&w, &inst).unwrap();
+            let extra: Vec<u16> = extra.iter().map(|k| w.item(k).unwrap()).collect();
+            let r = plan.solve(&w, &extra);
+            assert_eq!(r.masks[w.start as usize], want, "start {start:?}, held {extra:?}");
+        }
+    }
 
     /// Support that exists only through the fact itself: `a` opens with `key` or with the `gem`
     /// found in `b`, which is reached only through `a`; an event in `a` lights a counter that
