@@ -32,7 +32,7 @@ The API runs uploaded code, so the compose file publishes it on `127.0.0.1` only
 
 ```sh
 TOKEN=$(sudo cat secrets/admin_token)
-curl -H "Authorization: Bearer $TOKEN" --data-binary @player.yaml \
+curl -X PUT -H "Authorization: Bearer $TOKEN" --data-binary @player.yaml \
   "http://127.0.0.1:38282/api/yamls?name=player.yaml"
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:38282/api/yamls
 ```

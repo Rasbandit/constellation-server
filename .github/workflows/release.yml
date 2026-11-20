@@ -52,7 +52,7 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
           test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
           printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
-          code=$(curl -s -o up.out -w '%{http_code}' -H "Authorization: Bearer $T" --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
+          code=$(curl -s -X PUT -o up.out -w '%{http_code}' -H "Authorization: Bearer $T" --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
           cat up.out; echo " (HTTP $code)"
           test "$code" = 201
           docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
