@@ -5,9 +5,9 @@
 //! The race tests (fence race, cancel safety) are gate G-DB items (doc 11 section 4.8).
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, ManifestRecord,
-    ManifestStore, MemLogStore, Snapshot, StoreError, UploadKind, UploadRecord, UploadStore,
-    blob_key,
+    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, JobState, JobStore, LogStore,
+    ManifestRecord, ManifestStore, MemLogStore, Snapshot, StoreError, UploadKind, UploadRecord,
+    UploadStore, blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore + ManifestStore + UploadStore {
+trait Store: LogStore + BlobStore + ManifestStore + UploadStore + JobStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
 }
 
@@ -485,6 +485,34 @@ async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>
     assert_eq!(s.upload_list(UploadKind::Apworld).await.unwrap(), metas);
 }
 
+/// A job's status is written whole and read back; only queued and running jobs go stale, a
+/// stale one is failed once, and a job marked alive since it was listed is not failed.
+async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc<S>) {
+    let id = |c: char| c.to_string().repeat(64);
+    let (q, r, d) = (id('a'), id('b'), id('c'));
+    s.job_put(&q, JobState::Queued, "q1").await.unwrap();
+    s.job_put(&r, JobState::Running, "r1").await.unwrap();
+    s.job_put(&d, JobState::Done, "d1").await.unwrap();
+    assert_eq!(s.job_status(&q).await.unwrap().as_deref(), Some("q1"));
+    assert_eq!(s.job_status(&id('f')).await.unwrap(), None);
+    let hour = Duration::from_secs(3600);
+    assert_eq!(s.job_stale(hour).await.unwrap(), [], "all just marked alive");
+    let now = s.job_stale(Duration::ZERO).await.unwrap();
+    assert_eq!(now, [(q.clone(), "q1".to_owned()), (r.clone(), "r1".to_owned())], "never done");
+    // Marked alive since: not failed.
+    assert!(!s.job_fail_stale(&q, "failed", hour).await.unwrap());
+    assert!(s.job_fail_stale(&r, "r failed", Duration::ZERO).await.unwrap());
+    assert!(!s.job_fail_stale(&r, "again", Duration::ZERO).await.unwrap(), "once");
+    assert!(!s.job_fail_stale(&d, "done stays", Duration::ZERO).await.unwrap());
+    assert_eq!(s.job_status(&r).await.unwrap().as_deref(), Some("r failed"));
+    assert_eq!(s.job_status(&d).await.unwrap().as_deref(), Some("d1"));
+    // A put replaces the status; a touch of a finished job changes nothing.
+    s.job_put(&q, JobState::Done, "q2").await.unwrap();
+    s.job_touch(&q).await.unwrap();
+    assert_eq!(s.job_stale(Duration::ZERO).await.unwrap(), []);
+    assert_eq!(s.job_status(&q).await.unwrap().as_deref(), Some("q2"));
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -521,6 +549,7 @@ macro_rules! contract {
                 blobs_are_stored_once_by_key_and_checked_on_write,
                 manifests_are_deduplicated_checked_and_listed_in_pages,
                 uploads_are_deduplicated_by_kind_checked_and_listed,
+                jobs_are_read_back_and_only_stale_unfinished_ones_fail,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

@@ -180,13 +180,9 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(st, 200, "{back}");
     let fixture_json: Value = serde_json::from_str(&fixture_text).unwrap();
     assert_eq!(back, fixture_json);
+    // The status is in the store (#119), so the job folder, its copies of the inputs, is gone.
     let world_dir = setup.root.join("data/worlds").join(&id);
-    let mut files: Vec<String> = std::fs::read_dir(&world_dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    files.sort();
-    assert_eq!(files, ["status.json"], "the job's copies of its inputs are removed");
+    assert!(!world_dir.exists(), "the job folder is removed when the job ends");
     // What the sandbox showed the sidecar, and what it let it do.
     let g = &done["generation"];
     assert_eq!(g["custom_worlds"], json!(["my_world.apworld"]), "only the chosen world, by module");
@@ -205,10 +201,11 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(world["id"].as_str(), Some(world_id.as_str()));
     drop(server.stop());
 
-    // The status is on disk: a new server process still reports it.
+    // With no database the store is in memory, so a new server process has no such world, as
+    // it has no rooms; on Postgres a status survives (`worlds::tests::pg` in the server).
     let server = setup.start();
-    let (st, after) = http(&server, "GET", &format!("/api/worlds/{id}"), t, b"").await;
-    assert_eq!((st, after), (200, done));
+    let (st, _) = http(&server, "GET", &format!("/api/worlds/{id}"), t, b"").await;
+    assert_eq!(st, 404);
 }
 
 #[tokio::test]

@@ -814,6 +814,118 @@ impl crate::UploadStore for PgLogStore {
     }
 }
 
+/// The seconds of `d` as Postgres takes them in `make_interval`.
+fn secs(d: core::time::Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+/// Generation statuses in the `world_jobs` table (migration 0006).
+impl crate::JobStore for PgLogStore {
+    async fn job_put(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        let (id, status) = (id.to_owned(), status.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO world_jobs (id, state, status) VALUES ($1, $2, $3) \
+                     ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, \
+                     status = EXCLUDED.status, updated_at = now()",
+                )
+                .bind(&id)
+                .bind(state.as_str())
+                .bind(&status)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_status(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let id = id.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT status FROM world_jobs WHERE id = $1")
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_touch(&self, id: &str) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE world_jobs SET updated_at = now() \
+                     WHERE id = $1 AND state IN ('queued', 'running')",
+                )
+                .bind(&id)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_stale(
+        &self,
+        older_than: core::time::Duration,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let older = secs(older_than);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_as(
+                    "SELECT id, status FROM world_jobs WHERE state IN ('queued', 'running') \
+                     AND updated_at <= now() - make_interval(secs => $1) ORDER BY id",
+                )
+                .bind(older)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: core::time::Duration,
+    ) -> Result<bool, StoreError> {
+        let (id, status, older) = (id.to_owned(), status.to_owned(), secs(older_than));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE world_jobs SET state = 'failed', status = $2, updated_at = now() \
+                     WHERE id = $1 AND state IN ('queued', 'running') \
+                     AND updated_at <= now() - make_interval(secs => $3)",
+                )
+                .bind(&id)
+                .bind(&status)
+                .bind(older)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
 /// A manifest's listing columns (never its bytes).
 #[derive(sqlx::FromRow)]
 struct ManifestRow {

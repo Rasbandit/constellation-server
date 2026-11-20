@@ -4,14 +4,16 @@
 //! reads.
 
 use log::{
-    BlobKey, ManifestRecord, ManifestStore, MemLogStore, PgLogStore, StoreError, UploadKind,
-    UploadRecord, UploadStore,
+    BlobKey, JobState, JobStore, ManifestRecord, ManifestStore, MemLogStore, PgLogStore,
+    StoreError, UploadKind, UploadRecord, UploadStore,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-/// Where the manifests and the uploaded world and player files live: the host's store.
+/// Where the manifests, the uploaded world and player files and the generations' statuses live:
+/// the host's store.
 #[derive(Debug, Clone)]
 pub(crate) enum Db {
     Pg(Arc<PgLogStore>),
@@ -61,6 +63,54 @@ impl Db {
         match self {
             Self::Pg(s) => s.upload_list(kind).await,
             Self::Mem(s) => s.upload_list(kind).await,
+        }
+    }
+
+    pub(crate) async fn job_put(
+        &self,
+        id: &str,
+        state: JobState,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Pg(s) => s.job_put(id, state, status).await,
+            Self::Mem(s) => s.job_put(id, state, status).await,
+        }
+    }
+
+    pub(crate) async fn job_status(&self, id: &str) -> Result<Option<String>, StoreError> {
+        match self {
+            Self::Pg(s) => s.job_status(id).await,
+            Self::Mem(s) => s.job_status(id).await,
+        }
+    }
+
+    pub(crate) async fn job_touch(&self, id: &str) -> Result<(), StoreError> {
+        match self {
+            Self::Pg(s) => s.job_touch(id).await,
+            Self::Mem(s) => s.job_touch(id).await,
+        }
+    }
+
+    pub(crate) async fn job_stale(
+        &self,
+        older: Duration,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        match self {
+            Self::Pg(s) => s.job_stale(older).await,
+            Self::Mem(s) => s.job_stale(older).await,
+        }
+    }
+
+    pub(crate) async fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older: Duration,
+    ) -> Result<bool, StoreError> {
+        match self {
+            Self::Pg(s) => s.job_fail_stale(id, status, older).await,
+            Self::Mem(s) => s.job_fail_stale(id, status, older).await,
         }
     }
 

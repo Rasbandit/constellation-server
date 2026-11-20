@@ -36,10 +36,20 @@ pub struct MemLogStore {
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
     uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
+    jobs: Mutex<BTreeMap<String, Job>>,
 }
 
 /// An upload's record and file.
 type Upload = (crate::UploadRecord, Vec<u8>);
+
+/// A job's state, status and when it was last marked alive.
+type Job = (crate::JobState, String, std::time::Instant);
+
+/// Queued or running, and not marked alive for `older_than`.
+fn stale(job: &Job, older_than: core::time::Duration) -> bool {
+    use crate::JobState::{Queued, Running};
+    matches!(job.0, Queued | Running) && job.2.elapsed() >= older_than
+}
 
 /// Insert unless present, under the lock; what is stored after.
 fn put_once<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: K, v: &[u8]) -> Vec<u8> {
@@ -369,6 +379,72 @@ impl crate::UploadStore for MemLogStore {
         let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
         let all = m.iter().filter(|((k, _), _)| *k == kind).map(|(_, (r, _))| r.meta.clone());
         ready(Ok(all.collect()))
+    }
+}
+
+impl MemLogStore {
+    /// Mark job `id` as last alive `by` ago, as if its process stopped then.
+    pub fn age_job_for_tests(&self, id: &str, by: core::time::Duration) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id) {
+            job.2 = job.2.checked_sub(by).unwrap_or(job.2);
+        }
+    }
+}
+
+impl crate::JobStore for MemLogStore {
+    fn job_put(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let job = (state, status.to_owned(), std::time::Instant::now());
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner).insert(id.to_owned(), job);
+        ready(Ok(()))
+    }
+
+    fn job_status(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(jobs.get(id).map(|j| j.1.clone())))
+    }
+
+    fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+        use crate::JobState::{Queued, Running};
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id).filter(|j| matches!(j.0, Queued | Running)) {
+            job.2 = std::time::Instant::now();
+        }
+        ready(Ok(()))
+    }
+
+    fn job_stale(
+        &self,
+        older_than: core::time::Duration,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> + Send {
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let old = jobs.iter().filter(|(_, j)| stale(j, older_than));
+        ready(Ok(old.map(|(id, j)| (id.clone(), j.1.clone())).collect()))
+    }
+
+    fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: core::time::Duration,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let failed = match jobs.get_mut(id).filter(|j| stale(j, older_than)) {
+            Some(job) => {
+                *job = (crate::JobState::Failed, status.to_owned(), std::time::Instant::now());
+                true
+            }
+            None => false,
+        };
+        ready(Ok(failed))
     }
 }
 

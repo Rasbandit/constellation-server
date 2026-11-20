@@ -11,6 +11,7 @@ mod mem;
 #[cfg(feature = "postgres")]
 mod pg;
 
+use core::time::Duration;
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 
 pub use mem::MemLogStore;
@@ -353,6 +354,92 @@ pub trait UploadStore: Send + Sync + 'static {
         &self,
         kind: UploadKind,
     ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+}
+
+/// Where a generation is (`world_jobs.state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Waiting for a generation permit.
+    Queued,
+    /// Generating.
+    Running,
+    /// Finished with a world.
+    Done,
+    /// Finished without one.
+    Failed,
+}
+
+impl JobState {
+    /// The state's name in the store, as the status API shows it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The state named `s`, if it is one.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Queued, Self::Running, Self::Done, Self::Failed]
+            .into_iter()
+            .find(|j| j.as_str() == s)
+    }
+}
+
+/// World generations' statuses, shared by every server instance. Queued and running jobs are
+/// marked alive by the process running them; one that stops being marked is stale.
+pub trait JobStore: Send + Sync + 'static {
+    /// Write job `id`'s status (JSON text, opaque to the store) and state, marking it alive.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_put(
+        &self,
+        id: &str,
+        state: JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Job `id`'s status.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_status(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
+    /// Mark job `id` alive, while it is queued or running.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The queued and running jobs not marked alive for `older_than`, with their statuses.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_stale(
+        &self,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> + Send;
+
+    /// Fail job `id` with `status`, only while it is still queued or running and not marked
+    /// alive for `older_than` (its process may have marked it since it was listed); whether
+    /// it was failed.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.

@@ -202,6 +202,13 @@ pub struct Limits {
     /// Wall-clock limit of one sandboxed generation, after which it is killed
     /// (`CONSTELLATION_GEN_TIMEOUT_MS`; design value: one real world took about 22 s here).
     pub gen_timeout_ms: u64,
+    /// A queued or running generation marks itself alive in the store this often, so another
+    /// server instance can tell it from one whose process stopped (#119; a cost trade, not a
+    /// design value).
+    pub gen_heartbeat_secs: u64,
+    /// A queued or running generation not marked alive for this long is failed: its process
+    /// stopped. Several heartbeats, so one slow write never fails a live job.
+    pub gen_stale_secs: u64,
     /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
     /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
     pub gen_memory_bytes: u64,
@@ -347,6 +354,8 @@ impl Limits {
         admin_write_refill_milli_per_sec: 1000,
         inspect_timeout_ms: 30_000,
         gen_timeout_ms: 15 * 60 * 1000,
+        gen_heartbeat_secs: 15,
+        gen_stale_secs: 60,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
         gen_error_max_bytes: 16 * 1024,
         gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
@@ -872,6 +881,8 @@ mod tests {
             (256, 4 << 30, 80)
         );
         assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
+        assert_eq!((l.gen_heartbeat_secs, l.gen_stale_secs), (15, 60));
+        assert!(l.gen_stale_secs >= 3 * l.gen_heartbeat_secs, "several beats before stale");
     }
 
     #[test]
