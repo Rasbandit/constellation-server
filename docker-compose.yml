@@ -34,6 +34,7 @@ services:
       CONSTELLATION_SANDBOX_MODE: container
     secrets: [database_url, admin_token]
     mem_limit: 6g
+    memswap_limit: 6g # no swap beyond mem_limit
     pids_limit: 512
     # Default seccomp profile plus only what bubblewrap needs (docs/container.md). Not privileged,
     # no added capabilities.
