@@ -285,6 +285,21 @@ fn a_check_marks_a_hint_found_for_both_sides() {
 }
 
 #[test]
+fn the_room_lists_each_hint_once_for_both_sides() {
+    let mut s = room(FREE);
+    assert!(s.hints().is_empty());
+    apply(&mut s, &at(), scout(1, &[11, 12])).unwrap();
+    let all = s.hints();
+    assert_eq!(all.len(), 2, "each hint once, not once per side");
+    assert!(all.iter().all(|h| h.finding == SlotNo(1)));
+    assert_eq!(all.iter().map(|h| h.location).collect::<Vec<_>>(), [11, 12]);
+    for slot in [1, 2] {
+        let mine = s.hints_of(SlotNo(slot));
+        assert!(mine.iter().all(|h| all.contains(h)), "slot {slot}'s hints are in the room's");
+    }
+}
+
+#[test]
 fn start_hints_are_in_the_fresh_room_and_a_bad_one_is_refused() {
     let base = room(FREE);
     let s = base

@@ -90,11 +90,8 @@ export function PlayRoom() {
           <Feed feed={feed} me={me} footer={mine && r.state !== 'closed' && !liveRooms ? <ChatBox roomId={id} slot={mine} /> : undefined} />
         </Card>
         <Card title="Hints">
-          {liveRooms ? (
-            <p className="muted">Not available yet: the server does not keep hints.</p>
-          ) : (
-            <HintBoard hints={hints.data ?? []} slots={r.slotList} me={me} onStatus={onHintStatus} />
-          )}
+          {/* Live rooms are read-only here: a player marks hints from their client. */}
+          <HintBoard hints={hints.data ?? []} slots={r.slotList} me={me} onStatus={liveRooms ? undefined : onHintStatus} />
         </Card>
       </div>
     </div>

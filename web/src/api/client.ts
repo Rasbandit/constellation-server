@@ -1,5 +1,5 @@
 import { getAdminToken, rejectAdminToken } from './token';
-import { toRoom, type RoomView } from './roomView';
+import { toHint, toRoom, type RoomView } from './roomView';
 import { toApWorld, toManifest, toPlayers, type ApWorldRecord, type ManifestRecord, type YamlRecord } from './uploads';
 import type {
   ApiError,
@@ -132,8 +132,11 @@ export const api = {
   /** Live rooms: the event stream itself carries the history (and resumes with Last-Event-ID). */
   feed: (id: string, after = 0): Promise<FeedItem[]> =>
     adminApi ? Promise.resolve([]) : call<FeedItem[]>('GET', `/api/rooms/${enc(id)}/feed?after=${after}`),
-  /** Live rooms: the server stores no hints yet, so there are none to show. */
-  hints: (id: string): Promise<Hint[]> => (adminApi ? Promise.resolve([]) : call<Hint[]>('GET', `/api/rooms/${enc(id)}/hints`)),
+  /** Live rooms: the hints are in the room view. */
+  hints: (id: string): Promise<Hint[]> =>
+    adminApi
+      ? call<RoomView>('GET', `/api/worlds/${enc(id)}/room`).then((v) => (v.hints ?? []).map(toHint))
+      : call<Hint[]>('GET', `/api/rooms/${enc(id)}/hints`),
   chat: (id: string, slot: SlotNo, text: string) => call<FeedItem>('POST', `/api/rooms/${enc(id)}/chat`, { body: { slot, text } }),
   setHintStatus: (id: string, hint: string, status: HintStatus) =>
     call<Hint>('POST', `/api/rooms/${enc(id)}/hints/${enc(hint)}`, { body: { status } }),

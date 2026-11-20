@@ -174,7 +174,7 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
         <Stat label="Online" value={`${r.slotsOnline}/${r.slots}`} />
         <Stat label="Goals done" value={`${r.slotsDone}/${r.slots}`} />
         <Stat label="Checks" value={`${pct(done, total)}%`} sub={`${done} of ${total}`} />
-        {!liveRooms && <Stat label="Open hints" value={(hints.data ?? []).filter((h) => h.status !== 'found').length} />}
+        <Stat label="Open hints" value={(hints.data ?? []).filter((h) => h.status !== 'found').length} />
       </div>
 
       <Card title="Players" actions={liveRooms ? undefined : <span className="muted small">Actions per player: items, hints, rename, release, kick</span>}>
@@ -216,14 +216,12 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
             </ol>
           )}
         </Card>
-        {!liveRooms && (
-          <div className="stack">
-            <RulesCard room={r} onSave={(patch) => run(admin.updateRules(patch), 'Rules saved')} />
-            <Card title="All hints">
-              <HintBoard hints={hints.data ?? []} slots={r.slotList} me={null} />
-            </Card>
-          </div>
-        )}
+        <div className="stack">
+          {!liveRooms && <RulesCard room={r} onSave={(patch) => run(admin.updateRules(patch), 'Rules saved')} />}
+          <Card title="All hints">
+            <HintBoard hints={hints.data ?? []} slots={r.slotList} me={null} />
+          </Card>
+        </div>
       </div>
 
       <Modal open={acting !== null} title={acting === 'pick' ? 'Send an item or hint' : acting ? `Manage ${acting.name}` : ''} onClose={() => setActing(null)}>

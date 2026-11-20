@@ -1,4 +1,4 @@
-import type { CollectMode, FeedItem, ItemFlag, ReleaseMode, Room, Slot } from './types';
+import type { CollectMode, FeedItem, Hint, HintStatus, ItemFlag, ReleaseMode, Room, Slot } from './types';
 
 // The server's read-only room view (`GET /api/worlds/:id/room` and its SSE stream
 // `/api/worlds/:id/room/events`; crates/edge-compat/src/view.rs) turned into what the pages use.
@@ -22,6 +22,25 @@ export interface RoomView {
     items_received: number;
     goal: boolean;
   }[];
+  /** Every hint in the room, once each. */
+  hints: HintView[];
+}
+
+/** A hint as the server sends it, in the summary and (with `kind`) on the stream. */
+export interface HintView {
+  finding: number;
+  finding_name: string | null;
+  receiver: number;
+  receiver_name: string | null;
+  item: number;
+  item_name: string | null;
+  location: number;
+  location_name: string | null;
+  entrance: string | null;
+  flags: number;
+  /** 0 unspecified, 10 no priority, 20 avoid, 30 priority, 40 found. */
+  status: number;
+  found: boolean;
 }
 
 /** One entry of the room's event stream. `seq` is set on durable events only. */
@@ -41,6 +60,9 @@ export type RoomEvent =
       flags: number;
     }
   | { kind: 'goal'; seq: number; slot: number; name: string | null }
+  /** A new hint (`paid`: the asking slot spent points), or a hint's status changed by its receiver. */
+  | (HintView & { kind: 'hint'; seq: number; slot: number | null; name: string | null; paid: boolean })
+  | (HintView & { kind: 'hint_status'; seq: number; slot: number | null; name: string | null })
   | { kind: 'join' | 'leave' | 'chat'; slot: number; name: string | null; text?: string | null }
   /** The room restarted (or the viewer fell too far behind): drop what was shown. */
   | { kind: 'reset' };
@@ -55,6 +77,35 @@ function flagOf(flags: number): ItemFlag {
   if (flags & 4) return 'trap';
   return 'filler';
 }
+
+const STATUS: Record<number, HintStatus> = { 0: 'unspecified', 10: 'no_priority', 20: 'avoid', 30: 'priority', 40: 'found' };
+
+/** A hint status value; one this page does not know shows as unmarked. */
+export function hintStatus(h: Pick<HintView, 'status' | 'found'>): HintStatus {
+  return h.found ? 'found' : (STATUS[h.status] ?? 'unspecified');
+}
+
+/** A hint is one per (finding slot, location), so that is its id. */
+export function toHint(h: HintView): Hint {
+  return {
+    id: `${h.finding}:${h.location}`,
+    finding: h.finding,
+    receiving: h.receiver,
+    item: h.item_name ?? `item ${h.item}`,
+    flag: flagOf(h.flags),
+    location: h.location_name ?? `location ${h.location}`,
+    entrance: h.entrance || undefined,
+    status: hintStatus(h),
+  };
+}
+
+const STATUS_TEXT: Record<HintStatus, string> = {
+  priority: 'priority',
+  unspecified: 'unmarked',
+  no_priority: 'not needed',
+  avoid: 'avoid',
+  found: 'found',
+};
 
 export function toRoom(id: string, v: RoomView): Room {
   const slotList: Slot[] = v.slots.map((s) => ({
@@ -113,6 +164,17 @@ export function toFeed(e: RoomEvent, n: number): FeedItem | null {
     }
     case 'goal':
       return { ...base, kind: 'goal', text: `${e.name ?? `player ${e.slot}`} reached their goal`, slots: [e.slot] };
+    case 'hint':
+    case 'hint_status': {
+      const receiver = e.receiver_name ?? `player ${e.receiver}`;
+      const finder = e.finding_name ?? `player ${e.finding}`;
+      const h = toHint(e);
+      const text =
+        e.kind === 'hint'
+          ? `Hint: ${receiver}'s ${h.item} is at ${h.location} in ${finder}'s world (${STATUS_TEXT[h.status]})`
+          : `${e.name ?? receiver} marked ${h.item} ${STATUS_TEXT[h.status]}`;
+      return { ...base, kind: 'hint', text, slots: [...new Set([e.finding, e.receiver])] };
+    }
     case 'join':
     case 'leave':
     case 'chat': {
