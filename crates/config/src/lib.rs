@@ -169,6 +169,10 @@ pub struct Limits {
     pub manifest_check_concurrency: usize,
     /// Address-space cap of a fill or manifest check child process, bytes (design value).
     pub fill_memory_bytes: u64,
+    /// Process and thread cap of a fill or manifest check child process. The system counts every
+    /// task of the server's user against it, so it is a brake on runaway spawning, not a tight
+    /// bound; 0 leaves it off (design value).
+    pub fill_max_processes: u64,
     /// CPU-seconds cap of a fill or manifest check child process (design value).
     pub fill_cpu_secs: u64,
     /// Wall-clock limit of one fill child process, after which it is killed (design value).
@@ -237,6 +241,10 @@ pub const FILL_SETUP_WORKERS: usize = 4;
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
 pub const FILL_MAX_WORKERS: usize = 64;
+
+/// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
+/// listing columns and an index).
+pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 
 /// The generator version a data-only seed records (what clients of the compatible protocol
 /// expect; a format value, not a limit).
@@ -318,6 +326,7 @@ impl Limits {
         manifest_check_concurrency: 2,
         fill_memory_bytes: 1024 * 1024 * 1024,
         fill_cpu_secs: 120,
+        fill_max_processes: 8192,
         fill_timeout_ms: 60_000,
         gen_concurrency: 1,
         gen_queue_max: 64,
@@ -829,6 +838,7 @@ mod tests {
             (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),
             (1 << 30, 120, 60_000)
         );
+        assert_eq!(l.fill_max_processes, 8192);
         assert_eq!((l.admin_write_burst, l.admin_write_refill_milli_per_sec), (30, 1000));
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));

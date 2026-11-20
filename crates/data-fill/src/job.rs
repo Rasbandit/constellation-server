@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::seed::{Player, generate as fill, manifest_game};
+use crate::seed::{Player, checked_name, generate as fill, manifest_game};
 use crate::world::World;
 
 /// A fill request: the manifest, who plays it, and the seed's name and random stream.
@@ -37,7 +37,7 @@ pub fn inspect(input: &[u8]) -> Result<Vec<u8>, String> {
     let m: Value = serde_json::from_slice(input).map_err(|e| format!("not valid JSON: {e}"))?;
     let game = manifest_game(&m)?;
     let version = match &m["version"] {
-        Value::String(v) if !v.trim().is_empty() => v.trim().to_owned(),
+        Value::String(v) => checked_name("version", v)?.to_owned(),
         Value::Number(n) => n.to_string(),
         _ => return Err("the manifest needs a \"version\"".to_owned()),
     };

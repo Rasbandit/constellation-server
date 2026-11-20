@@ -141,3 +141,24 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     );
     assert!(data_fill::job::inspect(b"[]").is_err());
 }
+
+#[test]
+fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
+    let (m, _) = players();
+    let check = |key: &str, value: &str| {
+        let mut m = m.clone();
+        m[key] = json!(value);
+        data_fill::job::inspect(m.to_string().as_bytes()).map(|_| ())
+    };
+    for key in ["game", "version"] {
+        assert!(
+            check(key, &"x".repeat(config::MANIFEST_NAME_MAX_BYTES)).is_ok(),
+            "{key} at the cap"
+        );
+        let long = check(key, &"x".repeat(config::MANIFEST_NAME_MAX_BYTES + 1)).unwrap_err();
+        assert!(long.contains("longer than"), "{key}: {long}");
+        for bad in ["a\u{0}b", "a\nb", "\u{7f}"] {
+            assert!(check(key, bad).unwrap_err().contains("control"), "{key} {bad:?}");
+        }
+    }
+}

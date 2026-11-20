@@ -82,9 +82,10 @@ const ENGINE_DATA_ONLY: &str = "data-only";
 
 /// How the data-only jobs (a fill, a manifest check) run: in a capped child process, always but
 /// in the unit tests of this module, whose executable is not the server's.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum JobRunner {
-    Child,
+    /// This executable's path, found once at startup (see `sandbox::exe_path`).
+    Child(PathBuf),
     #[cfg(test)]
     InProcess,
 }
@@ -243,7 +244,7 @@ pub(crate) fn open(
         queued: Arc::new(AtomicUsize::new(0)),
         checks: Semaphore::new(limits.manifest_check_concurrency.max(1)),
         manifests: Manifests::new(manifests::Db::Mem(Arc::new(log::MemLogStore::new())), &limits),
-        jobs: JobRunner::Child,
+        jobs: JobRunner::Child(crate::sandbox::exe_path()?),
         write_rate: edge_compat::RateTable::new(
             limits.admin_write_burst,
             limits.admin_write_refill_milli_per_sec,
@@ -285,8 +286,8 @@ impl Worlds {
         input: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, Failure> {
-        match self.jobs {
-            JobRunner::Child => run_job(job, input, &self.limits, timeout).await,
+        match &self.jobs {
+            JobRunner::Child(exe) => run_job(exe, job, input, &self.limits, timeout).await,
             #[cfg(test)]
             JobRunner::InProcess => {
                 let (job, input) = (job.to_owned(), input.to_vec());
@@ -538,7 +539,15 @@ async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]) -> Reply 
     }
     let id = content_id(body);
     if let Some(stored) = w.manifests.record(&id).await.map_err(store_error)? {
-        return Ok(json_reply(StatusCode::OK, &stored));
+        // A stored manifest whose bytes no longer hash to its id (a torn row) is not served as
+        // stored: it falls through to the check and is written again, which heals it.
+        match w.manifests.bytes(&id).await {
+            Ok(Some(_)) => return Ok(json_reply(StatusCode::OK, &stored)),
+            Ok(None) | Err(log::StoreError::Corrupt(_)) => {
+                tracing::warn!(id, "stored manifest is missing or torn; storing it again");
+            }
+            Err(e) => return Err(store_error(e)),
+        }
     }
     let Ok(_check) = w.checks.try_acquire() else {
         return Ok(busy(w, "too many manifests are being checked"));
@@ -1548,7 +1557,9 @@ mod tests {
     async fn a_manifest_that_is_not_json_has_no_game_or_does_not_compile_is_refused() {
         let root = temp("manifest-bad");
         let w = worlds(&root, Limits::DESIGN);
-        let bad: [(&str, Vec<u8>); 5] = [
+        let bad: [(&str, Vec<u8>); 7] = [
+            ("game with a NUL", manifest(|m| m["game"] = json!("a\u{0}b"))),
+            ("game past the cap", manifest(|m| m["game"] = json!("x".repeat(129)))),
             ("not json", b"{".to_vec()),
             ("no game", manifest(|m| drop(m.as_object_mut().unwrap().remove("game")))),
             ("empty game", manifest(|m| m["game"] = json!(" "))),
@@ -1561,6 +1572,35 @@ mod tests {
         }
         let none = w.manifests.list(None, None, None).await.unwrap();
         assert!(none.0.is_empty(), "nothing kept");
+    }
+
+    /// A stored manifest whose bytes were torn is not answered as stored: the same upload again
+    /// checks and stores it, which heals it.
+    #[tokio::test]
+    async fn uploading_a_torn_manifest_again_heals_it() {
+        let root = temp("manifest-heal");
+        let store = Arc::new(log::MemLogStore::new());
+        let mut w = worlds(&root, Limits::DESIGN);
+        w.manifests = Manifests::new(manifests::Db::Mem(Arc::clone(&store)), &Limits::DESIGN);
+        let body = manifest(|_| {});
+        let first = upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let id = content_id(&body);
+        store.tear_manifest_for_tests(&hex_key(&id));
+        assert!(w.manifests.bytes(&id).await.is_err(), "the torn row is refused on read");
+        let again = upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        assert_eq!(again.status(), StatusCode::CREATED, "stored again, not answered as stored");
+        assert_eq!(w.manifests.bytes(&id).await.unwrap().as_deref(), Some(&body));
+        let third = upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
+    }
+
+    fn hex_key(id: &str) -> [u8; 32] {
+        let mut key = [0_u8; 32];
+        for (k, pair) in key.iter_mut().zip(id.as_bytes().chunks(2)) {
+            *k = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        key
     }
 
     #[tokio::test]

@@ -7,14 +7,14 @@ export const NAME_MAX = 16;
 export interface ReadinessInput {
   roomName: string;
   apworlds: ApWorld[];
-  /** Data-only worlds (the server's engine fills them); at most one, and no APWorlds beside it. */
+  /** Data-only worlds (the server's engine fills them); at most one, and no legacy world files beside it. */
   manifests?: ManifestWorld[];
   players: PlayerFile[];
-  /** Games the server can generate without an uploaded APWorld. */
+  /** Games the server can generate without an uploaded legacy world file. */
   builtinGames: string[];
 }
 
-/** Which engine generates the room: the data-fill engine for a manifest, the sandboxed legacy generator for APWorlds. */
+/** Which engine generates the room: the data-fill engine for a manifest, the sandboxed legacy generator for legacy world files. */
 export type Engine = 'data-only' | 'legacy';
 
 export interface Readiness {
@@ -22,7 +22,7 @@ export interface Readiness {
   /** `null` until a world file is added. */
   engine: Engine | null;
   checks: ReadinessCheck[];
-  /** Games some player needs that have no APWorld yet. */
+  /** Games some player needs that have no legacy world file yet. */
   missingGames: string[];
   /** For each player id, what is wrong with its connection name (if anything). */
   nameProblems: Record<string, string>;

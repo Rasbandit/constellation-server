@@ -23,17 +23,36 @@ pub struct Player {
     pub instance: Instance,
 }
 
-/// The manifest's game name, trimmed: the one reading of it (the upload record, the folder and
+/// A game or version name from a manifest, trimmed: not empty, at most
+/// `config::MANIFEST_NAME_MAX_BYTES`, no control characters (it is kept in listing columns, an
+/// index and file names).
+///
+/// # Errors
+/// A message naming what is wrong with it.
+pub fn checked_name<'a>(what: &str, name: &'a str) -> Result<&'a str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("the manifest needs a {what:?}"));
+    }
+    if name.len() > config::MANIFEST_NAME_MAX_BYTES {
+        return Err(format!(
+            "the manifest's {what:?} is longer than {} bytes",
+            config::MANIFEST_NAME_MAX_BYTES
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(format!("the manifest's {what:?} holds a control character"));
+    }
+    Ok(name)
+}
+
+/// The manifest's game name, checked: the one reading of it (the upload record, the folder and
 /// the seed all use this).
 ///
 /// # Errors
-/// When the manifest has no game, or an empty one.
+/// When the manifest has no game, or one [`checked_name`] refuses.
 pub fn manifest_game(manifest: &Value) -> Result<&str, String> {
-    manifest["game"]
-        .as_str()
-        .map(str::trim)
-        .filter(|g| !g.is_empty())
-        .ok_or_else(|| "the manifest needs a \"game\" name".to_owned())
+    checked_name("game", manifest["game"].as_str().unwrap_or(""))
 }
 
 /// Fill a room of `players`, all playing the world `manifest` describes (its `game` key names

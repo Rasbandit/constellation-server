@@ -227,6 +227,16 @@ impl crate::raw::RawBlobs for MemLogStore {
     }
 }
 
+impl MemLogStore {
+    /// Damage a stored manifest's bytes, as a torn write would, so a test can see it healed.
+    pub fn tear_manifest_for_tests(&self, id: &BlobKey) {
+        let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(id) {
+            bytes.push(0);
+        }
+    }
+}
+
 impl crate::ManifestStore for MemLogStore {
     fn manifest_put(
         &self,
