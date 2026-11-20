@@ -20,6 +20,9 @@
 //! never goes on an excluded location; every player's goal must hold (accessibility is not
 //! required beyond that); no local-item option (#91), no accessibility modes or progression balancing (#92).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use serde::Deserialize;
 use spec_rng::SpecRng;
 
@@ -387,9 +390,21 @@ struct Linked<'a, 'w> {
     seq: u32,
     /// Per player: lost facts or was handed copies during this removal.
     touched: Vec<bool>,
+    touched_list: Vec<usize>,
     /// Per player: gated to re-derivation (see `Reach::begin_rederive`).
     gated: Vec<bool>,
+    gated_list: Vec<usize>,
     rederiving: bool,
+    /// Players with something to run, lowest first (`queued`: already in `ready`).
+    ready: BinaryHeap<Reverse<usize>>,
+    queued: Vec<bool>,
+    /// Players whose outbox may hold messages nobody has delivered yet.
+    outboxes: Vec<usize>,
+    /// Suspects over all states, lowest rank first: `(rank, player)`. An entry is current when
+    /// the player's own lowest suspect still has that rank.
+    suspects: BinaryHeap<Reverse<(u32, usize)>>,
+    /// Players handed a `Move` since the last look (their suspects changed).
+    moved: Vec<usize>,
 }
 
 impl<'a, 'w> Linked<'a, 'w> {
@@ -399,8 +414,22 @@ impl<'a, 'w> Linked<'a, 'w> {
             models: seats.iter().map(|s| Reach::new(s.w, s.plan)).collect(),
             seq: 1,
             touched: vec![false; seats.len()],
+            touched_list: Vec::new(),
             gated: vec![false; seats.len()],
+            gated_list: Vec::new(),
             rederiving: false,
+            ready: BinaryHeap::new(),
+            queued: vec![false; seats.len()],
+            outboxes: Vec::new(),
+            suspects: BinaryHeap::new(),
+            moved: Vec::new(),
+        }
+    }
+
+    /// Player `p` has something to run.
+    fn mark(&mut self, p: usize) {
+        if !std::mem::replace(&mut self.queued[p], true) {
+            self.ready.push(Reverse(p));
         }
     }
 
@@ -413,6 +442,7 @@ impl<'a, 'w> Linked<'a, 'w> {
             let seq = self.seq;
             self.with(p, |m| m.reset_from(seq));
             self.seats[p].plan.prime(&mut self.models[p], held);
+            self.mark(p);
         }
         for (p, row) in placed.iter().enumerate() {
             for (l, g) in row.iter().enumerate() {
@@ -431,19 +461,25 @@ impl<'a, 'w> Linked<'a, 'w> {
     fn hold(&mut self, p: usize, loc: u32, g: Given) {
         if usize::from(g.to) == p {
             self.models[p].hold(loc, g.item);
+            self.mark(p);
         } else {
             self.models[p].hold_away(loc, g.to, g.item);
+            self.outboxes.push(p);
         }
     }
 
     /// Run states and pass their messages on until nothing is left to do.
     fn settle(&mut self) {
-        self.deliver_all();
-        while let Some(p) = self.models.iter().position(|m| !m.idle()) {
-            self.with(p, Reach::run);
-            self.deliver(p);
-            // Messages may have been queued by `hold_away` for other states too.
-            self.deliver_all();
+        loop {
+            while let Some(p) = self.outboxes.pop() {
+                self.deliver(p);
+            }
+            let Some(Reverse(p)) = self.ready.pop() else { return };
+            self.queued[p] = false;
+            if !self.models[p].idle() {
+                self.with(p, Reach::run);
+                self.deliver(p);
+            }
         }
     }
 
@@ -456,12 +492,6 @@ impl<'a, 'w> Linked<'a, 'w> {
         out
     }
 
-    fn deliver_all(&mut self) {
-        for p in 0..self.models.len() {
-            self.deliver(p);
-        }
-    }
-
     /// Hand state `p`'s messages to their receivers.
     fn deliver(&mut self, p: usize) {
         let mut i = 0;
@@ -471,60 +501,80 @@ impl<'a, 'w> Linked<'a, 'w> {
             let to = match msg {
                 Msg::Give { to, item, rank } => {
                     self.models[usize::from(to)].give(item, rank);
+                    self.mark(usize::from(to));
                     to
                 }
                 Msg::Move { to, item, from, rank } => {
                     self.models[usize::from(to)].shift(item, from, rank);
+                    self.moved.push(usize::from(to));
                     to
                 }
             };
             let q = usize::from(to);
             debug_assert_ne!(q, p, "an item for the same player is held in place");
-            self.touched[q] = true;
+            if !std::mem::replace(&mut self.touched[q], true) {
+                self.touched_list.push(q);
+            }
             // A state that lost nothing but is handed copies while re-deriving must not
             // derive more than the smaller room supports: it is gated like the others.
             if self.rederiving && !self.gated[q] {
                 self.gated[q] = true;
+                self.gated_list.push(q);
                 self.models[q].gate();
             }
         }
         self.models[p].outbox.clear();
     }
 
+    /// Queue player `p`'s lowest suspect.
+    fn suspect(&mut self, p: usize) {
+        if let Some(k) = self.models[p].next_suspect() {
+            self.suspects.push(Reverse((k, p)));
+        }
+    }
+
     /// Take one assumed copy of `item` back from `owner`, across the room.
     fn take_back(&mut self, owner: u16, item: u16) -> bool {
         let o = usize::from(owner);
         let Some(before) = self.models[o].start_removal(item) else { return false };
-        self.touched.fill(false);
+        for q in self.touched_list.drain(..) {
+            self.touched[q] = false;
+        }
         self.touched[o] = true;
+        self.touched_list.push(o);
+        self.suspects.clear();
+        self.moved.clear();
+        self.suspect(o);
         // Check suspects lowest rank first over all states: a check at rank k needs every
         // retraction below k done, in whichever state it happened. (A check made too early is
         // queued again when a lower fact is retracted, so the order is for cost, not for
         // exactness; the ranks themselves are what exactness rests on, see the cycle test.)
-        while let Some((p, _)) = self
-            .models
-            .iter()
-            .enumerate()
-            .filter_map(|(p, m)| m.next_suspect().map(|k| (p, k)))
-            .min_by_key(|(p, k)| (*k, *p))
-        {
+        while let Some(Reverse((k, p))) = self.suspects.pop() {
+            if self.models[p].next_suspect() != Some(k) {
+                continue; // stale: the player's lowest suspect has a current entry of its own
+            }
             self.models[p].cascade_one();
             self.deliver(p);
+            self.suspect(p);
+            while let Some(q) = self.moved.pop() {
+                self.suspect(q);
+            }
         }
         self.models[o].end_cascade(before);
         self.rederiving = true;
-        for p in 0..self.models.len() {
-            if self.touched[p] {
-                self.gated[p] = true;
-                self.with(p, Reach::begin_rederive);
+        for i in 0..self.touched_list.len() {
+            let p = self.touched_list[i];
+            if !std::mem::replace(&mut self.gated[p], true) {
+                self.gated_list.push(p);
             }
+            self.with(p, Reach::begin_rederive);
+            self.mark(p);
         }
         self.settle();
         self.rederiving = false;
-        for p in 0..self.models.len() {
-            if std::mem::take(&mut self.gated[p]) {
-                self.models[p].end_rederive();
-            }
+        for p in self.gated_list.drain(..) {
+            self.gated[p] = false;
+            self.models[p].end_rederive();
         }
         true
     }
@@ -697,16 +747,23 @@ fn groups(pool: Vec<Given>, per_player: bool) -> Vec<Vec<Given>> {
     if !per_player {
         return pool.into_iter().rev().map(|g| vec![g]).collect();
     }
-    let mut piles: Vec<(u16, Vec<Given>)> = Vec::new();
+    // Piles in the order players first appear; `pile[owner]` indexes them.
+    let mut piles: Vec<Vec<Given>> = Vec::new();
+    let mut pile: Vec<Option<usize>> = Vec::new();
     for g in pool {
-        match piles.iter_mut().find(|(o, _)| *o == g.to) {
-            Some((_, v)) => v.push(g),
-            None => piles.push((g.to, vec![g])),
+        let o = usize::from(g.to);
+        if pile.len() <= o {
+            pile.resize(o + 1, None);
         }
+        let k = *pile[o].get_or_insert(piles.len());
+        if k == piles.len() {
+            piles.push(Vec::new());
+        }
+        piles[k].push(g);
     }
     let mut out = Vec::new();
     loop {
-        let round: Vec<Given> = piles.iter_mut().filter_map(|(_, v)| v.pop()).collect();
+        let round: Vec<Given> = piles.iter_mut().filter_map(Vec::pop).collect();
         if round.is_empty() {
             return out;
         }

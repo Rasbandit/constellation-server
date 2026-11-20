@@ -167,15 +167,16 @@ Two things this run found. The start inventory of the player with shuffled clock
 
 | Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 23.5 | 19.7 | 19.7 | 0.096 | 252 | 14 | 0.00 | 0.71 |
-| 2 | 44.3 | 76.9 | 38.5 | 0.227 | 309 | 14 | 0.51 | 0.99 |
-| 3 | 67.6 | 146.3 | 48.8 | 0.456 | 429 | 19 | 0.66 | 1.33 |
-| 10 | 238.7 | 1 195 | 120 | 3.78 | 1 083 | 49 | 0.87 | 3.69 |
-| 20 (extra) | 440.6 | 3 802 | 190 | 10.6 | 1 551 | 77 | 0.92 | 7.10 |
+| 1 | 22.1 | 19.3 | 19.3 | 0.096 | 252 | 14 | 0.00 | 0.71 |
+| 2 | 40.5 | 70.5 | 35.3 | 0.227 | 309 | 14 | 0.51 | 1.01 |
+| 3 | 60.0 | 130.0 | 43.3 | 0.456 | 429 | 19 | 0.66 | 1.37 |
+| 10 | 203.5 | 1 060 | 106 | 3.78 | 1 083 | 49 | 0.87 | 3.83 |
+| 20 (extra) | 386.6 | 3 597 | 180 | 10.6 | 1 551 | 77 | 0.92 | 7.37 |
 
-- **Memory per added player: about 335 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.10 MB, linear: 272 KB for the second player, then 331 to 343 KB each.
-- **Setup per added player: about 22 ms** on one thread (parse the instance, resolve the plan), and it runs on `config::FILL_SETUP_WORKERS` threads in the product.
-- **Fill time per added player grows with the room**: 20, 38, 49, 120 and 190 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 57 ms, of the 3rd 69 ms, of each of players 4 to 10 about 150 ms, of players 11 to 20 about 260 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.2 s.
+- **Memory per added player: about 350 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.37 MB, linear: 291 KB for the second player, then 346 to 351 KB each.
+- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and it runs on `config::FILL_SETUP_WORKERS` threads in the product.
+- **Fill time per added player grows with the room**: 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
+- The cheap changes (a min-heap of suspects over players, a worklist of players with something to run, piles indexed by owner) are in: placements are byte-identical to before them (61 fills over 1, 2, 3 and 10 players, clock on and off, and the three-player fixture) and the time dropped 10 to 12 percent at 10 and 20 players. What is left is rule evaluation (the evaluations column is unchanged), not bookkeeping.
 - Every fill is one full solve, then incremental steps (`solves` 1 in all rows).
 
 
