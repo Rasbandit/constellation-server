@@ -1,14 +1,10 @@
 import { renderToString } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { HttpError } from './client';
+import { api, HttpError } from './client';
+import { openEventStream } from './sse';
+import { getAdminToken, rejectAdminToken, setAdminToken } from './token';
+import { NeedsToken } from '../components/TokenPrompt';
 
-// The pages only ask for a token against a real server (liveRooms); the vitest build is the stub.
-vi.mock('./client', async (orig) => ({ ...(await orig<typeof import('./client')>()), liveRooms: true }));
-
-const { api } = await import('./client');
-const { getAdminToken, rejectAdminToken, setAdminToken } = await import('./token');
-const { openEventStream } = await import('./sse');
-const { NeedsToken } = await import('../components/TokenPrompt');
 
 const TOKEN = 't'.repeat(32);
 let session: Map<string, string>;
@@ -39,7 +35,7 @@ function fetchAnswering(status: number) {
 
 describe('the admin token prompt', () => {
   it('shows the prompt, not the page, until a token is entered', () => {
-    const page = () => renderToString(<NeedsToken>the page</NeedsToken>);
+    const page = () => renderToString(<NeedsToken live>the page</NeedsToken>);
     expect(page()).toContain('Admin token');
     expect(page()).not.toContain('the page');
     setAdminToken(`  ${TOKEN}  `);
@@ -73,7 +69,7 @@ describe('the admin token prompt', () => {
     await expect(api.games()).rejects.toBeInstanceOf(HttpError);
     expect(getAdminToken()).toBeNull();
     expect(session.size).toBe(0);
-    const page = renderToString(<NeedsToken>the page</NeedsToken>);
+    const page = renderToString(<NeedsToken live>the page</NeedsToken>);
     expect(page).toContain('Admin token');
     expect(page).toContain('refused the admin token');
   });

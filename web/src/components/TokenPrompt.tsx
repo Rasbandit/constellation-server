@@ -3,9 +3,9 @@ import { liveRooms } from '../api/client';
 import { setAdminToken, useAdminToken } from '../api/token';
 
 /** Shows its page once the admin token is known; against the demo stub there is no token. */
-export function NeedsToken({ children }: { children: ReactNode }) {
+export function NeedsToken({ children, live = liveRooms }: { children: ReactNode; live?: boolean }) {
   const { token } = useAdminToken();
-  return !liveRooms || token ? <>{children}</> : <TokenPrompt />;
+  return !live || token ? <>{children}</> : <TokenPrompt />;
 }
 
 function TokenPrompt() {
