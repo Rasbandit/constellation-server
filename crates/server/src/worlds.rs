@@ -67,6 +67,9 @@ pub(crate) struct Worlds {
     proxy_header: Option<HeaderName>,
 }
 
+/// `status.engine` of a world the data-fill engine generates (a legacy world has none).
+const ENGINE_DATA_ONLY: &str = "data-only";
+
 /// What stores a kind of upload: its folder and file extension under the data folder, and which
 /// game names its record holds. Files go to `<data dir>/<folder>/<game>/<sha256>.<ext>` for every
 /// kind alike, so a new kind is one entry here plus its route.
@@ -616,6 +619,9 @@ fn prepare(w: &Worlds, world: &Path, apworlds: &[Value], yamls: &[Value]) -> Res
 async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
     let req: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("bad JSON: {e}")))?;
+    if req.get("manifest").is_some() {
+        return create_data_only_world(&w, &req);
+    }
     let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).map_err(bad)?;
     let yamls = chosen(&w, &req, "yamls", Kind::Yaml).map_err(bad)?;
     if yamls.is_empty() {
@@ -626,21 +632,60 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
     if modules.windows(2).any(|p| p.first() == p.get(1)) {
         return Err(bad("two apworlds have the same module name".to_owned()));
     }
-    let ids = |ms: &[Value]| ms.iter().map(|m| m["id"].clone()).collect::<Vec<_>>();
     let (apworld_ids, yaml_ids) = (ids(&apworlds), ids(&yamls));
+    let id = new_world_id(&w, &[&apworld_ids, &yaml_ids]);
+    let world = w.dir.join("worlds").join(&id);
+    prepare(&w, &world, &apworlds, &yamls).map_err(internal)?;
+    let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
+    queue(&w, world, status)
+}
+
+fn ids(metas: &[Value]) -> Vec<Value> {
+    metas.iter().map(|m| m["id"].clone()).collect()
+}
+
+/// A world id no other world has: a hash of the chosen ids, the time and a counter.
+fn new_world_id(w: &Worlds, chosen: &[&Vec<Value>]) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let n = w.seq.fetch_add(1, Ordering::Relaxed);
-    let seed = format!("{apworld_ids:?}{yaml_ids:?}{nanos}-{}-{n}", std::process::id());
-    let id = content_id(seed.as_bytes());
-    let world = w.dir.join("worlds").join(&id);
-    prepare(&w, &world, &apworlds, &yamls).map_err(internal)?;
-    let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
+    content_id(format!("{chosen:?}{nanos}-{}-{n}", std::process::id()).as_bytes())
+}
+
+/// Write the queued status and start the job: the one place every kind of world is queued.
+fn queue(w: &Arc<Worlds>, world: PathBuf, status: Value) -> Reply {
     write_status(&world, &status).map_err(internal)?;
+    let id = status["id"].clone();
     tracing::info!(world = %id, "generation queued");
-    tokio::spawn(generate(Arc::clone(&w), world, status));
+    tokio::spawn(generate(Arc::clone(w), world, status));
     Ok(json_reply(StatusCode::ACCEPTED, &json!({"id": id, "status": "queued"})))
+}
+
+/// `POST /api/worlds` with `{"manifest": <id>, "yamls": [<id>...]}`: a data-only world, filled by
+/// the engine in this process (no world code runs, no sandbox). The player files are JSON
+/// documents with a `name` and the world's options, pool and start items (`PlayerFile`).
+fn create_data_only_world(w: &Arc<Worlds>, req: &Value) -> Reply {
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    if req.get("apworlds").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+        return Err(bad("a manifest world takes no apworlds".to_owned()));
+    }
+    let manifest =
+        chosen(w, &json!({"manifest": [req["manifest"].clone()]}), "manifest", Kind::Manifest)
+            .map_err(bad)?;
+    let yamls = chosen(w, req, "yamls", Kind::Yaml).map_err(bad)?;
+    if yamls.is_empty() {
+        return Err(bad("choose at least one player file".to_owned()));
+    }
+    let world_ids = (ids(&manifest), ids(&yamls));
+    let id = new_world_id(w, &[&world_ids.0, &world_ids.1]);
+    let world = w.dir.join("worlds").join(&id);
+    std::fs::create_dir_all(&world).map_err(internal)?;
+    let status = json!({
+        "id": id, "status": "queued", "engine": ENGINE_DATA_ONLY,
+        "manifest": world_ids.0[0], "yamls": world_ids.1,
+    });
+    queue(w, world, status)
 }
 
 fn write_status(world: &Path, status: &Value) -> std::io::Result<()> {
@@ -671,25 +716,11 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
         tracing::error!(error = %e, "status write failed");
     }
     tracing::info!(world = %id, "generation running");
-    let (custom, yamls, out) =
-        (format!("{AP}/custom_worlds"), format!("{JOB}/yamls"), format!("{JOB}/out"));
-    let mounts = [
-        Mount::Ro(world.join("apworlds"), custom.clone()),
-        Mount::Ro(world.join("yamls"), yamls.clone()),
-        Mount::Scratch(out.clone()),
-    ];
-    let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
-    let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
-    let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
-        Ok(stdout) => publish(&w, stdout).await,
-        Err(e) => Err(e.to_string()),
+    let result = if status["engine"] == ENGINE_DATA_ONLY {
+        generate_data_only(&w, &status).await
+    } else {
+        generate_sandboxed(&w, &world, &id).await
     };
-    // The job's copies of its inputs; the uploads they came from stay in the data folder.
-    for sub in ["apworlds", "yamls"] {
-        if let Err(e) = std::fs::remove_dir_all(world.join(sub)) {
-            tracing::warn!(world = %id, error = %e, "job folder not cleaned up");
-        }
-    }
     let done = result.is_ok();
     match result {
         Ok((loaded, report)) => {
@@ -715,6 +746,95 @@ async fn generate(w: Arc<Worlds>, world: PathBuf, mut status: Value) {
     }
 }
 
+/// A legacy world: the sidecar generates it in the sandbox from the chosen files.
+async fn generate_sandboxed(w: &Worlds, world: &Path, id: &str) -> Result<(Loaded, Value), String> {
+    let (custom, yamls, out) =
+        (format!("{AP}/custom_worlds"), format!("{JOB}/yamls"), format!("{JOB}/out"));
+    let mounts = [
+        Mount::Ro(world.join("apworlds"), custom.clone()),
+        Mount::Ro(world.join("yamls"), yamls.clone()),
+        Mount::Scratch(out.clone()),
+    ];
+    let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
+    let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
+    let result = match w.sandbox.run(true, &mounts, &args, timeout).await {
+        Ok(stdout) => publish(w, stdout).await,
+        Err(e) => Err(e.to_string()),
+    };
+    // The job's copies of its inputs; the uploads they came from stay in the data folder.
+    for sub in ["apworlds", "yamls"] {
+        if let Err(e) = std::fs::remove_dir_all(world.join(sub)) {
+            tracing::warn!(world = %id, error = %e, "job folder not cleaned up");
+        }
+    }
+    result
+}
+
+/// What a player file of a manifest world holds: the slot's `name` and the world's instance for
+/// this player (`data_fill::Instance`: options, locations, pool, classes, start items).
+/// Real YAML player files are not read for manifest worlds yet (see #114).
+fn player_file(w: &Worlds, meta: &Value) -> Result<data_fill::seed::Player, String> {
+    let id = meta["id"].as_str().unwrap_or("");
+    let label = meta["name"].as_str().unwrap_or(id);
+    let path = record_dir(w, Kind::Yaml, id)
+        .ok_or(format!("no upload {id}"))?
+        .join(format!("{id}.{}", Kind::Yaml.ext()));
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc: Value = serde_json::from_slice(&raw)
+        .map_err(|e| format!("{label}: a manifest world reads JSON player files: {e}"))?;
+    let name = doc["name"].as_str().ok_or(format!("{label}: the player file has no name"))?;
+    let instance = serde::Deserialize::deserialize(&doc)
+        .map_err(|e| format!("{label}: not a player instance: {e}"))?;
+    Ok(data_fill::seed::Player { name: name.to_owned(), instance })
+}
+
+/// A manifest world: the engine fills it in this process, on a blocking thread (it is CPU
+/// work), under the same one-job-at-a-time permit, time limit and bundle size limit as a
+/// legacy world; the seed then goes through the same import and publish.
+/// shortcut: the time limit stops waiting, not the thread (the fill cannot be interrupted),
+/// and the sandbox's memory cap does not apply; move the fill to a subprocess if manifests
+/// from untrusted users arrive (see #115).
+async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value), String> {
+    let id = status["id"].as_str().unwrap_or("");
+    let manifest_id = status["manifest"].as_str().unwrap_or("");
+    let dir = record_dir(w, Kind::Manifest, manifest_id).ok_or("the manifest is gone")?;
+    let manifest = std::fs::read(dir.join(format!("{manifest_id}.{}", Kind::Manifest.ext())))
+        .map_err(|e| e.to_string())?;
+    let players = status["yamls"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|y| {
+            let y = y.as_str().unwrap_or("");
+            let meta = record_dir(w, Kind::Yaml, y)
+                .and_then(|d| read_json(&d.join(format!("{y}.json"))))
+                .ok_or(format!("no upload {y}"))?;
+            player_file(w, &meta)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // The seed is the world id's own hash: the same world id gives the same seed.
+    let rng_seed =
+        u64::from_le_bytes(Sha256::digest(id.as_bytes())[..8].try_into().unwrap_or([0; 8]));
+    let seed_name = format!("data-only-{}", id.get(..12).unwrap_or(id));
+    let limits = w.limits;
+    let report =
+        json!({"engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players.len()});
+    let job = tokio::task::spawn_blocking(move || -> Result<Loaded, String> {
+        let m: Value = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
+        let workers = config::FILL_SETUP_WORKERS;
+        let bundle = data_fill::seed::generate(&m, &seed_name, &players, rng_seed, workers)?;
+        let text = serde_json::to_string(&bundle).map_err(|e| e.to_string())?;
+        parse_bundle(text.as_bytes(), &limits)
+    });
+    let timeout = Duration::from_millis(limits.gen_timeout_ms);
+    let loaded = tokio::time::timeout(timeout, job)
+        .await
+        .map_err(|_| format!("generation took longer than {} ms", limits.gen_timeout_ms))?
+        .unwrap_or_else(|e| Err(e.to_string()))?;
+    publish_loaded(w, loaded.clone()).await?;
+    Ok((loaded, report))
+}
+
 /// Import the sidecar's v1 bundle (encoded to v2 off the runtime) into the host's store: its
 /// seed and packages, never a file. With `--rooms` it is also listed as a room, after its seed
 /// name is claimed.
@@ -725,12 +845,19 @@ async fn publish(w: &Worlds, stdout: Vec<u8>) -> Result<(Loaded, Value), String>
         parse_bundle(out.bundle.get().as_bytes(), &limits).map(|loaded| (loaded, out.report))
     });
     let (loaded, report) = parsed.await.unwrap_or_else(|e| Err(e.to_string()))?;
-    // The world's code chose the seed name: a hosted one is refused, listed or not.
+    publish_loaded(w, loaded.clone()).await?;
+    Ok((loaded, report))
+}
+
+/// Store a generated seed in the host's store and list it as a room (with `--rooms`), after its
+/// seed name is claimed. The world's generator chose the name: a hosted one is refused, listed
+/// or not.
+async fn publish_loaded(w: &Worlds, loaded: Loaded) -> Result<(), String> {
     let list = w.rooms.is_some();
     w.claim_seed(loaded.bundle.seed_name())?;
     let importer = w.importer.as_ref().ok_or("no host to store the seed in")?;
-    importer.import(loaded.clone(), list).await?;
-    Ok((loaded, report))
+    importer.import(loaded, list).await?;
+    Ok(())
 }
 
 /// The listed room of a finished world (`--rooms` only): its rooms folder, key and join address
@@ -1265,5 +1392,69 @@ mod tests {
             assert_eq!(e.0, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {}", e.1);
         }
         assert_eq!(json_of(list(&w, Kind::Manifest).unwrap()).await, json!([]), "nothing kept");
+    }
+
+    /// The wiring, end to end but for the HTTP layer: an uploaded manifest and two player files,
+    /// a queued world, the engine's fill, the seed stored in the host and its room listed and
+    /// loaded. Fails without `generate_data_only` (the world would stay queued, or fail).
+    #[tokio::test]
+    async fn a_manifest_world_is_generated_by_the_engine_and_hosted_as_a_room() {
+        let root = temp("data-only");
+        let rooms = root.join("rooms");
+        std::fs::create_dir_all(&rooms).unwrap();
+        let (_, mut host) =
+            crate::app(&crate::Source::Rooms(rooms), None, None, Limits::DESIGN).await.unwrap();
+        let (waker, folder) = (host.waker(), host.folder().unwrap());
+        tokio::spawn(async move { host.supervise().await });
+        let mut w = worlds(&root, Limits::DESIGN);
+        w.importer = Some(waker);
+        w.rooms = Some((folder, "host:1".to_owned()));
+        let w = Arc::new(w);
+
+        let body = manifest(|_| {});
+        let up = upload(&w, Kind::Manifest, Some("name=m.json"), &body).await.unwrap();
+        let manifest_id = json_of(up).await["id"].clone();
+        let doc: Value =
+            serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+                .unwrap();
+        let mut yamls = Vec::new();
+        for (k, name) in ["Ann", "Bo"].into_iter().enumerate() {
+            let mut player = doc["instances"][k].clone();
+            player["name"] = json!(name);
+            let meta = stored(
+                &root,
+                "yamls/fixture-game",
+                "yaml",
+                player.to_string().as_bytes(),
+                json!({"name": name}),
+            );
+            yamls.push(meta["id"].clone());
+        }
+        let req = json!({"manifest": manifest_id, "yamls": yamls});
+        let queued =
+            create_world(State(Arc::clone(&w)), Bytes::from(req.to_string())).await.unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
+        let mut status = read_status(&w, &id).unwrap();
+        assert_eq!(status["engine"], ENGINE_DATA_ONLY);
+        for _ in 0..600 {
+            status = read_status(&w, &id).unwrap();
+            if status["status"] != "queued" && status["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status["status"], "done", "{status}");
+        assert_eq!(status["slots"], 2);
+        assert_eq!(status["generation"]["engine"], ENGINE_DATA_ONLY);
+        let (folder, key, address) = hosted(&w, &status).expect("the room is listed");
+        assert_eq!(address, key.address("host:1"));
+        let (room, _visit) = folder.enter(key).await.unwrap();
+        let summary = room.summary().await.unwrap();
+        assert_eq!(summary["slots"].as_array().map(Vec::len), Some(2), "{summary}");
+        // A manifest world takes no apworlds.
+        let both = json!({"manifest": manifest_id, "yamls": yamls, "apworlds": ["x"]});
+        let e = create_world(State(w), Bytes::from(both.to_string())).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
     }
 }

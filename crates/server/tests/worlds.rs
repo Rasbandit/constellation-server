@@ -246,6 +246,59 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
     assert_eq!(connected["cmd"], "Connected", "{connected}");
 }
 
+/// A manifest world through the web API: the manifest and JSON player files are uploaded, the
+/// engine generates the seed (no sidecar runs), and a client joins the hosted room.
+#[tokio::test]
+async fn a_manifest_world_uploaded_over_http_becomes_a_room_a_client_joins() {
+    let setup = Setup::new("manifest");
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let env = setup.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+    let t = Some(TOKEN);
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    // The game `e2e::connect_packet` asks for.
+    manifest["game"] = json!("Archipela-Go 2: Electric Boogaloo");
+    manifest["version"] = json!("1");
+    let (st, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    assert_eq!(st, 201, "{m}");
+    let mut yamls = Vec::new();
+    for (k, name) in ["Ann", "Bo"].into_iter().enumerate() {
+        let mut player = doc["instances"][k].clone();
+        player["name"] = json!(name);
+        let (st, y) = http(
+            &server,
+            "PUT",
+            &format!("/api/yamls?name={name}.yaml"),
+            t,
+            player.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(st, 201, "{y}");
+        yamls.push(y["id"].clone());
+    }
+    let req = json!({"manifest": m["id"], "yamls": yamls}).to_string();
+    let (st, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 202, "{job}");
+    server.wait_for_log("generation done").unwrap();
+    let st = status(&server, job["id"].as_str().unwrap()).await;
+    assert_eq!(
+        (st["status"].as_str(), st["engine"].as_str()),
+        (Some("done"), Some("data-only")),
+        "{st}"
+    );
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (_, connected, _) = e2e::join_via(server.addr, &url, "Bo").await.unwrap();
+    assert_eq!(connected["cmd"], "Connected", "{connected}");
+}
+
 /// Start a server with a rooms folder and generate one world (the fixture); returns the server,
 /// the world id and its status once the server hosts it as a room.
 async fn hosted_world(setup: &Setup) -> (Server, String, Value) {
