@@ -81,14 +81,7 @@ impl Setup {
     }
 }
 
-/// The admin API's own address, from its log line.
-fn admin_addr(server: &Server) -> String {
-    let line = server.wait_for_log("admin api").unwrap();
-    let rest = line.split_once("addr=").unwrap().1;
-    rest.split_whitespace().next().unwrap().to_owned()
-}
-
-/// One HTTP/1.1 request to the admin API on its own connection; returns the status and the body
+/// One HTTP/1.1 request to the server's one port on its own connection; returns the status and the body
 /// as JSON (or as a JSON string when it is not JSON).
 async fn http(
     server: &Server,
@@ -97,7 +90,7 @@ async fn http(
     token: Option<&str>,
     body: &[u8],
 ) -> (u16, Value) {
-    request(&admin_addr(server), method, path, token, body).await
+    request(&server.addr.to_string(), method, path, token, body).await
 }
 
 async fn request(
@@ -319,7 +312,7 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     let fixture = e2e::fixture().unwrap();
     let view = |server: &Server| {
         let path = format!("/api/worlds/{id}/room");
-        let addr = admin_addr(server);
+        let addr = server.addr.to_string();
         async move { request(&addr, "GET", &path, Some(TOKEN), b"").await }
     };
     let (code, room) = view(&server).await;
@@ -340,7 +333,7 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     assert_eq!((&bob["items_received"], &bob["goal"]), (&json!(0), &json!(false)));
 
     // The event stream, on its own connection, before anything happens.
-    let addr = admin_addr(&server);
+    let addr = server.addr.to_string();
     let mut sse = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let head = format!(
         "GET /api/worlds/{id}/room/events HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
@@ -543,23 +536,24 @@ async fn an_upload_over_its_cap_is_refused_with_413() {
 async fn every_route_needs_the_admin_token() {
     let setup = Setup::new("auth");
     let server = setup.start();
+    // The burst of wrong tokens is 5 per client address: four tokenless requests and one wrong.
     for (method, path) in [
         ("GET", "/api/apworlds"),
         ("PUT", "/api/yamls?name=a.yaml"),
         ("POST", "/api/worlds"),
         ("GET", "/api/worlds/00"),
     ] {
-        for token in [None, Some("wrong"), Some("test-admin-token-test-admin-tokenx")] {
-            let (st, _) = http(&server, method, path, token, b"x").await;
-            assert_eq!(st, 401, "{method} {path} {token:?}");
-        }
+        let (st, _) = http(&server, method, path, None, b"x").await;
+        assert_eq!(st, 401, "{method} {path}");
     }
-    let room = server.url().trim_start_matches("ws://").to_owned();
-    let (st, _) = request(&room, "GET", "/healthz", None, b"").await;
+    let (st, _) = http(&server, "GET", "/api/apworlds", Some("wrong"), b"").await;
+    assert_eq!(st, 401);
+    let (st, _) = http(&server, "GET", "/api/apworlds", Some("wrong"), b"").await;
+    assert_eq!(st, 429, "past the burst, wrong tokens are rate limited");
+    let (st, _) = http(&server, "GET", "/api/apworlds", Some(TOKEN), b"").await;
+    assert_eq!(st, 200, "the right token is never limited");
+    let (st, _) = http(&server, "GET", "/healthz", None, b"").await;
     assert_eq!(st, 200, "the room's own routes are unchanged");
-    let (st, _) = request(&room, "GET", "/api/apworlds", Some(TOKEN), b"").await;
-    assert_eq!(st, 404, "the admin API is never on the room's port");
-    assert!(admin_addr(&server).starts_with("127.0.0.1:"), "loopback by default");
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ pub use view::view_start;
 pub mod wire;
 
 use config::Limits;
-use limit::RateTable;
+pub use limit::RateTable;
 use proto::Cid;
 use room_core::HintRules;
 use runtime::RoomHandle;

@@ -23,14 +23,16 @@ use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox};
 use crate::{Loaded, hex, parse_bundle};
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use config::{Generation, Limits};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -57,6 +59,11 @@ pub(crate) struct Worlds {
     rooms: Option<(RoomsFolder, String)>,
     /// The host's store, where every finished world's seed and packages go.
     importer: Option<Waker>,
+    /// Wrong tokens per client address (`admin_auth_fail_burst`).
+    auth_fails: edge_compat::RateTable<IpAddr>,
+    /// Behind a reverse proxy: the header carrying the client address (`--trusted-proxy-header`).
+    /// Off by default, because any client could send it.
+    proxy_header: Option<HeaderName>,
 }
 
 /// What stores a kind of upload: its folder and file extension under the data folder, and which
@@ -201,6 +208,12 @@ pub(crate) fn open(
         seq: AtomicU64::new(0),
         rooms: None,
         importer: None,
+        auth_fails: edge_compat::RateTable::new(
+            limits.admin_auth_fail_burst,
+            limits.admin_auth_fail_refill_milli_per_sec,
+            limits.rate_table_max_keys,
+        ),
+        proxy_header: None,
     })
 }
 
@@ -226,15 +239,18 @@ impl Worlds {
         Ok(())
     }
 
-    /// The routes, rooted at `/api`. With `rooms` (the host's rooms folder and the public
-    /// `host:port`), finished worlds are hosted as rooms.
+    /// The routes, rooted at `/api` (every path under it needs the token). With `rooms` (the
+    /// host's rooms folder and the public `host:port`), finished worlds are hosted as rooms.
+    /// `proxy_header` names the header a trusted reverse proxy puts the client address in.
     pub(crate) fn router(
         mut self,
         importer: Waker,
         rooms: Option<(RoomsFolder, String)>,
+        proxy_header: Option<HeaderName>,
     ) -> Router {
         self.rooms = rooms;
         self.importer = Some(importer);
+        self.proxy_header = proxy_header;
         routes(Arc::new(self))
     }
 }
@@ -249,17 +265,44 @@ fn routes(state: Arc<Worlds>) -> Router {
         .route("/api/worlds/{id}/room", get(room_summary))
         .route("/api/worlds/{id}/bundle", get(world_bundle))
         .route("/api/worlds/{id}/room/events", get(room_events))
+        // Anything else under /api is the token's too: 401 without it, never the web UI's 404.
+        .route("/api", any(StatusCode::NOT_FOUND))
+        .route("/api/", any(StatusCode::NOT_FOUND))
+        .route("/api/{*rest}", any(StatusCode::NOT_FOUND))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
         .layer(DefaultBodyLimit::max(body_cap))
         .with_state(state)
 }
 
+/// A wrong token is a bare 401 (no detail for a scanner). A client address that sends more than
+/// `admin_auth_fail_burst` of them gets 429 until its bucket refills. A right token is never
+/// counted or refused, so nobody can lock the admin out by guessing from the same address (all
+/// clients share the proxy's address unless `--trusted-proxy-header` is set).
 async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
     if authorized(req.headers(), &w.token) {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "admin token required").into_response()
+        return next.run(req).await;
     }
+    let ip = client_ip(&req, w.proxy_header.as_ref());
+    if w.auth_fails.take(ip, std::time::Instant::now()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let refill = u64::from(w.limits.admin_auth_fail_refill_milli_per_sec).max(1);
+    let wait = 1000_u64.div_ceil(refill).max(1);
+    let mut res = StatusCode::TOO_MANY_REQUESTS.into_response();
+    res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
+    res
+}
+
+/// The address failures are counted under: the last entry of the trusted proxy header (the one
+/// the proxy itself appended; earlier ones are the client's to forge), else the peer's.
+fn client_ip(req: &Request, proxy_header: Option<&HeaderName>) -> IpAddr {
+    proxy_header
+        .and_then(|name| req.headers().get(name))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
 /// `Authorization: Bearer <token>` whose SHA-256 equals `want`. Both sides are hashed first, so

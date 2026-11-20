@@ -72,7 +72,7 @@ impl Bucket {
 /// Buckets by key (a slot, a client address), shared by every session of a room, so a
 /// reconnect does not refill them.
 #[derive(Debug)]
-pub(crate) struct RateTable<K> {
+pub struct RateTable<K> {
     burst: u32,
     refill_milli_per_sec: u32,
     max_keys: usize,
@@ -80,12 +80,14 @@ pub(crate) struct RateTable<K> {
 }
 
 impl<K: Hash + Eq> RateTable<K> {
-    pub(crate) fn new(burst: u32, refill_milli_per_sec: u32, max_keys: usize) -> Self {
+    /// A table of buckets that start full at `burst` tokens and refill at `refill_milli_per_sec`.
+    #[must_use]
+    pub fn new(burst: u32, refill_milli_per_sec: u32, max_keys: usize) -> Self {
         Self { burst, refill_milli_per_sec, max_keys, buckets: Mutex::new(HashMap::new()) }
     }
 
     /// One token for `key` at `now`. The lock is never held across an await.
-    pub(crate) fn take(&self, key: K, now: Instant) -> bool {
+    pub fn take(&self, key: K, now: Instant) -> bool {
         self.with(key, now, |b| b.take(now))
     }
 

@@ -5,7 +5,7 @@
 //! Rules: a file that exists is served (tower-http `ServeDir`: content type, `Last-Modified`,
 //! ranges, the precompressed sibling the client accepts). A path that is not a file falls back to
 //! `index.html` only for a GET or HEAD that accepts HTML and whose last segment has no extension
-//! and is not under `/assets/` or `/api/` (the admin API is never on this port); anything else is a 404, so a broken asset link is never HTML.
+//! and is not under `/assets/`; anything else is a 404, so a broken asset link is never HTML.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
@@ -49,7 +49,10 @@ impl WebDir {
         // `//assets/x` is `/assets/x` everywhere. It is not percent-decoded.
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let normal = format!("/{}", parts.join("/"));
-        let target = if self.is_file(&parts).await {
+        // `/api` is the admin API's, never a file or a page (the router sends it there first).
+        let target = if parts.first() == Some(&"api") {
+            return StatusCode::NOT_FOUND.into_response();
+        } else if self.is_file(&parts).await {
             normal.as_str()
         } else if falls_back(method, path, &parts, h) {
             "/index.html"
@@ -88,8 +91,8 @@ impl WebDir {
 }
 
 /// May this missing path be answered with the app? Only a page load: a GET or HEAD that accepts
-/// HTML (no `Accept` counts), for a name without an extension, dot segment or `%` escape, outside `/assets/`
-/// and `/api/` (the admin API is never on this port).
+/// HTML (no `Accept` counts), for a name without an extension, dot segment or `%` escape, outside
+/// `/assets/`. `/api` never gets here: the router gates it, and [`WebDir::serve`] refuses it.
 fn falls_back(method: &Method, path: &str, parts: &[&str], h: &HeaderMap) -> bool {
     let accepts_html = h.get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_none_or(|a| {
         a.split(',')
@@ -100,7 +103,7 @@ fn falls_back(method: &Method, path: &str, parts: &[&str], h: &HeaderMap) -> boo
         && !path.contains('%')
         && parts.iter().all(|p| !p.starts_with('.'))
         && parts.last().is_none_or(|last| !last.contains('.'))
-        && parts.first().is_none_or(|first| !matches!(*first, "assets" | "api"))
+        && parts.first().is_none_or(|first| *first != "assets")
 }
 
 /// The headers every UI answer carries, and a weak `ETag` (size and mtime, per encoding) with
