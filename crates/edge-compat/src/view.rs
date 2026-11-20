@@ -6,6 +6,7 @@
 use crate::CompatRoom;
 use crate::session::Fanout;
 use proto::{Event, EventKind, Seq, SlotNo};
+use room_core::{Hint, hint_status};
 use runtime::{Published, RoomError, Subscription};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -47,25 +48,83 @@ impl CompatRoom {
         s.and_then(|s| s.flags(s.find(location)?)).unwrap_or(0)
     }
 
+    /// The receiver and item at `finding`'s `location`, from the placement.
+    fn target(&self, finding: u32, location: i64) -> Option<(u32, i64)> {
+        let s = self.bundle.slot(finding)?;
+        let (to, item) = s.target(s.find(location)?)?;
+        Some((self.bundle.slot_at(to)?.id(), item))
+    }
+
+    /// What a host sees of a hint: who finds it where, who gets which item, its status
+    /// ([`hint_status`] values) and whether it is found.
+    fn hint(&self, h: &Hint) -> Value {
+        let (finding, receiver) = (h.finding.0, h.receiver.0);
+        json!({
+            "finding": finding,
+            "finding_name": self.player(Some(finding)),
+            "receiver": receiver,
+            "receiver_name": self.player(Some(receiver)),
+            "item": h.item,
+            "item_name": self.item_name(receiver, h.item),
+            "location": h.location,
+            "location_name": self.location_name(finding, h.location),
+            "entrance": self.bundle.slot(finding).and_then(|s| s.entrance(h.location)),
+            "flags": self.flags(finding, h.location),
+            "status": h.status,
+            "found": h.found,
+        })
+    }
+
+    /// A hint event as the host sees it: `kind` and `seq`, the slot that wrote it, and the
+    /// hint with its new status. `found` is what the status says; a check finds the hint later
+    /// with a `checked` event, not a hint event.
+    fn hint_event(
+        &self,
+        kind: &str,
+        e: &Event,
+        finding: SlotNo,
+        location: i64,
+        status: u8,
+    ) -> Value {
+        let (receiver, item) = self.target(finding.0, location).unwrap_or_default();
+        let h = Hint {
+            finding,
+            location,
+            receiver: SlotNo(receiver),
+            item,
+            status,
+            found: status == hint_status::FOUND,
+        };
+        let mut v = self.hint(&h);
+        v["kind"] = json!(kind);
+        v["seq"] = json!(e.seq.0);
+        v["slot"] = json!(e.slot.map(|s| s.0));
+        v["name"] = json!(self.player(e.slot.map(|s| s.0)));
+        v
+    }
+
     /// The room now: its seed, and per slot its name, game, whether a session is on it, checked
-    /// locations of its total, items received and goal.
+    /// locations of its total, items received and goal; and every hint in the room, once each.
     ///
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.
     pub async fn summary(&self) -> Result<Value, RoomError> {
         let ids: Vec<u32> = self.bundle.slots().map(|s| s.id()).collect();
-        let progress = self
+        let (progress, hints) = self
             .room
             .read(move |s| {
-                ids.iter()
+                let progress = ids
+                    .iter()
                     .map(|&id| {
                         let slot = SlotNo(id);
                         let items = s.cursor(slot).map_or(0, |c| c.item_head.0);
                         (id, (s.checked_count(slot), items, s.has_goal(slot)))
                     })
-                    .collect::<BTreeMap<_, _>>()
+                    .collect::<BTreeMap<_, _>>();
+                (progress, s.hints())
             })
             .await?;
+        let hints: Vec<Value> = hints.iter().map(|h| self.hint(h)).collect();
         let online = self.presence.connections().await;
         let slots: Vec<Value> = self
             .bundle
@@ -95,7 +154,12 @@ impl CompatRoom {
             "release_mode": o.release_mode,
             "collect_mode": o.collect_mode,
         });
-        Ok(json!({"seed": self.bundle.seed_name(), "options": options, "slots": slots}))
+        Ok(json!({
+            "seed": self.bundle.seed_name(),
+            "options": options,
+            "slots": slots,
+            "hints": hints,
+        }))
     }
 
     /// A host's view of the room's stream: the durable events from where [`view_start`] puts
@@ -114,8 +178,8 @@ impl CompatRoom {
         Ok((self.room.subscribe(start).await?, start, reset))
     }
 
-    /// What a host sees of one durable event; `None` for events with nothing to show (data
-    /// storage writes and hints).
+    /// What a host sees of one durable event; `None` for data storage writes, which have
+    /// nothing to show.
     #[must_use]
     pub fn describe_event(&self, e: &Event) -> Option<Value> {
         let slot = e.slot.map(|s| s.0);
@@ -144,9 +208,15 @@ impl CompatRoom {
             EventKind::Goal => {
                 json!({"kind": "goal", "seq": e.seq.0, "slot": slot, "name": self.player(slot)})
             }
-            EventKind::KvSet { .. }
-            | EventKind::HintAdded { .. }
-            | EventKind::HintStatus { .. } => return None,
+            EventKind::HintAdded { finding, location, status, paid } => {
+                let mut v = self.hint_event("hint", e, *finding, *location, *status);
+                v["paid"] = json!(paid);
+                v
+            }
+            EventKind::HintStatus { finding, location, status } => {
+                self.hint_event("hint_status", e, *finding, *location, *status)
+            }
+            EventKind::KvSet { .. } => return None,
         })
     }
 

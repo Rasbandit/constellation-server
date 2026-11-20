@@ -257,11 +257,13 @@ impl RoomState {
     /// its `_read_hints_` key.
     #[must_use]
     pub fn hints_of(&self, slot: SlotNo) -> Vec<Hint> {
-        self.hints
-            .iter()
-            .filter_map(|(pos, i, r)| self.hint_view(pos, i, r.status))
-            .filter(|h| h.finding == slot || h.receiver == slot)
-            .collect()
+        self.hints().into_iter().filter(|h| h.finding == slot || h.receiver == slot).collect()
+    }
+
+    /// Every hint in the room, once each, in (finding slot, location) order.
+    #[must_use]
+    pub fn hints(&self) -> Vec<Hint> {
+        self.hints.iter().filter_map(|(pos, i, r)| self.hint_view(pos, i, r.status)).collect()
     }
 
     /// The one place a hint event changes state (called from `record`).

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyEvent, toFeed, toRoom, type RoomEvent, type RoomView } from './roomView';
+import { applyEvent, toFeed, toHint, toRoom, type HintView, type RoomEvent, type RoomView } from './roomView';
 
 const W = 'c'.repeat(64);
 
@@ -12,7 +12,42 @@ const view: RoomView = {
     { slot: 1, team: 0, name: 'Rasbandit-MM', game: '2 Ship 2 Harkinian (MM)', connected: true, clients: 1, checked: 1, locations: 1516, items_received: 1, goal: false },
     { slot: 2, team: 0, name: 'Bob', game: 'Other', connected: false, clients: 0, checked: 0, locations: 10, items_received: 0, goal: true },
   ],
+  hints: [],
 };
+
+const hint: HintView = {
+  finding: 1, finding_name: 'Alice', receiver: 2, receiver_name: 'Bob',
+  item: 126, item_name: 'Ocarina', location: 1, location_name: 'Clock Town Chest',
+  entrance: null, flags: 1, status: 30, found: false,
+};
+
+describe('toHint', () => {
+  it('takes names, flag and status from the server, keyed by finding slot and location', () => {
+    expect(toHint(hint)).toEqual({
+      id: '1:1',
+      finding: 1,
+      receiving: 2,
+      item: 'Ocarina',
+      flag: 'progression',
+      location: 'Clock Town Chest',
+      entrance: undefined,
+      status: 'priority',
+    });
+  });
+
+  it('shows found once checked, unnamed ids, an entrance, and an unknown status as unmarked', () => {
+    expect(toHint({ ...hint, found: true }).status).toBe('found');
+    expect(toHint({ ...hint, status: 20 }).status).toBe('avoid');
+    expect(toHint({ ...hint, status: 10 }).status).toBe('no_priority');
+    expect(toHint({ ...hint, status: 0 }).status).toBe('unspecified');
+    expect(toHint({ ...hint, status: 99 }).status).toBe('unspecified');
+    expect(toHint({ ...hint, item_name: null, location_name: null, entrance: 'Cave' })).toMatchObject({
+      item: 'item 126',
+      location: 'location 1',
+      entrance: 'Cave',
+    });
+  });
+});
 
 describe('toRoom', () => {
   it('takes every number and status from the server, inventing none', () => {
@@ -73,6 +108,20 @@ describe('toFeed', () => {
     expect(toFeed({ kind: 'leave', slot: 1, name: 'Alice' }, 1)).toMatchObject({ kind: 'leave', text: 'Alice disconnected' });
     expect(toFeed({ kind: 'chat', slot: 2, name: 'Bob', text: 'hi' }, 1)).toMatchObject({ kind: 'chat', text: 'Bob: hi' });
     expect(toFeed({ kind: 'goal', seq: 9, slot: 2, name: 'Bob' }, 1)).toMatchObject({ kind: 'goal', text: 'Bob reached their goal' });
+  });
+
+  it('describes a new hint and a status change as hint lines for both sides', () => {
+    expect(toFeed({ ...hint, status: 0, kind: 'hint', seq: 4, slot: 2, name: 'Bob', paid: true }, 1)).toEqual({
+      seq: 1,
+      at: '',
+      kind: 'hint',
+      text: "Hint: Bob's Ocarina is at Clock Town Chest in Alice's world (unmarked)",
+      slots: [1, 2],
+    });
+    expect(toFeed({ ...hint, kind: 'hint_status', seq: 5, slot: 2, name: 'Bob' }, 2)).toMatchObject({
+      kind: 'hint',
+      text: 'Bob marked Ocarina priority',
+    });
   });
 
   it('shows nothing for a check alone (its item event says it) or an unknown kind', () => {

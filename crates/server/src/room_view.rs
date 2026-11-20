@@ -223,6 +223,56 @@ mod tests {
         );
     }
 
+    /// Issue #82: a hint and its status change are on the stream, and the summary lists the
+    /// hint with its status until a check finds it.
+    #[tokio::test]
+    async fn hints_are_in_the_stream_and_the_summary() {
+        use proto::{Command, HintAsk, HintRequest, SlotNo};
+        let (_host, room, live) = fixture_room().await;
+        let (location, item, _) = e2e::locations_for(1, 2).unwrap()[0];
+        let ask = HintAsk { finding: SlotNo(1), location, status: 0 };
+        let req = HintRequest { slot: SlotNo(1), asks: vec![ask], pay: false, keep_found: true };
+        live.command(Command::Hint(Box::new(req))).await.unwrap().unwrap();
+        let status = Command::HintStatus {
+            slot: SlotNo(2),
+            finding: SlotNo(1),
+            location,
+            status: room_core::hint_status::PRIORITY,
+        };
+        live.command(status).await.unwrap().unwrap();
+
+        let mut s = Box::pin(entries(Arc::clone(&room), Seq(0), 400, None).await.unwrap());
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let (id, v) = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+                .await
+                .expect("an entry in time")
+                .expect("the stream is open");
+            got.push((id, v));
+        }
+        let (id, added) = &got[0];
+        assert_eq!(*id, Some(1));
+        assert_eq!(added["kind"], "hint");
+        assert_eq!((added["finding"].as_u64(), added["receiver"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(
+            (added["location"].as_i64(), added["item"].as_i64()),
+            (Some(location), Some(item))
+        );
+        assert_eq!((added["status"].as_u64(), &added["paid"]), (Some(0), &json!(false)));
+        assert!(added["item_name"].is_string() && added["location_name"].is_string());
+        let (id, changed) = &got[1];
+        assert_eq!((*id, &changed["kind"]), (Some(2), &json!("hint_status")));
+        assert_eq!((changed["slot"].as_u64(), changed["status"].as_u64()), (Some(2), Some(30)));
+
+        let hints = room.summary().await.unwrap()["hints"].clone();
+        assert_eq!(hints.as_array().map(Vec::len), Some(1), "one hint, listed once");
+        assert_eq!((hints[0]["status"].as_u64(), &hints[0]["found"]), (Some(30), &json!(false)));
+        let cid = proto::Cid(location.unsigned_abs());
+        live.command(Command::Check { slot: SlotNo(1), cid, location }).await.unwrap().unwrap();
+        let hints = room.summary().await.unwrap()["hints"].clone();
+        assert_eq!((hints[0]["status"].as_u64(), &hints[0]["found"]), (Some(40), &json!(true)));
+    }
+
     #[tokio::test]
     async fn history_is_capped_to_the_newest_events() {
         let (_host, room, live) = fixture_room().await;
