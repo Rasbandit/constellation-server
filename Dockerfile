@@ -1,4 +1,5 @@
-# Room server only: no web UI, no admin/generation API (that needs python and bwrap).
+# Room server plus the upload and generation API (--data-dir): python, bubblewrap and the generator
+# checkout. No web UI. GEN_REPO_URL and GEN_REPO_REF are required build args (docs/container.md).
 # The rust-toolchain.toml channel is `stable`, so the builder image tracks stable too.
 FROM rust:1-bookworm AS build
 WORKDIR /src
@@ -12,14 +13,37 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p server --bin constellation-server \
     && cp target/release/constellation-server /constellation-server
 
+# The generator checkout and a venv with what the sidecar and generator need. The venv is built on
+# the runtime's own distro so its python matches.
+FROM debian:bookworm-slim AS gen
+ARG GEN_REPO_URL
+ARG GEN_REPO_REF
+RUN if [ -z "$GEN_REPO_URL" ] || [ -z "$GEN_REPO_REF" ]; then \
+      echo "build args GEN_REPO_URL and GEN_REPO_REF are required (see docs/container.md)" >&2; exit 1; fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git python3 python3-venv python3-dev build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && git init -q /opt/gen/ap && cd /opt/gen/ap \
+    && git fetch -q --depth 1 "$GEN_REPO_URL" "$GEN_REPO_REF" && git checkout -q FETCH_HEAD \
+    && mkdir -p custom_worlds && rm -rf .git \
+    && grep -viE '^(kivy|pyshortcuts|#|[[:space:]]*$)' requirements.txt > /tmp/requirements.txt \
+    && python3 -m venv /opt/gen/venv \
+    && /opt/gen/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+
 # sqlx uses rustls with the system root certificates, so ca-certificates is the only runtime dependency.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates python3 bubblewrap \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home constellation \
     && mkdir -p /data/rooms && chown -R constellation /data
 COPY --from=build /constellation-server /usr/local/bin/constellation-server
+COPY --from=gen /opt/gen /opt/gen
+COPY tools/ap-gen /opt/constellation/tools/ap-gen
+COPY tools/ap-import /opt/constellation/tools/ap-import
+ENV CONSTELLATION_AP_DIR=/opt/gen/ap \
+    CONSTELLATION_AP_PYTHON=/opt/gen/venv/bin/python \
+    CONSTELLATION_AP_GEN_SCRIPT=/opt/constellation/tools/ap-gen/ap_gen.py
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER 10001
 EXPOSE 38281

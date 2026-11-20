@@ -3,7 +3,9 @@ target
 .github
 web
 docs
-tools
+tools/*
+!tools/ap-gen
+!tools/ap-import
 **/node_modules
 **/__pycache__
 .env

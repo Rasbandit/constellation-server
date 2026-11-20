@@ -27,16 +27,33 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ghcr.io/rasbandit/constellation-server:ci
-          build-args: BUILD_SHA=${{ github.sha }}
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            GEN_REPO_URL=${{ vars.GEN_REPO_URL }}
+            GEN_REPO_REF=${{ vars.GEN_REPO_REF }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Compose needs the build args set even with --no-build.
+      - run: echo "GEN_REPO_URL=${{ vars.GEN_REPO_URL }}" >> .env && echo "GEN_REPO_REF=${{ vars.GEN_REPO_REF }}" >> .env
       # Run the built image under compose: uid, secret read, healthcheck, Postgres 18 volume.
       - run: |
           mkdir secrets
           echo ci-password > secrets/postgres_password
           echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
-          chmod 400 secrets/database_url && sudo chown 10001 secrets/database_url
+          openssl rand -hex 16 > secrets/admin_token
+          chmod 400 secrets/database_url secrets/admin_token
+          sudo chown 10001 secrets/database_url secrets/admin_token
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
+      # The admin API: 401 without the token, 200 with it. Then a yaml upload runs the sandbox
+      # (bubblewrap under the seccomp profile) and must land under /data/yamls/<game>/.
+      - run: |
+          A=http://127.0.0.1:38282
+          T=$(cat secrets/admin_token)
+          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
+          printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
+          curl -sf -H "Authorization: Bearer $T" --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml"
+          docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
       - if: failure()
         run: docker compose logs
       - if: always()
@@ -74,6 +91,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GEN_REPO_URL=${{ vars.GEN_REPO_URL }}
+            GEN_REPO_REF=${{ vars.GEN_REPO_REF }}
           # A release build carries the bare version (no BUILD_SHA).
           cache-from: type=gha
           cache-to: type=gha,mode=max
