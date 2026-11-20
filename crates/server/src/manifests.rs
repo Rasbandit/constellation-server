@@ -3,12 +3,15 @@
 //! never reads a manifest, and a size-bounded in-memory cache in front of the bytes a generation
 //! reads.
 
-use log::{BlobKey, ManifestRecord, ManifestStore, MemLogStore, PgLogStore, StoreError};
+use log::{
+    BlobKey, ManifestRecord, ManifestStore, MemLogStore, PgLogStore, StoreError, UploadKind,
+    UploadRecord, UploadStore,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// Where the manifests live: the host's store.
+/// Where the manifests and the uploaded world and player files live: the host's store.
 #[derive(Debug, Clone)]
 pub(crate) enum Db {
     Pg(Arc<PgLogStore>),
@@ -16,6 +19,51 @@ pub(crate) enum Db {
 }
 
 impl Db {
+    /// Postgres: what is stored here outlives the process.
+    pub(crate) const fn is_durable(&self) -> bool {
+        matches!(self, Self::Pg(_))
+    }
+
+    pub(crate) async fn upload_put(
+        &self,
+        r: &UploadRecord,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Pg(s) => s.upload_put(r, bytes).await,
+            Self::Mem(s) => s.upload_put(r, bytes).await,
+        }
+    }
+
+    pub(crate) async fn upload_meta(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<String>, StoreError> {
+        match self {
+            Self::Pg(s) => s.upload_meta(kind, id).await,
+            Self::Mem(s) => s.upload_meta(kind, id).await,
+        }
+    }
+
+    pub(crate) async fn upload_bytes(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        match self {
+            Self::Pg(s) => s.upload_bytes(kind, id).await,
+            Self::Mem(s) => s.upload_bytes(kind, id).await,
+        }
+    }
+
+    pub(crate) async fn upload_list(&self, kind: UploadKind) -> Result<Vec<String>, StoreError> {
+        match self {
+            Self::Pg(s) => s.upload_list(kind).await,
+            Self::Mem(s) => s.upload_list(kind).await,
+        }
+    }
+
     async fn put(&self, r: &ManifestRecord, bytes: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Pg(s) => s.manifest_put(r, bytes).await,
@@ -103,7 +151,7 @@ pub(crate) struct Manifests {
 }
 
 /// The id as the 32 bytes it is the hex of. `id` must be 64 lowercase hex digits.
-fn key_of(id: &str) -> Option<BlobKey> {
+pub(crate) fn key_of(id: &str) -> Option<BlobKey> {
     let mut key = [0_u8; 32];
     if id.len() != 64 {
         return None;

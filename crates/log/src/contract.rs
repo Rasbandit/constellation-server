@@ -6,7 +6,8 @@
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
     AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, ManifestRecord,
-    ManifestStore, MemLogStore, Snapshot, StoreError, blob_key,
+    ManifestStore, MemLogStore, Snapshot, StoreError, UploadKind, UploadRecord, UploadStore,
+    blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore + ManifestStore {
+trait Store: LogStore + BlobStore + ManifestStore + UploadStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
 }
 
@@ -448,6 +449,42 @@ async fn a_cancelled_append_lands_whole_or_not_at_all_and_the_next_one_works<S: 
     println!("cancel safety: {cancels} of 200 rounds cancelled, head {head}");
 }
 
+fn upload(kind: UploadKind, game: &str, body: &[u8]) -> UploadRecord {
+    let id = blob_key(body);
+    let meta = format!("{game} {}", String::from_utf8_lossy(body));
+    UploadRecord { kind, id, game: game.to_owned(), meta }
+}
+
+/// An upload is stored once by kind and id with its record, read back whole and checked on
+/// write; the two kinds never see each other, and a listing is one kind's, ascending by id.
+async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>) {
+    let bodies: Vec<Vec<u8>> = (0..4).map(|i| format!("upload {i}").into_bytes()).collect();
+    let worlds: Vec<UploadRecord> =
+        bodies.iter().map(|b| upload(UploadKind::Apworld, "g", b)).collect();
+    for (r, b) in worlds.iter().zip(&bodies) {
+        s.upload_put(r, b).await.unwrap();
+    }
+    // The same file again keeps its first record and bytes.
+    s.upload_put(&upload(UploadKind::Apworld, "other", &bodies[0]), &bodies[0]).await.unwrap();
+    let (k, id) = (UploadKind::Apworld, worlds[0].id);
+    assert_eq!(s.upload_meta(k, &id).await.unwrap(), Some(worlds[0].meta.clone()));
+    assert_eq!(s.upload_bytes(k, &id).await.unwrap(), Some(bodies[0].clone()));
+    // The same bytes as a player file are another upload.
+    assert_eq!(s.upload_meta(UploadKind::Yaml, &id).await.unwrap(), None);
+    let player = upload(UploadKind::Yaml, "p", &bodies[0]);
+    s.upload_put(&player, &bodies[0]).await.unwrap();
+    assert_eq!(s.upload_list(UploadKind::Yaml).await.unwrap(), [player.meta]);
+    // Bytes that are not the id's are refused and leave nothing.
+    let lie = upload(UploadKind::Apworld, "g", b"other bytes");
+    assert!(matches!(s.upload_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
+    assert_eq!(s.upload_meta(UploadKind::Apworld, &lie.id).await.unwrap(), None);
+    assert_eq!(s.upload_bytes(UploadKind::Apworld, &blob_key(b"none")).await.unwrap(), None);
+    let mut want = worlds;
+    want.sort_by_key(|r| r.id);
+    let metas: Vec<String> = want.into_iter().map(|r| r.meta).collect();
+    assert_eq!(s.upload_list(UploadKind::Apworld).await.unwrap(), metas);
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -483,6 +520,7 @@ macro_rules! contract {
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
                 manifests_are_deduplicated_checked_and_listed_in_pages,
+                uploads_are_deduplicated_by_kind_checked_and_listed,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

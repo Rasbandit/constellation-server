@@ -719,6 +719,101 @@ impl crate::ManifestStore for PgLogStore {
     }
 }
 
+/// Uploads in the `world_uploads` table (migration 0005).
+impl crate::UploadStore for PgLogStore {
+    async fn upload_put(&self, r: &crate::UploadRecord, bytes: &[u8]) -> Result<(), StoreError> {
+        if crate::blob_key(bytes) != r.id {
+            return Err(StoreError::Corrupt(
+                "an upload put under an id it does not hash to".into(),
+            ));
+        }
+        let (r, bytes) = (r.clone(), bytes.to_vec());
+        let size = bound(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    // Write once; a row whose bytes are not its id's (torn) is healed.
+                    "INSERT INTO world_uploads (kind, id, game, size, meta, bytes) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (kind, id) DO UPDATE SET bytes = EXCLUDED.bytes \
+                     WHERE sha256(world_uploads.bytes) <> world_uploads.id",
+                )
+                .bind(r.kind.as_str())
+                .bind(r.id.to_vec())
+                .bind(&r.game)
+                .bind(size)
+                .bind(&r.meta)
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn upload_meta(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<String>, StoreError> {
+        let id = id.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT meta FROM world_uploads WHERE kind = $1 AND id = $2")
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn upload_bytes(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = id.to_vec();
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT bytes FROM world_uploads WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        match found {
+            Some(b) if crate::blob_key(&b) != *id => {
+                Err(StoreError::Corrupt("a stored upload does not match its id".into()))
+            }
+            found => Ok(found),
+        }
+    }
+
+    async fn upload_list(&self, kind: crate::UploadKind) -> Result<Vec<String>, StoreError> {
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT meta FROM world_uploads WHERE kind = $1 ORDER BY id")
+                    .bind(kind.as_str())
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
 /// A manifest's listing columns (never its bytes).
 #[derive(sqlx::FromRow)]
 struct ManifestRow {

@@ -277,6 +277,84 @@ pub trait ManifestStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<ManifestRecord>, StoreError>> + Send;
 }
 
+/// The kinds of upload a legacy generation reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UploadKind {
+    /// A world file (`.apworld`).
+    Apworld,
+    /// A player file (`.yaml`).
+    Yaml,
+}
+
+impl UploadKind {
+    /// The kind's name in the store (`world_uploads.kind`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apworld => "apworld",
+            Self::Yaml => "yaml",
+        }
+    }
+}
+
+/// An upload's record: what the upload API answers with, kept beside the file so a listing
+/// never reads a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// Which kind of upload.
+    pub kind: UploadKind,
+    /// The content address: the SHA-256 of the file.
+    pub id: BlobKey,
+    /// The game it is for, as one folder-style name (shown and grouped only).
+    pub game: String,
+    /// The record as JSON text, opaque to the store.
+    pub meta: String,
+}
+
+/// Uploaded world and player files, deduplicated by kind and content address, with their
+/// records beside them. Memory and Postgres implement it.
+pub trait UploadStore: Send + Sync + 'static {
+    /// Store a file under `record.id` (its SHA-256). Idempotent: a file already stored keeps
+    /// its record.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when `record.id` is not the hash of `bytes`; the store failing.
+    fn upload_put(
+        &self,
+        record: &UploadRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// An upload's record (JSON text), without its file.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_meta(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
+    /// An upload's file, checked against its id.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the stored bytes do not hash to `id`; the store failing.
+    fn upload_bytes(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+
+    /// Every record of `kind` (JSON text), ascending by id.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_list(
+        &self,
+        kind: UploadKind,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+}
+
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
 #[must_use]
 pub fn blob_key(bytes: &[u8]) -> BlobKey {

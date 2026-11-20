@@ -250,8 +250,8 @@ fn open_mode_warning(api_on: bool, token: Option<&str>) -> Option<&'static str> 
 
 /// The admin API (`/api/*`, token-gated) on the room router, ahead of the WebSocket upgrade and
 /// the web UI, which only take what `/healthz`, `/version` and `/api` did not. No admin API
-/// without `--data-dir`.
-fn mount_admin(
+/// without `--data-dir`. Uploads an older server kept as files move into the host's store first.
+async fn mount_admin(
     router: Router,
     api: Option<worlds::Worlds>,
     host: &Host,
@@ -259,12 +259,15 @@ fn mount_admin(
     proxy_header: Option<axum::http::HeaderName>,
 ) -> Router {
     match api {
-        Some(w) => router.merge(w.router(
-            host.waker(),
-            host.folder().map(|f| (f, public_addr)),
-            proxy_header,
-            host.manifest_db(),
-        )),
+        Some(w) => router.merge(
+            w.router(
+                host.waker(),
+                host.folder().map(|f| (f, public_addr)),
+                proxy_header,
+                host.manifest_db(),
+            )
+            .await,
+        ),
         None => router,
     }
 }
@@ -770,7 +773,8 @@ pub async fn run(
             &host,
             format!("{}:{}", args.public_host, addr.port()),
             args.trusted_proxy_header,
-        );
+        )
+        .await;
         tracing::info!(%addr, rooms = host.len(), "listening");
         Ok::<_, RunError>((listener, router, host))
     };
@@ -999,7 +1003,8 @@ mod tests {
         let e = worlds_api(Some(&dir), Some("t"), None, Limits::DESIGN).unwrap_err();
         assert!(e.contains("CONSTELLATION_AP_DIR"), "{e}");
         assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
-        assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
+        // Uploads live in the store (#119): no upload folders, only job folders.
+        assert!(!dir.join("apworlds").exists() && dir.join("worlds").is_dir());
         assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
     }
 
@@ -1065,7 +1070,8 @@ mod tests {
             &host,
             "localhost:1".to_owned(),
             proxy_header.map(|h| h.parse().unwrap()),
-        );
+        )
+        .await;
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {

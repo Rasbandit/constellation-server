@@ -71,7 +71,7 @@ server {
 In token mode, add `--trusted-proxy-header X-Forwarded-For` to the server command, and only if the proxy is the only way to reach the port. The compose file publishes `38281` on all interfaces (it also serves players directly), so the header would be forgeable by anyone who reaches the port directly: firewall it to the proxy first, or change the publish to `127.0.0.1:38281:38281` in your own override (the shipped default is left as is).
 
 ## Uploads
-The admin API (`--data-dir /data`, on the room port) stores uploaded files as `/data/<kind>/<game>/<sha256>.<ext>` (`/data/apworlds/...`, `/data/yamls/...`; layout in the README). Game manifests will land in `/data/manifests/<game>/` once their upload route ships (#101). Back up the `data` volume and the `pgdata` volume together: uploads are files, the room logs and finished seeds are in Postgres.
+The admin API (`--data-dir /data`, on the room port) stores uploaded world and player files, and game manifests, in Postgres (README). The `data` volume holds only each generation's job folder and status; back up the `pgdata` volume for everything else. Files an older image kept under `/data/apworlds/` and `/data/yamls/` are moved into Postgres on the first start of this one.
 
 In open mode no header is needed. In token mode every route needs `Authorization: Bearer <token>` (the Docker secret `secrets/admin_token`, at least 32 bytes).
 

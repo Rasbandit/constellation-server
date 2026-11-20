@@ -35,7 +35,11 @@ pub struct MemLogStore {
     packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
+    uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
 }
+
+/// An upload's record and file.
+type Upload = (crate::UploadRecord, Vec<u8>);
 
 /// Insert unless present, under the lock; what is stored after.
 fn put_once<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: K, v: &[u8]) -> Vec<u8> {
@@ -297,6 +301,74 @@ impl crate::ManifestStore for MemLogStore {
             .cloned()
             .collect();
         ready(Ok(page))
+    }
+}
+
+impl MemLogStore {
+    /// Damage a stored upload's bytes, as a torn write would, so a test can see the read
+    /// check and the heal.
+    pub fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
+        let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(&(kind, *id)) {
+            bytes.push(0);
+        }
+    }
+}
+
+impl crate::UploadStore for MemLogStore {
+    fn upload_put(
+        &self,
+        record: &crate::UploadRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let ok = crate::blob_key(bytes) == record.id;
+        if ok {
+            let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+            let row = m
+                .entry((record.kind, record.id))
+                .or_insert_with(|| (record.clone(), bytes.to_vec()));
+            // A torn row is healed, as on Postgres.
+            if crate::blob_key(&row.1) != record.id {
+                bytes.clone_into(&mut row.1);
+            }
+        }
+        ready(if ok {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("an upload put under an id it does not hash to".into()))
+        })
+    }
+
+    fn upload_meta(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).map(|(r, _)| r.meta.clone())))
+    }
+
+    fn upload_bytes(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(match m.get(&(kind, *id)) {
+            Some((_, b)) if crate::blob_key(b) != *id => {
+                Err(StoreError::Corrupt("a stored upload does not match its id".into()))
+            }
+            found => Ok(found.map(|(_, b)| b.clone())),
+        })
+    }
+
+    fn upload_list(
+        &self,
+        kind: crate::UploadKind,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        let all = m.iter().filter(|((k, _), _)| *k == kind).map(|(_, (r, _))| r.meta.clone());
+        ready(Ok(all.collect()))
     }
 }
 

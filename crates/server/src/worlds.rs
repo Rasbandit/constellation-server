@@ -1,14 +1,15 @@
 //! Uploads of `.apworld` and player `.yaml` files, and seed generation from a chosen set of
 //! them, over HTTP. Admin only: every route needs `Authorization: Bearer <token>`.
 //!
-//! Storage is plain files under the data folder:
-//! - `apworlds/<game>/<sha256>.apworld` and `yamls/<game>/<sha256>.yaml`, content-addressed,
-//!   each with a `<sha256>.json` holding the upload's name and what the sidecar's inspect found.
-//!   `<game>` is the inspected game name made safe by [`game_slug`] (a yaml of several games
-//!   goes under `mixed`). The id stays the sha256, so a lookup scans the game folders; files
-//!   from before the game folders sit directly in `apworlds/` and `yamls/` and are read too;
+//! Storage:
+//! - uploads live in the host's store (`world_uploads`, migration 0005), content-addressed by
+//!   their sha256, each with its record: the upload's name and what the sidecar's inspect found,
+//!   and its game ([`game_slug`]; a yaml of several games is `mixed`). Every server instance
+//!   sees them. Uploads an older server kept as files (`apworlds/` and `yamls/`, by game or
+//!   flat) are moved into the store at startup ([`Worlds::import_files`]);
 //! - `worlds/<id>/` per generation: `apworlds/<module>.apworld` and `yamls/` (the chosen
-//!   files), `status.json`, and on success `bundle.seed` (seed file v2) with its game packages
+//!   files, written from the store for the job and removed when it ends), `status.json`
+//!   (not in the store yet, see #119), and on success `bundle.seed` (seed file v2) with its game packages
 //!   in `packages/` (`docs/seed-bundle-v2.md`). The server converts the sidecar's stdout (v1
 //!   JSON from `tools/ap-import`) to v2 itself; no folder here is ever writable inside the
 //!   sandbox.
@@ -31,6 +32,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, put};
 use config::{Generation, Limits};
+use log::{UploadKind, UploadRecord};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -55,6 +57,8 @@ pub(crate) struct Worlds {
     checks: Semaphore,
     /// Uploaded manifests: in the database, with a bounded cache.
     manifests: Manifests,
+    /// Uploaded world and player files: in the database.
+    uploads: manifests::Db,
     /// How a manifest fill or check runs.
     jobs: JobRunner,
     /// Uploads and generation requests per client address (`admin_write_burst`).
@@ -99,9 +103,9 @@ impl Drop for JobSlot {
     }
 }
 
-/// What stores a kind of upload: its folder and file extension under the data folder, and which
-/// game names its record holds. Files go to `<data dir>/<folder>/<game>/<sha256>.<ext>` for every
-/// kind alike, so a new kind is one entry here plus its route.
+/// What stores a kind of upload: its folder and file extension (in a job folder, and under the
+/// data folder of an older server), and which game names its record holds. Every kind is stored
+/// alike, so a new kind is one entry here plus its route and a [`UploadKind`].
 struct KindSpec {
     folder: &'static str,
     ext: &'static str,
@@ -141,6 +145,12 @@ impl Kind {
     }
     const fn ext(self) -> &'static str {
         self.spec().ext
+    }
+    const fn store(self) -> UploadKind {
+        match self {
+            Self::Apworld => UploadKind::Apworld,
+            Self::Yaml => UploadKind::Yaml,
+        }
     }
     const fn cap(self, l: &Limits) -> usize {
         match self {
@@ -184,15 +194,6 @@ fn game_folder(kind: Kind, meta: &Value) -> String {
     }
 }
 
-/// The folder holding upload `id`'s files: its game folder, or the old flat folder. `id` must
-/// pass [`valid_id`].
-fn record_dir(dir: &Path, kind: Kind, id: &str) -> Option<PathBuf> {
-    let store = dir.join(kind.folder());
-    let json = format!("{id}.json");
-    let games = std::fs::read_dir(&store).ok()?.filter_map(Result::ok).map(|e| e.path());
-    std::iter::once(store.clone()).chain(games).find(|d| d.join(&json).is_file())
-}
-
 type Reply = Result<Response, (StatusCode, String)>;
 
 fn internal(e: impl core::fmt::Display) -> (StatusCode, String) {
@@ -231,10 +232,11 @@ pub(crate) fn open(
     if dir.join("tmp").exists() {
         std::fs::remove_dir_all(dir.join("tmp")).map_err(io)?;
     }
-    for sub in ["apworlds", "yamls", "worlds", "tmp"] {
+    for sub in ["worlds", "tmp"] {
         std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     recover(&dir.join("worlds"))?;
+    let mem = Arc::new(log::MemLogStore::new());
     Ok(Worlds {
         dir: dir.to_owned(),
         token: token.map(|t| Sha256::digest(t.as_bytes()).into()),
@@ -243,7 +245,9 @@ pub(crate) fn open(
         one_gen: Arc::new(Semaphore::new(limits.gen_concurrency.max(1))),
         queued: Arc::new(AtomicUsize::new(0)),
         checks: Semaphore::new(limits.manifest_check_concurrency.max(1)),
-        manifests: Manifests::new(manifests::Db::Mem(Arc::new(log::MemLogStore::new())), &limits),
+        // Until [`Worlds::router`] gives it the host's store.
+        manifests: Manifests::new(manifests::Db::Mem(Arc::clone(&mem)), &limits),
+        uploads: manifests::Db::Mem(mem),
         jobs: JobRunner::Child(crate::sandbox::exe_path()?),
         write_rate: edge_compat::RateTable::new(
             limits.admin_write_burst,
@@ -319,21 +323,108 @@ impl Worlds {
         Ok(())
     }
 
-    /// The routes, rooted at `/api` (every path under it needs the token). With `rooms` (the
-    /// host's rooms folder and the public `host:port`), finished worlds are hosted as rooms.
+    /// The routes, rooted at `/api` (every path under it needs the token), on the host's store
+    /// `db`, after the files an older server kept are moved into it. With `rooms` (the host's
+    /// rooms folder and the public `host:port`), finished worlds are hosted as rooms.
     /// `proxy_header` names the header a trusted reverse proxy puts the client address in.
-    pub(crate) fn router(
+    pub(crate) async fn router(
         mut self,
         importer: Waker,
         rooms: Option<(RoomsFolder, String)>,
         proxy_header: Option<HeaderName>,
-        manifests: manifests::Db,
+        db: manifests::Db,
     ) -> Router {
-        self.manifests = Manifests::new(manifests, &self.limits);
+        self.uploads = db.clone();
+        self.manifests = Manifests::new(db, &self.limits);
+        self.import_files(self.uploads.is_durable()).await;
         self.rooms = rooms;
         self.importer = Some(importer);
         self.proxy_header = proxy_header;
         routes(Arc::new(self))
+    }
+}
+
+impl Worlds {
+    /// Upload `id`'s record, if stored.
+    ///
+    /// # Errors
+    /// The store failing, or a record that is not JSON.
+    async fn upload_meta(&self, kind: Kind, id: &str) -> Result<Option<Value>, String> {
+        let Some(key) = manifests::key_of(id) else { return Ok(None) };
+        let meta = self.uploads.upload_meta(kind.store(), &key).await;
+        let meta = meta.map_err(|e| format!("the store: {e:?}"))?;
+        meta.map(|m| serde_json::from_str(&m).map_err(|e| format!("upload {id}: bad record: {e}")))
+            .transpose()
+    }
+
+    /// Upload `id`'s file, checked against its id.
+    ///
+    /// # Errors
+    /// No such upload, or the store failing.
+    async fn upload_file(&self, kind: Kind, id: &str) -> Result<Vec<u8>, String> {
+        let key = manifests::key_of(id).ok_or(format!("bad id {id}"))?;
+        let file = self.uploads.upload_bytes(kind.store(), &key).await;
+        file.map_err(|e| format!("upload {id}: {e:?}"))?.ok_or(format!("no upload {id}"))
+    }
+
+    /// Move the uploads an older server kept as files (`apworlds/` and `yamls/`, in game
+    /// folders or flat) into the store, each checked against its id. With `remove` (a durable
+    /// store) each file and its record go once stored, and then every folder left empty; an
+    /// in-memory store keeps them, to read again on the next start. A file that does not move
+    /// stays, with a warning, and is tried again on the next start.
+    async fn import_files(&self, remove: bool) {
+        let (mut moved, mut kept) = (0_usize, 0_usize);
+        for kind in [Kind::Apworld, Kind::Yaml] {
+            let root = self.dir.join(kind.folder());
+            let Ok(games) = std::fs::read_dir(&root) else { continue };
+            let mut dirs = vec![root];
+            dirs.extend(games.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()));
+            for dir in &dirs {
+                let Ok(entries) = std::fs::read_dir(dir) else { continue };
+                let records = entries.filter_map(Result::ok).map(|e| e.path());
+                for record in records.filter(|p| p.extension().is_some_and(|x| x == "json")) {
+                    match self.import_file(kind, &record, remove).await {
+                        Ok(()) => moved += 1,
+                        Err(why) => {
+                            kept += 1;
+                            let file = record.display();
+                            tracing::warn!(%file, "old upload not moved into the store: {why}");
+                        }
+                    }
+                }
+            }
+            if remove {
+                // Game folders first, then the kind's; only an empty folder is removed.
+                for dir in dirs.iter().rev() {
+                    drop(std::fs::remove_dir(dir));
+                }
+            }
+        }
+        if moved + kept > 0 {
+            tracing::info!(moved, kept, removed = remove, "old upload files moved into the store");
+        }
+    }
+
+    /// Move one upload an older server kept: `record` is its `<id>.json`, beside its file.
+    async fn import_file(&self, kind: Kind, record: &Path, remove: bool) -> Result<(), String> {
+        let id = record.file_stem().and_then(|s| s.to_str()).filter(|s| valid_id(s));
+        let id = id.ok_or("not an upload record")?;
+        let file = record.with_extension(kind.ext());
+        let meta = read_json(record).ok_or("its record is not readable JSON")?;
+        let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        if content_id(&bytes) != id {
+            return Err("its file does not hash to its id".to_owned());
+        }
+        let key = manifests::key_of(id).ok_or("bad id")?;
+        let game = game_folder(kind, &meta);
+        let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
+        self.uploads.upload_put(&row, &bytes).await.map_err(|e| format!("the store: {e:?}"))?;
+        if remove {
+            for path in [&file, record] {
+                std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -594,9 +685,7 @@ async fn upload(w: &Worlds, kind: Kind, query: Option<&str>, body: &[u8]) -> Rep
         return Err((StatusCode::BAD_REQUEST, "empty upload".to_owned()));
     }
     let id = content_id(body);
-    if let Some(meta) =
-        record_dir(&w.dir, kind, &id).and_then(|d| read_json(&d.join(format!("{id}.json"))))
-    {
+    if let Some(meta) = w.upload_meta(kind, &id).await.map_err(internal)? {
         return Ok(json_reply(StatusCode::OK, &meta));
     }
     let n = w.seq.fetch_add(1, Ordering::Relaxed);
@@ -626,12 +715,10 @@ async fn inspect_and_store(
     for (k, v) in [("id", json!(id)), ("name", json!(name)), ("bytes", json!(body.len()))] {
         meta[k] = v;
     }
-    let store = w.dir.join(kind.folder()).join(game_folder(kind, &meta));
-    std::fs::create_dir_all(&store).map_err(internal)?;
-    std::fs::rename(tmp.join(&file), store.join(format!("{id}.{}", kind.ext())))
-        .map_err(internal)?;
-    write_atomic(&store.join(format!("{id}.json")), meta.to_string().as_bytes())
-        .map_err(internal)?;
+    let key = manifests::key_of(id).ok_or_else(|| internal("an upload id that is not hex"))?;
+    let game = game_folder(kind, &meta);
+    let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
+    w.uploads.upload_put(&row, body).await.map_err(store_error)?;
     Ok(meta)
 }
 
@@ -683,50 +770,53 @@ fn valid_module(m: &str) -> bool {
 }
 
 async fn list_apworlds(State(w): State<Arc<Worlds>>) -> Reply {
-    list(&w, Kind::Apworld)
+    list(&w, Kind::Apworld).await
 }
 
 async fn list_yamls(State(w): State<Arc<Worlds>>) -> Reply {
-    list(&w, Kind::Yaml)
+    list(&w, Kind::Yaml).await
 }
 
-fn list(w: &Worlds, kind: Kind) -> Reply {
-    let store = w.dir.join(kind.folder());
-    let games =
-        std::fs::read_dir(&store).map_err(internal)?.filter_map(Result::ok).map(|e| e.path());
-    let mut all: Vec<Value> = std::iter::once(store.clone())
-        .chain(games.filter(|p| p.is_dir()))
-        .filter_map(|d| std::fs::read_dir(d).ok())
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| read_json(&e.path()))
-        .collect();
+async fn list(w: &Worlds, kind: Kind) -> Reply {
+    let records = w.uploads.upload_list(kind.store()).await.map_err(store_error)?;
+    let mut all: Vec<Value> = records.iter().filter_map(|r| serde_json::from_str(r).ok()).collect();
     let key = |v: &Value| (v["name"].as_str().unwrap_or("").to_owned(), v["id"].to_string());
     all.sort_by_key(key);
     Ok(json_reply(StatusCode::OK, &Value::Array(all)))
 }
 
-/// The ids in `body[field]`: each valid, stored, and listed once.
-fn chosen(w: &Worlds, body: &Value, field: &str, kind: Kind) -> Result<Vec<Value>, String> {
-    let ids = body.get(field).and_then(Value::as_array).ok_or(format!("{field} must be a list"))?;
+/// The ids in `body[field]`: each valid, stored, and listed once. A bad choice is a 400 with
+/// its reason; the store failing is a 500.
+async fn chosen(
+    w: &Worlds,
+    body: &Value,
+    field: &str,
+    kind: Kind,
+) -> Result<Vec<Value>, (StatusCode, String)> {
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let ids = body.get(field).and_then(Value::as_array);
+    let ids = ids.ok_or_else(|| bad(format!("{field} must be a list")))?;
     let mut metas = Vec::with_capacity(ids.len());
-    for id in ids {
-        let id = id.as_str().filter(|i| valid_id(i)).ok_or(format!("{field}: bad id {id}"))?;
+    for raw in ids {
+        let id = raw.as_str().filter(|i| valid_id(i));
+        let id = id.ok_or_else(|| bad(format!("{field}: bad id {raw}")))?;
         if metas.iter().any(|m: &Value| m["id"] == id) {
-            return Err(format!("{field}: {id} is listed twice"));
+            return Err(bad(format!("{field}: {id} is listed twice")));
         }
-        let meta = record_dir(&w.dir, kind, id)
-            .and_then(|d| read_json(&d.join(format!("{id}.json"))))
-            .ok_or(format!("{field}: no upload {id}"))?;
-        metas.push(meta);
+        let meta = w.upload_meta(kind, id).await.map_err(internal)?;
+        metas.push(meta.ok_or_else(|| bad(format!("{field}: no upload {id}")))?);
     }
     Ok(metas)
 }
 
-/// Lay out a world folder: the chosen files (apworlds named by module, as Archipelago loads
-/// them).
-fn prepare(w: &Worlds, world: &Path, apworlds: &[Value], yamls: &[Value]) -> Result<(), String> {
+/// Lay out a world folder: the chosen files, written from the store (apworlds named by
+/// module, as Archipelago loads them).
+async fn prepare(
+    w: &Worlds,
+    world: &Path,
+    apworlds: &[Value],
+    yamls: &[Value],
+) -> Result<(), String> {
     let e = |e: std::io::Error| e.to_string();
     for sub in ["apworlds", "yamls"] {
         std::fs::create_dir_all(world.join(sub)).map_err(e)?;
@@ -735,13 +825,9 @@ fn prepare(w: &Worlds, world: &Path, apworlds: &[Value], yamls: &[Value]) -> Res
         for m in metas {
             let id = m["id"].as_str().unwrap_or("");
             let stem = if kind == Kind::Apworld { m["module"].as_str().unwrap_or("") } else { id };
-            let from = record_dir(&w.dir, kind, id)
-                .ok_or(format!("no upload {id}"))?
-                .join(format!("{id}.{}", kind.ext()));
+            let file = w.upload_file(kind, id).await?;
             let to = world.join(kind.folder()).join(format!("{stem}.{}", kind.ext()));
-            if std::fs::hard_link(&from, &to).is_err() {
-                std::fs::copy(&from, &to).map_err(e)?;
-            }
+            std::fs::write(&to, file).map_err(e)?;
         }
     }
     Ok(())
@@ -754,8 +840,8 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
     if req.get("manifest").is_some() {
         return create_data_only_world(&w, &req, slot).await;
     }
-    let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).map_err(bad)?;
-    let yamls = chosen(&w, &req, "yamls", Kind::Yaml).map_err(bad)?;
+    let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).await?;
+    let yamls = chosen(&w, &req, "yamls", Kind::Yaml).await?;
     if yamls.is_empty() {
         return Err(bad("choose at least one yaml".to_owned()));
     }
@@ -767,7 +853,7 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
     let (apworld_ids, yaml_ids) = (ids(&apworlds), ids(&yamls));
     let id = new_world_id(&w, &[&apworld_ids, &yaml_ids]);
     let world = w.dir.join("worlds").join(&id);
-    prepare(&w, &world, &apworlds, &yamls).map_err(internal)?;
+    prepare(&w, &world, &apworlds, &yamls).await.map_err(internal)?;
     let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
     queue(&w, world, status, slot)
 }
@@ -807,7 +893,7 @@ async fn create_data_only_world(w: &Arc<Worlds>, req: &Value, slot: JobSlot) -> 
     let manifest_id = manifest_id.ok_or_else(|| bad("manifest: bad id".to_owned()))?;
     let manifest = w.manifests.record(manifest_id).await.map_err(store_error)?;
     let manifest = manifest.ok_or_else(|| bad(format!("manifest: no upload {manifest_id}")))?;
-    let yamls = chosen(w, req, "yamls", Kind::Yaml).map_err(bad)?;
+    let yamls = chosen(w, req, "yamls", Kind::Yaml).await?;
     if yamls.is_empty() {
         return Err(bad("choose at least one player file".to_owned()));
     }
@@ -934,23 +1020,28 @@ struct FillReq<'a> {
 
 /// The players' files as fill request players. Real YAML player files are not read for manifest
 /// worlds yet (see #114).
-fn player_requests(dir: &Path, yamls: &[String]) -> Result<Vec<PlayerReq>, String> {
-    yamls
+fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String> {
+    files
         .iter()
-        .map(|id| {
-            let folder = record_dir(dir, Kind::Yaml, id).ok_or(format!("no upload {id}"))?;
-            let label = read_json(&folder.join(format!("{id}.json")))
-                .and_then(|m| m["name"].as_str().map(str::to_owned))
-                .unwrap_or_else(|| id.clone());
-            let raw = std::fs::read(folder.join(format!("{id}.{}", Kind::Yaml.ext())))
-                .map_err(|e| e.to_string())?;
-            let doc: Value = serde_json::from_slice(&raw)
+        .map(|(label, raw)| {
+            let doc: Value = serde_json::from_slice(raw)
                 .map_err(|e| format!("{label}: a manifest world reads JSON player files: {e}"))?;
             let name =
                 doc["name"].as_str().ok_or(format!("{label}: the player file has no name"))?;
             Ok(PlayerReq { name: name.to_owned(), instance: doc.clone() })
         })
         .collect()
+}
+
+/// Each chosen player file from the store, with the name it was uploaded under (for errors).
+async fn player_files(w: &Worlds, yamls: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut files = Vec::with_capacity(yamls.len());
+    for id in yamls {
+        let meta = w.upload_meta(Kind::Yaml, id).await?.ok_or(format!("no upload {id}"))?;
+        let label = meta["name"].as_str().map_or_else(|| id.clone(), str::to_owned);
+        files.push((label, w.upload_file(Kind::Yaml, id).await?));
+    }
+    Ok(files)
 }
 
 /// A manifest world: the engine fills it in a child process under the fill caps (address space,
@@ -970,16 +1061,16 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     let rng_seed =
         u64::from_le_bytes(Sha256::digest(id.as_bytes())[..8].try_into().unwrap_or([0; 8]));
     let seed_name = format!("data-only-{}", id.get(..12).unwrap_or(id));
-    let dir = w.dir.clone();
+    let files = player_files(w, &yamls).await?;
     let players = yamls.len();
-    // Reading the files and building the request is blocking work.
+    // Building the request is blocking work.
     let input = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let text = String::from_utf8(manifest.to_vec()).map_err(|e| e.to_string())?;
         let raw = serde_json::value::RawValue::from_string(text).map_err(|e| e.to_string())?;
         let req = FillReq {
             manifest: &raw,
             seed_name: &seed_name,
-            players: player_requests(&dir, &yamls)?,
+            players: player_requests(&files)?,
             rng_seed,
             workers: config::FILL_SETUP_WORKERS,
         };
@@ -1241,9 +1332,21 @@ mod tests {
         w
     }
 
-    /// Store `body` under `data/<folder>` as an earlier upload did, with record `meta` plus
-    /// its id; returns the record.
-    fn stored(root: &Path, folder: &str, ext: &str, body: &[u8], mut meta: Value) -> Value {
+    /// Store `body` in `w`'s store as an earlier upload did, with record `meta` plus its id;
+    /// returns the record.
+    async fn stored(w: &Worlds, kind: Kind, body: &[u8], mut meta: Value) -> Value {
+        let id = content_id(body);
+        meta["id"] = json!(id);
+        let key = manifests::key_of(&id).unwrap();
+        let game = game_folder(kind, &meta);
+        let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
+        w.uploads.upload_put(&row, body).await.unwrap();
+        meta
+    }
+
+    /// Write `body` under `data/<folder>` as an older server kept an upload, with record
+    /// `meta` plus its id; returns the record.
+    fn old_file(root: &Path, folder: &str, ext: &str, body: &[u8], mut meta: Value) -> Value {
         let id = content_id(body);
         meta["id"] = json!(id);
         let dir = root.join("data").join(folder);
@@ -1266,11 +1369,9 @@ mod tests {
         let root = temp("cap");
         let limits = Limits { apworld_max_bytes: 8, yaml_max_bytes: 4, ..Limits::DESIGN };
         let w = worlds(&root, limits);
-        for (kind, folder, ext, cap) in
-            [(Kind::Apworld, "apworlds", "apworld", 8), (Kind::Yaml, "yamls", "yaml", 4)]
-        {
+        for (kind, folder, cap) in [(Kind::Apworld, "apworlds", 8), (Kind::Yaml, "yamls", 4)] {
             let body = vec![b'x'; cap];
-            let meta = stored(&root, folder, ext, &body, json!({"name": "a"}));
+            let meta = stored(&w, kind, &body, json!({"name": "a"})).await;
             let r = upload(&w, kind, Some("name=a"), &body).await.unwrap();
             assert_eq!(r.status(), StatusCode::OK, "{folder}");
             assert_eq!(json_of(r).await, meta);
@@ -1283,36 +1384,50 @@ mod tests {
     async fn a_list_holds_each_stored_record_once() {
         let root = temp("list");
         let w = worlds(&root, Limits::DESIGN);
-        let meta = stored(&root, "yamls", "yaml", b"name: a", json!({"name": "a.yaml"}));
-        let r = list(&w, Kind::Yaml).unwrap();
+        let meta = stored(&w, Kind::Yaml, b"name: a", json!({"name": "a.yaml"})).await;
+        let r = list(&w, Kind::Yaml).await.unwrap();
         assert_eq!(json_of(r).await, json!([meta]));
-        assert_eq!(json_of(list(&w, Kind::Apworld).unwrap()).await, json!([]));
+        assert_eq!(json_of(list(&w, Kind::Apworld).await.unwrap()).await, json!([]));
     }
 
-    #[test]
-    fn chosen_ids_must_each_be_stored_and_listed_once() {
+    /// The reason a choice of yamls is refused (always a 400).
+    async fn refused(w: &Worlds, ids: Value) -> String {
+        let e = chosen(w, &json!({ "yamls": ids }), "yamls", Kind::Yaml).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST, "{}", e.1);
+        e.1
+    }
+
+    #[tokio::test]
+    async fn chosen_ids_must_each_be_stored_and_listed_once() {
         let root = temp("chosen");
         let w = worlds(&root, Limits::DESIGN);
-        let a = stored(&root, "yamls", "yaml", b"a", json!({"name": "a"}));
-        let b = stored(&root, "yamls", "yaml", b"b", json!({"name": "b"}));
-        let pick = |ids: Value| chosen(&w, &json!({ "yamls": ids }), "yamls", Kind::Yaml);
-        assert_eq!(pick(json!([a["id"], b["id"]])).unwrap(), [a.clone(), b]);
-        assert!(pick(json!([a["id"], a["id"]])).unwrap_err().contains("listed twice"));
-        assert!(pick(json!([content_id(b"c")])).unwrap_err().contains("no upload"));
-        assert!(pick(json!(["../x"])).unwrap_err().contains("bad id"));
-        assert!(pick(json!("x")).unwrap_err().contains("must be a list"));
-        let none = chosen(&w, &json!({}), "apworlds", Kind::Apworld).unwrap_err();
+        let a = stored(&w, Kind::Yaml, b"a", json!({"name": "a"})).await;
+        let b = stored(&w, Kind::Yaml, b"b", json!({"name": "b"})).await;
+        let both = json!({ "yamls": [a["id"], b["id"]] });
+        assert_eq!(chosen(&w, &both, "yamls", Kind::Yaml).await.unwrap(), [a.clone(), b]);
+        assert!(refused(&w, json!([a["id"], a["id"]])).await.contains("listed twice"));
+        assert!(refused(&w, json!([content_id(b"c")])).await.contains("no upload"));
+        assert!(refused(&w, json!(["../x"])).await.contains("bad id"));
+        assert!(refused(&w, json!("x")).await.contains("must be a list"));
+        // The same bytes stored as the other kind are not a choice of this one.
+        stored(&w, Kind::Apworld, b"zip", json!({})).await;
+        assert!(refused(&w, json!([content_id(b"zip")])).await.contains("no upload"));
+        let none = chosen(&w, &json!({}), "apworlds", Kind::Apworld).await.unwrap_err().1;
         assert!(none.contains("apworlds must be a list"), "{none}");
     }
 
-    #[test]
-    fn a_world_folder_holds_the_chosen_files_apworlds_named_by_module() {
+    /// The job folder gets the chosen files from the store; nothing is kept beside it.
+    #[tokio::test]
+    async fn a_world_folder_holds_the_chosen_files_apworlds_named_by_module() {
         let root = temp("prepare");
         let w = worlds(&root, Limits::DESIGN);
-        let apworld = stored(&root, "apworlds", "apworld", b"zip", json!({"module": "clique"}));
-        let yaml = stored(&root, "yamls", "yaml", b"name: a", json!({}));
+        let apworld = stored(&w, Kind::Apworld, b"zip", json!({"module": "clique"})).await;
+        let yaml = stored(&w, Kind::Yaml, b"name: a", json!({})).await;
         let world = root.join("data/worlds/w");
-        prepare(&w, &world, &[apworld], std::slice::from_ref(&yaml)).unwrap();
+        prepare(&w, &world, &[apworld], std::slice::from_ref(&yaml)).await.unwrap();
+        for old in ["apworlds", "yamls"] {
+            assert!(!root.join("data").join(old).exists(), "no {old} folder in the data folder");
+        }
         let names = |sub: &str| -> Vec<String> {
             let entries = std::fs::read_dir(world.join(sub)).unwrap().filter_map(Result::ok);
             entries.map(|e| e.file_name().to_string_lossy().into_owned()).collect()
@@ -1328,9 +1443,9 @@ mod tests {
     async fn two_apworlds_with_one_module_name_are_refused_before_anything_runs() {
         let root = temp("same-module");
         let w = Arc::new(worlds(&root, Limits::DESIGN));
-        let one = stored(&root, "apworlds", "apworld", b"1", json!({"module": "clique"}));
-        let two = stored(&root, "apworlds", "apworld", b"2", json!({"module": "clique"}));
-        let yaml = stored(&root, "yamls", "yaml", b"y", json!({}));
+        let one = stored(&w, Kind::Apworld, b"1", json!({"module": "clique"})).await;
+        let two = stored(&w, Kind::Apworld, b"2", json!({"module": "clique"})).await;
+        let yaml = stored(&w, Kind::Yaml, b"y", json!({})).await;
         let req = json!({"apworlds": [one["id"], two["id"]], "yamls": [yaml["id"]]});
         let e = create_world(State(w), Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e, (StatusCode::BAD_REQUEST, "two apworlds have the same module name".into()));
@@ -1480,24 +1595,51 @@ mod tests {
         assert_eq!(yaml(&["Clique", "Other"]), MIXED);
     }
 
-    /// Uploads by game, and old flat ones, are all found by id, listed, and survive a restart.
+    /// Uploads an older server kept as files, by game and flat, move into the store: found by
+    /// id, listed, and their files readable. In memory the files stay, to move again on the next
+    /// start (#119).
     #[tokio::test]
-    async fn an_id_is_found_in_a_game_folder_or_the_old_flat_one_also_after_a_restart() {
+    async fn old_upload_files_by_game_or_flat_move_into_the_store() {
         let root = temp("by-game");
+        let flat = old_file(&root, "yamls", "yaml", b"flat", json!({"name": "flat"}));
+        let grouped = old_file(&root, "yamls/clique", "yaml", b"g1", json!({"name": "g1"}));
+        let same_game = old_file(&root, "yamls/clique", "yaml", b"g2", json!({"name": "g2"}));
+        let world = old_file(&root, "apworlds/clique", "apworld", b"zip", json!({"module": "m"}));
         let w = worlds(&root, Limits::DESIGN);
-        let flat = stored(&root, "yamls", "yaml", b"flat", json!({"name": "flat"}));
-        let grouped = stored(&root, "yamls/clique", "yaml", b"g1", json!({"name": "g1"}));
-        let same_game = stored(&root, "yamls/clique", "yaml", b"g2", json!({"name": "g2"}));
-        drop(w);
-        let w = worlds(&root, Limits::DESIGN);
-        let ids = json!([flat["id"], grouped["id"], same_game["id"]]);
-        let got = chosen(&w, &json!({ "yamls": ids }), "yamls", Kind::Yaml).unwrap();
+        w.import_files(false).await;
+        let ids = json!({ "yamls": [flat["id"], grouped["id"], same_game["id"]] });
+        let got = chosen(&w, &ids, "yamls", Kind::Yaml).await.unwrap();
         assert_eq!(got, [flat.clone(), grouped.clone(), same_game.clone()]);
-        let listed = json_of(list(&w, Kind::Yaml).unwrap()).await;
-        assert_eq!(listed, json!([flat, grouped, same_game]));
-        let dir = record_dir(&w.dir, Kind::Yaml, grouped["id"].as_str().unwrap()).unwrap();
-        assert_eq!(dir, root.join("data/yamls/clique"));
-        assert!(record_dir(&w.dir, Kind::Yaml, &"0".repeat(64)).is_none());
+        let listed = json_of(list(&w, Kind::Yaml).await.unwrap()).await;
+        let mut want = vec![flat, grouped.clone(), same_game];
+        want.sort_by_key(|v| v["name"].as_str().unwrap().to_owned());
+        assert_eq!(listed, Value::Array(want));
+        assert_eq!(
+            w.upload_file(Kind::Apworld, world["id"].as_str().unwrap()).await.unwrap(),
+            b"zip"
+        );
+        assert!(
+            root.join("data/yamls/clique")
+                .join(format!("{}.yaml", grouped["id"].as_str().unwrap()))
+                .is_file()
+        );
+    }
+
+    /// With a durable store each moved file is removed, then the folders left empty; a file
+    /// whose bytes are not its id's stays where it was, and nothing of it is stored.
+    #[tokio::test]
+    async fn a_moved_old_file_is_removed_and_a_damaged_one_stays() {
+        let root = temp("move");
+        let good = old_file(&root, "yamls/clique", "yaml", b"good", json!({"name": "good"}));
+        let bad = old_file(&root, "apworlds", "apworld", b"bad", json!({"module": "m"}));
+        let bad_id = bad["id"].as_str().unwrap();
+        std::fs::write(root.join(format!("data/apworlds/{bad_id}.apworld")), b"torn").unwrap();
+        let w = worlds(&root, Limits::DESIGN);
+        w.import_files(true).await;
+        assert!(w.upload_meta(Kind::Yaml, good["id"].as_str().unwrap()).await.unwrap().is_some());
+        assert!(!root.join("data/yamls").exists(), "moved, and the emptied folders removed");
+        assert!(w.upload_meta(Kind::Apworld, bad_id).await.unwrap().is_none());
+        assert!(root.join(format!("data/apworlds/{bad_id}.json")).is_file(), "kept to look at");
     }
 
     /// The test world with a game name and version, as an uploaded manifest.
@@ -1661,12 +1803,12 @@ mod tests {
     }
 
     /// A player file as the sidecar's inspect records it: one player with a game.
-    fn player_yaml(root: &Path, name: &str, game: &str, doc: &Value) -> Value {
+    async fn player_yaml(w: &Worlds, name: &str, game: &str, doc: &Value) -> Value {
         let mut doc = doc.clone();
         doc["name"] = json!(name);
         doc["game"] = json!(game);
         let meta = json!({"name": name, "players": [{"name": name, "game": game}]});
-        stored(root, "yamls/fixture-game", "yaml", doc.to_string().as_bytes(), meta)
+        stored(w, Kind::Yaml, doc.to_string().as_bytes(), meta).await
     }
 
     fn fixture_instances() -> Vec<Value> {
@@ -1691,17 +1833,17 @@ mod tests {
         let mut w = worlds(&root, Limits::DESIGN);
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
+        w.uploads = db.clone();
         w.manifests = Manifests::new(db, &Limits::DESIGN);
         let w = Arc::new(w);
 
         let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
         let manifest_id = json_of(up).await["id"].clone();
         let insts = fixture_instances();
-        let yamls: Vec<Value> = ["Ann", "Bo"]
-            .iter()
-            .enumerate()
-            .map(|(k, n)| player_yaml(&root, n, "Fixture Game", &insts[k])["id"].clone())
-            .collect();
+        let mut yamls = Vec::new();
+        for (k, n) in ["Ann", "Bo"].iter().enumerate() {
+            yamls.push(player_yaml(&w, n, "Fixture Game", &insts[k]).await["id"].clone());
+        }
         let req = json!({"manifest": manifest_id, "yamls": yamls});
         let queued =
             create_world(State(Arc::clone(&w)), Bytes::from(req.to_string())).await.unwrap();
@@ -1739,8 +1881,8 @@ mod tests {
         let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
         let manifest_id = json_of(up).await["id"].clone();
         let insts = fixture_instances();
-        let ok = player_yaml(&root, "Ann", "Fixture Game", &insts[0]);
-        let other = player_yaml(&root, "Bo", "Other Game", &insts[1]);
+        let ok = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await;
+        let other = player_yaml(&w, "Bo", "Other Game", &insts[1]).await;
         let req = json!({"manifest": manifest_id, "yamls": [ok["id"], other["id"]]});
         let e = create_world(State(w), Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
@@ -1758,7 +1900,7 @@ mod tests {
         let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
         let manifest_id = json_of(up).await["id"].clone();
         let insts = fixture_instances();
-        let yaml = player_yaml(&root, "Ann", "Fixture Game", &insts[0]);
+        let yaml = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await;
         let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
         // The one generation permit is taken, so the first job waits queued.
         let held = w.one_gen.acquire().await.unwrap();
@@ -1776,5 +1918,49 @@ mod tests {
         }
         let third = create_world(State(w), Bytes::from(req)).await.unwrap();
         assert_eq!(third.status(), StatusCode::ACCEPTED, "the finished job gave its slot back");
+    }
+
+    #[cfg(feature = "pg-tests")]
+    mod pg {
+        use super::*;
+
+        async fn store() -> manifests::Db {
+            let url = config::load_secrets().unwrap().database_url.expect(
+                "pg-tests needs CONSTELLATION_DATABASE_URL (docs/TESTING.md rule 5: no silent skip)",
+            );
+            let db = log::testing::fresh_schema(&url).await.unwrap();
+            let pg = log::PgLogStore::connect(&db, &Limits::DESIGN).await.unwrap();
+            manifests::Db::Pg(Arc::new(pg))
+        }
+
+        /// On Postgres an old upload file is moved in and removed, a new upload is stored, and
+        /// both are there for the next process: nothing of either is left in the data folder
+        /// (#119).
+        #[tokio::test]
+        async fn uploads_live_in_postgres_and_old_files_move_in_once() {
+            let root = temp("pg-uploads");
+            let old = old_file(&root, "yamls/clique", "yaml", b"old", json!({"name": "old"}));
+            let db = store().await;
+            let mut w = worlds(&root, Limits::DESIGN);
+            w.uploads = db.clone();
+            w.import_files(w.uploads.is_durable()).await;
+            assert!(!root.join("data/yamls").exists(), "moved in and removed");
+            let new = stored(&w, Kind::Apworld, b"zip", json!({"module": "m"})).await;
+            drop(w);
+
+            let mut w = worlds(&root, Limits::DESIGN);
+            w.uploads = db;
+            let ids = json!({ "yamls": [old["id"]] });
+            assert_eq!(
+                chosen(&w, &ids, "yamls", Kind::Yaml).await.unwrap(),
+                std::slice::from_ref(&old)
+            );
+            assert_eq!(json_of(list(&w, Kind::Yaml).await.unwrap()).await, json!([old]));
+            let file = w.upload_file(Kind::Apworld, new["id"].as_str().unwrap()).await.unwrap();
+            assert_eq!(file, b"zip");
+            // The same file uploaded again is answered from its record, without the sandbox.
+            let again = upload(&w, Kind::Apworld, Some("name=x.apworld"), b"zip").await.unwrap();
+            assert_eq!((again.status(), json_of(again).await), (StatusCode::OK, new));
+        }
     }
 }
