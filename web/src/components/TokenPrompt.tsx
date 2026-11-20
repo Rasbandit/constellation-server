@@ -1,11 +1,15 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { liveRooms } from '../api/client';
-import { setAdminToken, useAdminToken } from '../api/token';
+import { loadAuthMode, setAdminToken, useAdminToken } from '../api/token';
 
-/** Shows its page once the admin token is known; against the demo stub there is no token. */
+/** Shows its page once the admin token is known, or at once when the server needs none (open mode) or is the demo stub. */
 export function NeedsToken({ children, live = liveRooms }: { children: ReactNode; live?: boolean }) {
-  const { token } = useAdminToken();
-  return !live || token ? <>{children}</> : <TokenPrompt />;
+  const { token, required } = useAdminToken();
+  useEffect(() => {
+    if (live && required === null) void loadAuthMode();
+  }, [live, required]);
+  if (!live || required === false || token) return <>{children}</>;
+  return required === null ? null : <TokenPrompt />;
 }
 
 function TokenPrompt() {

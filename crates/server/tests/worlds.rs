@@ -592,19 +592,14 @@ async fn bad_input_is_refused_before_it_touches_a_path() {
     assert_eq!(st, 400);
 }
 
-#[test]
-fn the_server_refuses_a_data_dir_without_the_admin_token() {
+#[tokio::test]
+async fn without_a_token_the_server_warns_and_serves_the_api_open() {
     let setup = Setup::new("notoken");
     let data = setup.root.join("data").display().to_string();
     let env: Vec<(String, String)> = setup.env().into_iter().skip(1).collect();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let out = e2e::command(Path::new(BIN), &["--data-dir", &data], &env)
-        .env_remove("CONSTELLATION_ADMIN_TOKEN")
-        .env_remove("CONSTELLATION_ADMIN_TOKEN_FILE")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let log = String::from_utf8_lossy(&out.stderr);
-    assert!(log.contains("CONSTELLATION_ADMIN_TOKEN"), "{log}");
-    assert!(!log.contains("listening"), "{log}");
+    let server = Server::start(Path::new(BIN), &["--data-dir", &data], &env).unwrap();
+    server.wait_for_log("admin API is open").unwrap();
+    let (st, _) = http(&server, "GET", "/api/apworlds", None, b"").await;
+    assert_eq!(st, 200, "open mode: no header needed");
 }

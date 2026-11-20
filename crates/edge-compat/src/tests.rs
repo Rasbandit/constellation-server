@@ -897,6 +897,18 @@ fn a_full_rate_table_forgets_idle_keys_and_refuses_while_all_are_limited() {
     assert!(table.take(2_u32, later), "key 1 refilled, so it was forgotten");
 }
 
+#[test]
+fn a_full_rate_table_is_swept_at_most_once_a_second() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let table = RateTable::new(1, 10_000, 1);
+    assert!(table.take(1_u32, t0));
+    assert!(!table.take(2_u32, t0), "swept now: key 1 is still limited");
+    let soon = t0 + Duration::from_millis(100);
+    assert!(!table.take(2_u32, soon), "key 1 is full again, but the last sweep was too recent");
+    assert!(table.take(2_u32, t0 + Duration::from_secs(1)), "a second on, the sweep runs");
+}
+
 #[tokio::test]
 async fn a_slow_checker_resyncs_its_own_checks_and_items_with_nothing_missed_or_doubled() {
     // A one-entry queue, and A checks without reading: A itself falls behind. The first event A

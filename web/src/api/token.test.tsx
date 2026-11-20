@@ -2,7 +2,7 @@ import { renderToString } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, HttpError } from './client';
 import { openEventStream } from './sse';
-import { getAdminToken, rejectAdminToken, setAdminToken } from './token';
+import { getAdminToken, loadAuthMode, rejectAdminToken, setAdminToken } from './token';
 import { NeedsToken } from '../components/TokenPrompt';
 
 
@@ -33,8 +33,26 @@ function fetchAnswering(status: number) {
   return seen;
 }
 
+/** The server's answer to `GET /api/auth`, read into the store. */
+async function serverNeedsToken(body: unknown, status = 200) {
+  vi.stubGlobal('fetch', async () => new Response(JSON.stringify(body), { status }));
+  await loadAuthMode();
+}
+
 describe('the admin token prompt', () => {
-  it('shows the prompt, not the page, until a token is entered', () => {
+  it('shows no prompt when the server is open (no token configured)', async () => {
+    await serverNeedsToken({ token_required: false });
+    expect(renderToString(<NeedsToken live>the page</NeedsToken>)).toBe('the page');
+    expect(getAdminToken()).toBeNull();
+  });
+
+  it('prompts when the server cannot say (the safe side)', async () => {
+    await serverNeedsToken('nope', 500);
+    expect(renderToString(<NeedsToken live>the page</NeedsToken>)).toContain('Admin token');
+  });
+
+  it('shows the prompt, not the page, until a token is entered', async () => {
+    await serverNeedsToken({ token_required: true });
     const page = () => renderToString(<NeedsToken live>the page</NeedsToken>);
     expect(page()).toContain('Admin token');
     expect(page()).not.toContain('the page');
@@ -64,6 +82,7 @@ describe('the admin token prompt', () => {
   });
 
   it('drops the token on a 401, says why, and brings the prompt back', async () => {
+    await serverNeedsToken({ token_required: true });
     setAdminToken(TOKEN);
     fetchAnswering(401);
     await expect(api.games()).rejects.toBeInstanceOf(HttpError);

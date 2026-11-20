@@ -45,35 +45,45 @@ jobs:
           mkdir secrets
           echo ci-password > secrets/postgres_password
           echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
-          openssl rand -hex 16 > secrets/admin_token
-          chmod 400 secrets/database_url secrets/admin_token
-          sudo chown 10001 secrets/database_url secrets/admin_token
+          chmod 400 secrets/database_url
+          sudo chown 10001 secrets/database_url
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
-      # The admin API is on the one public port: 401 without the token, 200 with it. Then a yaml
-      # upload runs the sandbox (bubblewrap under the seccomp profile) and must land under
-      # /data/yamls/<game>/. The token is masked so it cannot show in the log.
+      # The default compose runs the admin API open (POC): /api answers 200 with no token. Then a
+      # yaml upload runs the sandbox (bubblewrap under the seccomp profile) and must land under
+      # /data/yamls/<game>/.
       - run: |
           A=http://127.0.0.1:38281
-          T=$(sudo cat secrets/admin_token)
-          echo "::add-mask::$T"
-          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 200
+          curl -sf $A/api/auth | grep -q '"token_required":false'
           printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
-          code=$(curl -s -X PUT -o up.out -w '%{http_code}' -H "Authorization: Bearer $T" --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
+          code=$(curl -s -X PUT -o up.out -w '%{http_code}' --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
           cat up.out; echo " (HTTP $code)"
           test "$code" = 201
           docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
       # The one public port serves the UI and the version: `/` is the app, a missing asset is a
-      # 404, /version carries the build, and /api without the token is a 401, not the app.
+      # 404, /version carries the build, and an unknown /api path is a 404, not the app.
       - run: |
           P=http://127.0.0.1:38281
           curl -sf $P/ | grep -qi '<div id="root">'
           curl -sf -H 'Accept: text/html' $P/abcdefgh23 | grep -qi '<div id="root">'
           test "$(curl -s -o /dev/null -w '%{http_code}' $P/assets/missing.js)" = 404
-          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/yamls)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/nope)" = 404
           curl -sf $P/version | grep -q '"version":"'
           js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
           curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'
+      # Token mode (the switch for later): the same image with the token override answers 401
+      # without the token, 429 after a burst of wrong ones, and 200 with it. Masked, never echoed.
+      - run: |
+          openssl rand -hex 16 > secrets/admin_token
+          chmod 400 secrets/admin_token
+          sudo chown 10001 secrets/admin_token
+          T=$(sudo cat secrets/admin_token)
+          echo "::add-mask::$T"
+          CONSTELLATION_TAG=ci docker compose -f docker-compose.yml -f docker-compose.token.yml up -d --no-build --wait --wait-timeout 120
+          A=http://127.0.0.1:38281
+          curl -sf $A/api/auth | grep -q '"token_required":true'
+          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
       - if: failure()
         run: docker compose logs
       - if: always()

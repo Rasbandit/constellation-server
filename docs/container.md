@@ -6,10 +6,9 @@ The image holds the room server, the web UI and the upload and generation API. R
 cp .env.example .env   # set GEN_REPO_URL and GEN_REPO_REF too (see Building)
 mkdir -p secrets
 openssl rand -hex 24 > secrets/postgres_password
-openssl rand -hex 16 > secrets/admin_token
 printf 'postgres://constellation:%s@postgres/constellation' "$(cat secrets/postgres_password)" > secrets/database_url
-chmod 400 secrets/database_url secrets/admin_token && sudo chown 10001 secrets/database_url secrets/admin_token
-docker compose up -d
+chmod 400 secrets/database_url && sudo chown 10001 secrets/database_url
+docker compose up -d   # admin API open, see "The admin API on the same port"
 ```
 
 - Secrets are files mounted as Docker secrets; the server reads the database URL from `CONSTELLATION_DATABASE_URL_FILE`. The server runs as uid 10001 and the mount keeps the host file's owner and mode, so `database_url` must be readable by that uid: the `chmod 400` and `chown 10001` above keep it private to it, and the same for `admin_token` (the Postgres entrypoint reads its password file as root, so `postgres_password` can stay `600`).
@@ -31,9 +30,11 @@ The web stage of the Dockerfile builds `web/` from `bun.lock` (`bun install --fr
 The server (`--web-dir`) answers, in order: `/healthz`, `/version`, `/api/*` (the admin API, below), a WebSocket upgrade at `/<key>` (the room; with `--bundle` any path), then the UI for every other GET and HEAD: an existing file, else `index.html` for a page load (no extension, not under `/assets/`, `Accept` takes HTML). A missing file, a missing `/assets/*` path or a request that does not want HTML is a 404, never the app. So a plain GET of `/<key>` loads the UI (its `/c/:code` and room pages) and an upgrade of the same URL joins the room. Files carry `ETag` and `Last-Modified`; `/assets/*` (hashed names) is `public, max-age=31536000, immutable`, everything else `no-cache`; the client's `Accept-Encoding` picks the stored `.br` or `.gz`. Every answer has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and a CSP (`default-src 'self'`, `frame-ancestors 'none'`). Paths are not decoded and the resolved file must lie inside the folder, so `..`, encoded `..` and a symlink out all get the app or a 404. The UI's version badge reads `GET /version` from its own origin.
 
 ### The admin API on the same port
-There is one public port (`38281`). `/api/*` is served on it, always on when the server has `--data-dir` (compose sets it), and it comes before the room upgrade and the UI, so a room key can never shadow it and the UI never answers under `/api`. Every `/api` path, even an unknown one, needs `Authorization: Bearer <token>`; without it the answer is a bare 401 with no body. The UI asks for the token on its create and upload pages, keeps it in `sessionStorage` (this tab only) and sends it as that header; a 401 clears it.
+There is one public port (`38281`). `/api/*` is served on it, always on when the server has `--data-dir` (compose sets it), and it comes before the room upgrade and the UI, so a room key can never shadow it and the UI never answers under `/api`. **Open mode (the current default):** with no admin token configured, `/api` needs nothing and the server logs a warning at start. The risk: anyone who can reach the port can upload an `.apworld` and have it run inside the sandbox. Until a token is on, restrict the port yourself (an nginx `allow`/`deny` list or a firewall). **Token mode:** set `CONSTELLATION_ADMIN_TOKEN` or `CONSTELLATION_ADMIN_TOKEN_FILE` (with compose: `openssl rand -hex 16 > secrets/admin_token`, `chmod 400` and `sudo chown 10001` it, then `docker compose -f docker-compose.yml -f docker-compose.token.yml up -d`). Then every `/api` path, even an unknown one, needs `Authorization: Bearer <token>`; without it the answer is a bare 401 with no body. `GET /api/auth` is always open and answers only `{"token_required":bool}`; the UI reads it, so it shows no prompt in open mode, and in token mode asks for the token on its pages, keeps it in `sessionStorage` (this tab only) and sends it as that header; a 401 clears it.
 
-The API runs uploaded code, so the token is the boundary: the Docker secret `secrets/admin_token`, at least 32 bytes, compared in constant time. Wrong tokens are counted per client address (5 in a burst, one more every 10 s: `admin_auth_fail_*` in `crates/config`); past that a wrong or missing token gets 429 with `Retry-After`. A right token is never refused. Behind a proxy every client has the proxy's address, so the count is shared; start the server with `--trusted-proxy-header X-Forwarded-For` (or `X-Real-IP`) so it counts per real client. Only the last entry of that header is used (the one your proxy appended), and the proxy must overwrite or append it: never turn the flag on when clients can reach the port without the proxy, because they could then send any address.
+**Known limit in token mode:** the room view a player opens from a join link is part of `/api`, so a player would need the admin token, which they must never get. Until a read-only player credential exists (#111), use open mode behind an allow-list, or share room pages only with people who hold the token.
+
+In token mode the token is the boundary (the API runs uploaded code): at least 32 bytes, compared in constant time. Wrong tokens are counted per client address (an IPv6 address counts as its /64; 5 in a burst, one more every 10 s: `admin_auth_fail_*` in `crates/config`); past that a wrong or missing token gets 429 with `Retry-After`. A right token is never refused. Behind a proxy every client has the proxy's address, so the count is shared; start the server with `--trusted-proxy-header X-Forwarded-For` (or `X-Real-IP`) so it counts per real client. Only the last entry of the last line of that header is used (the one your proxy appended), and the proxy must overwrite or append it: never turn the flag on when clients can reach the port without the proxy, because they could then send any address.
 
 TLS comes from the reverse proxy; never expose the port over plain HTTP, since the token and the uploads travel on it. For `const.ras.band` with nginx (plain pass-through, no auth of its own):
 
@@ -65,14 +66,15 @@ server {
 }
 ```
 
-With this proxy, add `--trusted-proxy-header X-Forwarded-For` to the server command. Compose publishes the port on all interfaces by default; to make the proxy the only way in, publish it as `127.0.0.1:38281:38281` (or firewall it).
+In token mode, add `--trusted-proxy-header X-Forwarded-For` to the server command, and only if the proxy is the only way to reach the port. The compose file publishes `38281` on all interfaces (it also serves players directly), so the header would be forgeable by anyone who reaches the port directly: firewall it to the proxy first, or change the publish to `127.0.0.1:38281:38281` in your own override (the shipped default is left as is).
 
 ## Uploads
 The admin API (`--data-dir /data`, on the room port) stores uploaded files as `/data/<kind>/<game>/<sha256>.<ext>` (`/data/apworlds/...`, `/data/yamls/...`; layout in the README). Game manifests will land in `/data/manifests/<game>/` once their upload route ships (#101). Back up the `data` volume and the `pgdata` volume together: uploads are files, the room logs and finished seeds are in Postgres.
 
-Every route needs `Authorization: Bearer <token>`; the token is the Docker secret `secrets/admin_token` (at least 32 bytes: `openssl rand -hex 16 > secrets/admin_token`; `chmod 400` and `sudo chown 10001` it like the database URL).
+In open mode no header is needed. In token mode every route needs `Authorization: Bearer <token>` (the Docker secret `secrets/admin_token`, at least 32 bytes).
 
 ```sh
+# Open mode: drop the -H lines. Token mode:
 TOKEN=$(sudo cat secrets/admin_token)
 curl -X PUT -H "Authorization: Bearer $TOKEN" --data-binary @player.yaml \
   "http://127.0.0.1:38281/api/yamls?name=player.yaml"

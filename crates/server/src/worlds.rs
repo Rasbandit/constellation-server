@@ -42,8 +42,8 @@ use tokio::sync::Semaphore;
 /// The API's shared state.
 pub(crate) struct Worlds {
     dir: PathBuf,
-    /// SHA-256 of the admin token (compared in constant time, see [`authorized`]).
-    token: [u8; 32],
+    /// SHA-256 of the admin token, or None: open mode, no auth (compared in constant time, see [`authorized`]).
+    token: Option<[u8; 32]>,
     sandbox: Sandbox,
     limits: Limits,
     /// One generation at a time.
@@ -184,7 +184,7 @@ fn json_text(status: StatusCode, text: String) -> Response {
 /// When the data folder cannot be made or read.
 pub(crate) fn open(
     dir: &Path,
-    token: &str,
+    token: Option<&str>,
     paths: Generation,
     limits: Limits,
 ) -> Result<Worlds, String> {
@@ -199,7 +199,7 @@ pub(crate) fn open(
     recover(&dir.join("worlds"))?;
     Ok(Worlds {
         dir: dir.to_owned(),
-        token: Sha256::digest(token.as_bytes()).into(),
+        token: token.map(|t| Sha256::digest(t.as_bytes()).into()),
         sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Semaphore::new(1),
@@ -270,8 +270,16 @@ fn routes(state: Arc<Worlds>) -> Router {
         .route("/api/", any(StatusCode::NOT_FOUND))
         .route("/api/{*rest}", any(StatusCode::NOT_FOUND))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
+        // After the gate, so it is open: the web UI asks whether to prompt for a token.
+        .route("/api/auth", get(auth_mode))
         .layer(DefaultBodyLimit::max(body_cap))
         .with_state(state)
+}
+
+/// `GET /api/auth`: `{"token_required": bool}`, so the UI knows whether to ask for a token.
+async fn auth_mode(State(w): State<Arc<Worlds>>) -> impl IntoResponse {
+    let body = format!("{{\"token_required\":{}}}", w.token.is_some());
+    ([(header::CONTENT_TYPE, "application/json")], body)
 }
 
 /// A wrong token is a bare 401 (no detail for a scanner). A client address that sends more than
@@ -279,7 +287,9 @@ fn routes(state: Arc<Worlds>) -> Router {
 /// counted or refused, so nobody can lock the admin out by guessing from the same address (all
 /// clients share the proxy's address unless `--trusted-proxy-header` is set).
 async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
-    if authorized(req.headers(), &w.token) {
+    // Open mode (no token configured): everyone is admin, nothing is counted.
+    let Some(want) = &w.token else { return next.run(req).await };
+    if authorized(req.headers(), want) {
         return next.run(req).await;
     }
     let ip = client_ip(&req, w.proxy_header.as_ref());
@@ -293,16 +303,21 @@ async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Respons
     res
 }
 
-/// The address failures are counted under: the last entry of the trusted proxy header (the one
-/// the proxy itself appended; earlier ones are the client's to forge), else the peer's.
+/// The address failures are counted under: the last entry of the last line of the trusted proxy
+/// header (what the proxy itself appended; earlier lines and entries are the client's to forge),
+/// else the peer's. An IPv6 address counts as its /64, since one host owns a whole /64.
 fn client_ip(req: &Request, proxy_header: Option<&HeaderName>) -> IpAddr {
-    proxy_header
-        .and_then(|name| req.headers().get(name))
+    let ip = proxy_header
+        .and_then(|name| req.headers().get_all(name).iter().next_back())
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
         .and_then(|v| v.trim().parse().ok())
         .or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    match ip {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+        v4 => v4,
+    }
 }
 
 /// `Authorization: Bearer <token>` whose SHA-256 equals `want`. Both sides are hashed first, so
@@ -802,6 +817,24 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_client_is_counted_by_its_64() {
+        let req = |ip: &str| {
+            let mut r = Request::new(axum::body::Body::empty());
+            r.extensions_mut().insert(ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 1)));
+            r
+        };
+        assert_eq!(
+            client_ip(&req("2001:db8:1:2::1"), None),
+            client_ip(&req("2001:db8:1:2:ffff::9"), None)
+        );
+        assert_ne!(
+            client_ip(&req("2001:db8:1:2::1"), None),
+            client_ip(&req("2001:db8:1:3::1"), None)
+        );
+        assert_eq!(client_ip(&req("10.0.0.7"), None), "10.0.0.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
     fn only_the_exact_bearer_token_is_authorized() {
         let want: [u8; 32] = Sha256::digest(b"s3cret").into();
         assert!(authorized(&headers("Bearer s3cret"), &want));
@@ -849,13 +882,13 @@ mod tests {
         let w = worlds(&root, Limits::DESIGN);
         let shown = format!("{w:?}");
         assert_eq!(shown, format!("Worlds {{ dir: {:?}, .. }}", root.join("data")));
-        assert!(!shown.contains("token") && !shown.contains(&hex(&w.token)), "{shown}");
+        assert!(!shown.contains("token") && !shown.contains(&hex(&w.token.unwrap())), "{shown}");
     }
 
     /// The API's state on a fake checkout under `root`, data in `root/data`.
     fn worlds(root: &Path, limits: Limits) -> Worlds {
         let paths = crate::sandbox::tests::layout(root);
-        open(&root.join("data"), "token", paths, limits).unwrap()
+        open(&root.join("data"), Some("token"), paths, limits).unwrap()
     }
 
     /// Store `body` under `data/<folder>` as an earlier upload did, with record `meta` plus

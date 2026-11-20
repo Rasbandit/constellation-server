@@ -9,6 +9,9 @@ use std::hash::Hash;
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
+/// The shortest time between two sweeps of a full [`RateTable`].
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Tokens in thousandths, so slow refill rates stay exact in integers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bucket {
@@ -76,14 +79,16 @@ pub struct RateTable<K> {
     burst: u32,
     refill_milli_per_sec: u32,
     max_keys: usize,
-    buckets: Mutex<HashMap<K, Bucket>>,
+    /// The buckets, and when a full table was last swept (a sweep walks every key, so a flood of
+    /// new keys must not trigger one per request).
+    buckets: Mutex<(HashMap<K, Bucket>, Option<Instant>)>,
 }
 
 impl<K: Hash + Eq> RateTable<K> {
     /// A table of buckets that start full at `burst` tokens and refill at `refill_milli_per_sec`.
     #[must_use]
     pub fn new(burst: u32, refill_milli_per_sec: u32, max_keys: usize) -> Self {
-        Self { burst, refill_milli_per_sec, max_keys, buckets: Mutex::new(HashMap::new()) }
+        Self { burst, refill_milli_per_sec, max_keys, buckets: Mutex::new((HashMap::new(), None)) }
     }
 
     /// One token for `key` at `now`. The lock is never held across an await.
@@ -108,14 +113,19 @@ impl<K: Hash + Eq> RateTable<K> {
     /// Run `f` on `key`'s bucket, made full when new; `false` when the table is full of keys
     /// that are all still limited.
     fn with(&self, key: K, now: Instant, f: impl FnOnce(&mut Bucket) -> bool) -> bool {
-        let mut map = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        let (map, swept) = &mut *guard;
         if !map.contains_key(&key) && map.len() >= self.max_keys {
-            // A full bucket is the same as a new one, so forgetting it changes nothing. A bucket
-            // in debt has no tokens, so it is never full and is kept.
-            map.retain(|_, b| {
-                b.refill(now);
-                b.tokens < b.cap
-            });
+            // At most one sweep a second: a full table of limited keys is not walked again for
+            // every new key. A full bucket is the same as a new one, so forgetting it changes
+            // nothing; a bucket in debt has no tokens, so it is never full and is kept.
+            if swept.is_none_or(|t| now.saturating_duration_since(t) >= SWEEP_EVERY) {
+                *swept = Some(now);
+                map.retain(|_, b| {
+                    b.refill(now);
+                    b.tokens < b.cap
+                });
+            }
             if map.len() >= self.max_keys {
                 return false;
             }

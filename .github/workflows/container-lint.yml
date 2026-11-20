@@ -22,3 +22,4 @@ jobs:
       - run: |
           mkdir secrets && touch secrets/database_url secrets/postgres_password secrets/admin_token
           GEN_REPO_URL=x GEN_REPO_REF=x docker compose config -q
+          GEN_REPO_URL=x GEN_REPO_REF=x docker compose -f docker-compose.yml -f docker-compose.token.yml config -q

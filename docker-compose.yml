@@ -27,10 +27,9 @@ services:
       - ${CONSTELLATION_PUBLIC_HOST:-localhost}
     environment:
       CONSTELLATION_DATABASE_URL_FILE: /run/secrets/database_url
-      CONSTELLATION_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       # No per-job cgroup in a container: the limits below bound uploaded code instead (README).
       CONSTELLATION_SANDBOX_MODE: container
-    secrets: [database_url, admin_token]
+    secrets: [database_url]
     mem_limit: 6g
     memswap_limit: 6g # no swap beyond mem_limit
     pids_limit: 512
@@ -64,8 +63,6 @@ volumes:
   data:
   pgdata:
 secrets:
-  admin_token:
-    file: ${CONSTELLATION_ADMIN_TOKEN_FILE:-./secrets/admin_token}
   database_url:
     file: ${CONSTELLATION_DATABASE_URL_FILE:-./secrets/database_url}
   postgres_password:

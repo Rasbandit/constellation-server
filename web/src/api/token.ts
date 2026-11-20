@@ -11,6 +11,8 @@ interface TokenState {
   token: string | null;
   /** Why the token was dropped (shown by the prompt), until a new one is entered. */
   notice: string | null;
+  /** From `GET /api/auth`: null until known. False: the server is open (no token), no prompt. */
+  required: boolean | null;
 }
 
 const read = (): string | null => {
@@ -21,7 +23,7 @@ const read = (): string | null => {
   }
 };
 
-let state: TokenState = { token: read(), notice: null };
+let state: TokenState = { token: read(), notice: null, required: null };
 const listeners = new Set<() => void>();
 
 function set(next: TokenState) {
@@ -36,10 +38,14 @@ function set(next: TokenState) {
 }
 
 export const getAdminToken = () => state.token;
-export const setAdminToken = (token: string) => set({ token: token.trim() || null, notice: null });
+export const setAdminToken = (token: string) => set({ ...state, token: token.trim() || null, notice: null });
 /** The server refused the token (401): forget it and say so. */
 export const rejectAdminToken = () =>
-  set({ token: null, notice: 'The server refused the admin token (missing or wrong). Enter it again.' });
+  set({
+    ...state,
+    token: null,
+    notice: 'The server refused the admin token (missing or wrong). Enter it again.',
+  });
 
 export function useAdminToken(): TokenState {
   return useSyncExternalStore(
@@ -50,4 +56,21 @@ export function useAdminToken(): TokenState {
     () => state,
     () => state,
   );
+}
+
+/**
+ * Ask the server whether it wants a token (`GET /api/auth`, open to everyone, says nothing else).
+ * An answer we cannot read counts as "required": the prompt is the safe side.
+ */
+export async function loadAuthMode(): Promise<void> {
+  let required = true;
+  try {
+    const res = await fetch('/api/auth');
+    const body: unknown = res.ok ? await res.json() : null;
+    const v = (body as { token_required?: unknown } | null)?.token_required;
+    if (typeof v === 'boolean') required = v;
+  } catch {
+    // unreadable: keep the safe default
+  }
+  set({ ...state, required });
 }
