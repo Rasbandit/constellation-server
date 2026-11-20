@@ -5,7 +5,7 @@ import type { Hint, HintStatus, Room, Slot } from '../api/types';
 import { Feed, HintBoard, LinkBadge, SlotTable } from '../components/room';
 import { shortLink } from '../components/phases';
 import { Card, CopyButton, RoomStatePill, StatusPill, useToast } from '../components/ui';
-import { address, pct } from '../lib/format';
+import { pct } from '../lib/format';
 import { useLiveRoom, useStored } from '../lib/live';
 
 export function PlayRoom() {
@@ -102,7 +102,6 @@ export function PlayRoom() {
 }
 
 function ConnectCard({ room: r, me }: { room: Room; me: Slot | null }) {
-  const addr = address(r.host, r.port);
   return (
     <Card title="How to connect" className="connect">
       <div className="join-ways">
@@ -123,9 +122,9 @@ function ConnectCard({ room: r, me }: { room: Room; me: Slot | null }) {
         </div>}
         <div className="join-way">
           <span className="small muted">Server (type into your game's client)</span>
-          <code>{addr}</code>
+          <code>{r.address}</code>
           <div className="row-inline">
-            <CopyButton text={addr} />
+            <CopyButton text={r.address} />
           </div>
         </div>
       </div>

@@ -1,8 +1,8 @@
 //! Many rooms in one process, each found by its room key.
 //!
 //! A room key is the room's public address (doc 01 D1.1, D-12): 10 characters of lowercase
-//! base32 (`a` to `z`, `2` to `7`), so it is also a valid DNS label for the hostname form
-//! `{room_key}.{host}` (doc 01 section 3.8.1). It is not a secret. A new room draws its key at
+//! base32 (`a` to `z`, `2` to `7`), so it is also safe as one URL path segment
+//! (`ws://{host}:{port}/{room_key}`, doc 01 section 3.8.1). It is not a secret. A new room draws its key at
 //! random (50 bits from the OS); with Postgres the key is stored with the room, so a restart
 //! serves the room under the same key.
 //!
@@ -65,6 +65,20 @@ impl RoomKey {
             ));
         }
         Ok(Self(key))
+    }
+
+    /// The key a request path names: `/{room_key}` or `/{room_key}/`, nothing else. Case is
+    /// ignored.
+    #[must_use]
+    pub fn from_path(path: &str) -> Option<Self> {
+        let rest = path.strip_prefix('/')?;
+        Self::parse(rest.strip_suffix('/').unwrap_or(rest)).ok()
+    }
+
+    /// The join address clients type: `{public}/{key}`, with `public` the `host:port`.
+    #[must_use]
+    pub fn address(&self, public: &str) -> String {
+        format!("{public}/{}", self.0)
     }
 
     /// The key as text.

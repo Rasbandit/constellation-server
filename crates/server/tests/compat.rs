@@ -358,9 +358,9 @@ mod scenarios {
         line.split("key=").nth(1).unwrap().split_whitespace().next().unwrap().to_owned()
     }
 
-    /// A WebSocket URL naming `key` in the host; the TCP connection goes to the server.
+    /// A WebSocket URL naming `key` in the path.
     fn room_url(server: &Server, key: &str) -> String {
-        format!("ws://{key}.example:{}", server.addr.port())
+        format!("ws://localhost:{}/{key}", server.addr.port())
     }
 
     #[tokio::test]
@@ -383,7 +383,7 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn each_key_in_the_host_reaches_its_own_room() {
+    async fn each_key_in_the_path_reaches_its_own_room() {
         let (server, dir) = rooms_server("route", &["alpha", "beta"]);
         let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
         let (loc, item, _) = alice_locations_for(2)[0];
@@ -396,7 +396,7 @@ mod scenarios {
         check(&mut alice_a, &[loc]).await;
         let (got, _) = bob_a.next_cmd("ReceivedItems").await.unwrap();
         assert_eq!(got["items"][0]["item"], item);
-        // Room B never saw that check; room A did. Upper case in the host is the same key.
+        // Room B never saw that check; room A did. Upper case in the path is the same key.
         let (_, connected_b, _) =
             e2e::join_via(server.addr, &room_url(&server, &b.to_ascii_uppercase()), "Alice")
                 .await
@@ -414,10 +414,15 @@ mod scenarios {
         let (server, dir) = rooms_server("unknown", &["alpha", "beta"]);
         let unknown = e2e::Client::connect_via(server.addr, &room_url(&server, "zzzzzzzzzz")).await;
         assert!(unknown.unwrap_err().contains("404"));
-        // No key in the host at all: with two rooms the server does not guess.
+        // The old hostname form names no room any more.
+        let a = key_of(&server, "alpha");
+        let old = e2e::http_get(server.addr, &format!("{a}.example"), "/", true).await;
+        assert!(old.starts_with("HTTP/1.1 404"), "{old}");
+        // No key in the path at all: with two rooms the server does not guess.
         let none = e2e::Client::connect(&server.url()).await;
         assert!(none.unwrap_err().contains("404"));
         let ws = e2e::http_get(server.addr, "x", "/", true).await;
+        assert!(ws.contains("connect through <this host>/{room_key}"), "{ws}");
         assert!(ws.contains("this server runs 2 rooms"), "{ws}");
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -475,11 +480,12 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn one_bundle_takes_every_host() {
+    async fn one_bundle_takes_every_path() {
         let server = start(&[]).unwrap();
-        // A host whose first label only looks like a key still reaches the one room.
+        // A path that is no key still reaches the one room.
         e2e::join_via(server.addr, &room_url(&server, "playground"), "Alice").await.unwrap();
         e2e::join(&server.url(), "Bob").await.unwrap();
+        e2e::join(&format!("{}/a/b", server.url()), "Bob").await.unwrap();
     }
 
     /// The number of listed rooms changes while a rooms folder runs (a scan adds one, D-30

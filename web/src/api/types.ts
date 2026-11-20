@@ -63,7 +63,7 @@ export interface GeneratedWorld {
   id: string;
   seed: string;
   roomKey: string;
-  /** `{room_key}.{host}:{port}`: what a player types into their client. */
+  /** `{host}:{port}/{room_key}`: what a player types into their client. */
   address: string;
 }
 
@@ -104,8 +104,8 @@ export interface RoomSummary {
 }
 
 export interface Room extends RoomSummary {
-  host: string;
-  port: number;
+  /** `{host}:{port}/{room_key}`: what a player types into their client. */
+  address: string;
   seed: string;
   rules: RoomRules;
   slotList: Slot[];

@@ -619,12 +619,12 @@ async fn publish(w: &Worlds, stdout: Vec<u8>) -> Result<(Loaded, Value), String>
 }
 
 /// The listed room of a finished world (`--rooms` only): its rooms folder, key and join address
-/// (`{key}.{host}:{port}`). Found by the seed name in the world's status; the host lists each
+/// (`{host}:{port}/{key}`). Found by the seed name in the world's status; the host lists each
 /// seed once.
 fn hosted<'a>(w: &'a Worlds, status: &Value) -> Option<(&'a RoomsFolder, RoomKey, String)> {
     let (folder, public) = w.rooms.as_ref()?;
     let key = folder.key_of(status["seed_name"].as_str()?)?;
-    let address = format!("{key}.{public}");
+    let address = key.address(public);
     Some((folder, key, address))
 }
 
