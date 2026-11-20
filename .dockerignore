@@ -7,3 +7,5 @@ tools
 **/node_modules
 **/__pycache__
 .env
+secrets
+.env.*
