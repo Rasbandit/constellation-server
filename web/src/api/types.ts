@@ -26,6 +26,15 @@ export interface ApWorld {
   module?: string;
 }
 
+/** A data-only world manifest the server stored; the engine fills it, no world code runs. */
+export interface ManifestWorld {
+  id: string;
+  fileName: string;
+  game: string;
+  version: string;
+  sizeBytes: number;
+}
+
 export interface PlayerFile {
   id: string;
   fileName: string | null;
@@ -54,6 +63,8 @@ export interface RoomRules {
 export interface CreateRoomRequest {
   name: string;
   apworlds: ApWorld[];
+  /** A data-only world; a room has this or APWorlds, never both. */
+  manifest?: ManifestWorld | null;
   players: PlayerFile[];
   rules: RoomRules;
 }

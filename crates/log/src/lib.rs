@@ -214,6 +214,69 @@ pub(crate) mod raw {
     }
 }
 
+/// What a manifest listing shows, kept beside the manifest so a listing never reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestRecord {
+    /// The content address: the SHA-256 of the manifest.
+    pub id: BlobKey,
+    /// The uploaded file's name (shown only).
+    pub name: String,
+    /// The world's game name.
+    pub game: String,
+    /// The world's version.
+    pub version: String,
+    /// Manifest size in bytes.
+    pub bytes: u64,
+    /// Items in the world.
+    pub items: u32,
+    /// Locations in the world.
+    pub locations: u32,
+}
+
+/// Uploaded world manifests, deduplicated by content address, with the listing columns beside
+/// them. Memory and Postgres implement it; a listing is keyset-paged by id.
+pub trait ManifestStore: Send + Sync + 'static {
+    /// Store a manifest under `record.id` (its SHA-256). Idempotent: a manifest already stored
+    /// keeps its record.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when `record.id` is not the hash of `bytes`; the store failing.
+    fn manifest_put(
+        &self,
+        record: &ManifestRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// A manifest's record, without its bytes.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn manifest_record(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<ManifestRecord>, StoreError>> + Send;
+
+    /// A manifest's bytes, checked against its id.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the stored bytes do not hash to `id`; the store failing.
+    fn manifest_bytes(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+
+    /// Up to `limit` records ascending by id, after `after`, of `game` when given.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn manifest_list(
+        &self,
+        game: Option<&str>,
+        after: Option<&BlobKey>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<ManifestRecord>, StoreError>> + Send;
+}
+
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
 #[must_use]
 pub fn blob_key(bytes: &[u8]) -> BlobKey {

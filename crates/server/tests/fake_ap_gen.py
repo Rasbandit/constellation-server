@@ -92,8 +92,20 @@ def main(argv):
                           "world_version": "1.0.0", "id": "../../etc", "name": "spoofed"}))
         return 0
     if cmd == "inspect-yaml":
-        name = Path(argv[1]).read_text().strip()
-        print(json.dumps([{"name": name, "game": "Fake Game"}]))
+        text = Path(argv[1]).read_text().strip()
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            # As the real inspect: a document needs a string name and a string game.
+            for key in ("name", "game"):
+                if not isinstance(doc.get(key), str) or not doc[key].strip():
+                    print(f"refused: document 1 has no {key}", file=sys.stderr)
+                    return 1
+            print(json.dumps([{"name": doc["name"], "game": doc["game"]}]))
+            return 0
+        print(json.dumps([{"name": text, "game": "Fake Game"}]))
         return 0
     if cmd == "generate":
         a = dict(zip(argv[1::2], argv[2::2]))

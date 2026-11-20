@@ -1,6 +1,6 @@
 import { getAdminToken, rejectAdminToken } from './token';
 import { toRoom, type RoomView } from './roomView';
-import { toApWorld, toPlayers, type ApWorldRecord, type YamlRecord } from './uploads';
+import { toApWorld, toManifest, toPlayers, type ApWorldRecord, type ManifestRecord, type YamlRecord } from './uploads';
 import type {
   ApiError,
   AuditEntry,
@@ -97,7 +97,8 @@ export async function generateWorld(
   if (req.players.length === 0 || req.players.some((p) => !p.yamlId)) {
     throw new Error('Every player needs an uploaded YAML to generate on the server');
   }
-  const body = { apworlds: [...new Set(req.apworlds.map((w) => w.id))], yamls: [...new Set(req.players.map((p) => p.yamlId))] };
+  const yamls = [...new Set(req.players.map((p) => p.yamlId))];
+  const body = req.manifest ? { manifest: req.manifest.id, yamls } : { apworlds: [...new Set(req.apworlds.map((w) => w.id))], yamls };
   const job = await call<{ id: string }>('POST', '/api/worlds', { body });
   for (let done = 0; done < ROOM_POLLS; ) {
     const s = await call<WorldStatus>('GET', `/api/worlds/${enc(job.id)}`);
@@ -114,6 +115,8 @@ export const api = {
   catalog: (game: string) => call<GameCatalog>('GET', `/api/games/${enc(game)}`),
   /** Inspected and stored by the server; the same file again returns the stored one. */
   uploadApWorld: (f: File) => call<ApWorldRecord>('PUT', `/api/apworlds?name=${enc(f.name)}`, { raw: f }).then(toApWorld),
+  /** Checked by the server's engine; the game and version are read from the file. */
+  uploadManifest: (f: File) => call<ManifestRecord>('PUT', `/api/manifests?name=${enc(f.name)}`, { raw: f }).then(toManifest),
   /** One player per document in the file. */
   uploadPlayerFile: (f: File) => call<YamlRecord>('PUT', `/api/yamls?name=${enc(f.name)}`, { raw: f }).then(toPlayers),
 

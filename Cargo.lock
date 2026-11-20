@@ -1462,6 +1462,7 @@ dependencies = [
  "allocation-counter",
  "axum",
  "config",
+ "data-fill",
  "e2e",
  "edge-compat",
  "futures-util",

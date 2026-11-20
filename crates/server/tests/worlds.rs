@@ -246,6 +246,64 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
     assert_eq!(connected["cmd"], "Connected", "{connected}");
 }
 
+/// The game `e2e::connect_packet` asks for.
+const GAME: &str = "Archipela-Go 2: Electric Boogaloo";
+
+/// A manifest world through the web API: the manifest and JSON player files are uploaded, the
+/// engine generates the seed (no sidecar runs), and a client joins the hosted room.
+#[tokio::test]
+async fn a_manifest_world_uploaded_over_http_becomes_a_room_a_client_joins() {
+    let setup = Setup::new("manifest");
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let env = setup.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+    let t = Some(TOKEN);
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (st, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    assert_eq!(st, 201, "{m}");
+    let (st, listed) = http(&server, "GET", "/api/manifests?limit=10", t, b"").await;
+    assert_eq!((st, &listed["items"][0]["id"], &listed["next"]), (200, &m["id"], &Value::Null));
+    let mut yamls = Vec::new();
+    for (k, name) in ["Ann", "Bo"].into_iter().enumerate() {
+        let mut player = doc["instances"][k].clone();
+        player["name"] = json!(name);
+        player["game"] = json!(GAME);
+        let (st, y) = http(
+            &server,
+            "PUT",
+            &format!("/api/yamls?name={name}.yaml"),
+            t,
+            player.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(st, 201, "{y}");
+        yamls.push(y["id"].clone());
+    }
+    let req = json!({"manifest": m["id"], "yamls": yamls}).to_string();
+    let (st, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 202, "{job}");
+    server.wait_for_log("generation done").unwrap();
+    let st = status(&server, job["id"].as_str().unwrap()).await;
+    assert_eq!(
+        (st["status"].as_str(), st["engine"].as_str()),
+        (Some("done"), Some("data-only")),
+        "{st}"
+    );
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (_, connected, _) = e2e::join_via(server.addr, &url, "Bo").await.unwrap();
+    assert_eq!(connected["cmd"], "Connected", "{connected}");
+}
+
 /// Start a server with a rooms folder and generate one world (the fixture); returns the server,
 /// the world id and its status once the server hosts it as a room.
 async fn hosted_world(setup: &Setup) -> (Server, String, Value) {
@@ -602,4 +660,95 @@ async fn without_a_token_the_server_warns_and_serves_the_api_open() {
     server.wait_for_log("admin API is open").unwrap();
     let (st, _) = http(&server, "GET", "/api/apworlds", None, b"").await;
     assert_eq!(st, 200, "open mode: no header needed");
+}
+
+/// Through the real upload route: a player file with no game is refused by the sidecar's inspect,
+/// and one for another game than the manifest's is refused when the world is requested.
+#[tokio::test]
+async fn player_files_of_a_manifest_world_need_a_name_and_the_manifests_game() {
+    let setup = Setup::new("manifest-players");
+    let server = setup.start();
+    let t = Some(TOKEN);
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (_, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    let player = |name: &str, game: Option<&str>| {
+        let mut p = doc["instances"][0].clone();
+        p["name"] = json!(name);
+        if let Some(g) = game {
+            p["game"] = json!(g);
+        }
+        p.to_string()
+    };
+    let (st, e) =
+        http(&server, "PUT", "/api/yamls?name=a.yaml", t, player("Ann", None).as_bytes()).await;
+    assert_eq!(st, 422, "{e}");
+    let (st, other) =
+        http(&server, "PUT", "/api/yamls?name=b.yaml", t, player("Bo", Some("Other")).as_bytes())
+            .await;
+    assert_eq!(st, 201, "{other}");
+    let req = json!({"manifest": m["id"], "yamls": [other["id"]]}).to_string();
+    let (st, e) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 400, "{e}");
+}
+
+/// The fill runs in a child process that is killed at its time limit, not just waited for.
+#[tokio::test]
+async fn a_manifest_fill_past_its_time_is_killed_and_reported_failed() {
+    let setup = Setup::new("manifest-timeout");
+    // A copy of the binary under this test's own folder, so only this test's children name it.
+    let bin = setup.root.join("server-copy");
+    std::fs::copy(BIN, &bin).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    // Too short for any process to start and finish.
+    let mut env = setup.env();
+    env.push(("CONSTELLATION_FILL_TIMEOUT_MS".into(), "1".into()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start(&bin, &["--data-dir", &data], &env).unwrap();
+    let t = Some(TOKEN);
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (_, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    let mut p = doc["instances"][0].clone();
+    p["name"] = json!("Ann");
+    p["game"] = json!(GAME);
+    let (_, y) = http(&server, "PUT", "/api/yamls?name=a.yaml", t, p.to_string().as_bytes()).await;
+    let req = json!({"manifest": m["id"], "yamls": [y["id"]]}).to_string();
+    let (st, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 202, "{job}");
+    server.wait_for_log("generation failed").unwrap();
+    let st = status(&server, job["id"].as_str().unwrap()).await;
+    assert_eq!(st["status"], "failed", "{st}");
+    assert!(st["error"].as_str().unwrap().contains("timed out"), "{st}");
+    let marker = bin.display().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && processes_naming("fill-job").iter().any(|p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+    {
+        tokio::task::yield_now().await;
+    }
+    // Only the server itself names its copy now; a fill child would too, with `fill-job`.
+    let left: Vec<u32> = processes_naming("fill-job")
+        .into_iter()
+        .filter(|p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+        .collect();
+    assert_eq!(left, Vec::<u32>::new(), "no fill child is left");
 }

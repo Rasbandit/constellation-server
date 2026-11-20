@@ -37,6 +37,7 @@ Types are in `src/api/types.ts`. Names follow CWP v1 (`crates/proto/schema/cwp-v
 | GET | `/api/games/:game` | | `GameCatalog` (items with flags, locations) |
 | PUT | `/api/apworlds?name=<file>` | raw `.apworld` | 201 (200 if already stored) `{id, name, bytes, module, game, world_version, ...}` |
 | PUT | `/api/yamls?name=<file>` | raw `.yaml` | 201 (200 if already stored) `{id, name, bytes, players: [{name, game}]}` |
+| PUT | `/api/manifests?name=<file>` | raw `.json` manifest | 201 (200 if already stored) `{id, name, bytes, game, version, items, locations}` |
 | GET | `/api/rooms` | | `RoomSummary[]` |
 | POST | `/api/rooms/check` | `CreateRoomRequest` | readiness checks |
 | POST | `/api/rooms` | `CreateRoomRequest` | 201 `Room` with `adminKey`, or 422 with the failing checks |

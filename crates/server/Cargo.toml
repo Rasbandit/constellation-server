@@ -46,6 +46,8 @@ memory-harness = ["dep:allocation-counter"]
 allocation-counter = { version = "0.8", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
+# Generation for a data-only manifest world, and its upload check (compile).
+data-fill = { path = "../data-fill" }
 edge-compat = { path = "../edge-compat" }
 futures-util.workspace = true
 getrandom = { version = "0.4", default-features = false }

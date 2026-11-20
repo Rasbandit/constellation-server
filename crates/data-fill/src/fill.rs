@@ -42,12 +42,28 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// Per world item: whether its class is `progression` (what counts as held).
+    /// Per world item: its classification bits as a seed records them (1 progression, 2
+    /// useful, 4 trap; filler and items outside the pool 0). The one place a pool class
+    /// becomes bits.
+    #[must_use]
+    pub fn flags(&self, w: &World) -> Vec<u8> {
+        // A world's items are indexed by `u16` (the compile refuses more).
+        (0..=u16::MAX)
+            .take(w.items())
+            .map(|i| match self.pool_class.get(w.item_key(i)).map(String::as_str) {
+                Some("progression") => 1,
+                Some("useful") => 2,
+                Some("trap") => 4,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// Per world item: whether its class is `progression` (what counts as held): bit 1 of
+    /// [`Instance::flags`].
     #[must_use]
     pub fn progression(&self, w: &World) -> Vec<bool> {
-        (0..u16::try_from(w.items()).unwrap_or(0))
-            .map(|i| self.pool_class.get(w.item_key(i)).is_some_and(|c| c == "progression"))
-            .collect()
+        self.flags(w).into_iter().map(|f| f & 1 != 0).collect()
     }
 }
 
