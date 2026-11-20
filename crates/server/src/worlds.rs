@@ -1,8 +1,9 @@
-//! Uploads of `.apworld` and player `.yaml` files, and seed generation from a chosen set of
+//! Uploads of `.apworld`, player `.yaml` and data-only world manifest files, and seed generation from a chosen set of
 //! them, over HTTP. Admin only: every route needs `Authorization: Bearer <token>`.
 //!
 //! Storage is plain files under the data folder:
-//! - `apworlds/<game>/<sha256>.apworld` and `yamls/<game>/<sha256>.yaml`, content-addressed,
+//! - `apworlds/<game>/<sha256>.apworld`, `yamls/<game>/<sha256>.yaml` and
+//!   `manifests/<game>/<sha256>.manifest` (JSON, checked by the engine's compile), content-addressed,
 //!   each with a `<sha256>.json` holding the upload's name and what the sidecar's inspect found.
 //!   `<game>` is the inspected game name made safe by [`game_slug`] (a yaml of several games
 //!   goes under `mixed`). The id stays the sha256, so a lookup scans the game folders; files
@@ -68,7 +69,7 @@ pub(crate) struct Worlds {
 
 /// What stores a kind of upload: its folder and file extension under the data folder, and which
 /// game names its record holds. Files go to `<data dir>/<folder>/<game>/<sha256>.<ext>` for every
-/// kind alike, so a new kind is one entry here plus its route (game manifests: see #101).
+/// kind alike, so a new kind is one entry here plus its route.
 struct KindSpec {
     folder: &'static str,
     ext: &'static str,
@@ -76,7 +77,7 @@ struct KindSpec {
     games: fn(&Value) -> Vec<&str>,
 }
 
-const KINDS: [KindSpec; 2] = [
+const KINDS: [KindSpec; 3] = [
     KindSpec {
         folder: "apworlds",
         ext: "apworld",
@@ -90,6 +91,12 @@ const KINDS: [KindSpec; 2] = [
             players.iter().filter_map(|p| p["game"].as_str()).collect()
         },
     },
+    KindSpec {
+        // Not `json`: the record beside each file is `<sha256>.json`.
+        folder: "manifests",
+        ext: "manifest",
+        games: |meta| meta["game"].as_str().into_iter().collect(),
+    },
 ];
 
 /// The kinds of upload; the discriminant indexes [`KINDS`].
@@ -97,6 +104,7 @@ const KINDS: [KindSpec; 2] = [
 enum Kind {
     Apworld = 0,
     Yaml = 1,
+    Manifest = 2,
 }
 
 impl Kind {
@@ -113,6 +121,7 @@ impl Kind {
         match self {
             Self::Apworld => l.apworld_max_bytes,
             Self::Yaml => l.yaml_max_bytes,
+            Self::Manifest => l.manifest_max_bytes,
         }
     }
 }
@@ -193,7 +202,7 @@ pub(crate) fn open(
     if dir.join("tmp").exists() {
         std::fs::remove_dir_all(dir.join("tmp")).map_err(io)?;
     }
-    for sub in ["apworlds", "yamls", "worlds", "tmp"] {
+    for sub in ["apworlds", "yamls", "manifests", "worlds", "tmp"] {
         std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     recover(&dir.join("worlds"))?;
@@ -256,10 +265,12 @@ impl Worlds {
 }
 
 fn routes(state: Arc<Worlds>) -> Router {
-    let body_cap = state.limits.apworld_max_bytes.max(state.limits.yaml_max_bytes);
+    let l = &state.limits;
+    let body_cap = l.apworld_max_bytes.max(l.yaml_max_bytes).max(l.manifest_max_bytes);
     Router::new()
         .route("/api/apworlds", get(list_apworlds).put(put_apworld))
         .route("/api/yamls", get(list_yamls).put(put_yaml))
+        .route("/api/manifests", get(list_manifests).put(put_manifest))
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route("/api/worlds/{id}/room", get(room_summary))
@@ -401,6 +412,10 @@ async fn put_yaml(State(w): State<Arc<Worlds>>, RawQuery(q): RawQuery, body: Byt
     upload(&w, Kind::Yaml, q.as_deref(), &body).await
 }
 
+async fn put_manifest(State(w): State<Arc<Worlds>>, RawQuery(q): RawQuery, body: Bytes) -> Reply {
+    upload(&w, Kind::Manifest, q.as_deref(), &body).await
+}
+
 /// Check, inspect in the sandbox, then store an upload. The same content again returns the
 /// stored record.
 async fn upload(w: &Worlds, kind: Kind, query: Option<&str>, body: &[u8]) -> Reply {
@@ -440,35 +455,10 @@ async fn inspect_and_store(
     let file = format!("upload.{}", kind.ext());
     std::fs::create_dir_all(tmp).map_err(internal)?;
     std::fs::write(tmp.join(&file), body).map_err(internal)?;
-    let inside = format!("{JOB}/{file}");
-    let (unpacked, entries) =
-        (w.limits.apworld_max_unpacked_bytes.to_string(), w.limits.apworld_max_entries.to_string());
-    let args: Vec<&str> = match kind {
-        Kind::Apworld => {
-            vec!["inspect-apworld", &inside, "--max-unpacked", &unpacked, "--max-entries", &entries]
-        }
-        Kind::Yaml => vec!["inspect-yaml", &inside],
-    };
-    let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
-    let found = w
-        .sandbox
-        .run(false, &[Mount::Ro(tmp.to_owned(), JOB.to_owned())], &args, timeout)
-        .await
-        .map_err(|e| match e {
-            Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
-            Failure::Broken(why) => internal(why),
-        })?;
-    let found: Value = serde_json::from_slice(&found)
-        .map_err(|e| internal(format!("sidecar printed bad JSON: {e}")))?;
-    let mut meta = match (kind, found) {
-        (Kind::Apworld, Value::Object(o)) => {
-            if !o.get("module").and_then(Value::as_str).is_some_and(valid_module) {
-                return Err((StatusCode::UNPROCESSABLE_ENTITY, "bad module name".to_owned()));
-            }
-            Value::Object(o)
-        }
-        (Kind::Yaml, players @ Value::Array(_)) => json!({"players": players}),
-        (_, other) => return Err(internal(format!("unexpected inspect result {other}"))),
+    let mut meta = if kind == Kind::Manifest {
+        inspect_manifest(body).await?
+    } else {
+        inspect_in_sandbox(w, kind, &file, tmp).await?
     };
     // The server's own fields last, so the sidecar can never set them.
     for (k, v) in [("id", json!(id)), ("name", json!(name)), ("bytes", json!(body.len()))] {
@@ -481,6 +471,69 @@ async fn inspect_and_store(
     write_atomic(&store.join(format!("{id}.json")), meta.to_string().as_bytes())
         .map_err(internal)?;
     Ok(meta)
+}
+
+/// What the sidecar finds in an `.apworld` or a player `.yaml` (the file is `tmp/<file>`).
+async fn inspect_in_sandbox(
+    w: &Worlds,
+    kind: Kind,
+    file: &str,
+    tmp: &Path,
+) -> Result<Value, (StatusCode, String)> {
+    let inside = format!("{JOB}/{file}");
+    let (unpacked, entries) =
+        (w.limits.apworld_max_unpacked_bytes.to_string(), w.limits.apworld_max_entries.to_string());
+    let args: Vec<&str> = match kind {
+        Kind::Apworld => {
+            vec!["inspect-apworld", &inside, "--max-unpacked", &unpacked, "--max-entries", &entries]
+        }
+        Kind::Yaml => vec!["inspect-yaml", &inside],
+        Kind::Manifest => return Err(internal("a manifest is not inspected in the sandbox")),
+    };
+    let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
+    let found = w
+        .sandbox
+        .run(false, &[Mount::Ro(tmp.to_owned(), JOB.to_owned())], &args, timeout)
+        .await
+        .map_err(|e| match e {
+            Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
+            Failure::Broken(why) => internal(why),
+        })?;
+    let found: Value = serde_json::from_slice(&found)
+        .map_err(|e| internal(format!("sidecar printed bad JSON: {e}")))?;
+    match (kind, found) {
+        (Kind::Apworld, Value::Object(o)) => {
+            if !o.get("module").and_then(Value::as_str).is_some_and(valid_module) {
+                return Err((StatusCode::UNPROCESSABLE_ENTITY, "bad module name".to_owned()));
+            }
+            Ok(Value::Object(o))
+        }
+        (Kind::Yaml, players @ Value::Array(_)) => Ok(json!({"players": players})),
+        (_, other) => Err(internal(format!("unexpected inspect result {other}"))),
+    }
+}
+
+/// A manifest's game and version, once the engine compiles it. Nothing in it runs: it is data,
+/// parsed and compiled off the async runtime (CPU-heavy for a large world). The engine's compile
+/// is the check for now; the full schema validator is #27.
+async fn inspect_manifest(body: &[u8]) -> Result<Value, (StatusCode, String)> {
+    let body = body.to_vec();
+    let refused = |why: String| (StatusCode::UNPROCESSABLE_ENTITY, why);
+    tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let m: Value = serde_json::from_slice(&body).map_err(|e| format!("not valid JSON: {e}"))?;
+        let game = m["game"].as_str().map(str::trim).filter(|g| !g.is_empty());
+        let game = game.ok_or("the manifest needs a \"game\" name")?;
+        let version = match &m["version"] {
+            Value::String(v) if !v.trim().is_empty() => v.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return Err("the manifest needs a \"version\"".to_owned()),
+        };
+        let w = data_fill::World::load(&m)?;
+        Ok(json!({"game": game, "version": version, "items": w.items(), "locations": w.locations()}))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(refused)
 }
 
 /// What Archipelago imports as `worlds.<module>`; also the file name in `custom_worlds`, so it
@@ -497,6 +550,10 @@ async fn list_apworlds(State(w): State<Arc<Worlds>>) -> Reply {
 
 async fn list_yamls(State(w): State<Arc<Worlds>>) -> Reply {
     list(&w, Kind::Yaml)
+}
+
+async fn list_manifests(State(w): State<Arc<Worlds>>) -> Reply {
+    list(&w, Kind::Manifest)
 }
 
 fn list(w: &Worlds, kind: Kind) -> Reply {
@@ -914,10 +971,18 @@ mod tests {
     #[tokio::test]
     async fn an_upload_of_exactly_its_cap_is_taken_and_one_byte_more_is_refused() {
         let root = temp("cap");
-        let w = worlds(&root, Limits { apworld_max_bytes: 8, yaml_max_bytes: 4, ..Limits::DESIGN });
-        for (kind, folder, ext, cap) in
-            [(Kind::Apworld, "apworlds", "apworld", 8), (Kind::Yaml, "yamls", "yaml", 4)]
-        {
+        let limits = Limits {
+            apworld_max_bytes: 8,
+            yaml_max_bytes: 4,
+            manifest_max_bytes: 6,
+            ..Limits::DESIGN
+        };
+        let w = worlds(&root, limits);
+        for (kind, folder, ext, cap) in [
+            (Kind::Apworld, "apworlds", "apworld", 8),
+            (Kind::Yaml, "yamls", "yaml", 4),
+            (Kind::Manifest, "manifests", "manifest", 6),
+        ] {
             let body = vec![b'x'; cap];
             let meta = stored(&root, folder, ext, &body, json!({"name": "a"}));
             let r = upload(&w, kind, Some("name=a"), &body).await.unwrap();
@@ -1098,7 +1163,7 @@ mod tests {
     /// A record of `kind` naming `games`, shaped as that kind's inspect result.
     fn record(kind: Kind, games: &[&str]) -> Value {
         match kind {
-            Kind::Apworld => json!({"game": games.first()}),
+            Kind::Apworld | Kind::Manifest => json!({"game": games.first()}),
             Kind::Yaml => {
                 json!({"players": games.iter().map(|g| json!({"game": g})).collect::<Vec<_>>()})
             }
@@ -1108,7 +1173,7 @@ mod tests {
     /// Every kind in the table: its game folder is safe, and it is the same rule for all.
     #[test]
     fn every_kind_stores_under_a_safe_game_folder_and_several_games_go_under_mixed() {
-        for (i, kind) in [Kind::Apworld, Kind::Yaml].into_iter().enumerate() {
+        for (i, kind) in [Kind::Apworld, Kind::Yaml, Kind::Manifest].into_iter().enumerate() {
             assert_eq!(kind as usize, i, "Kind must index KINDS");
             assert_eq!(game_folder(kind, &record(kind, &["Clique"])), "clique");
             assert_eq!(game_folder(kind, &record(kind, &[])), UNKNOWN_GAME);
@@ -1123,7 +1188,7 @@ mod tests {
                 assert_eq!(path.components().count(), 4, "{hostile}: {path:?}");
             }
         }
-        assert_eq!(KINDS.len(), 2);
+        assert_eq!(KINDS.len(), 3);
         let yaml = |games: &[&str]| game_folder(Kind::Yaml, &record(Kind::Yaml, games));
         assert_eq!(yaml(&["Clique", "Clique"]), "clique");
         assert_eq!(yaml(&["Clique", "Other"]), MIXED);
@@ -1147,5 +1212,58 @@ mod tests {
         let dir = record_dir(&w, Kind::Yaml, grouped["id"].as_str().unwrap()).unwrap();
         assert_eq!(dir, root.join("data/yamls/clique"));
         assert!(record_dir(&w, Kind::Yaml, &"0".repeat(64)).is_none());
+    }
+
+    /// The test world with a game name and version, as an uploaded manifest.
+    fn manifest(edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let doc: Value =
+            serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+                .unwrap();
+        let mut m = doc["manifest"].clone();
+        m["game"] = json!("Fixture Game");
+        m["version"] = json!("1.2");
+        edit(&mut m);
+        m.to_string().into_bytes()
+    }
+
+    /// A manifest is checked by the engine's own compile at the boundary, never run, and kept
+    /// under its game like every other kind (see #27 for the full schema validator).
+    #[tokio::test]
+    async fn a_manifest_is_validated_stored_by_game_and_listed() {
+        let root = temp("manifest");
+        let w = worlds(&root, Limits::DESIGN);
+        let body = manifest(|_| {});
+        let r = upload(&w, Kind::Manifest, Some("name=world.json"), &body).await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let meta = json_of(r).await;
+        let id = content_id(&body);
+        assert_eq!(
+            (&meta["id"], &meta["game"], &meta["version"]),
+            (&json!(id), &json!("Fixture Game"), &json!("1.2"))
+        );
+        assert_eq!(meta["name"], "world.json");
+        let dir = root.join("data/manifests/fixture-game");
+        assert_eq!(std::fs::read(dir.join(format!("{id}.manifest"))).unwrap(), body);
+        let again = upload(&w, Kind::Manifest, Some("name=world.json"), &body).await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(json_of(list(&w, Kind::Manifest).unwrap()).await, json!([meta]));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_is_not_json_has_no_game_or_does_not_compile_is_refused() {
+        let root = temp("manifest-bad");
+        let w = worlds(&root, Limits::DESIGN);
+        let bad: [(&str, Vec<u8>); 5] = [
+            ("not json", b"{".to_vec()),
+            ("no game", manifest(|m| drop(m.as_object_mut().unwrap().remove("game")))),
+            ("empty game", manifest(|m| m["game"] = json!(" "))),
+            ("no version", manifest(|m| drop(m.as_object_mut().unwrap().remove("version")))),
+            ("no regions", manifest(|m| drop(m.as_object_mut().unwrap().remove("regions")))),
+        ];
+        for (why, body) in bad {
+            let e = upload(&w, Kind::Manifest, Some("name=m.json"), &body).await.unwrap_err();
+            assert_eq!(e.0, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {}", e.1);
+        }
+        assert_eq!(json_of(list(&w, Kind::Manifest).unwrap()).await, json!([]), "nothing kept");
     }
 }

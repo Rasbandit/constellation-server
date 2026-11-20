@@ -158,6 +158,8 @@ pub struct Limits {
     pub apworld_max_entries: u64,
     /// Largest player `.yaml` upload, bytes (design value: real ones are a few KB).
     pub yaml_max_bytes: usize,
+    /// Largest world manifest upload, bytes (design value: the large test world is 830 KB).
+    pub manifest_max_bytes: usize,
     /// Wall-clock limit of one sandboxed inspect call, after which it is killed (design value).
     pub inspect_timeout_ms: u64,
     /// Wall-clock limit of one sandboxed generation, after which it is killed
@@ -277,6 +279,7 @@ impl Limits {
         apworld_max_unpacked_bytes: 256 * 1024 * 1024,
         apworld_max_entries: 20_000,
         yaml_max_bytes: 1024 * 1024,
+        manifest_max_bytes: 8 * 1024 * 1024,
         inspect_timeout_ms: 30_000,
         gen_timeout_ms: 15 * 60 * 1000,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -772,6 +775,7 @@ mod tests {
     fn upload_and_generation_limits_are_design_values() {
         let l = Limits::DESIGN;
         assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
+        assert_eq!(l.manifest_max_bytes, 8 << 20);
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
         assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
