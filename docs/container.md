@@ -13,13 +13,16 @@ docker compose up -d
 
 - Secrets are files mounted as Docker secrets; the server reads the database URL from `CONSTELLATION_DATABASE_URL_FILE`. The server runs as uid 10001 and the mount keeps the host file's owner and mode, so `database_url` must be readable by that uid: the `chmod 400` and `chown 10001` above keep it private to it (the Postgres entrypoint reads its password file as root, so `postgres_password` can stay `600`).
 - Seed bundles (`*.json`) go in the `rooms` volume at `/data/rooms`, for example `docker compose cp seed.json server:/data/rooms/` (the server lists the folder, no restart needed for a new room) or a bind mount in place of the `rooms` volume. Each room logs `room ready key=<key>`.
-- Postgres 19: the volume is mounted at `/var/lib/postgresql` with `PGDATA=/var/lib/postgresql/19/docker`, the layout the official image has used since 18.
+- Postgres 18: the volume is mounted at `/var/lib/postgresql` with `PGDATA=/var/lib/postgresql/18/docker`, the layout the official image has used since 18.
 - `restart: on-failure`, never `always`. Exit code 3 means a newer owner fenced this process, and restarting it makes two instances fight over one database. The image entrypoint (`docker/entrypoint.sh`) runs the server as a child, forwards SIGTERM and SIGINT to it, and turns exit 3 into 0 (logging `server exited 3 (fenced ...)`), so `on-failure` leaves it stopped. Every other exit code passes through and restarts.
 - The image runs as a non-root user. It listens on plain HTTP and WebSocket; TLS and a reverse proxy are outside this file.
 
 ## DNS
 
 A client reaches a room at `<key>.<host>:<port>` (the first label of the `Host` header is the room key). A deployment needs a wildcard DNS record `*.<host>` pointing at the server (and a wildcard TLS certificate if TLS ends in front of it). A proxy must pass `Host` through unchanged. For a trial on one machine, `<key>.127.0.0.1.sslip.io` resolves without DNS setup.
+
+## Uploads
+With `--data-dir` the server stores uploaded files as `<data-dir>/<kind>/<game>/<sha256>.<ext>` (layout in the README); keep `<data-dir>` on a volume (`/data`) and back up that volume together with the Postgres volume. Game manifests will land in `/data/manifests/<game>/` once the upload route for them ships (#101). The compose file does not enable `--data-dir` yet: the sandbox that inspects and runs uploads needs a user session cgroup (`systemd-run --user`) and unprivileged user namespaces, which a container does not have by default (see the PR notes for #97).
 
 ## Versions and releases
 One version covers the server, the web UI and the image: `version` under `[workspace.package]` in `Cargo.toml` (every crate inherits it). `web/package.json` must carry the same one; `tools/version-check/check.sh` checks that and CI runs it, so there is no per-PR bump. The server answers `GET /version` with `{"version":"<version>"}`; a build made with `CONSTELLATION_BUILD_SHA` set (the image's `BUILD_SHA` build arg, used for every non-release build) reads `<version>+<short sha>`. The web UI shows `server <v> / web <v>` in a corner badge and flags a difference.

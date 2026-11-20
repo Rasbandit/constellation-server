@@ -2,8 +2,11 @@
 //! them, over HTTP. Admin only: every route needs `Authorization: Bearer <token>`.
 //!
 //! Storage is plain files under the data folder:
-//! - `apworlds/<sha256>.apworld` and `yamls/<sha256>.yaml`, content-addressed, each with a
-//!   `<sha256>.json` holding the upload's name and what the sidecar's inspect found;
+//! - `apworlds/<game>/<sha256>.apworld` and `yamls/<game>/<sha256>.yaml`, content-addressed,
+//!   each with a `<sha256>.json` holding the upload's name and what the sidecar's inspect found.
+//!   `<game>` is the inspected game name made safe by [`game_slug`] (a yaml of several games
+//!   goes under `mixed`). The id stays the sha256, so a lookup scans the game folders; files
+//!   from before the game folders sit directly in `apworlds/` and `yamls/` and are read too;
 //! - `worlds/<id>/` per generation: `apworlds/<module>.apworld` and `yamls/` (the chosen
 //!   files), `status.json`, and on success `bundle.seed` (seed file v2) with its game packages
 //!   in `packages/` (`docs/seed-bundle-v2.md`). The server converts the sidecar's stdout (v1
@@ -56,25 +59,48 @@ pub(crate) struct Worlds {
     importer: Option<Waker>,
 }
 
-/// The two kinds of upload.
+/// What stores a kind of upload: its folder and file extension under the data folder, and which
+/// game names its record holds. Files go to `<data dir>/<folder>/<game>/<sha256>.<ext>` for every
+/// kind alike, so a new kind is one entry here plus its route (game manifests: see #101).
+struct KindSpec {
+    folder: &'static str,
+    ext: &'static str,
+    /// The game names in a record (untrusted; [`game_folder`] makes the folder from them).
+    games: fn(&Value) -> Vec<&str>,
+}
+
+const KINDS: [KindSpec; 2] = [
+    KindSpec {
+        folder: "apworlds",
+        ext: "apworld",
+        games: |meta| meta["game"].as_str().into_iter().collect(),
+    },
+    KindSpec {
+        folder: "yamls",
+        ext: "yaml",
+        games: |meta| {
+            let players = meta["players"].as_array().map_or(&[][..], Vec::as_slice);
+            players.iter().filter_map(|p| p["game"].as_str()).collect()
+        },
+    },
+];
+
+/// The kinds of upload; the discriminant indexes [`KINDS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Apworld,
-    Yaml,
+    Apworld = 0,
+    Yaml = 1,
 }
 
 impl Kind {
+    const fn spec(self) -> &'static KindSpec {
+        &KINDS[self as usize]
+    }
     const fn folder(self) -> &'static str {
-        match self {
-            Self::Apworld => "apworlds",
-            Self::Yaml => "yamls",
-        }
+        self.spec().folder
     }
     const fn ext(self) -> &'static str {
-        match self {
-            Self::Apworld => "apworld",
-            Self::Yaml => "yaml",
-        }
+        self.spec().ext
     }
     const fn cap(self, l: &Limits) -> usize {
         match self {
@@ -82,6 +108,49 @@ impl Kind {
             Self::Yaml => l.yaml_max_bytes,
         }
     }
+}
+
+/// Longest game folder name.
+const MAX_SLUG: usize = 64;
+/// The folder of a yaml that names several games.
+const MIXED: &str = "mixed";
+/// The folder when an upload names no usable game.
+const UNKNOWN_GAME: &str = "unknown";
+
+/// A game name from an upload (untrusted) as one folder name: lowercase `a-z0-9_-` only, so
+/// never a `.`, a separator or an empty name, and at most [`MAX_SLUG`] long.
+fn game_slug(game: &str) -> String {
+    let mut slug = String::new();
+    for c in game.chars().flat_map(char::to_lowercase) {
+        let c = if matches!(c, 'a'..='z' | '0'..='9' | '_') { c } else { '-' };
+        if c != '-' || !(slug.is_empty() || slug.ends_with('-')) {
+            slug.push(c);
+        }
+    }
+    slug.truncate(MAX_SLUG);
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() { UNKNOWN_GAME.to_owned() } else { slug.to_owned() }
+}
+
+/// The game folder for an upload's record: its one game, or [`MIXED`] for several.
+fn game_folder(kind: Kind, meta: &Value) -> String {
+    let mut games = (kind.spec().games)(meta);
+    games.sort_unstable();
+    games.dedup();
+    match games[..] {
+        [] => UNKNOWN_GAME.to_owned(),
+        [one] => game_slug(one),
+        _ => MIXED.to_owned(),
+    }
+}
+
+/// The folder holding upload `id`'s files: its game folder, or the old flat folder. `id` must
+/// pass [`valid_id`].
+fn record_dir(w: &Worlds, kind: Kind, id: &str) -> Option<PathBuf> {
+    let store = w.dir.join(kind.folder());
+    let json = format!("{id}.json");
+    let games = std::fs::read_dir(&store).ok()?.filter_map(Result::ok).map(|e| e.path());
+    std::iter::once(store.clone()).chain(games).find(|d| d.join(&json).is_file())
 }
 
 type Reply = Result<Response, (StatusCode, String)>;
@@ -286,9 +355,9 @@ async fn upload(w: &Worlds, kind: Kind, query: Option<&str>, body: &[u8]) -> Rep
         return Err((StatusCode::BAD_REQUEST, "empty upload".to_owned()));
     }
     let id = content_id(body);
-    let store = w.dir.join(kind.folder());
-    let meta_path = store.join(format!("{id}.json"));
-    if let Some(meta) = read_json(&meta_path) {
+    if let Some(meta) =
+        record_dir(w, kind, &id).and_then(|d| read_json(&d.join(format!("{id}.json"))))
+    {
         return Ok(json_reply(StatusCode::OK, &meta));
     }
     let n = w.seq.fetch_add(1, Ordering::Relaxed);
@@ -347,7 +416,8 @@ async fn inspect_and_store(
     for (k, v) in [("id", json!(id)), ("name", json!(name)), ("bytes", json!(body.len()))] {
         meta[k] = v;
     }
-    let store = w.dir.join(kind.folder());
+    let store = w.dir.join(kind.folder()).join(game_folder(kind, &meta));
+    std::fs::create_dir_all(&store).map_err(internal)?;
     std::fs::rename(tmp.join(&file), store.join(format!("{id}.{}", kind.ext())))
         .map_err(internal)?;
     write_atomic(&store.join(format!("{id}.json")), meta.to_string().as_bytes())
@@ -372,8 +442,13 @@ async fn list_yamls(State(w): State<Arc<Worlds>>) -> Reply {
 }
 
 fn list(w: &Worlds, kind: Kind) -> Reply {
-    let mut all: Vec<Value> = std::fs::read_dir(w.dir.join(kind.folder()))
-        .map_err(internal)?
+    let store = w.dir.join(kind.folder());
+    let games =
+        std::fs::read_dir(&store).map_err(internal)?.filter_map(Result::ok).map(|e| e.path());
+    let mut all: Vec<Value> = std::iter::once(store.clone())
+        .chain(games.filter(|p| p.is_dir()))
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| read_json(&e.path()))
@@ -392,7 +467,8 @@ fn chosen(w: &Worlds, body: &Value, field: &str, kind: Kind) -> Result<Vec<Value
         if metas.iter().any(|m: &Value| m["id"] == id) {
             return Err(format!("{field}: {id} is listed twice"));
         }
-        let meta = read_json(&w.dir.join(kind.folder()).join(format!("{id}.json")))
+        let meta = record_dir(w, kind, id)
+            .and_then(|d| read_json(&d.join(format!("{id}.json"))))
             .ok_or(format!("{field}: no upload {id}"))?;
         metas.push(meta);
     }
@@ -410,7 +486,9 @@ fn prepare(w: &Worlds, world: &Path, apworlds: &[Value], yamls: &[Value]) -> Res
         for m in metas {
             let id = m["id"].as_str().unwrap_or("");
             let stem = if kind == Kind::Apworld { m["module"].as_str().unwrap_or("") } else { id };
-            let from = w.dir.join(kind.folder()).join(format!("{id}.{}", kind.ext()));
+            let from = record_dir(w, kind, id)
+                .ok_or(format!("no upload {id}"))?
+                .join(format!("{id}.{}", kind.ext()));
             let to = world.join(kind.folder()).join(format!("{stem}.{}", kind.ext()));
             if std::fs::hard_link(&from, &to).is_err() {
                 std::fs::copy(&from, &to).map_err(e)?;
@@ -743,6 +821,7 @@ mod tests {
         let id = content_id(body);
         meta["id"] = json!(id);
         let dir = root.join("data").join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{id}.{ext}")), body).unwrap();
         std::fs::write(dir.join(format!("{id}.json")), meta.to_string()).unwrap();
         meta
@@ -922,5 +1001,75 @@ mod tests {
         assert_eq!(read("d"), json!({"id": "d", "status": "done", "bundle": "/b"}));
         assert_eq!(read("f")["status"], "failed");
         assert!(!worlds.join("q/status.tmp").exists(), "the write is atomic");
+    }
+    #[test]
+    fn a_game_name_becomes_a_safe_short_folder_name() {
+        assert_eq!(game_slug("../../x"), "x");
+        assert_eq!(game_slug("Majora's Mask"), "majora-s-mask");
+        assert_eq!(game_slug(".."), UNKNOWN_GAME);
+        assert_eq!(game_slug(""), UNKNOWN_GAME);
+        assert_eq!(game_slug("a/b\\c.d"), "a-b-c-d");
+        assert_eq!(game_slug(&"x".repeat(500)).len(), MAX_SLUG);
+        for game in ["../../etc", "/abs", "a\0b", "é", "..\\.."] {
+            let s = game_slug(game);
+            assert!(
+                !s.is_empty() && s.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '-'))
+            );
+            assert!(!s.starts_with('-'), "{s}");
+        }
+    }
+
+    /// A record of `kind` naming `games`, shaped as that kind's inspect result.
+    fn record(kind: Kind, games: &[&str]) -> Value {
+        match kind {
+            Kind::Apworld => json!({"game": games.first()}),
+            Kind::Yaml => {
+                json!({"players": games.iter().map(|g| json!({"game": g})).collect::<Vec<_>>()})
+            }
+        }
+    }
+
+    /// Every kind in the table: its game folder is safe, and it is the same rule for all.
+    #[test]
+    fn every_kind_stores_under_a_safe_game_folder_and_several_games_go_under_mixed() {
+        for (i, kind) in [Kind::Apworld, Kind::Yaml].into_iter().enumerate() {
+            assert_eq!(kind as usize, i, "Kind must index KINDS");
+            assert_eq!(game_folder(kind, &record(kind, &["Clique"])), "clique");
+            assert_eq!(game_folder(kind, &record(kind, &[])), UNKNOWN_GAME);
+            assert_eq!(game_folder(kind, &record(kind, &["../../x"])), "x");
+            for hostile in ["..", "/abs", "a/../b", "", "\\..\\x", "a\0b"] {
+                let folder = game_folder(kind, &record(kind, &[hostile]));
+                let path = Path::new("/data").join(kind.folder()).join(&folder);
+                assert!(
+                    path.starts_with(format!("/data/{}", kind.folder())),
+                    "{hostile}: {path:?}"
+                );
+                assert_eq!(path.components().count(), 4, "{hostile}: {path:?}");
+            }
+        }
+        assert_eq!(KINDS.len(), 2);
+        let yaml = |games: &[&str]| game_folder(Kind::Yaml, &record(Kind::Yaml, games));
+        assert_eq!(yaml(&["Clique", "Clique"]), "clique");
+        assert_eq!(yaml(&["Clique", "Other"]), MIXED);
+    }
+
+    /// Uploads by game, and old flat ones, are all found by id, listed, and survive a restart.
+    #[tokio::test]
+    async fn an_id_is_found_in_a_game_folder_or_the_old_flat_one_also_after_a_restart() {
+        let root = temp("by-game");
+        let w = worlds(&root, Limits::DESIGN);
+        let flat = stored(&root, "yamls", "yaml", b"flat", json!({"name": "flat"}));
+        let grouped = stored(&root, "yamls/clique", "yaml", b"g1", json!({"name": "g1"}));
+        let same_game = stored(&root, "yamls/clique", "yaml", b"g2", json!({"name": "g2"}));
+        drop(w);
+        let w = worlds(&root, Limits::DESIGN);
+        let ids = json!([flat["id"], grouped["id"], same_game["id"]]);
+        let got = chosen(&w, &json!({ "yamls": ids }), "yamls", Kind::Yaml).unwrap();
+        assert_eq!(got, [flat.clone(), grouped.clone(), same_game.clone()]);
+        let listed = json_of(list(&w, Kind::Yaml).unwrap()).await;
+        assert_eq!(listed, json!([flat, grouped, same_game]));
+        let dir = record_dir(&w, Kind::Yaml, grouped["id"].as_str().unwrap()).unwrap();
+        assert_eq!(dir, root.join("data/yamls/clique"));
+        assert!(record_dir(&w, Kind::Yaml, &"0".repeat(64)).is_none());
     }
 }

@@ -16,12 +16,12 @@ services:
     volumes:
       - rooms:/data/rooms
   postgres:
-    image: postgres:19
+    image: postgres:18
     restart: unless-stopped
     environment:
       POSTGRES_USER: constellation
       POSTGRES_DB: constellation
-      PGDATA: /var/lib/postgresql/19/docker
+      PGDATA: /var/lib/postgresql/18/docker
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets: [postgres_password]
     volumes:
