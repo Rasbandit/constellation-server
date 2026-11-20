@@ -3,6 +3,9 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
+# Empty on a release build; any other build shows `<version>+<short sha>` at GET /version.
+ARG BUILD_SHA=""
+ENV CONSTELLATION_BUILD_SHA=$BUILD_SHA
 # Cache mounts keep the registry and target between builds; the binary is copied out of the mount.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

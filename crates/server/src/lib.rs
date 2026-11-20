@@ -245,6 +245,21 @@ async fn healthz(State(s): State<AppState>) -> (StatusCode, &'static str) {
     health(read(&s.rooms).all_running())
 }
 
+/// The build's version: the workspace version, plus `+<short sha>` when `CONSTELLATION_BUILD_SHA`
+/// was set at compile time. A release build leaves it unset and shows the bare version.
+fn version_string(version: &str, sha: Option<&str>) -> String {
+    match sha.filter(|s| !s.is_empty()) {
+        Some(sha) => format!("{version}+{}", sha.get(..7).unwrap_or(sha)),
+        None => version.to_owned(),
+    }
+}
+
+/// `GET /version`: `{"version": "<version>[+<short sha>]"}`. The web UI compares it with its own.
+async fn version() -> impl IntoResponse {
+    let v = version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"));
+    ([(header::CONTENT_TYPE, "application/json")], format!("{{\"version\":\"{v}\"}}"))
+}
+
 /// Rebuild the room from `store` (snapshot, then the tail through `fold`, then the stored
 /// cursors) and start its task on `mailbox`. `epoch` must be the claim just made.
 async fn start_room<S: LogStore>(
@@ -351,8 +366,11 @@ pub async fn app(
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
-    let router =
-        Router::new().route("/", get(upgrade)).route("/healthz", get(healthz)).with_state(state);
+    let router = Router::new()
+        .route("/", get(upgrade))
+        .route("/healthz", get(healthz))
+        .route("/version", get(version))
+        .with_state(state);
     Ok((router, host))
 }
 
@@ -1014,5 +1032,13 @@ mod tests {
     fn healthz_is_ok_only_while_the_room_runs() {
         assert_eq!(health(true), (StatusCode::OK, "ok"));
         assert_eq!(health(false), (StatusCode::SERVICE_UNAVAILABLE, "room stopped"));
+    }
+
+    #[test]
+    fn version_has_a_short_sha_only_when_one_was_built_in() {
+        assert_eq!(version_string("0.1.0", None), "0.1.0");
+        assert_eq!(version_string("0.1.0", Some("")), "0.1.0");
+        assert_eq!(version_string("0.1.0", Some("abcdef1234567")), "0.1.0+abcdef1");
+        assert_eq!(version_string("0.1.0", Some("abc")), "0.1.0+abc");
     }
 }

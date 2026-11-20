@@ -66,8 +66,21 @@ jobs:
           dockerfile: Dockerfile
           ignore: DL3008 # apt packages are not version-pinned: bookworm-slim security updates matter more
       - run: sh docker/test-entrypoint.sh
-      - run: shellcheck docker/*.sh
+      # One version for server, web and image; the test feeds the script mismatched fixtures.
+      - run: sh tools/version-check/test.sh && sh tools/version-check/check.sh
+      - run: shellcheck docker/*.sh tools/version-check/*.sh
       # The secret files only need to exist for the config check.
       - run: |
           mkdir secrets && touch secrets/database_url secrets/postgres_password
           docker compose config -q
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults: { run: { working-directory: web } }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      # Not frozen: bun.lock is from an older bun and a frozen install fails on it.
+      - run: bun install
+      - run: bun --bun run typecheck
+      - run: bun --bun run test

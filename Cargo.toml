@@ -5,6 +5,7 @@ exclude = ["crates/e2e-ap"]
 members = ["crates/bits", "crates/proto", "crates/config", "crates/spec-rng", "crates/room-core", "crates/log", "crates/sim", "crates/seed-bundle", "crates/runtime", "crates/edge-compat", "crates/server", "crates/e2e", "crates/data-fill"]
 
 [workspace.package]
+version = "0.1.0" # the one version of server, web and image; bumped once per release (docs/container.md)
 edition = "2024"
 license = "LicenseRef-PolyForm-Strict-1.0.0"
 rust-version = "1.94" # sqlx 0.9.0 needs 1.94 (D-98). shortcut: placeholder MSRV, owner sets the window (doc 05 section 19)

@@ -21,6 +21,9 @@ docker compose up -d
 
 A client reaches a room at `<key>.<host>:<port>` (the first label of the `Host` header is the room key). A deployment needs a wildcard DNS record `*.<host>` pointing at the server (and a wildcard TLS certificate if TLS ends in front of it). A proxy must pass `Host` through unchanged. For a trial on one machine, `<key>.127.0.0.1.sslip.io` resolves without DNS setup.
 
-## Releases
+## Versions and releases
+One version covers the server, the web UI and the image: `version` under `[workspace.package]` in `Cargo.toml` (every crate inherits it). `web/package.json` must carry the same one; `tools/version-check/check.sh` checks that and CI runs it, so there is no per-PR bump. The server answers `GET /version` with `{"version":"<version>"}`; a build made with `CONSTELLATION_BUILD_SHA` set (the image's `BUILD_SHA` build arg, used for every non-release build) reads `<version>+<short sha>`. The web UI shows `server <v> / web <v>` in a corner badge and flags a difference.
+
+To release: bump the version in `Cargo.toml` and `web/package.json` (and `Cargo.lock`, by building once), merge, then tag `v<version>`, for example `git tag v0.2.0 && git push origin v0.2.0`. The release workflow refuses a tag that is not `v<Cargo version>`, then builds and pushes the image tagged `0.2.0` and `0.2` (and `latest`, unless the tag has a suffix such as `-rc1`) with a bare version at `/version`.
 
 Pushing a tag `v*` runs `.github/workflows/release.yml`, which pushes `linux/amd64` to `ghcr.io/<owner>/constellation-server`. Pre-release tags (such as `v0.2.0-rc1`) do not move `latest`.

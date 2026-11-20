@@ -6,6 +6,7 @@ import { CreateRoom } from './pages/CreateRoom';
 import { Home } from './pages/Home';
 import { NotFound } from './pages/NotFound';
 import { PlayRoom } from './pages/PlayRoom';
+import { VersionTag } from './components/ui';
 
 export function App() {
   return (
@@ -46,6 +47,7 @@ export function App() {
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>
+      <VersionTag />
     </div>
   );
 }
