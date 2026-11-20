@@ -1,0 +1,111 @@
+name: release
+# The image is built on main and on tags, never on PRs (packaging PRs get the seconds-long
+# container-lint workflow). A push to main builds it and runs it under compose; a tag
+# vX.Y.Z (equal to the Cargo.toml version) builds and pushes linux/amd64 to GHCR. A manual run
+# (workflow_dispatch) builds and runs it on any branch without pushing.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+permissions:
+  contents: read
+jobs:
+  smoke:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ghcr.io/rasbandit/constellation-server:ci
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            GEN_REPO_URL=${{ secrets.GEN_REPO_URL }}
+            GEN_REPO_REF=${{ vars.GEN_REPO_REF }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Compose needs the build args set even with --no-build.
+      - run: printf 'GEN_REPO_URL=%s\nGEN_REPO_REF=%s\n' "$GEN_REPO_URL" "$GEN_REPO_REF" >> .env
+        env:
+          GEN_REPO_URL: ${{ secrets.GEN_REPO_URL }}
+          GEN_REPO_REF: ${{ vars.GEN_REPO_REF }}
+      # Run the built image under compose: uid, secret read, healthcheck, Postgres 18 volume.
+      - run: |
+          mkdir secrets
+          echo ci-password > secrets/postgres_password
+          echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
+          openssl rand -hex 16 > secrets/admin_token
+          chmod 400 secrets/database_url secrets/admin_token
+          sudo chown 10001 secrets/database_url secrets/admin_token
+          CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
+      # The admin API: 401 without the token, 200 with it. Then a yaml upload runs the sandbox
+      # (bubblewrap under the seccomp profile) and must land under /data/yamls/<game>/.
+      - run: |
+          A=http://127.0.0.1:38282
+          T=$(sudo cat secrets/admin_token)
+          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
+          printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
+          code=$(curl -s -X PUT -o up.out -w '%{http_code}' -H "Authorization: Bearer $T" --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
+          cat up.out; echo " (HTTP $code)"
+          test "$code" = 201
+          docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
+      - if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v
+  push:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      # The tagged commit must be on main, so a tag on a side branch cannot publish `latest`.
+      - run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      # The tag must be v<Cargo version> and web/package.json must agree.
+      - run: sh tools/version-check/check.sh "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/constellation-server
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # No attestation: it would embed the build args (the generator URL is a secret).
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GEN_REPO_URL=${{ secrets.GEN_REPO_URL }}
+            GEN_REPO_REF=${{ vars.GEN_REPO_REF }}
+          # A release build carries the bare version (no BUILD_SHA).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

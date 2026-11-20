@@ -433,6 +433,10 @@ pub struct Generation {
     /// Host paths no sandbox mount may contain: the server user's home (`HOME`) and the secret
     /// files (`CONSTELLATION_*_FILE`).
     pub private: Vec<std::path::PathBuf>,
+    /// `CONSTELLATION_SANDBOX_MODE=container`: no per-job cgroup (`systemd-run --user`); the
+    /// container's own memory and process limits bound the jobs instead. Never detected, only
+    /// asked for. Default (`systemd`, or unset): a cgroup per job.
+    pub container_mode: bool,
 }
 
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
@@ -456,6 +460,11 @@ pub fn load_generation() -> Result<Option<Generation>, String> {
 fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Generation>, String> {
     const KEYS: [&str; 3] =
         ["CONSTELLATION_AP_DIR", "CONSTELLATION_AP_PYTHON", "CONSTELLATION_AP_GEN_SCRIPT"];
+    let container_mode = match var("CONSTELLATION_SANDBOX_MODE").as_deref() {
+        None | Some("" | "systemd") => false,
+        Some("container") => true,
+        Some(_) => return Err("CONSTELLATION_SANDBOX_MODE must be `systemd` or `container`".into()),
+    };
     let [ap, py, side] = KEYS.map(|k| var(k).filter(|v| !v.is_empty()));
     let (Some(ap), Some(py), Some(side)) = (&ap, &py, &side) else {
         if ap.is_none() && py.is_none() && side.is_none() {
@@ -478,6 +487,7 @@ fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Genera
         python: path(py, KEYS[1])?,
         sidecar: path(side, KEYS[2])?,
         private,
+        container_mode,
     }))
 }
 
@@ -832,6 +842,23 @@ mod tests {
             ("CONSTELLATION_AP_GEN_SCRIPT", "/s"),
         ];
         assert!(generation_from(env(rel)).unwrap_err().contains("absolute"));
+        // The sandbox mode: systemd by default, container only when asked, anything else refused.
+        macro_rules! mode {
+            ($m:expr) => {
+                generation_from(env(&[
+                    ("CONSTELLATION_AP_DIR", "/ap"),
+                    ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+                    ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap_gen.py"),
+                    ("CONSTELLATION_SANDBOX_MODE", $m),
+                ]))
+                .map(|g| g.unwrap().container_mode)
+            };
+        }
+        assert_eq!(mode!(""), Ok(false));
+        assert_eq!(mode!("systemd"), Ok(false));
+        assert_eq!(mode!("container"), Ok(true));
+        assert!(mode!("docker").unwrap_err().contains("SANDBOX_MODE"));
+        assert!(generation_from(env(&[("CONSTELLATION_SANDBOX_MODE", "x")])).is_err());
     }
 
     #[test]

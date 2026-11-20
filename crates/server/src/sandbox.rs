@@ -142,8 +142,24 @@ impl Sandbox {
             format!("MemoryMax={}", l.gen_cgroup_memory_bytes),
             format!("TasksMax={}", l.gen_cgroup_tasks),
         );
-        push(&[&"systemd-run", &"--user", &"--scope", &"--quiet", &"--collect"]);
-        push(&[&"-p", &mem_max, &"-p", &"MemorySwapMax=0", &"-p", &tasks, &"--", &"env", &"-i"]);
+        if self.paths.container_mode {
+            // The container's own memory and pids limits bound the job instead (compose
+            // `mem_limit`, `pids_limit`); every bwrap isolation flag below stays.
+            push(&[&"env", &"-i"]);
+        } else {
+            push(&[&"systemd-run", &"--user", &"--scope", &"--quiet", &"--collect"]);
+            push(&[
+                &"-p",
+                &mem_max,
+                &"-p",
+                &"MemorySwapMax=0",
+                &"-p",
+                &tasks,
+                &"--",
+                &"env",
+                &"-i",
+            ]);
+        }
         push(&[&"bwrap", &"--unshare-all", &"--unshare-user", &"--disable-userns"]);
         push(&[&"--cap-drop", &"ALL", &"--die-with-parent", &"--new-session", &"--clearenv"]);
         push(&[&"--setenv", &"PATH", &"/usr/bin", &"--setenv", &"HOME", &"/tmp"]);
@@ -261,11 +277,19 @@ async fn exec(argv: &[OsString], l: &Limits, timeout: Duration) -> Result<Vec<u8
 }
 
 /// Check once at startup that each job can get its own cgroup (`systemd-run --user`
-/// needs a user session with the memory controller); without it no job could run.
+/// needs a user session with the memory controller); without it no job could run. In
+/// container mode there is no such cgroup, so nothing is checked and a warning says so.
 ///
 /// # Errors
 /// What `systemd-run` said.
-pub fn check_host(l: &Limits) -> Result<(), String> {
+pub fn check_host(container_mode: bool, l: &Limits) -> Result<(), String> {
+    if container_mode {
+        tracing::warn!(
+            "sandbox mode CONTAINER: no per-job cgroup; uploaded code is bounded only by \
+             prlimit and the container's own memory and pids limits (set mem_limit and pids_limit)"
+        );
+        return Ok(());
+    }
     let out = std::process::Command::new("systemd-run")
         .args(["--user", "--scope", "--quiet", "--collect", "-p"])
         .arg(format!("MemoryMax={}", l.gen_cgroup_memory_bytes))
@@ -405,6 +429,7 @@ pub(crate) mod tests {
             python: "/usr/bin/python3".into(),
             sidecar: root.join("tools/ap-gen/ap_gen.py"),
             private: vec![],
+            container_mode: false,
         }
     }
 
@@ -415,6 +440,34 @@ pub(crate) mod tests {
 
     fn joined(v: &[OsString]) -> String {
         v.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Container mode drops only the per-job cgroup: every bwrap flag and prlimit stay.
+    #[test]
+    fn container_mode_has_no_systemd_run_but_every_isolation_flag() {
+        let root = temp("argv-container");
+        let normal = sandbox(&root);
+        let container = Sandbox {
+            paths: Generation { container_mode: true, ..normal.paths.clone() },
+            ..sandbox(&root)
+        };
+        let args = ["inspect-yaml", "/job/x.yaml"];
+        let (n, c) =
+            (joined(&normal.argv(false, &[], &args)), joined(&container.argv(false, &[], &args)));
+        assert!(!c.contains("systemd-run") && !c.contains("MemoryMax"), "{c}");
+        let rest = n.split_once(" -- env -i ").unwrap().1;
+        assert_eq!(c, format!("env -i {rest}"), "everything after the cgroup is identical");
+        for flag in [
+            "--unshare-all",
+            "--unshare-user",
+            "--disable-userns",
+            "--cap-drop ALL",
+            "--die-with-parent",
+            "--clearenv",
+            "/usr/bin/prlimit",
+        ] {
+            assert!(c.contains(flag), "{flag}: {c}");
+        }
     }
 
     #[test]
@@ -555,7 +608,7 @@ pub(crate) mod tests {
     #[test]
     fn a_host_where_no_job_could_start_is_refused() {
         let tiny = Limits { gen_cgroup_memory_bytes: 1, ..Limits::DESIGN };
-        let e = check_host(&tiny).unwrap_err();
+        let e = check_host(false, &tiny).unwrap_err();
         assert!(e.contains("systemd-run"), "{e}");
     }
 
