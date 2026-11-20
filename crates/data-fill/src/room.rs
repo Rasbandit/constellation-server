@@ -15,7 +15,7 @@
 //!
 //! Per-player state is owned by the room and shared data (`World`, `Plan`) is immutable and
 //! `Sync`; only the fill is sequential. Choices where the legacy multiplayer fill has options
-//! (see `docs/world-rules-section.md`): one shared pool and one shuffled list of locations
+//! (see `docs/world-rules-section.md`): rounds of one item per player; one shared pool and one shuffled list of locations
 //! over all players; an item with a placement group stays in its owner's world; progression
 //! never goes on an excluded location; every player's goal must hold (accessibility is not
 //! required beyond that); no local-item option (#91), no accessibility modes or progression balancing (#92).
@@ -346,12 +346,6 @@ impl<'a, 'w> Linked<'a, 'w> {
         } else {
             self.models[p].hold_away(loc, g.to, g.item);
         }
-    }
-
-    /// Place `g` at a location and bring every state to its fixed point.
-    fn place(&mut self, p: usize, loc: u32, g: Given) {
-        self.hold(p, loc, g);
-        self.settle();
     }
 
     /// Run states and pass their messages on until nothing is left to do.
