@@ -6,6 +6,7 @@ import { Phases } from '../components/phases';
 import { Card, Dropzone, Empty, Modal, useToast } from '../components/ui';
 import { bytes } from '../lib/format';
 import { gamesOf } from '../api/uploads';
+import { jsonKind } from '../lib/jsonKind';
 import { NAME_MAX, checkReadiness } from '../lib/readiness';
 
 const defaultRules: RoomRules = { hintCostPct: 10, releaseMode: 'goal', collectMode: 'goal', password: '', spoilerLog: true };
@@ -55,13 +56,22 @@ export function CreateRoom() {
     }
   }
 
+  /** A `.json` file dropped in the wrong zone is refused here, before it is uploaded. */
+  const refuseWrongZone = async (f: File, zone: 'manifest' | 'player') => {
+    const kind = await jsonKind(f);
+    if (kind === 'other' || kind === zone) return false;
+    toast(`${f.name} looks like a ${kind === 'manifest' ? 'world manifest' : 'player file'}; drop it in the ${kind === 'manifest' ? 'manifest' : 'player'} area.`, 'error');
+    return true;
+  };
+
   const addPlayerFiles = (files: File[]) =>
-    files.forEach((f) =>
+    files.forEach(async (f) => {
+      if (await refuseWrongZone(f, 'player')) return;
       track(api.uploadPlayerFile(f)).then(
         (added) => setPlayers((ps) => [...ps, ...added]),
         (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
-      ),
-    );
+      );
+    });
 
   const addWorldFiles = (files: File[]) =>
     files.forEach((f) =>
@@ -72,12 +82,13 @@ export function CreateRoom() {
     );
 
   const addManifestFiles = (files: File[]) =>
-    files.forEach((f) =>
+    files.forEach(async (f) => {
+      if (await refuseWrongZone(f, 'manifest')) return;
       track(api.uploadManifest(f)).then(
         (m) => setManifests((ms) => [...ms, m]),
         (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
-      ),
-    );
+      );
+    });
 
   const updatePlayer = (id: string, patch: Partial<PlayerFile>) =>
     setPlayers((ps) => ps.map((p) => (p.id === id ? { ...p, ...patch, error: patch.game ? undefined : p.error } : p)));
@@ -160,7 +171,7 @@ export function CreateRoom() {
               accept=".yaml,.yml,.json"
               onFiles={addPlayerFiles}
               title="Drop player files"
-              hint="YAML files, or JSON files for a manifest world. Several at once; a YAML file can hold several players. Or use Add game/player for one player with their files."
+              hint="YAML files, or JSON files with a name and a game for a manifest world. Several at once; a YAML file can hold several players. Or use Add game/player for one player with their files."
             />
             {players.length > 0 && (
               <div className="table-wrap">
