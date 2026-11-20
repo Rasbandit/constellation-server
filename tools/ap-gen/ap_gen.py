@@ -16,8 +16,9 @@ How generation follows Archipelago 0.6.8 (files in its checkout, read, not copie
 - `worlds/__init__.py` loads `.apworld` files from `user_path("custom_worlds")` when
   `Utils.user_path` is the checkout itself, which it picks only for a writable checkout. The
   sandbox mounts the checkout read-only, so this sets that choice (`user_path.cached_path`)
-  before anything reads it, and seeds default settings in memory (no host.yaml is written). The sandbox mounts the job's apworlds at `custom_worlds/`, so
-  `--apworlds` must be that folder. A world loads as `worlds.<file stem>`, so each file is
+  before anything reads it. It also seeds default settings in memory, so no settings file is
+  written. The sandbox mounts the job's apworlds at `custom_worlds/`, so `--apworlds` must be
+  that folder. A world loads as `worlds.<file stem>`, so each file is
   named after the top-level folder inside it.
 - `Generate.mystery_argparse` and `Generate.main` roll the player settings from the yamls in
   `--player_files_path`, then `Main.main` generates and writes `AP_<seed>.zip` (the
