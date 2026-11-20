@@ -145,6 +145,7 @@ class DefaultSettings(unittest.TestCase):
                 "    if c is None: Settings(None).save('host.yaml')\n"
                 "    return c\n")
             sys.path.insert(0, d)
+            sys.modules.pop("settings", None)  # never reuse a settings module an earlier test imported
             try:
                 import settings
                 ap_gen.use_default_settings()
