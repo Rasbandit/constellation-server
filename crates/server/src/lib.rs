@@ -70,7 +70,7 @@ pub struct Args {
     /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
     pub admin_port: u16,
     /// The host name clients reach this server by; a room's join address is
-    /// `{room_key}.{public_host}:{port}` (default `localhost`).
+    /// `{public_host}:{port}/{room_key}` (default `localhost`).
     pub public_host: String,
 }
 
@@ -186,8 +186,8 @@ struct AppState {
     rooms: Arc<RwLock<Rooms>>,
     /// Asks the host to load a cold room.
     wake: host::Waker,
-    /// `--bundle`: the one room takes every host (see [`route`]).
-    any_host: bool,
+    /// `--bundle`: the one room takes every path (see [`route`]).
+    any_path: bool,
     options: Options,
     /// One permit per open WebSocket (`Limits::max_connections`).
     slots: Arc<Semaphore>,
@@ -362,14 +362,15 @@ pub async fn app(
     let state = AppState {
         rooms: host.rooms(),
         wake: host.waker(),
-        any_host: matches!(source, Source::Bundle(_)),
+        any_path: matches!(source, Source::Bundle(_)),
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
     };
     let router = Router::new()
-        .route("/", get(upgrade))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        // Every other path is a room's (`/{room_key}`); `route` decides.
+        .fallback(get(upgrade))
         .with_state(state);
     Ok((router, host))
 }
@@ -425,37 +426,21 @@ async fn start<S: LogStore>(
     Ok(handle)
 }
 
-/// The room key a `Host` header names: its first DNS label, when that is a room key
-/// (`{room_key}.{host}`, doc 01 section 3.8.1). The port, if any, is ignored; an IP address
-/// names no key.
-#[must_use]
-pub fn key_from_host(host: &str) -> Option<RoomKey> {
-    if host.starts_with('[') {
-        return None;
-    }
-    let name = host.split(':').next()?;
-    if name.parse::<std::net::Ipv4Addr>().is_ok() {
-        return None;
-    }
-    RoomKey::parse(name.split('.').next()?).ok()
-}
-
-/// The room a connection with this `Host` header joins.
+/// The room a connection to this path joins (`/{room_key}`, doc 01 section 3.8.1).
 ///
-/// With `--bundle` (`any_host`) the one room takes every connection, whatever the host, so old
-/// addresses keep working (a host whose first label only looks like a key, such as
-/// `playground.example`, is not refused). With `--rooms` the first label must be the key of a
-/// listed room, however many there are: the count changes at runtime, so an old link to a
-/// room that ended must never land in another one.
-fn route(rooms: &Rooms, host: Option<&str>, any_host: bool) -> Result<Route, String> {
-    let only = if any_host { rooms.only_with_key() } else { None };
+/// With `--bundle` (`any_path`) the one room takes every connection, whatever the path, so old
+/// addresses keep working. With `--rooms` the path must be the key of a listed room, however
+/// many there are: the count changes at runtime, so an old link to a room that ended must never
+/// land in another one.
+fn route(rooms: &Rooms, path: &str, any_path: bool) -> Result<Route, String> {
+    let only = if any_path { rooms.only_with_key() } else { None };
     let key = match only {
         Some((key, _)) => key.clone(),
-        None => match host.and_then(key_from_host) {
+        None => match RoomKey::from_path(path) {
             Some(key) => key,
             None => {
                 return Err(format!(
-                    "this server runs {} rooms; connect through {{room_key}}.<this host>",
+                    "this server runs {} rooms; connect through <this host>/{{room_key}}",
                     rooms.len()
                 ));
             }
@@ -508,25 +493,25 @@ const NOT_LOADED: &str = "the room could not be loaded; try again";
 
 /// The answer to a connection that got no room. A room that did not load is the server's
 /// fault and may work on a retry, so it is a 503 with a generic body, never the error text.
-fn refused(host: Option<&str>, no: NoRoom) -> Response {
+fn refused(path: &str, no: NoRoom) -> Response {
     match no {
         NoRoom::Unknown(why) => {
-            tracing::info!(host, "{why}");
+            tracing::info!(path, "{why}");
             (StatusCode::NOT_FOUND, why).into_response()
         }
         NoRoom::Failed(why) => {
-            tracing::warn!(host, %why, "room did not load");
+            tracing::warn!(path, %why, "room did not load");
             (StatusCode::SERVICE_UNAVAILABLE, NOT_LOADED).into_response()
         }
     }
 }
 
-/// The room a connection with this `Host` header joins, woken first when it is cold.
+/// The room a connection to this path joins, woken first when it is cold.
 async fn find(
     s: &AppState,
-    host: Option<&str>,
+    path: &str,
 ) -> Result<(RoomKey, Arc<CompatRoom>, rooms::Visit), NoRoom> {
-    let found = route(&read(&s.rooms), host, s.any_host).map_err(NoRoom::Unknown)?;
+    let found = route(&read(&s.rooms), path, s.any_path).map_err(NoRoom::Unknown)?;
     let key = match found {
         Route::Ready(key, room, visit) => return Ok((key, room, visit)),
         Route::Cold(key) => key,
@@ -557,17 +542,17 @@ pub(crate) async fn enter(
 async fn upgrade(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     ws: IncomingUpgrade,
 ) -> Response {
     let Ok(permit) = Arc::clone(&s.slots).try_acquire_owned() else {
         tracing::warn!("connection cap reached");
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     };
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
-    let (key, room, visit) = match find(&s, host).await {
+    let path = uri.path();
+    let (key, room, visit) = match find(&s, path).await {
         Ok(found) => found,
-        Err(no) => return refused(host, no),
+        Err(no) => return refused(path, no),
     };
     let (response, fut) = match ws.upgrade(s.options) {
         Ok(pair) => pair,
@@ -906,15 +891,12 @@ mod tests {
     }
 
     #[test]
-    fn the_key_is_the_hosts_first_label_without_the_port() {
-        let key = |h: &str| key_from_host(h).map(|k| k.as_str().to_owned());
-        assert_eq!(key("abcdefgh23.example.gg"), Some("abcdefgh23".to_owned()));
-        assert_eq!(key("abcdefgh23.example.gg:38281"), Some("abcdefgh23".to_owned()));
-        assert_eq!(key("ABCDEFGH23.127.0.0.1.sslip.io:38281"), Some("abcdefgh23".to_owned()));
-        assert_eq!(key("abcdefgh23"), Some("abcdefgh23".to_owned()));
-        for none in
-            ["example.gg", "localhost:38281", "127.0.0.1:38281", "[::1]:38281", "", "abcdefgh1.x"]
-        {
+    fn the_key_is_the_one_path_segment() {
+        let key = |p: &str| RoomKey::from_path(p).map(|k| k.as_str().to_owned());
+        assert_eq!(key("/abcdefgh23"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("/ABCDEFGH23"), Some("abcdefgh23".to_owned()));
+        assert_eq!(key("/abcdefgh23/"), Some("abcdefgh23".to_owned()));
+        for none in ["/", "", "/healthz", "/abcdefgh1x", "/abcdefgh23/more", "abcdefgh23.x"] {
             assert_eq!(key(none), None, "{none:?}");
         }
     }
@@ -1014,12 +996,12 @@ mod tests {
     /// store) goes to the log only. An unknown room keeps its 404 and its reason (#63).
     #[tokio::test]
     async fn a_failed_load_hides_its_error_text_and_an_unknown_room_keeps_its_reason() {
-        let failed = refused(Some("k.x"), NoRoom::Failed("postgres: secret detail".to_owned()));
+        let failed = refused("/k", NoRoom::Failed("postgres: secret detail".to_owned()));
         assert_eq!(
             reply(failed).await,
             (StatusCode::SERVICE_UNAVAILABLE, "the room could not be loaded; try again".to_owned())
         );
-        let unknown = refused(None, NoRoom::Unknown("no room with key k".to_owned()));
+        let unknown = refused("/", NoRoom::Unknown("no room with key k".to_owned()));
         assert_eq!(reply(unknown).await, (StatusCode::NOT_FOUND, "no room with key k".to_owned()));
     }
 

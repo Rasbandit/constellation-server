@@ -33,10 +33,10 @@ describe('generateWorld', () => {
     const calls = server([
       { id: JOB, status: 'running' },
       { id: JOB, status: 'done', seed_name: '42' },
-      { id: JOB, status: 'done', seed_name: '42', room_key: 'k3y', address: 'k3y.localhost:38281' },
+      { id: JOB, status: 'done', seed_name: '42', room_key: 'k3y', address: 'localhost:38281/k3y' },
     ]);
     const w = await generateWorld(req([player('a', Y), player('b', Y)]), noWait);
-    expect(w).toEqual({ id: JOB, seed: '42', roomKey: 'k3y', address: 'k3y.localhost:38281' });
+    expect(w).toEqual({ id: JOB, seed: '42', roomKey: 'k3y', address: 'localhost:38281/k3y' });
     expect(calls[0]).toEqual({ method: 'POST', path: '/api/worlds', body: { apworlds: [W], yamls: [Y] } });
     expect(calls.slice(1).map((c) => c.path)).toEqual(Array(3).fill(`/api/worlds/${JOB}`));
   });

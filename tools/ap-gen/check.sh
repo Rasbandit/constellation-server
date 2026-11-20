@@ -7,7 +7,7 @@
 #
 # The server also runs with --rooms (holding the e2e fixture, so there are two rooms and a
 # client must name its room key). With a command (`just e2e-full`): wait until the server hosts
-# the generated world as a room, then run the command with ROOM_URL (ws://<key>.localhost:<port>)
+# the generated world as a room, then run the command with ROOM_URL (ws://localhost:<port>/<key>)
 # and ROOM_BUNDLE (the generated bundle as v1 JSON, from GET /api/worlds/<id>/bundle: the
 # server decodes the seed it keeps in its store) set; the script exits with its status.
 set -euo pipefail

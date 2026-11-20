@@ -67,6 +67,19 @@ impl RoomKey {
         Ok(Self(key))
     }
 
+    /// The key a request path names: exactly one segment, `/{room_key}` (a trailing slash is
+    /// fine). Case is ignored.
+    #[must_use]
+    pub fn from_path(path: &str) -> Option<Self> {
+        Self::parse(path.strip_prefix('/')?.trim_end_matches('/')).ok()
+    }
+
+    /// The join address clients type: `{public}/{key}`, with `public` the `host:port`.
+    #[must_use]
+    pub fn address(&self, public: &str) -> String {
+        format!("{public}/{}", self.0)
+    }
+
     /// The key as text.
     #[must_use]
     pub fn as_str(&self) -> &str {

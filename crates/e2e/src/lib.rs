@@ -259,7 +259,7 @@ impl Client {
     }
 
     /// Open TCP to `addr` and do the WebSocket handshake for `url`, so the request's `Host`
-    /// header is `url`'s host (`{room_key}.example:port`) without that name resolving anywhere.
+    /// header is `url`'s host without that name resolving anywhere.
     ///
     /// # Errors
     /// When the connection or the handshake fails.

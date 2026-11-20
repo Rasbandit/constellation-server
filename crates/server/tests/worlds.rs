@@ -246,7 +246,7 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
     assert_eq!(st["status"], "done", "{st}");
     assert_eq!(st["room_key"], key.as_str(), "{st}");
     let port = server.addr.port();
-    assert_eq!(st["address"], format!("{key}.localhost:{port}"), "{st}");
+    assert_eq!(st["address"], format!("localhost:{port}/{key}"), "{st}");
 
     let url = format!("ws://{}", st["address"].as_str().unwrap());
     let (_, connected, _) = e2e::join_via(server.addr, &url, "Alice").await.unwrap();
