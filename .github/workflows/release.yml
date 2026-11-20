@@ -35,7 +35,7 @@ jobs:
           mkdir secrets
           echo ci-password > secrets/postgres_password
           echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
-          sudo chown 10001 secrets/database_url && chmod 400 secrets/database_url
+          chmod 400 secrets/database_url && sudo chown 10001 secrets/database_url
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
       - if: failure()
         run: docker compose logs
