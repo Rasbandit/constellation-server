@@ -1,0 +1,156 @@
+//! The fill's output as a seed: [`generate`] compiles a manifest, fills every player's world
+//! together and assembles the [`SeedBundle`] a room runs on, with each item's class, the
+//! spheres (when a location is first reachable) and slot details. `seed_bundle::v2::encode`
+//! (or `seed_bundle::import_v1`) writes it as a v2 seed (`docs/seed-bundle-v2.md`).
+
+use std::collections::BTreeMap;
+
+use seed_bundle::{GameData, Mode, SeedBundle, ServerOptions, Slot, SlotKind, Version};
+use serde_json::{Value, json};
+use spec_rng::SpecRng;
+
+use crate::fill::Instance;
+use crate::room::{self, Seat};
+use crate::spheres::RoomSpheres;
+use crate::world::World;
+
+/// The generator version a seed records (the one clients of the compatible protocol expect).
+const GENERATOR_VERSION: Version = Version { major: 0, minor: 6, build: 8 };
+/// Server options a generated seed starts with (hint cost percent, points per checked location).
+const HINT_COST: u8 = 10;
+const CHECK_POINTS: u32 = 1;
+
+/// One player: the slot name and the resolved instance of their world.
+#[derive(Debug, Clone)]
+pub struct Player {
+    /// The slot's name, which is also its connect name.
+    pub name: String,
+    /// Options, locations, pool and start items for this player.
+    pub instance: Instance,
+}
+
+/// Fill a room of `players`, all playing the world `manifest` describes (its `game` key names
+/// it), and assemble the seed named `seed_name`. The same `rng_seed` gives the same bundle
+/// whatever `workers` is.
+///
+/// # Errors
+/// A message for a manifest the engine refuses or without a `game`, a player without a name
+/// or with a repeated one, an instance the world lacks keys for, a fill that is stuck, or a
+/// world a player cannot finish.
+pub fn generate(
+    manifest: &Value,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+) -> Result<SeedBundle, String> {
+    let game = manifest["game"]
+        .as_str()
+        .filter(|g| !g.trim().is_empty())
+        .ok_or("the manifest has no game name")?;
+    for (k, p) in players.iter().enumerate() {
+        if p.name.trim().is_empty() {
+            return Err(format!("player {} has no name", k + 1));
+        }
+        if players[..k].iter().any(|q| q.name == p.name) {
+            return Err(format!("player name {:?} repeats", p.name));
+        }
+    }
+    let w = World::load(manifest)?;
+    let pairs: Vec<(&World, &Instance)> = players.iter().map(|p| (&w, &p.instance)).collect();
+    let plans = room::plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
+    let progression: Vec<Vec<bool>> = players.iter().map(|p| p.instance.progression(&w)).collect();
+    let seats: Vec<Seat<'_>> = plans
+        .iter()
+        .zip(&progression)
+        .map(|(plan, progression)| Seat { w: &w, plan, progression })
+        .collect();
+    let (filled, spheres) = room::fill_room_spheres(
+        &seats,
+        &mut SpecRng::from_u64(rng_seed),
+        config::FILL_MAX_ATTEMPTS,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    if let Some(p) = filled.beatable.iter().position(|b| !b) {
+        return Err(format!("player {} cannot reach their goal", p + 1));
+    }
+    assemble(&w, game, seed_name, players, &seats, &filled.placed, &spheres)
+}
+
+/// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.
+fn assemble(
+    w: &World,
+    game: &str,
+    seed_name: &str,
+    players: &[Player],
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<room::Given>>],
+    spheres: &RoomSpheres,
+) -> Result<SeedBundle, String> {
+    let flags: Vec<Vec<u8>> = players.iter().map(|p| p.instance.flags(w)).collect();
+    let rows = room::placements_flagged(seats, placed, Some(spheres), &flags)
+        .map_err(|e| format!("{e:?}"))?;
+    let mut slots = Vec::with_capacity(players.len());
+    for (k, (p, locations)) in players.iter().zip(rows).enumerate() {
+        let start_inventory = p
+            .instance
+            .start_inventory
+            .iter()
+            .map(|key| w.item(key).map(|i| w.item_id(i)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("player {}: {e}", k + 1))?;
+        slots.push(Slot {
+            id: u32::try_from(k + 1).map_err(|e| e.to_string())?,
+            team: 0,
+            name: p.name.clone(),
+            game: game.to_owned(),
+            kind: SlotKind::Player,
+            minimum_client_version: Version { major: 0, minor: 0, build: 0 },
+            group_members: Vec::new(),
+            locations,
+            slot_data: json!({}),
+            start_inventory,
+            entrances: BTreeMap::new(),
+        });
+    }
+    let connect_names = slots.iter().map(|s| (s.name.clone(), (s.team, s.id))).collect();
+    Ok(SeedBundle {
+        format: seed_bundle::FORMAT,
+        seed_name: seed_name.to_owned(),
+        generator_version: GENERATOR_VERSION,
+        server_options: ServerOptions {
+            password: None,
+            hint_cost: HINT_COST,
+            location_check_points: CHECK_POINTS,
+            release_mode: Mode::Auto,
+            collect_mode: Mode::Goal,
+            remaining_mode: Mode::Goal,
+        },
+        slots,
+        connect_names,
+        games: BTreeMap::from([(game.to_owned(), game_data(w)?)]),
+        race_mode: 0,
+        start_hints: Vec::new(),
+    })
+}
+
+/// The world's names and ids as the game's data package; the checksum is the hash of both
+/// tables, so it changes with them.
+fn game_data(w: &World) -> Result<GameData, String> {
+    let items: BTreeMap<String, i64> = (0..u16::try_from(w.items()).map_err(|e| e.to_string())?)
+        .map(|i| (w.item_key(i).to_owned(), w.item_id(i)))
+        .collect();
+    let locations: BTreeMap<String, i64> = (0..u32::try_from(w.locations())
+        .map_err(|e| e.to_string())?)
+        .map(|l| (w.loc_key(l).to_owned(), w.loc_id(l)))
+        .collect();
+    let tables = serde_json::to_string(&json!({"items": items, "locations": locations}))
+        .map_err(|e| e.to_string())?;
+    let checksum = seed_bundle::bundle_hash(&tables)?.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(GameData {
+        item_name_to_id: items,
+        location_name_to_id: locations,
+        checksum,
+        ..GameData::default()
+    })
+}

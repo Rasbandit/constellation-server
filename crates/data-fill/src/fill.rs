@@ -51,6 +51,22 @@ impl Instance {
     }
 }
 
+impl Instance {
+    /// Per world item: its classification bits as a seed records them (1 progression, 2
+    /// useful, 4 trap; filler and items outside the pool 0).
+    #[must_use]
+    pub fn flags(&self, w: &World) -> Vec<u8> {
+        (0..u16::try_from(w.items()).unwrap_or(0))
+            .map(|i| match self.pool_class.get(w.item_key(i)).map(String::as_str) {
+                Some("progression") => 1,
+                Some("useful") => 2,
+                Some("trap") => 4,
+                _ => 0,
+            })
+            .collect()
+    }
+}
+
 /// An instance resolved to world indices, with the seed's option and roll values.
 #[derive(Debug, Clone)]
 pub struct Plan {

@@ -11,6 +11,7 @@ pub mod parity_rng;
 pub mod reach;
 pub mod room;
 pub mod section;
+pub mod seed;
 pub mod spheres;
 pub mod world;
 

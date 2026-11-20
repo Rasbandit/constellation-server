@@ -216,7 +216,8 @@ pub fn locked_placed(seats: &[Seat<'_>]) -> Vec<Vec<Option<Given>>> {
 
 /// The room as seed-bundle placements, one list per slot (player order, locations ascending):
 /// `receiver` is the owner's slot (from 1), `item` an id in the owner's world, `sphere` the
-/// round of `spheres` that reached the location (from 0) when given.
+/// round of `spheres` that reached the location (from 0) when given. Flags carry the
+/// progression bit only; [`placements_flagged`] sets every class.
 ///
 /// # Errors
 /// [`FillError::Instance`] for seats or placements that do not fit the room (see [`check_placed`]).
@@ -224,6 +225,22 @@ pub fn placements(
     seats: &[Seat<'_>],
     placed: &[Vec<Option<Given>>],
     spheres: Option<&RoomSpheres>,
+) -> Result<Vec<Vec<seed_bundle::Placed>>, FillError> {
+    let flags: Vec<Vec<u8>> =
+        seats.iter().map(|s| s.progression.iter().map(|p| u8::from(*p)).collect()).collect();
+    placements_flagged(seats, placed, spheres, &flags)
+}
+
+/// [`placements`] with each item's full classification bits: `flags[owner][item]` (1
+/// progression, 2 useful, 4 trap; see `Instance::flags`). An item outside the list gets 0.
+///
+/// # Errors
+/// As [`placements`].
+pub fn placements_flagged(
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<Given>>],
+    spheres: Option<&RoomSpheres>,
+    flags: &[Vec<u8>],
 ) -> Result<Vec<Vec<seed_bundle::Placed>>, FillError> {
     check_placed(seats, placed)?;
     let mut round = std::collections::HashMap::new();
@@ -240,12 +257,13 @@ pub fn placements(
                     let g = (*g)?;
                     let (l, p) = (u32::try_from(l).unwrap_or(0), u16::try_from(p).unwrap_or(0));
                     let owner = &seats[usize::from(g.to)];
-                    let progression = owner.progression.get(usize::from(g.item)).copied();
+                    let flag =
+                        flags.get(usize::from(g.to)).and_then(|f| f.get(usize::from(g.item)));
                     Some(seed_bundle::Placed {
                         location: seats[usize::from(p)].w.loc_id(l),
                         item: owner.w.item_id(g.item),
                         receiver: u32::from(g.to) + 1,
-                        flags: u8::from(progression.unwrap_or(false)),
+                        flags: flag.copied().unwrap_or(0),
                         sphere: round.get(&(p, l)).copied(),
                     })
                 })
