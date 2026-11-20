@@ -283,12 +283,10 @@ pub(super) fn run(
             let fill_seed = a.fill_seed_base + seed;
             let (mut files, mut ours, mut model) = (Vec::new(), Vec::new(), None);
             for _ in 0..3 {
-                let mut sb = [0u8; 32];
-                sb[..8].copy_from_slice(&fill_seed.to_le_bytes());
                 let t = Instant::now();
                 let (filled, sp) = fill_room_spheres(
                     &seats,
-                    &mut SpecRng::from_seed(sb),
+                    &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
                 )
                 .map_err(|e| format!("fill {seed}: {e:?}"))?;

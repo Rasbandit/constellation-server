@@ -415,13 +415,7 @@ fn reachability(
     let scope: Option<BTreeSet<String>> =
         (!cx.scope_all).then(|| s.inst.locations.iter().cloned().collect());
     let all = s.progression_items();
-    let mut rng = SpecRng::from_seed({
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&seed.to_le_bytes());
-        b[8..16].copy_from_slice(b"inventor");
-        b[16..24].copy_from_slice(&player.unwrap_or(0).to_le_bytes());
-        b
-    });
+    let mut rng = SpecRng::from_u64_tagged(seed, b"inventor", player.unwrap_or(0));
     let mut invs: Vec<(String, Vec<String>)> =
         vec![("no items".into(), Vec::new()), ("all items".into(), all.clone())];
     for j in 0..share {
@@ -538,14 +532,12 @@ fn run(a: &Args) -> R<Value> {
             let mut ours: BTreeMap<String, String> = BTreeMap::new();
             let mut model = None;
             for _ in 0..3 {
-                let mut sb = [0u8; 32];
-                sb[..8].copy_from_slice(&fill_seed.to_le_bytes());
                 let t = Instant::now();
                 // Spheres come from the fill's own final state, not a fresh sweep.
                 let (filled, sp) = fill_spheres(
                     s.w,
                     &s.plan,
-                    &mut SpecRng::from_seed(sb),
+                    &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
                     &s.progression,
                 )

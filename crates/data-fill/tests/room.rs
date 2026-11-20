@@ -48,9 +48,7 @@ impl Room {
 }
 
 fn rng(seed: u64) -> SpecRng {
-    let mut b = [0u8; 32];
-    b[..8].copy_from_slice(&seed.to_le_bytes());
-    SpecRng::from_seed(b)
+    SpecRng::from_u64(seed)
 }
 
 /// The placements as `player:location=owner:item` lines, the form a seed file would hold.

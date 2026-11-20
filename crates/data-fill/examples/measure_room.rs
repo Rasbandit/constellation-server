@@ -88,19 +88,19 @@ fn main() -> Result<(), String> {
     let (plans, progression) = setup?;
     let seats: Vec<Seat<'_>> =
         (0..n).map(|p| Seat { w: &w, plan: &plans[p], progression: &progression[p] }).collect();
-    let mut sb = [0u8; 32];
-    sb[..8].copy_from_slice(&seed.to_le_bytes());
     let (filled, fill_ms) = run.phase("fill room", || {
-        fill_room_spheres(&seats, &mut SpecRng::from_seed(sb), config::FILL_MAX_ATTEMPTS)
+        fill_room_spheres(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
     });
     let (f, sp) = filled.map_err(|x| format!("{x:?}"))?;
     // Times without the counting allocator's bookkeeping in the closure: the median of five fills.
     let mut times: Vec<f64> = (0..5)
         .map(|k| {
-            let mut s = sb;
-            s[8] = k;
             let t = Instant::now();
-            drop(fill_room_spheres(&seats, &mut SpecRng::from_seed(s), config::FILL_MAX_ATTEMPTS));
+            drop(fill_room_spheres(
+                &seats,
+                &mut SpecRng::from_u64(seed + 1 + u64::from(k)),
+                config::FILL_MAX_ATTEMPTS,
+            ));
             t.elapsed().as_secs_f64() * 1e3
         })
         .collect();

@@ -648,9 +648,7 @@ pub(crate) mod tests {
             let (mut lit, mut waited) = (false, false);
             let late = w.loc("l15").unwrap();
             for seed in 1u64..=100 {
-                let mut sb = [0u8; 32];
-                sb[..8].copy_from_slice(&seed.to_le_bytes());
-                let mut rng = SpecRng::from_seed(sb);
+                let mut rng = SpecRng::from_u64(seed);
                 let mut items = plan.progression.clone();
                 rng.shuffle(&mut items);
                 let mut locs = plan.included.clone();
@@ -688,13 +686,11 @@ pub(crate) mod tests {
         let plan = Plan::new(&w, &inst).unwrap();
         let (mut with, mut without, mut rederived) = (0, 0, 0);
         for seed in 1u64..=200 {
-            let mut sb = [0u8; 32];
-            sb[..8].copy_from_slice(&seed.to_le_bytes());
             let progression = inst.progression(&w);
             let (a, sa) = fill_with(
                 &w,
                 &plan,
-                &mut SpecRng::from_seed(sb),
+                &mut SpecRng::from_u64(seed),
                 config::FILL_MAX_ATTEMPTS,
                 true,
                 Some(&progression),
@@ -703,7 +699,7 @@ pub(crate) mod tests {
             let (b, _) = fill_with(
                 &w,
                 &plan,
-                &mut SpecRng::from_seed(sb),
+                &mut SpecRng::from_u64(seed),
                 config::FILL_MAX_ATTEMPTS,
                 false,
                 None,

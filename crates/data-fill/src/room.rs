@@ -639,9 +639,7 @@ mod tests {
     use crate::reach::assert_same;
 
     fn rng(seed: u64) -> SpecRng {
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&seed.to_le_bytes());
-        SpecRng::from_seed(b)
+        SpecRng::from_u64(seed)
     }
 
     /// Three players of the richer test world (thresholds, a held-up `any`, events, clocks):

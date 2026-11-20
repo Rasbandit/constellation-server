@@ -151,9 +151,7 @@ fn run(args: &[String]) -> Result<Value, String> {
         });
     }
 
-    let mut seed_bytes = [0u8; 32];
-    seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    let mut rng = SpecRng::from_seed(seed_bytes);
+    let mut rng = SpecRng::from_u64(seed);
     let t = Instant::now();
     let filled =
         fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;

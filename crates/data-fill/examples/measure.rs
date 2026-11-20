@@ -88,15 +88,13 @@ fn main() -> Result<(), String> {
         }
     });
     println!("rules_bytes {}  pool {pool_keys}", w.rules_bytes());
-    let mut sb = [0u8; 32];
-    sb[..8].copy_from_slice(&seed.to_le_bytes());
-    let mut rng = SpecRng::from_seed(sb);
+    let mut rng = SpecRng::from_u64(seed);
     let filled = run
         .phase("fill", || fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS))
         .map_err(|x| format!("{x:?}"))?;
     // Beatability and spheres come from the fill's own state, no fresh sweep.
     let (beatable, reached) = (filled.beatable, filled.reached);
-    let mut rng2 = SpecRng::from_seed(sb);
+    let mut rng2 = SpecRng::from_u64(seed);
     let sp = run.phase("fill + spheres", || {
         fill_spheres(&w, &plan, &mut rng2, config::FILL_MAX_ATTEMPTS, &progression)
     });

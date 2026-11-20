@@ -163,3 +163,27 @@ mod properties {
         }
     }
 }
+
+/// `from_u64(n)` is the seed of `n` as 8 little-endian bytes followed by zeros, and the tagged
+/// form puts an 8-byte tag at bytes 8 to 16 and an index (little endian) at 16 to 24: the packing
+/// every data-fill caller wrote by hand before.
+#[test]
+fn from_u64_packs_the_seed_little_endian_then_zeros() {
+    let mut want = [0u8; 32];
+    want[..8].copy_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    let mut a = SpecRng::from_u64(0x0102_0304_0506_0708);
+    let mut b = SpecRng::from_seed(want);
+    assert_eq!(
+        (0..4).map(|_| a.next_u64()).collect::<Vec<_>>(),
+        (0..4).map(|_| b.next_u64()).collect::<Vec<_>>()
+    );
+    want[8..16].copy_from_slice(b"inventor");
+    want[16..24].copy_from_slice(&3u64.to_le_bytes());
+    let mut a = SpecRng::from_u64_tagged(0x0102_0304_0506_0708, b"inventor", 3);
+    want[..8].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    let mut b = SpecRng::from_seed(want);
+    assert_eq!(a.next_u64(), b.next_u64());
+    // Untagged is the tagged form with nothing set.
+    let mut c = SpecRng::from_u64_tagged(9, &[0; 8], 0);
+    assert_eq!(c.next_u64(), SpecRng::from_u64(9).next_u64());
+}

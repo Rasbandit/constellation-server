@@ -199,10 +199,7 @@ pub fn histogram(values: impl IntoIterator<Item = usize>) -> Value {
 /// A spec RNG for seed `seed` in stream `tag` (so fills, baselines and samples never share draws).
 #[must_use]
 pub fn seeded(seed: u64, tag: &[u8; 8]) -> spec_rng::SpecRng {
-    let mut b = [0u8; 32];
-    b[..8].copy_from_slice(&seed.to_le_bytes());
-    b[8..16].copy_from_slice(tag);
-    spec_rng::SpecRng::from_seed(b)
+    spec_rng::SpecRng::from_u64_tagged(seed, tag, 0)
 }
 
 /// Fills and baseline samples for one world instance.
