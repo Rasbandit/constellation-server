@@ -14,6 +14,7 @@
 
 mod room_view;
 mod sandbox;
+mod web;
 mod worlds;
 
 pub mod host;
@@ -72,12 +73,14 @@ pub struct Args {
     /// The host name clients reach this server by; a room's join address is
     /// `{public_host}:{port}/{room_key}` (default `localhost`).
     pub public_host: String,
+    /// The built web UI, served on the room port (`--web-dir`); none: no UI.
+    pub web_dir: Option<PathBuf>,
 }
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
      --port <port> [--host <ip>] [--public-host <name>] \
-     [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
+     [--web-dir <path>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
      needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
@@ -91,6 +94,7 @@ impl Args {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
         let (mut admin_host, mut admin_port, mut public_host) = (None, None, None);
+        let mut web_dir = None;
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -108,6 +112,7 @@ impl Args {
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
                 "--public-host" => public_host = Some(value()?),
+                "--web-dir" => web_dir = Some(PathBuf::from(value()?)),
                 "--admin-host" => {
                     admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
                 }
@@ -125,6 +130,7 @@ impl Args {
             admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             admin_port: admin_port.unwrap_or(0),
             public_host: public_host.unwrap_or_else(|| "localhost".to_owned()),
+            web_dir,
         })
     }
 }
@@ -191,6 +197,8 @@ struct AppState {
     options: Options,
     /// One permit per open WebSocket (`Limits::max_connections`).
     slots: Arc<Semaphore>,
+    /// The web UI for every request that is not a WebSocket upgrade; none: only rooms.
+    web: Option<Arc<web::WebDir>>,
 }
 
 /// The room's id: the first 8 bytes of SHA-256 of the seed name, so a restart on the same
@@ -342,6 +350,22 @@ pub async fn app(
     database_url: Option<&str>,
     limits: Limits,
 ) -> Result<(Router, Host), String> {
+    app_with_web(source, password, database_url, limits, None).await
+}
+
+/// [`app`], also serving the web UI built in `web_dir` on every path that is not a room's
+/// WebSocket upgrade.
+///
+/// # Errors
+/// As [`app`], and when `web_dir` is not a folder holding `index.html`.
+pub async fn app_with_web(
+    source: &Source,
+    password: Option<String>,
+    database_url: Option<&str>,
+    limits: Limits,
+    web_dir: Option<&std::path::Path>,
+) -> Result<(Router, Host), String> {
+    let web = web_dir.map(web::WebDir::open).transpose()?.map(Arc::new);
     let mut host = match source {
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
@@ -365,12 +389,14 @@ pub async fn app(
         any_path: matches!(source, Source::Bundle(_)),
         options,
         slots: Arc::new(Semaphore::new(limits.max_connections)),
+        web,
     };
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
-        // Every other path is a room's (`/{room_key}`); `route` decides.
-        .fallback(get(upgrade))
+        // A WebSocket upgrade on any other path is a room's (`/{room_key}`; `route` decides);
+        // a plain GET is the web UI's.
+        .fallback(get(upgrade_or_web))
         .with_state(state);
     Ok((router, host))
 }
@@ -539,6 +565,26 @@ pub(crate) async fn enter(
     Err(NoRoom::Failed(format!("room {key} went cold again right after it loaded")))
 }
 
+async fn upgrade_or_web(
+    State(s): State<AppState>,
+    peer: ConnectInfo<SocketAddr>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    ws: Result<IncomingUpgrade, StatusCode>,
+) -> Response {
+    let wants_ws = headers
+        .get(header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if let (false, Some(web)) = (wants_ws, &s.web) {
+        return web.serve(&method, uri.path(), &headers).await;
+    }
+    match ws {
+        Ok(ws) => upgrade(State(s), peer, uri, ws).await,
+        Err(status) => status.into_response(),
+    }
+}
+
 async fn upgrade(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -679,9 +725,14 @@ pub async fn run(
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;
-        let (router, host) =
-            app(&args.source, secrets.room_password, secrets.database_url.as_deref(), limits)
-                .await?;
+        let (router, host) = app_with_web(
+            &args.source,
+            secrets.room_password,
+            secrets.database_url.as_deref(),
+            limits,
+            args.web_dir.as_deref(),
+        )
+        .await?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
         let admin = match api.map(|w| w.router(host.waker(), host.folder().map(published))) {
@@ -1013,6 +1064,257 @@ mod tests {
         );
         let unknown = refused("/", NoRoom::Unknown("no room with key k".to_owned()));
         assert_eq!(reply(unknown).await, (StatusCode::NOT_FOUND, "no room with key k".to_owned()));
+    }
+
+    /// A build folder (`index.html`, one hashed asset) next to a secret it must never serve,
+    /// with a symlink to the secret inside the folder.
+    fn web_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("server-web-{name}-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        let dist = root.join("dist");
+        std::fs::create_dir_all(dist.join("assets")).unwrap();
+        std::fs::write(dist.join("index.html"), "<!doctype html><title>UI</title>").unwrap();
+        std::fs::write(dist.join("assets/app-abc123.js"), "console.log(1)").unwrap();
+        std::fs::write(root.join("secret.txt"), "TOP SECRET").unwrap();
+        std::fs::write(dist.join(".env"), "TOP SECRET dotfile").unwrap();
+        std::fs::create_dir_all(dist.join(".git")).unwrap();
+        std::fs::write(dist.join(".git/config"), "TOP SECRET dotfile").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.txt"), dist.join("leak.txt")).unwrap();
+        std::os::unix::fs::symlink(&root, dist.join("outside")).unwrap();
+        (root, dist)
+    }
+
+    /// Serve `source` and the UI in `dist` on a free port; the test sends raw requests to it.
+    async fn serve_ui(source: &Source, dist: &std::path::Path) -> SocketAddr {
+        let (router, host) =
+            app_with_web(source, None, None, Limits::DESIGN, Some(dist)).await.unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _host = host;
+            axum::serve(l, router.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        addr
+    }
+
+    /// One raw HTTP/1.1 request (no client rewrites the path); the head and the body as text.
+    async fn raw(addr: SocketAddr, path: &str, extra: &str) -> String {
+        raw_method(addr, "GET", path, extra).await
+    }
+
+    async fn raw_method(addr: SocketAddr, method: &str, path: &str, extra: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head =
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        // An upgraded socket stays open: read until the head is in, then stop.
+        let mut buf = [0_u8; 4096];
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") || !extra.contains("Upgrade") {
+            let n = s.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(buf.get(..n).unwrap());
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    const UPGRADE: &str = "Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+
+    #[tokio::test]
+    async fn the_ui_is_served_with_cache_headers_and_the_spa_fallback() {
+        let (root, dist) = web_fixture("spa");
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        let addr = serve_ui(&Source::Rooms(root.join("rooms")), &dist).await;
+        let index = raw(addr, "/", "").await;
+        assert!(index.starts_with("HTTP/1.1 200"), "{index}");
+        assert!(index.contains("<title>UI</title>") && index.contains("text/html"), "{index}");
+        assert!(index.to_lowercase().contains("cache-control: no-cache"), "{index}");
+        for h in [
+            "x-content-type-options: nosniff",
+            "referrer-policy: no-referrer",
+            "x-frame-options: deny",
+            "frame-ancestors 'none'",
+            "etag: w/",
+            "last-modified:",
+        ] {
+            assert!(index.to_lowercase().contains(h), "{h}: {index}");
+        }
+        let asset = raw(addr, "/assets/app-abc123.js", "").await;
+        assert!(asset.contains("console.log(1)") && asset.contains("text/javascript"), "{asset}");
+        assert!(asset.to_lowercase().contains("max-age=31536000, immutable"), "{asset}");
+        // A UI route, and a plain GET of a would-be room key, load the app.
+        for path in ["/create", "/rooms/abc/admin", "/abcdefgh23"] {
+            let r = raw(addr, path, "").await;
+            assert!(
+                r.starts_with("HTTP/1.1 200") && r.contains("<title>UI</title>"),
+                "{path}: {r}"
+            );
+        }
+        // A missing file with an extension, or anything under /assets, is a 404, not the app.
+        for path in [
+            "/assets/gone.js",
+            "/assets/gone",
+            "/favicon.ico",
+            "/x.map",
+            "/api/yamls",
+            "/api",
+            "//assets/gone",
+            "/%61ssets/gone",
+            "/.env",
+            "/.git/config",
+        ] {
+            assert!(raw(addr, path, "").await.starts_with("HTTP/1.1 404"), "{path}");
+        }
+        // The app only for a request that accepts HTML.
+        let json = raw(addr, "/create", "Accept: application/json\r\n").await;
+        assert!(json.starts_with("HTTP/1.1 404"), "{json}");
+        let page = raw(addr, "/create", "Accept: text/html,application/xhtml+xml;q=0.9\r\n").await;
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        // Query strings, a trailing slash, a direct index.html and a doubled slash before a real
+        // asset all work, and the asset stays immutable.
+        for path in ["/?x=1", "/create/", "/index.html", "/assets/app-abc123.js?v=1"] {
+            assert!(raw(addr, path, "").await.starts_with("HTTP/1.1 200"), "{path}");
+        }
+        let dbl = raw(addr, "//assets/app-abc123.js", "").await;
+        assert!(dbl.starts_with("HTTP/1.1 200") && dbl.contains("console.log(1)"), "{dbl}");
+        assert!(dbl.contains("immutable"), "{dbl}");
+        let head = raw_method(addr, "HEAD", "/assets/app-abc123.js", "").await;
+        assert!(head.starts_with("HTTP/1.1 200") && !head.contains("console.log"), "{head}");
+        // A directory is not a file.
+        assert!(raw(addr, "/assets", "").await.starts_with("HTTP/1.1 404"));
+        // The probes keep working.
+        assert!(raw(addr, "/healthz", "").await.ends_with("ok"));
+        assert!(raw(addr, "/version", "").await.contains("{\"version\":\""));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn the_ui_sends_the_precompressed_file_validators_and_head() {
+        let (root, dist) = web_fixture("encoding");
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        std::fs::write(dist.join("assets/app-abc123.js.br"), "BROTLI-BYTES").unwrap();
+        std::fs::write(dist.join("assets/app-abc123.js.gz"), "GZIP-BYTES").unwrap();
+        let addr = serve_ui(&Source::Rooms(root.join("rooms")), &dist).await;
+        let js = "/assets/app-abc123.js";
+        let br = raw(addr, js, "Accept-Encoding: gzip, br\r\n").await;
+        assert!(
+            br.contains("BROTLI-BYTES") && br.to_lowercase().contains("content-encoding: br"),
+            "{br}"
+        );
+        assert!(br.contains("text/javascript"), "the type is the original file's: {br}");
+        let gz = raw(addr, js, "Accept-Encoding: gzip\r\n").await;
+        assert!(gz.contains("GZIP-BYTES"), "{gz}");
+        let plain = raw(addr, js, "").await;
+        assert!(
+            plain.contains("console.log(1)") && !plain.to_lowercase().contains("content-encoding"),
+            "{plain}"
+        );
+        // A matching ETag is a 304 with no body.
+        let etag = br.lines().find_map(|l| l.strip_prefix("etag: ")).unwrap().to_owned();
+        let again =
+            raw(addr, js, &format!("Accept-Encoding: gzip, br\r\nIf-None-Match: {etag}\r\n")).await;
+        assert!(again.starts_with("HTTP/1.1 304") && !again.contains("BROTLI"), "{again}");
+        // A list, a weak form and `*` match too; another tag does not.
+        for m in [
+            format!("W/\"nope\", {etag}"),
+            etag.trim_start_matches("W/").to_owned(),
+            "*".to_owned(),
+        ] {
+            let r = raw(addr, js, &format!("Accept-Encoding: gzip, br\r\nIf-None-Match: {m}\r\n"))
+                .await;
+            assert!(r.starts_with("HTTP/1.1 304"), "{m}: {r}");
+        }
+        let other = raw(addr, js, "Accept-Encoding: gzip, br\r\nIf-None-Match: \"nope\"\r\n").await;
+        assert!(other.starts_with("HTTP/1.1 200"), "{other}");
+        // HEAD: the headers of the GET, no body.
+        let head = raw_method(addr, "HEAD", "/create", "").await;
+        assert!(head.starts_with("HTTP/1.1 200") && !head.contains("<title>"), "{head}");
+        // POST to a UI path is not a page load (the fallback route only takes GET, so 405).
+        assert!(
+            raw_method(addr, "POST", "/create", "Content-Length: 0\r\n")
+                .await
+                .starts_with("HTTP/1.1 405")
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_at_a_key_reaches_the_room_not_the_ui() {
+        let (root, dist) = web_fixture("upgrade");
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        let addr = serve_ui(&Source::Rooms(root.join("rooms")), &dist).await;
+        let r = raw(addr, "/abcdefgh23", UPGRADE).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        assert!(r.contains("no room with key abcdefgh23") && !r.contains("<title>"), "{r}");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn with_a_bundle_an_upgrade_on_any_path_joins_the_room_and_a_get_is_the_ui() {
+        let (root, dist) = web_fixture("bundle");
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+        let addr = serve_ui(&Source::Bundle(fixture), &dist).await;
+        for path in ["/", "/anything/at/all"] {
+            let r = raw(addr, path, UPGRADE).await;
+            assert!(r.starts_with("HTTP/1.1 101"), "{path}: {r}");
+        }
+        assert!(raw(addr, "/anything", "").await.contains("<title>UI</title>"));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn the_ui_never_serves_a_file_outside_its_folder() {
+        let (root, dist) = web_fixture("traversal");
+        std::fs::create_dir_all(root.join("rooms")).unwrap();
+        let addr = serve_ui(&Source::Rooms(root.join("rooms")), &dist).await;
+        for path in [
+            "/../secret.txt",
+            "/assets/../../secret.txt",
+            "/%2e%2e/secret.txt",
+            "/%2E%2E%2Fsecret.txt",
+            "/..%2fsecret.txt",
+            "/assets/%2e%2e/%2e%2e/secret.txt",
+            "/leak.txt",
+            "/outside/secret.txt",
+            "/outside/dist/../secret.txt",
+            "/.env",
+            "/.git/config",
+            "/assets/.env",
+        ] {
+            let r = raw(addr, path, "").await;
+            assert!(!r.contains("TOP SECRET"), "{path} leaked: {r}");
+            // Refused (404, or 400 for a path hyper rejects), or just the app: never a 5xx.
+            let ok = r.starts_with("HTTP/1.1 404") || r.starts_with("HTTP/1.1 400");
+            assert!(
+                ok || (r.starts_with("HTTP/1.1 200") && r.contains("<title>UI</title>")),
+                "{path}: {r}"
+            );
+        }
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn a_web_dir_without_index_html_is_refused() {
+        let (root, dist) = web_fixture("noindex");
+        std::fs::remove_file(dist.join("index.html")).unwrap();
+        let e = app_with_web(&Source::Rooms(root.clone()), None, None, Limits::DESIGN, Some(&dist))
+            .await
+            .unwrap_err();
+        assert!(e.contains("no index.html"), "{e}");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn web_dir_is_a_flag_and_off_by_default() {
+        assert_eq!(parse("--bundle b --port 1").unwrap().web_dir, None);
+        let a = parse("--bundle b --port 1 --web-dir /w").unwrap();
+        assert_eq!(a.web_dir, Some(PathBuf::from("/w")));
+        assert_eq!(parse("--bundle b --port 1 --web-dir").unwrap_err(), "--web-dir needs a value");
     }
 
     #[test]

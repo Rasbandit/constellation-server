@@ -1,7 +1,8 @@
 target
 .git
 .github
-web
+web/dist
+web/dist-artifact
 docs
 tools/*
 !tools/ap-gen
