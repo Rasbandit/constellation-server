@@ -6,7 +6,7 @@ const W = 'c'.repeat(64);
 const view: RoomView = {
   seed: '0189',
   room_key: 'ilypozn5hc',
-  address: 'ilypozn5hc.localhost:38281',
+  address: 'localhost:38281/ilypozn5hc',
   options: { password: false, hint_cost: 10, release_mode: 'auto', collect_mode: 'goal' },
   slots: [
     { slot: 1, team: 0, name: 'Rasbandit-MM', game: '2 Ship 2 Harkinian (MM)', connected: true, clients: 1, checked: 1, locations: 1516, items_received: 1, goal: false },
@@ -20,8 +20,7 @@ describe('toRoom', () => {
     expect(r).toMatchObject({
       id: W,
       state: 'running',
-      host: 'ilypozn5hc.localhost',
-      port: 38281,
+      address: 'localhost:38281/ilypozn5hc',
       seed: '0189',
       code: null,
       slots: 2,

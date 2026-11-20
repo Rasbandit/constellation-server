@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -46,6 +46,8 @@ memory-harness = ["dep:allocation-counter"]
 allocation-counter = { version = "0.8", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
+# Generation for a data-only manifest world, and its upload check (compile).
+data-fill = { path = "../data-fill" }
 edge-compat = { path = "../edge-compat" }
 futures-util.workspace = true
 getrandom = { version = "0.4", default-features = false }
@@ -57,9 +59,13 @@ seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std", "raw_value"] }
 sha2 = { version = "0.11", default-features = false }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "process", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "process", "time", "io-util", "fs"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Static files for the web UI: Last-Modified, ranges, and the precompressed .gz/.br lookup.
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
+httpdate = "1"
 yawc.workspace = true
 
 [dev-dependencies]

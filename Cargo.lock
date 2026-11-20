@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "bits"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "block-buffer"
@@ -180,7 +180,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "config"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "core-foundation"
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "data-fill"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "bits",
@@ -348,7 +348,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "seed-bundle",
@@ -359,12 +359,12 @@ dependencies = [
 
 [[package]]
 name = "edge-compat"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bits",
  "config",
  "futures-util",
- "log 0.0.0",
+ "log 0.1.0",
  "proto",
  "room-core",
  "runtime",
@@ -658,6 +658,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "config",
  "proto",
@@ -916,6 +922,16 @@ name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "miniz_oxide"
@@ -1075,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "regex",
  "schemars",
@@ -1238,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "room-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bits",
  "config",
@@ -1250,10 +1266,10 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "config",
- "log 0.0.0",
+ "log 0.1.0",
  "proto",
  "room-core",
  "serde_json",
@@ -1372,12 +1388,12 @@ dependencies = [
 
 [[package]]
 name = "seed-bundle"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bits",
  "config",
  "flate2",
- "log 0.0.0",
+ "log 0.1.0",
  "proto",
  "room-core",
  "serde",
@@ -1441,16 +1457,18 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "axum",
  "config",
+ "data-fill",
  "e2e",
  "edge-compat",
  "futures-util",
  "getrandom 0.4.3",
- "log 0.0.0",
+ "httpdate",
+ "log 0.1.0",
  "proto",
  "room-core",
  "runtime",
@@ -1460,6 +1478,8 @@ dependencies = [
  "sha2 0.11.1",
  "sqlx",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "yawc",
@@ -1536,10 +1556,10 @@ dependencies = [
 
 [[package]]
 name = "sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "config",
- "log 0.0.0",
+ "log 0.1.0",
  "pollster",
  "proto",
  "room-core",
@@ -1580,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "spec-rng"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hkdf",
  "proptest",
@@ -1943,6 +1963,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tower-http"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2015,6 +2060,12 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"

@@ -100,7 +100,7 @@ function AdminView({ id, adminKey, onBadKey }: { id: string; adminKey: string; o
             <span className="tag-admin">Host</span>
           </div>
           <p className="muted small">
-            {r.host}:{r.port} · seed {r.seed}
+            {r.address} · seed {r.seed}
           </p>
         </div>
         <div className="head-actions">

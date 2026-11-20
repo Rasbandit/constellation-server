@@ -383,7 +383,7 @@ mod restart {
         let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         let (a, b) = (key_of(&server, "alpha"), key_of(&server, "beta"));
         assert_ne!(a, b);
-        let url = |s: &Server, key: &str| format!("ws://{key}.example:{}", s.addr.port());
+        let url = |s: &Server, key: &str| format!("ws://localhost:{}/{key}", s.addr.port());
         let loc = locations_for(1, 2).unwrap()[0].0;
         let (mut alice, _, _) =
             e2e::join_via(server.addr, &url(&server, &a), "Alice").await.unwrap();
@@ -424,11 +424,11 @@ mod restart {
         std::fs::remove_file(dir.join("alpha.json")).unwrap();
         sql(&db, "UPDATE game_packages SET bytes = 'tampered'").await;
         let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
-        let url = format!("ws://{a}.example:{}", server.addr.port());
+        let url = format!("ws://localhost:{}/{a}", server.addr.port());
         assert!(e2e::join_via(server.addr, &url, "Alice").await.is_err());
         server.wait_for_log("does not match its key").unwrap();
         // The client is told only that the room did not load; the detail stays in the log.
-        let reply = e2e::http_get(server.addr, &format!("{a}.example"), "/", true).await;
+        let reply = e2e::http_get(server.addr, "localhost", &format!("/{a}"), true).await;
         assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
         assert!(reply.ends_with("\r\n\r\nthe room could not be loaded; try again"), "{reply}");
         drop(std::fs::remove_dir_all(&dir));
@@ -460,7 +460,7 @@ mod restart {
         let seeds: i64 =
             sqlx::query_scalar("SELECT count(*) FROM room_seeds").fetch_one(&mut c).await.unwrap();
         assert_eq!(seeds, 0, "no seed of the other bundle was written");
-        let url = format!("ws://{a}.example:{}", server.addr.port());
+        let url = format!("ws://localhost:{}/{a}", server.addr.port());
         e2e::join_via(server.addr, &url, "Alice").await.unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -488,7 +488,7 @@ mod restart {
         let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
         let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         let a = key_of(&server, "alpha");
-        let url = |s: &Server| format!("ws://{a}.example:{}", s.addr.port());
+        let url = |s: &Server| format!("ws://localhost:{}/{a}", s.addr.port());
         let loc = locations_for(1, 2).unwrap()[0].0;
         let (mut alice, _, _) = e2e::join_via(server.addr, &url(&server), "Alice").await.unwrap();
         alice.check(&[loc]).await.unwrap();
@@ -533,7 +533,7 @@ mod restart {
         let env = [("CONSTELLATION_DATABASE_URL", db.as_str())];
         let server = Server::start_rooms(Path::new(BIN), &dir, &[], &env).unwrap();
         server.wait_for_log("has finished (abandoned)").unwrap();
-        let url = format!("ws://{a}.example:{}", server.addr.port());
+        let url = format!("ws://localhost:{}/{a}", server.addr.port());
         assert!(e2e::Client::connect_via(server.addr, &url).await.unwrap_err().contains("404"));
         drop(std::fs::remove_dir_all(&dir));
     }

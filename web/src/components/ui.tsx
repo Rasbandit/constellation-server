@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { fetchServerVersion, versionBadge, webVersion } from '../api/version';
 import type { HintStatus, ItemFlag, RoomState, SlotStatus } from '../api/types';
 import { flagLabel, hintStatusLabel, roomStateLabel, slotStatusLabel } from '../lib/format';
 
@@ -165,3 +166,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 }
 
 export const useToast = () => useContext(ToastCtx);
+
+/** Permanent corner badge: server and web versions, flagged when they differ or the server is unreachable. */
+export function VersionTag() {
+  const [server, setServer] = useState<string>();
+  useEffect(() => {
+    void fetchServerVersion().then(setServer);
+  }, []);
+  const { text, mismatch } = versionBadge(server, webVersion);
+  return (
+    <small className={mismatch ? 'version-tag mismatch' : 'version-tag'} title={mismatch ? 'Server and web versions differ' : undefined}>
+      {text}
+    </small>
+  );
+}

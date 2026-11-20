@@ -613,6 +613,139 @@ impl crate::raw::RawBlobs for PgLogStore {
     }
 }
 
+/// Manifests in the `world_manifests` table (migration 0004).
+impl crate::ManifestStore for PgLogStore {
+    async fn manifest_put(
+        &self,
+        r: &crate::ManifestRecord,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if crate::blob_key(bytes) != r.id {
+            return Err(StoreError::Corrupt(
+                "a manifest put under an id it does not hash to".into(),
+            ));
+        }
+        let (r, bytes) = (r.clone(), bytes.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    // Write once; a row whose bytes are not its id's (torn) is healed.
+                    "INSERT INTO world_manifests (id, name, game, version, size, items, locations, bytes) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT (id) DO UPDATE SET bytes = EXCLUDED.bytes \
+                     WHERE sha256(world_manifests.bytes) <> world_manifests.id",
+                )
+                .bind(r.id.to_vec())
+                .bind(&r.name)
+                .bind(&r.game)
+                .bind(&r.version)
+                .bind(bound(r.bytes))
+                .bind(i32::try_from(r.items).unwrap_or(i32::MAX))
+                .bind(i32::try_from(r.locations).unwrap_or(i32::MAX))
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn manifest_record(
+        &self,
+        id: &BlobKey,
+    ) -> Result<Option<crate::ManifestRecord>, StoreError> {
+        let id = id.to_vec();
+        let rows = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, ManifestRow>("SELECT id, name, game, version, size, items, locations FROM world_manifests WHERE id = $1")
+                        .bind(&id)
+                        .fetch_all(&mut *c)
+                        .await
+                        .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().next().map(ManifestRow::record).transpose()
+    }
+
+    async fn manifest_bytes(&self, id: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = id.to_vec();
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT bytes FROM world_manifests WHERE id = $1")
+                        .bind(&key)
+                        .fetch_optional(&mut *c)
+                        .await
+                        .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        match found {
+            Some(b) if crate::blob_key(&b) != *id => {
+                Err(StoreError::Corrupt("a stored manifest does not match its id".into()))
+            }
+            found => Ok(found),
+        }
+    }
+
+    async fn manifest_list(
+        &self,
+        game: Option<&str>,
+        after: Option<&BlobKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::ManifestRecord>, StoreError> {
+        let (game, after) = (game.map(str::to_owned), after.map(|a| a.to_vec()));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, ManifestRow>("SELECT id, name, game, version, size, items, locations FROM world_manifests \
+                         WHERE ($1::text IS NULL OR game = $1) \
+                         AND ($2::bytea IS NULL OR id > $2) ORDER BY id LIMIT $3")
+                    .bind(game)
+                    .bind(after)
+                    .bind(limit)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(ManifestRow::record).collect()
+    }
+}
+
+/// A manifest's listing columns (never its bytes).
+#[derive(sqlx::FromRow)]
+struct ManifestRow {
+    id: Vec<u8>,
+    name: String,
+    game: String,
+    version: String,
+    size: i64,
+    items: i32,
+    locations: i32,
+}
+
+impl ManifestRow {
+    fn record(self) -> Result<crate::ManifestRecord, StoreError> {
+        let bad = |what: &str| StoreError::Corrupt(format!("a manifest row has a bad {what}"));
+        Ok(crate::ManifestRecord {
+            id: self.id.try_into().map_err(|_| bad("id"))?,
+            name: self.name,
+            game: self.game,
+            version: self.version,
+            bytes: u64::try_from(self.size).map_err(|_| bad("size"))?,
+            items: u32::try_from(self.items).map_err(|_| bad("items"))?,
+            locations: u32::try_from(self.locations).map_err(|_| bad("locations"))?,
+        })
+    }
+}
+
 impl LogStore for PgLogStore {
     async fn append(&self, batch: AppendBatch<'_>) -> Result<AppendReceipt, AppendError> {
         let job = Job::new(&batch)?;

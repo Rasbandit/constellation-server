@@ -6,11 +6,13 @@ pub mod decode;
 pub mod fairness;
 pub mod fill;
 mod fold;
+pub mod job;
 pub mod par;
 pub mod parity_rng;
 pub mod reach;
 pub mod room;
 pub mod section;
+pub mod seed;
 pub mod spheres;
 pub mod world;
 

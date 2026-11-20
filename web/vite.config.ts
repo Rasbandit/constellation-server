@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import react from '@vitejs/plugin-react';
 import { loadEnv } from 'vite';
 import { defineConfig } from 'vitest/config';
@@ -12,7 +13,12 @@ export default defineConfig(({ mode }) => {
   return {
     // The guard first: it must turn away other sites before the proxy adds the token.
     plugins: [...(admin.passthrough ? [adminGuard(admin.passthrough)] : []), react(), mockApi(admin.passthrough)],
-    define: { __CONSTELLATION_ADMIN_API__: JSON.stringify(admin.passthrough !== undefined) },
+    define: {
+      // Also on in the image build (CONSTELLATION_WEB_ADMIN_API=1): its /api is the server's own, behind the token prompt.
+      __CONSTELLATION_ADMIN_API__: JSON.stringify(admin.passthrough !== undefined || process.env.CONSTELLATION_WEB_ADMIN_API === '1'),
+      // The one reader of the web version (tools/version-check keeps it equal to Cargo.toml's).
+      __WEB_VERSION__: JSON.stringify(JSON.parse(readFileSync('package.json', 'utf8')).version),
+    },
     server: { port: 5173, proxy: admin.proxy },
     test: { environment: 'node' },
   };

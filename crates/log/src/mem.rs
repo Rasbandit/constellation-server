@@ -34,6 +34,7 @@ pub struct MemLogStore {
     /// Blobs (game packages) and room seeds: write once, like the tables.
     packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
+    manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
 }
 
 /// Insert unless present, under the lock; what is stored after.
@@ -223,6 +224,79 @@ impl crate::raw::RawBlobs for MemLogStore {
         key: &BlobKey,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
         ready(Ok(get(&self.packages, key)))
+    }
+}
+
+impl MemLogStore {
+    /// Damage a stored manifest's bytes, as a torn write would, so a test can see it healed.
+    pub fn tear_manifest_for_tests(&self, id: &BlobKey) {
+        let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(id) {
+            bytes.push(0);
+        }
+    }
+}
+
+impl crate::ManifestStore for MemLogStore {
+    fn manifest_put(
+        &self,
+        record: &crate::ManifestRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let ok = crate::blob_key(bytes) == record.id;
+        if ok {
+            let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+            let row = m.entry(record.id).or_insert_with(|| (record.clone(), bytes.to_vec()));
+            // A torn row is healed, as on Postgres.
+            if crate::blob_key(&row.1) != record.id {
+                bytes.clone_into(&mut row.1);
+            }
+        }
+        ready(if ok {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("a manifest put under an id it does not hash to".into()))
+        })
+    }
+
+    fn manifest_record(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<crate::ManifestRecord>, StoreError>> + Send {
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(id).map(|(r, _)| r.clone())))
+    }
+
+    fn manifest_bytes(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(match m.get(id) {
+            Some((_, b)) if crate::blob_key(b) != *id => {
+                Err(StoreError::Corrupt("a stored manifest does not match its id".into()))
+            }
+            found => Ok(found.map(|(_, b)| b.clone())),
+        })
+    }
+
+    fn manifest_list(
+        &self,
+        game: Option<&str>,
+        after: Option<&BlobKey>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<crate::ManifestRecord>, StoreError>> + Send {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = after.map_or(Unbounded, |a| Excluded(*a));
+        let page = m
+            .range((from, Unbounded))
+            .map(|(_, (r, _))| r)
+            .filter(|r| game.is_none_or(|g| r.game == g))
+            .take(limit)
+            .cloned()
+            .collect();
+        ready(Ok(page))
     }
 }
 

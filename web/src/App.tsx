@@ -6,6 +6,8 @@ import { CreateRoom } from './pages/CreateRoom';
 import { Home } from './pages/Home';
 import { NotFound } from './pages/NotFound';
 import { PlayRoom } from './pages/PlayRoom';
+import { NeedsToken } from './components/TokenPrompt';
+import { VersionTag } from './components/ui';
 
 export function App() {
   return (
@@ -39,13 +41,14 @@ export function App() {
         )}
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/create" element={<CreateRoom />} />
+          <Route path="/create" element={<NeedsToken><CreateRoom /></NeedsToken>} />
           <Route path="/c/:code" element={<CodeRedirect />} />
-          <Route path="/rooms/:id" element={<PlayRoom />} />
-          <Route path="/rooms/:id/admin" element={<AdminRoom />} />
+          <Route path="/rooms/:id" element={<NeedsToken><PlayRoom /></NeedsToken>} />
+          <Route path="/rooms/:id/admin" element={<NeedsToken><AdminRoom /></NeedsToken>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>
+      <VersionTag />
     </div>
   );
 }

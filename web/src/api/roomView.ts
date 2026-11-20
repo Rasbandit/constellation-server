@@ -1,4 +1,3 @@
-import { hostPort } from '../lib/format';
 import type { CollectMode, FeedItem, ItemFlag, ReleaseMode, Room, Slot } from './types';
 
 // The server's read-only room view (`GET /api/worlds/:id/room` and its SSE stream
@@ -81,7 +80,7 @@ export function toRoom(id: string, v: RoomView): Room {
     slotsDone: v.slots.filter((s) => s.goal).length,
     games: [...new Set(v.slots.map((s) => s.game))],
     code: null,
-    ...hostPort(v.address),
+    address: v.address,
     seed: v.seed,
     rules: {
       hintCostPct: v.options.hint_cost,

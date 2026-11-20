@@ -1,4 +1,4 @@
-import type { ApWorld, PlayerFile } from './types';
+import type { ApWorld, ManifestWorld, PlayerFile } from './types';
 
 // Records of the server's upload API (`PUT /api/apworlds`, `PUT /api/yamls`; branch
 // feat/web-upload-rooms, crates/server/src/worlds.rs). Uploads are content-addressed: the same
@@ -15,6 +15,17 @@ export interface ApWorldRecord {
   [manifestField: string]: unknown;
 }
 
+/** What the server stores for a manifest (`PUT /api/manifests`): its own fields plus its game and version. */
+export interface ManifestRecord {
+  id: string;
+  name: string;
+  bytes: number;
+  game: string;
+  version: string;
+  items: number;
+  locations: number;
+}
+
 /** What the server stores for a player `.yaml`: one entry per player document in the file. */
 export interface YamlRecord {
   id: string;
@@ -22,6 +33,10 @@ export interface YamlRecord {
   bytes: number;
   /** `game` is one name, or for a weighted pick "A, B" (sorted, comma and space). */
   players: { name: string; game: string }[];
+}
+
+export function toManifest(r: ManifestRecord): ManifestWorld {
+  return { id: r.id, fileName: r.name, game: r.game, version: r.version, sizeBytes: r.bytes };
 }
 
 export function toApWorld(r: ApWorldRecord): ApWorld {

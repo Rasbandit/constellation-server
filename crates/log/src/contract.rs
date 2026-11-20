@@ -5,8 +5,8 @@
 //! The race tests (fence race, cancel safety) are gate G-DB items (doc 11 section 4.8).
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, MemLogStore,
-    Snapshot, StoreError, blob_key,
+    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, ManifestRecord,
+    ManifestStore, MemLogStore, Snapshot, StoreError, blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore {
+trait Store: LogStore + BlobStore + ManifestStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
 }
 
@@ -247,6 +247,54 @@ async fn blobs_are_stored_once_by_key_and_checked_on_write<S: Store>(s: Arc<S>) 
     assert_eq!(s.get(&kb).await.unwrap(), None, "the refused put wrote nothing");
 }
 
+fn manifest(name: &str, game: &str, body: &[u8]) -> ManifestRecord {
+    ManifestRecord {
+        id: blob_key(body),
+        name: name.to_owned(),
+        game: game.to_owned(),
+        version: "1".to_owned(),
+        bytes: body.len() as u64,
+        items: 2,
+        locations: 3,
+    }
+}
+
+/// A manifest is stored once by id with its listing columns, read back whole and checked on
+/// write; a listing pages by id after a cursor, filters by game, and never holds the bytes.
+async fn manifests_are_deduplicated_checked_and_listed_in_pages<S: Store>(s: Arc<S>) {
+    let bodies: Vec<Vec<u8>> = (0..5).map(|i| format!("manifest {i}").into_bytes()).collect();
+    let mut want: Vec<ManifestRecord> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| manifest(&format!("m{i}"), if i % 2 == 0 { "Even" } else { "Odd" }, b))
+        .collect();
+    for (r, b) in want.iter().zip(&bodies) {
+        s.manifest_put(r, b).await.unwrap();
+    }
+    // The same manifest again keeps its first record and bytes.
+    s.manifest_put(&manifest("renamed", "Other", &bodies[0]), &bodies[0]).await.unwrap();
+    assert_eq!(s.manifest_record(&want[0].id).await.unwrap().as_ref(), Some(&want[0]));
+    assert_eq!(s.manifest_bytes(&want[0].id).await.unwrap(), Some(bodies[0].clone()));
+    assert_eq!(s.manifest_record(&blob_key(b"none")).await.unwrap(), None);
+    assert_eq!(s.manifest_bytes(&blob_key(b"none")).await.unwrap(), None);
+    // A put under an id the bytes do not hash to is refused and writes nothing.
+    let lie = manifest("lie", "Even", b"other bytes");
+    assert!(matches!(s.manifest_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
+    assert_eq!(s.manifest_record(&lie.id).await.unwrap(), None);
+
+    want.sort_by_key(|r| r.id);
+    let first = s.manifest_list(None, None, 2).await.unwrap();
+    assert_eq!(first, want[..2]);
+    let next = s.manifest_list(None, Some(&first[1].id), 2).await.unwrap();
+    assert_eq!(next, want[2..4]);
+    let rest = s.manifest_list(None, Some(&next[1].id), 10).await.unwrap();
+    assert_eq!(rest, want[4..]);
+    let odd: Vec<_> = want.iter().filter(|r| r.game == "Odd").cloned().collect();
+    assert_eq!(s.manifest_list(Some("Odd"), None, 10).await.unwrap(), odd);
+    assert_eq!(s.manifest_list(Some("None"), None, 10).await.unwrap(), []);
+    assert_eq!(s.manifest_list(None, None, 0).await.unwrap(), []);
+}
+
 /// A room's seed is written once; the same seed again is fine, a different one is refused
 /// (never dropped while reporting success), and rooms keep their own.
 async fn a_seed_is_written_once_and_a_different_one_is_refused<S: Store>(s: Arc<S>) {
@@ -434,6 +482,7 @@ macro_rules! contract {
                 an_older_snapshot_never_replaces_a_newer_one,
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
+                manifests_are_deduplicated_checked_and_listed_in_pages,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

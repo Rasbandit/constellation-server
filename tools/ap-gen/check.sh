@@ -7,7 +7,7 @@
 #
 # The server also runs with --rooms (holding the e2e fixture, so there are two rooms and a
 # client must name its room key). With a command (`just e2e-full`): wait until the server hosts
-# the generated world as a room, then run the command with ROOM_URL (ws://<key>.localhost:<port>)
+# the generated world as a room, then run the command with ROOM_URL (ws://localhost:<port>/<key>)
 # and ROOM_BUNDLE (the generated bundle as v1 JSON, from GET /api/worlds/<id>/bundle: the
 # server decodes the seed it keeps in its store) set; the script exits with its status.
 set -euo pipefail
@@ -29,11 +29,11 @@ CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHO
     --port 0 --data-dir "$work/data" 2>"$work/log" &
 pid=$!
 for _ in $(seq 100); do
-    # The admin API has its own listener (loopback); its line comes before the room's.
+    # The admin API is on the room's port.
     grep -q 'listening addr=' "$work/log" && break
     sleep 0.1
 done
-addr=$(grep -o 'admin api addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
+addr=$(grep -o 'listening addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
 [ -n "${addr:-}" ] || { cat "$work/log"; exit 1; }
 
 api() { curl -sS --fail-with-body -H @"$work/auth" "$@"; }

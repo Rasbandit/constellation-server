@@ -1,0 +1,14 @@
+target
+.git
+.github
+web/dist
+web/dist-artifact
+docs
+tools/*
+!tools/ap-gen
+!tools/ap-import
+**/node_modules
+**/__pycache__
+.env
+secrets
+.env.*

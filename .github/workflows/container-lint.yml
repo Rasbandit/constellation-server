@@ -1,0 +1,25 @@
+name: container-lint
+# Seconds, no image build (that is release.yml, on main and tags). Runs only for packaging changes.
+on:
+  pull_request:
+    paths: [Dockerfile, .dockerignore, docker-compose.yml, docker/**, .github/workflows/release.yml, .github/workflows/container-lint.yml]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008 # apt packages are not version-pinned: bookworm-slim security updates matter more
+      - run: shellcheck docker/*.sh
+      # Exit 3 -> 0, other codes pass through, SIGTERM is forwarded.
+      - run: sh docker/test-entrypoint.sh
+      # The secret files only need to exist for the config check.
+      - run: |
+          mkdir secrets && touch secrets/database_url secrets/postgres_password secrets/admin_token
+          GEN_REPO_URL=x GEN_REPO_REF=x docker compose config -q
+          GEN_REPO_URL=x GEN_REPO_REF=x docker compose -f docker-compose.yml -f docker-compose.token.yml config -q

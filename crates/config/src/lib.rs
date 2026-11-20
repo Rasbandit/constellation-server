@@ -154,6 +154,11 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
+    /// Wrong admin tokens one client address may send in a burst; more get HTTP 429 until the
+    /// bucket refills (design value). A right token is never counted.
+    pub admin_auth_fail_burst: u32,
+    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
+    pub admin_auth_fail_refill_milli_per_sec: u32,
     /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
     /// ones are tens of MB).
     pub apworld_max_bytes: usize,
@@ -163,6 +168,35 @@ pub struct Limits {
     pub apworld_max_entries: u64,
     /// Largest player `.yaml` upload, bytes (design value: real ones are a few KB).
     pub yaml_max_bytes: usize,
+    /// Largest world manifest upload, bytes (design value: the large test world is 830 KB).
+    pub manifest_max_bytes: usize,
+    /// Bytes of manifests the server keeps in memory for generation (least recently used go
+    /// first); the database holds every one (design value).
+    pub manifest_cache_bytes: usize,
+    /// Most records one listing page returns, whatever the caller asks (design value).
+    pub list_page_max: usize,
+    /// Manifest checks (a child process each) running at once; more are refused as busy.
+    pub manifest_check_concurrency: usize,
+    /// Address-space cap of a fill or manifest check child process, bytes (design value).
+    pub fill_memory_bytes: u64,
+    /// Process and thread cap of a fill or manifest check child process. The system counts every
+    /// task of the server's user against it, so it is a brake on runaway spawning, not a tight
+    /// bound; 0 leaves it off (design value).
+    pub fill_max_processes: u64,
+    /// CPU-seconds cap of a fill or manifest check child process (design value).
+    pub fill_cpu_secs: u64,
+    /// Wall-clock limit of one fill child process, after which it is killed (design value).
+    pub fill_timeout_ms: u64,
+    /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
+    pub gen_concurrency: usize,
+    /// Most generations queued or running at once; a new one past it is refused as busy
+    /// (design value).
+    pub gen_queue_max: usize,
+    /// Uploads and generation requests one client address may make in a burst, then
+    /// `admin_write_refill_milli_per_sec` per second after (design values).
+    pub admin_write_burst: u32,
+    /// Refill of the per-address write allowance, thousandths of a request per second.
+    pub admin_write_refill_milli_per_sec: u32,
     /// Wall-clock limit of one sandboxed inspect call, after which it is killed (design value).
     pub inspect_timeout_ms: u64,
     /// Wall-clock limit of one sandboxed generation, after which it is killed
@@ -217,6 +251,20 @@ pub const FILL_SETUP_WORKERS: usize = 4;
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
 pub const FILL_MAX_WORKERS: usize = 64;
+
+/// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
+/// listing columns and an index).
+pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
+
+/// The generator version a data-only seed records (what clients of the compatible protocol
+/// expect; a format value, not a limit).
+pub const SEED_GENERATOR_VERSION: (u32, u32, u32) = (0, 6, 8);
+
+/// Hint cost, percent of a slot's locations, that a data-only seed starts with (design value).
+pub const SEED_HINT_COST_PCT: u8 = 10;
+
+/// Hint points a data-only seed gives per checked location (design value).
+pub const SEED_CHECK_POINTS: u32 = 1;
 
 /// Most players one room's fill takes (a design value; player numbers are 16 bits).
 pub const ROOM_MAX_PLAYERS: usize = 1024;
@@ -279,10 +327,24 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
+        admin_auth_fail_burst: 5,
+        admin_auth_fail_refill_milli_per_sec: 100,
         apworld_max_bytes: 64 * 1024 * 1024,
         apworld_max_unpacked_bytes: 256 * 1024 * 1024,
         apworld_max_entries: 20_000,
         yaml_max_bytes: 1024 * 1024,
+        manifest_max_bytes: 8 * 1024 * 1024,
+        manifest_cache_bytes: 64 * 1024 * 1024,
+        list_page_max: 200,
+        manifest_check_concurrency: 2,
+        fill_memory_bytes: 1024 * 1024 * 1024,
+        fill_cpu_secs: 120,
+        fill_max_processes: 8192,
+        fill_timeout_ms: 60_000,
+        gen_concurrency: 1,
+        gen_queue_max: 64,
+        admin_write_burst: 30,
+        admin_write_refill_milli_per_sec: 1000,
         inspect_timeout_ms: 30_000,
         gen_timeout_ms: 15 * 60 * 1000,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -321,6 +383,9 @@ pub fn load() -> Limits {
     for (key, field) in [
         ("CONSTELLATION_MAX_CONNECTIONS", &mut l.max_connections),
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
+        ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
+        ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
+        ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
     ] {
         if let Some(v) = num(key).and_then(|v| usize::try_from(v).ok()) {
             *field = v;
@@ -332,6 +397,8 @@ pub fn load() -> Limits {
         ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
         ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
         ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
+        ("CONSTELLATION_FILL_MEMORY_BYTES", &mut l.fill_memory_bytes),
+        ("CONSTELLATION_FILL_TIMEOUT_MS", &mut l.fill_timeout_ms),
         ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
         ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
         ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
@@ -360,7 +427,7 @@ pub struct Secrets {
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
     /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. That API is refused without it.
+    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
     pub admin_token: Option<String>,
 }
 
@@ -449,6 +516,10 @@ pub struct Generation {
     /// Host paths no sandbox mount may contain: the server user's home (`HOME`) and the secret
     /// files (`CONSTELLATION_*_FILE`).
     pub private: Vec<std::path::PathBuf>,
+    /// `CONSTELLATION_SANDBOX_MODE=container`: no per-job cgroup (`systemd-run --user`); the
+    /// container's own memory and process limits bound the jobs instead. Never detected, only
+    /// asked for. Default (`systemd`, or unset): a cgroup per job.
+    pub container_mode: bool,
 }
 
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
@@ -472,6 +543,11 @@ pub fn load_generation() -> Result<Option<Generation>, String> {
 fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Generation>, String> {
     const KEYS: [&str; 3] =
         ["CONSTELLATION_AP_DIR", "CONSTELLATION_AP_PYTHON", "CONSTELLATION_AP_GEN_SCRIPT"];
+    let container_mode = match var("CONSTELLATION_SANDBOX_MODE").as_deref() {
+        None | Some("" | "systemd") => false,
+        Some("container") => true,
+        Some(_) => return Err("CONSTELLATION_SANDBOX_MODE must be `systemd` or `container`".into()),
+    };
     let [ap, py, side] = KEYS.map(|k| var(k).filter(|v| !v.is_empty()));
     let (Some(ap), Some(py), Some(side)) = (&ap, &py, &side) else {
         if ap.is_none() && py.is_none() && side.is_none() {
@@ -494,6 +570,7 @@ fn generation_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Genera
         python: path(py, KEYS[1])?,
         sidecar: path(side, KEYS[2])?,
         private,
+        container_mode,
     }))
 }
 
@@ -773,6 +850,14 @@ mod tests {
     fn upload_and_generation_limits_are_design_values() {
         let l = Limits::DESIGN;
         assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
+        assert_eq!(l.manifest_max_bytes, 8 << 20);
+        assert_eq!((l.gen_concurrency, l.gen_queue_max), (1, 64));
+        assert_eq!(
+            (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),
+            (1 << 30, 120, 60_000)
+        );
+        assert_eq!(l.fill_max_processes, 8192);
+        assert_eq!((l.admin_write_burst, l.admin_write_refill_milli_per_sec), (30, 1000));
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
         assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
@@ -850,6 +935,23 @@ mod tests {
             ("CONSTELLATION_AP_GEN_SCRIPT", "/s"),
         ];
         assert!(generation_from(env(rel)).unwrap_err().contains("absolute"));
+        // The sandbox mode: systemd by default, container only when asked, anything else refused.
+        macro_rules! mode {
+            ($m:expr) => {
+                generation_from(env(&[
+                    ("CONSTELLATION_AP_DIR", "/ap"),
+                    ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
+                    ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap_gen.py"),
+                    ("CONSTELLATION_SANDBOX_MODE", $m),
+                ]))
+                .map(|g| g.unwrap().container_mode)
+            };
+        }
+        assert_eq!(mode!(""), Ok(false));
+        assert_eq!(mode!("systemd"), Ok(false));
+        assert_eq!(mode!("container"), Ok(true));
+        assert!(mode!("docker").unwrap_err().contains("SANDBOX_MODE"));
+        assert!(generation_from(env(&[("CONSTELLATION_SANDBOX_MODE", "x")])).is_err());
     }
 
     #[test]

@@ -386,6 +386,14 @@ impl Host {
         Ok(host)
     }
 
+    /// Where the admin API keeps uploaded manifests: this host's store.
+    pub(crate) fn manifest_db(&self) -> crate::manifests::Db {
+        match &self.store {
+            Store::Pg(pg) => crate::manifests::Db::Pg(Arc::clone(pg)),
+            Store::Mem { log, .. } => crate::manifests::Db::Mem(Arc::clone(log)),
+        }
+    }
+
     /// What the router asks to load a cold room with; answered while [`Host::supervise`]
     /// runs.
     pub(crate) fn waker(&self) -> Waker {

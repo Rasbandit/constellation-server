@@ -37,6 +37,7 @@ Types are in `src/api/types.ts`. Names follow CWP v1 (`crates/proto/schema/cwp-v
 | GET | `/api/games/:game` | | `GameCatalog` (items with flags, locations) |
 | PUT | `/api/apworlds?name=<file>` | raw `.apworld` | 201 (200 if already stored) `{id, name, bytes, module, game, world_version, ...}` |
 | PUT | `/api/yamls?name=<file>` | raw `.yaml` | 201 (200 if already stored) `{id, name, bytes, players: [{name, game}]}` |
+| PUT | `/api/manifests?name=<file>` | raw `.json` manifest | 201 (200 if already stored) `{id, name, bytes, game, version, items, locations}` |
 | GET | `/api/rooms` | | `RoomSummary[]` |
 | POST | `/api/rooms/check` | `CreateRoomRequest` | readiness checks |
 | POST | `/api/rooms` | `CreateRoomRequest` | 201 `Room` with `adminKey`, or 422 with the failing checks |
@@ -69,17 +70,17 @@ The two upload routes are the server's own (branch `feat/web-upload-rooms`, `cra
 Point the dev server at the server's admin API and the upload, generation and room view routes (`/api/apworlds`, `/api/yamls`, `/api/worlds`) go there:
 
 ```sh
-CONSTELLATION_ADMIN_URL=http://127.0.0.1:<admin port> \
+CONSTELLATION_ADMIN_URL=http://127.0.0.1:<server port> \
 CONSTELLATION_ADMIN_TOKEN_FILE=<file with the token> \
 bun --bun run dev
 ```
 
-The admin port is the server's `admin api addr=` log line (it listens on loopback; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards, so the token never reaches the browser. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
+The admin API is on the server's one port (the `listening addr=` log line; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards. In this mode the pages still ask for a token once (any text works here, since the dev server overrides it); the built image has no dev server, so there the operator types the real token, which the page keeps in `sessionStorage` and sends as that header. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
 
 With the admin API configured, the pages show the real server and nothing from the stub:
 
 - **Create room** posts the uploaded ids to `POST /api/worlds` and polls `GET /api/worlds/:id` until the server hosts the world as a room (the server needs `--rooms` as well as `--data-dir`). The room is the world: its page is `/rooms/<world id>`, named by its room key. Every player must come from an uploaded YAML. The page asks for no room name, password or rules, because the server cannot take them from it yet (the password is the server's `CONSTELLATION_ROOM_PASSWORD`); a second world with a seed the server already hosts fails instead of sharing that room.
-- **The room pages** read `GET /api/worlds/:id/room` (seed, key, join address `{room_key}.{host}:{port}` from the server's `--public-host`, and per slot: connected from live sessions, checks of total locations, items received, goal) and the event stream `GET /api/worlds/:id/room/events` (server-sent events: items, checks, goals, joins, leaves, chat). The stream resumes by itself; after a server restart it sends a reset and the page starts its feed over. A new stream replays at most the newest `view_history_events` (400) events, and at most `view_streams` (64) are open at once (`crates/config`).
+- **The room pages** read `GET /api/worlds/:id/room` (seed, key, join address `{host}:{port}/{room_key}` from the server's `--public-host`, and per slot: connected from live sessions, checks of total locations, items received, goal) and the event stream `GET /api/worlds/:id/room/events` (server-sent events: items, checks, goals, joins, leaves, chat). The stream resumes by itself; after a server restart it sends a reset and the page starts its feed over. A new stream replays at most the newest `view_history_events` (400) events, and at most `view_streams` (64) are open at once (`crates/config`).
 - **Not available yet**, so hidden: send item, free hints, rename, slot passwords, release, collect, disconnect, pause, start, close, broadcast, rules, the host action log, chat from the page, hints, the room list and room codes. The admin page says so. A renamed player still connects with the name in their YAML.
 
 Only the dev server's own pages can use the proxy: a request for a proxied path whose `Host` is not a loopback name, or whose `Origin` or `Sec-Fetch-Site` says it comes from another page, gets 403 before the token is added (`mock/proxy.ts`, `adminGuard`). Without the proxy, every page carries a "Demo data" banner: rooms, players, checks and activity are made up by the stub, and the shared demo admin key stands in for host sign-in.

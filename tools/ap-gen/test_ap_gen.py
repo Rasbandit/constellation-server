@@ -5,6 +5,7 @@ Run: python -m pytest tools/ap-gen/test_ap_gen.py
 
 import json
 import stat
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -129,6 +130,30 @@ class Cli(unittest.TestCase):
     def test_a_refusal_exits_1(self):
         self.assertEqual(ap_gen.main(["inspect-apworld", "/nonexistent/x.apworld",
                                       "--max-unpacked", "1", "--max-entries", "1"]), 1)
+
+
+class DefaultSettings(unittest.TestCase):
+    def test_settings_come_from_memory_and_no_host_yaml_is_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "settings.py").write_text(
+                "skip_autosave = False\n"
+                "class Settings:\n"
+                "    def __init__(self, location): self.location = location\n"
+                "    def save(self, *a): raise OSError(30, 'Read-only file system')\n"
+                "def get_settings():\n"
+                "    c = getattr(get_settings, '_cache', None)\n"
+                "    if c is None: Settings(None).save('host.yaml')\n"
+                "    return c\n")
+            sys.path.insert(0, d)
+            sys.modules.pop("settings", None)  # never reuse a settings module an earlier test imported
+            try:
+                import settings
+                ap_gen.use_default_settings()
+                self.assertIsNone(settings.get_settings().location)
+                self.assertTrue(settings.skip_autosave)
+            finally:
+                sys.path.remove(d)
+                sys.modules.pop("settings", None)
 
 
 if __name__ == "__main__":
