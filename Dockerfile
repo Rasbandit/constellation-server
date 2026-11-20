@@ -18,12 +18,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS gen
 ARG GEN_REPO_URL
 ARG GEN_REPO_REF
+WORKDIR /opt/gen/ap
 RUN if [ -z "$GEN_REPO_URL" ] || [ -z "$GEN_REPO_REF" ]; then \
       echo "build args GEN_REPO_URL and GEN_REPO_REF are required (see docs/container.md)" >&2; exit 1; fi \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git python3 python3-venv python3-dev build-essential \
     && rm -rf /var/lib/apt/lists/* \
-    && git init -q /opt/gen/ap && cd /opt/gen/ap \
+    && git init -q . \
     && git fetch -q --depth 1 "$GEN_REPO_URL" "$GEN_REPO_REF" && git checkout -q FETCH_HEAD \
     && mkdir -p custom_worlds && rm -rf .git \
     && grep -viE '^(kivy|pyshortcuts|#|[[:space:]]*$)' requirements.txt > /tmp/requirements.txt \
