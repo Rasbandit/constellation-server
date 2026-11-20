@@ -1,21 +1,23 @@
 name: release
 # The image is built on main and on tags, never on PRs (packaging PRs get the seconds-long
-# container-lint workflow). A push to main builds it and runs it under compose; a tag
-# vX.Y.Z (equal to the Cargo.toml version) builds and pushes linux/amd64 to GHCR. A manual run
-# (workflow_dispatch) builds and runs it on any branch without pushing.
+# container-lint workflow). A push to main builds it, runs it under compose and, if that passes,
+# publishes it to GHCR as `main` and `sha-<short sha>`. A tag vX.Y.Z (equal to the Cargo.toml
+# version) publishes the version tags and `latest`. A manual run (workflow_dispatch) builds and
+# runs it on any branch without pushing.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 permissions:
   contents: read
 jobs:
   smoke:
     if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    # A newer merge replaces an older smoke run.
+    concurrency:
+      group: smoke-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -64,7 +66,13 @@ jobs:
       - if: always()
         run: docker compose down -v
   push:
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: smoke
+    # A tag (the smoke is skipped there) or a main push whose smoke passed.
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.smoke.result == 'success')) }}
+    # One publish at a time and never cancelled mid-push; a newer queued run replaces an older queued one.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -74,9 +82,11 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       # The tagged commit must be on main, so a tag on a side branch cannot publish `latest`.
-      - run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       # The tag must be v<Cargo version> and web/package.json must agree.
-      - run: sh tools/version-check/check.sh "$TAG"
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: sh tools/version-check/check.sh "$TAG"
         env:
           TAG: ${{ github.ref_name }}
       - uses: docker/setup-buildx-action@v4
@@ -91,9 +101,11 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/constellation-server
           flavor: latest=false
           tags: |
+            type=ref,event=branch
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
       - uses: docker/build-push-action@v7
         with:
           context: .
@@ -103,9 +115,10 @@ jobs:
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # A release build carries the bare version (no BUILD_SHA); a main build adds +<short sha>.
           build-args: |
+            BUILD_SHA=${{ github.ref == 'refs/heads/main' && github.sha || '' }}
             GEN_REPO_URL=${{ secrets.GEN_REPO_URL }}
             GEN_REPO_REF=${{ vars.GEN_REPO_REF }}
-          # A release build carries the bare version (no BUILD_SHA).
           cache-from: type=gha
           cache-to: type=gha,mode=max
