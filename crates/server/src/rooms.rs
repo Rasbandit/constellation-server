@@ -75,7 +75,7 @@ impl RoomKey {
         Self::parse(rest.strip_suffix('/').unwrap_or(rest)).ok()
     }
 
-    /// The join address clients type: `{public}/{key}`, with `public` the `host:port`.
+    /// The join address clients type: `{public}/{key}`, with `public` the `host:port` or a `ws(s)://host:port` URL.
     #[must_use]
     pub fn address(&self, public: &str) -> String {
         format!("{public}/{}", self.0)
