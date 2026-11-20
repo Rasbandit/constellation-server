@@ -16,7 +16,7 @@ How generation follows Archipelago 0.6.8 (files in its checkout, read, not copie
 - `worlds/__init__.py` loads `.apworld` files from `user_path("custom_worlds")` when
   `Utils.user_path` is the checkout itself, which it picks only for a writable checkout. The
   sandbox mounts the checkout read-only, so this sets that choice (`user_path.cached_path`)
-  before anything reads it. The sandbox mounts the job's apworlds at `custom_worlds/`, so
+  before anything reads it, and seeds default settings in memory (no host.yaml is written). The sandbox mounts the job's apworlds at `custom_worlds/`, so
   `--apworlds` must be that folder. A world loads as `worlds.<file stem>`, so each file is
   named after the top-level folder inside it.
 - `Generate.mystery_argparse` and `Generate.main` roll the player settings from the yamls in
@@ -143,6 +143,16 @@ def inspect_yaml(path: Path) -> list[dict[str, str]]:
     return players
 
 
+def use_default_settings() -> None:
+    """Give Archipelago its default settings from memory. Left alone, `get_settings` writes a
+    new host.yaml into the checkout, which the sandbox mounts read-only (and nothing here
+    should persist). Call after the checkout is on sys.path."""
+    import settings
+
+    settings.skip_autosave = True
+    settings.get_settings._cache = settings.Settings(None)
+
+
 def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]:
     """Generate a multiworld from the yamls; `out` is scratch space for Archipelago's output."""
     if not (ap / "custom_worlds").exists() or not os.path.samefile(apworlds, ap / "custom_worlds"):
@@ -159,6 +169,7 @@ def generate(ap: Path, apworlds: Path, yamls: Path, out: Path) -> dict[str, Any]
         import Utils
 
         Utils.user_path.cached_path = Utils.local_path()
+        use_default_settings()
 
         logging.basicConfig(stream=sys.stderr, level=logging.INFO)
         import ModuleUpdate
