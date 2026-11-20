@@ -144,6 +144,11 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
+    /// Wrong admin tokens one client address may send in a burst; more get HTTP 429 until the
+    /// bucket refills (design value). A right token is never counted.
+    pub admin_auth_fail_burst: u32,
+    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
+    pub admin_auth_fail_refill_milli_per_sec: u32,
     /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
     /// ones are tens of MB).
     pub apworld_max_bytes: usize,
@@ -266,6 +271,8 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
+        admin_auth_fail_burst: 5,
+        admin_auth_fail_refill_milli_per_sec: 100,
         apworld_max_bytes: 64 * 1024 * 1024,
         apworld_max_unpacked_bytes: 256 * 1024 * 1024,
         apworld_max_entries: 20_000,
@@ -344,7 +351,7 @@ pub struct Secrets {
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
     /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. That API is refused without it.
+    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
     pub admin_token: Option<String>,
 }
 

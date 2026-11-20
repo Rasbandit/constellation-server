@@ -1,3 +1,4 @@
+import { getAdminToken, rejectAdminToken } from './token';
 import { toRoom, type RoomView } from './roomView';
 import { toApWorld, toPlayers, type ApWorldRecord, type YamlRecord } from './uploads';
 import type {
@@ -34,7 +35,13 @@ async function call<T>(method: string, path: string, opts: { body?: unknown; raw
     headers['Content-Type'] = 'application/json';
     body = JSON.stringify(opts.body);
   }
+  const token = getAdminToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(path, { method, headers, body });
+  if (res.status === 401) {
+    rejectAdminToken();
+    throw new HttpError(401, { error: 'The admin token is missing or wrong.' });
+  }
   const text = await res.text();
   let data: unknown;
   try {

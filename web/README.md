@@ -69,12 +69,12 @@ The two upload routes are the server's own (branch `feat/web-upload-rooms`, `cra
 Point the dev server at the server's admin API and the upload, generation and room view routes (`/api/apworlds`, `/api/yamls`, `/api/worlds`) go there:
 
 ```sh
-CONSTELLATION_ADMIN_URL=http://127.0.0.1:<admin port> \
+CONSTELLATION_ADMIN_URL=http://127.0.0.1:<server port> \
 CONSTELLATION_ADMIN_TOKEN_FILE=<file with the token> \
 bun --bun run dev
 ```
 
-The admin port is the server's `admin api addr=` log line (it listens on loopback; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards, so the token never reaches the browser. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
+The admin API is on the server's one port (the `listening addr=` log line; use an SSH tunnel for a remote one). `CONSTELLATION_ADMIN_TOKEN` works instead of the file. The dev server adds `Authorization: Bearer <token>` when it forwards. In this mode the pages still ask for a token once (any text works here, since the dev server overrides it); the built image has no dev server, so there the operator types the real token, which the page keeps in `sessionStorage` and sends as that header. The server inspects uploads in a bubblewrap sandbox, so it needs Linux.
 
 With the admin API configured, the pages show the real server and nothing from the stub:
 

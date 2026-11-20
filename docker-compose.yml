@@ -23,18 +23,13 @@ services:
       - /opt/constellation/web
       - --data-dir
       - /data
-      - --admin-host
-      - 0.0.0.0
-      - --admin-port
-      - "38282"
       - --public-host
       - ${CONSTELLATION_PUBLIC_HOST:-localhost}
     environment:
       CONSTELLATION_DATABASE_URL_FILE: /run/secrets/database_url
-      CONSTELLATION_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       # No per-job cgroup in a container: the limits below bound uploaded code instead (README).
       CONSTELLATION_SANDBOX_MODE: container
-    secrets: [database_url, admin_token]
+    secrets: [database_url]
     mem_limit: 6g
     memswap_limit: 6g # no swap beyond mem_limit
     pids_limit: 512
@@ -46,8 +41,6 @@ services:
       - systempaths=unconfined
     ports:
       - "${CONSTELLATION_PORT:-38281}:38281"
-      # The admin API runs uploaded code: loopback on the host only. Reach it by SSH or a proxy.
-      - "127.0.0.1:${CONSTELLATION_ADMIN_PORT:-38282}:38282"
     volumes:
       - data:/data
   postgres:
@@ -70,8 +63,6 @@ volumes:
   data:
   pgdata:
 secrets:
-  admin_token:
-    file: ${CONSTELLATION_ADMIN_TOKEN_FILE:-./secrets/admin_token}
   database_url:
     file: ${CONSTELLATION_DATABASE_URL_FILE:-./secrets/database_url}
   postgres_password:

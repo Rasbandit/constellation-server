@@ -1,18 +1,17 @@
 # Running the room server in a container
 
-The image holds the room server, the web UI and the upload and generation API. Rooms and the UI share the one public port, 38281: `/` is the UI, a WebSocket upgrade on `/<key>` is a room. Flags and environment variables are in the README; the compose file runs `constellation-server --host 0.0.0.0 --port 38281 --rooms /data/rooms --data-dir /data` plus the admin listener (the image's own default is the same without `--data-dir`; its default command already has `--web-dir`).
+The image holds the room server, the web UI and the upload and generation API. Rooms and the UI share the one public port, 38281: `/` is the UI, a WebSocket upgrade on `/<key>` is a room. Flags and environment variables are in the README; the compose file runs `constellation-server --host 0.0.0.0 --port 38281 --rooms /data/rooms --data-dir /data` (the admin API shares the port; the image's own default is the same without `--data-dir`; its default command already has `--web-dir`).
 
 ```sh
 cp .env.example .env   # set GEN_REPO_URL and GEN_REPO_REF too (see Building)
 mkdir -p secrets
 openssl rand -hex 24 > secrets/postgres_password
-openssl rand -hex 16 > secrets/admin_token
 printf 'postgres://constellation:%s@postgres/constellation' "$(cat secrets/postgres_password)" > secrets/database_url
-chmod 400 secrets/database_url secrets/admin_token && sudo chown 10001 secrets/database_url secrets/admin_token
-docker compose up -d
+chmod 400 secrets/database_url && sudo chown 10001 secrets/database_url
+docker compose up -d   # admin API open, see "The admin API on the same port"
 ```
 
-- Secrets are files mounted as Docker secrets; the server reads the database URL from `CONSTELLATION_DATABASE_URL_FILE`. The server runs as uid 10001 and the mount keeps the host file's owner and mode, so `database_url` must be readable by that uid: the `chmod 400` and `chown 10001` above keep it private to it, and the same for `admin_token` (the Postgres entrypoint reads its password file as root, so `postgres_password` can stay `600`).
+- Secrets are files mounted as Docker secrets; the server reads the database URL from `CONSTELLATION_DATABASE_URL_FILE`. The server runs as uid 10001 and the mount keeps the host file's owner and mode, so `database_url` must be readable by that uid: the `chmod 400` and `chown 10001` above keep it private to it, and the same for `admin_token` if you turn the token on (the Postgres entrypoint reads its password file as root, so `postgres_password` can stay `600`).
 - Seed bundles (`*.json`) go in `/data/rooms` on the `data` volume, for example `docker compose cp seed.json server:/data/rooms/` (the server lists the folder, no restart needed for a new room) or a bind mount over `/data/rooms`. Each room logs `room ready key=<key>`.
 - Postgres 18: the volume is mounted at `/var/lib/postgresql` with `PGDATA=/var/lib/postgresql/18/docker`, the layout the official image has used since 18.
 - `restart: on-failure`, never `always`. Exit code 3 means a newer owner fenced this process, and restarting it makes two instances fight over one database. The image entrypoint (`docker/entrypoint.sh`) runs the server as a child, forwards SIGTERM and SIGINT to it, and turns exit 3 into 0 (logging `server exited 3 (fenced ...)`), so `on-failure` leaves it stopped. Every other exit code passes through and restarts.
@@ -28,31 +27,60 @@ Generation needs the generator's source, which is not in this repo and whose URL
 ## Web UI
 The web stage of the Dockerfile builds `web/` from `bun.lock` (`bun install --frozen-lockfile`), runs the type check and `vite build`, and compresses every text file once (`.gz` and `.br` next to it, `web/scripts/precompress.mjs`). Only `dist/` reaches the runtime image, in `/opt/constellation/web`; no bun, node or dev dependency does.
 
-The server (`--web-dir`) answers, in order: `/healthz`, `/version`, a WebSocket upgrade at `/<key>` (the room; with `--bundle` any path), then the UI for every other GET and HEAD: an existing file, else `index.html` for a page load (no extension, not under `/assets/`, `Accept` takes HTML). A missing file, a missing `/assets/*` path or a request that does not want HTML is a 404, never the app. So a plain GET of `/<key>` loads the UI (its `/c/:code` and room pages) and an upgrade of the same URL joins the room. Files carry `ETag` and `Last-Modified`; `/assets/*` (hashed names) is `public, max-age=31536000, immutable`, everything else `no-cache`; the client's `Accept-Encoding` picks the stored `.br` or `.gz`. Every answer has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and a CSP (`default-src 'self'`, `frame-ancestors 'none'`). Paths are not decoded and the resolved file must lie inside the folder, so `..`, encoded `..` and a symlink out all get the app or a 404. The UI's version badge reads `GET /version` from its own origin.
+The server (`--web-dir`) answers, in order: `/healthz`, `/version`, `/api/*` (the admin API, below), a WebSocket upgrade at `/<key>` (the room; with `--bundle` any path), then the UI for every other GET and HEAD: an existing file, else `index.html` for a page load (no extension, not under `/assets/`, `Accept` takes HTML). A missing file, a missing `/assets/*` path or a request that does not want HTML is a 404, never the app. So a plain GET of `/<key>` loads the UI (its `/c/:code` and room pages) and an upgrade of the same URL joins the room. Files carry `ETag` and `Last-Modified`; `/assets/*` (hashed names) is `public, max-age=31536000, immutable`, everything else `no-cache`; the client's `Accept-Encoding` picks the stored `.br` or `.gz`. Every answer has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and a CSP (`default-src 'self'`, `frame-ancestors 'none'`). Paths are not decoded and the resolved file must lie inside the folder, so `..`, encoded `..` and a symlink out all get the app or a 404. The UI's version badge reads `GET /version` from its own origin.
 
-### The admin API behind the UI
-The UI calls `/api/...` on its own origin, but the admin API listens on the separate admin port (`38282`, loopback on the host) because it runs uploaded code, and it needs `Authorization: Bearer <token>`. The server does not proxy it, and the browser never gets the token. To use the UI's create and upload pages, put a reverse proxy in front that does both jobs: forward `/` and WebSocket upgrades to `127.0.0.1:38281`, forward `/api/` to `127.0.0.1:38282` with the token added by the proxy, and require its own login (basic auth, SSO or an IP allow-list) on `/api/`, since whoever reaches it holds the admin token. For example in Caddy:
+### The admin API on the same port
+There is one public port (`38281`). `/api/*` is served on it, always on when the server has `--data-dir` (compose sets it), and it comes before the room upgrade and the UI, so a room key can never shadow it and the UI never answers under `/api`. **Open mode (the current default):** with no admin token configured, `/api` needs nothing and the server logs a warning at start. The risk: anyone who can reach the port can upload an `.apworld` and have it run inside the sandbox. Until a token is on, restrict the port yourself (an nginx `allow`/`deny` list or a firewall). **Token mode:** set `CONSTELLATION_ADMIN_TOKEN` or `CONSTELLATION_ADMIN_TOKEN_FILE` (with compose: `openssl rand -hex 16 > secrets/admin_token`, `chmod 400` and `sudo chown 10001` it, then `docker compose -f docker-compose.yml -f docker-compose.token.yml up -d`). Then every `/api` path, even an unknown one, needs `Authorization: Bearer <token>`; without it the answer is a bare 401 with no body. `GET /api/auth` is always open and answers only `{"token_required":bool}`; the UI reads it, so it shows no prompt in open mode, and in token mode asks for the token on its pages, keeps it in `sessionStorage` (this tab only) and sends it as that header; a 401 clears it.
+
+**Upgrading:** a deployment that already has `secrets/admin_token` but still runs only `docker-compose.yml` is now open, with a warning in the log; add `-f docker-compose.token.yml` to keep the token.
+
+**Known limit in token mode:** the room view a player opens from a join link is part of `/api`, so a player would need the admin token, which they must never get. Until a read-only player credential exists (#111), use open mode behind an allow-list, or share room pages only with people who hold the token.
+
+In token mode the token is the boundary (the API runs uploaded code): at least 32 bytes, compared in constant time. Wrong tokens are counted per client address (an IPv6 address counts as its /64; 5 in a burst, one more every 10 s: `admin_auth_fail_*` in `crates/config`); past that a wrong or missing token gets 429 with `Retry-After`. A right token is never refused. Behind a proxy every client has the proxy's address, so the count is shared; start the server with `--trusted-proxy-header X-Forwarded-For` (or `X-Real-IP`) so it counts per real client. Only the last entry of the last line of that header is used (the one your proxy appended), and the proxy must overwrite or append it: never turn the flag on when clients can reach the port without the proxy, because they could then send any address.
+
+TLS comes from the reverse proxy; never expose the port over plain HTTP, since the token and the uploads travel on it. For `const.ras.band` with nginx (plain pass-through, no auth of its own):
 
 ```
-play.example.com {
-    basicauth /api/* { admin <bcrypt hash> }
-    reverse_proxy /api/* 127.0.0.1:38282 { header_up Authorization "Bearer <admin token>" }
-    reverse_proxy 127.0.0.1:38281
+map $http_upgrade $connection_upgrade { default upgrade; "" close; }
+
+server {
+    listen 443 ssl;
+    server_name const.ras.band;
+    # ssl_certificate / ssl_certificate_key as usual
+
+    # Room uploads: at least apworld_max_bytes (64 MiB); the server enforces its own caps.
+    client_max_body_size 80m;
+
+    location / {
+        proxy_pass http://127.0.0.1:38281;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # Generation and the room event stream are long requests; do not buffer them.
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
 }
 ```
 
-Without that proxy the UI loads, shows the version badge and serves as the join page, but its `/api` calls get a 404 from the public port.
+In token mode, add `--trusted-proxy-header X-Forwarded-For` to the server command, and only if the proxy is the only way to reach the port. The compose file publishes `38281` on all interfaces (it also serves players directly), so the header would be forgeable by anyone who reaches the port directly: firewall it to the proxy first, or change the publish to `127.0.0.1:38281:38281` in your own override (the shipped default is left as is).
 
 ## Uploads
-The admin API (`--data-dir /data`, port 38282) stores uploaded files as `/data/<kind>/<game>/<sha256>.<ext>` (`/data/apworlds/...`, `/data/yamls/...`; layout in the README). Game manifests will land in `/data/manifests/<game>/` once their upload route ships (#101). Back up the `data` volume and the `pgdata` volume together: uploads are files, the room logs and finished seeds are in Postgres.
+The admin API (`--data-dir /data`, on the room port) stores uploaded files as `/data/<kind>/<game>/<sha256>.<ext>` (`/data/apworlds/...`, `/data/yamls/...`; layout in the README). Game manifests will land in `/data/manifests/<game>/` once their upload route ships (#101). Back up the `data` volume and the `pgdata` volume together: uploads are files, the room logs and finished seeds are in Postgres.
 
-The API runs uploaded code, so the compose file publishes it on `127.0.0.1` only. Reach it by SSH (`ssh -L 38282:127.0.0.1:38282 host`) or through a TLS proxy. Every route needs `Authorization: Bearer <token>`; the token is the Docker secret `secrets/admin_token` (at least 32 bytes: `openssl rand -hex 16 > secrets/admin_token`; `chmod 400` and `sudo chown 10001` it like the database URL).
+In open mode no header is needed. In token mode every route needs `Authorization: Bearer <token>` (the Docker secret `secrets/admin_token`, at least 32 bytes).
 
 ```sh
+# Open mode: drop the -H lines. Token mode:
 TOKEN=$(sudo cat secrets/admin_token)
 curl -X PUT -H "Authorization: Bearer $TOKEN" --data-binary @player.yaml \
-  "http://127.0.0.1:38282/api/yamls?name=player.yaml"
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:38282/api/yamls
+  "http://127.0.0.1:38281/api/yamls?name=player.yaml"
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:38281/api/yamls
 ```
 
 ### Sandbox inside a container
@@ -62,7 +90,7 @@ Uploaded code runs in bubblewrap (README, "Security model"). Two things differ i
   - `seccomp=./docker/seccomp-bwrap.json`: Docker's default profile plus an allow rule for `clone`, `unshare`, `setns`, `mount`, `umount`, `umount2` and `pivot_root`, without `CAP_SYS_ADMIN`. Re-sync it with Docker's default when you upgrade Docker.
   - `apparmor=unconfined`: the `docker-default` AppArmor profile denies `mount`. This drops AppArmor for this container (it only matters on hosts that use AppArmor).
   - `systempaths=unconfined`: Docker masks parts of `/proc` and `/sys`, and the kernel then refuses a new `/proc` mount inside a user namespace. This unmasks them for this container (for example `/proc/kcore` and `/proc/sys`; `/proc/sys` stays read-only to a process without capabilities).
-  The container is not privileged and has no added capabilities. The tradeoff: this container (the server as well as its jobs) has a weaker container boundary than a default one, so a job that escaped bubblewrap would face less. Do not run other services in it, keep the admin API on loopback, and keep the admin token secret.
+  The container is not privileged and has no added capabilities. The tradeoff: this container (the server as well as its jobs) has a weaker container boundary than a default one, so a job that escaped bubblewrap would face less. Do not run other services in it, and keep the admin token secret and the port behind a TLS proxy.
 
 ## Versions and releases
 One version covers the server, the web UI and the image: `version` under `[workspace.package]` in `Cargo.toml` (every crate inherits it). `web/package.json` must carry the same one; `tools/version-check/check.sh` checks that and the `version` workflow runs it on PRs that touch those files, so there is no per-PR bump. The server answers `GET /version` with `{"version":"<version>"}`; a build made with `CONSTELLATION_BUILD_SHA` set (the image's `BUILD_SHA` build arg, used for every non-release build) reads `<version>+<short sha>`. The web UI shows `server <v> / web <v>` in a corner badge and flags a difference.

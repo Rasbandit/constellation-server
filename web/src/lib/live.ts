@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, liveRooms } from '../api/client';
+import { openEventStream } from '../api/sse';
 import { applyEvent, FEED_LINES, type RoomEvent } from '../api/roomView';
 import type { FeedItem, Hint, Room } from '../api/types';
 
@@ -57,23 +58,25 @@ export function useLiveRoom(id: string, adminKey?: string) {
         hints.reload();
       }, 250);
     };
-    const es = new EventSource(api.streamUrl(id));
-    es.onopen = () => {
-      setLink('live');
-      api.feed(id, lastSeq.current).then((items) => !cancelled && add(items), () => undefined);
-    };
-    es.onerror = () => setLink(es.readyState === EventSource.CLOSED ? 'closed' : 'retrying');
-    es.addEventListener(api.streamEvent, (e) => {
-      const data: unknown = JSON.parse((e as MessageEvent).data);
-      // A live room's stream resumes by itself (Last-Event-ID) and says when to start over.
-      if (liveRooms) setFeed((f) => applyEvent(f, data as RoomEvent));
-      else add([data as FeedItem]);
-      refresh();
+    const stop = openEventStream(api.streamUrl(id), api.streamEvent, {
+      onOpen: () => {
+        setLink('live');
+        api.feed(id, lastSeq.current).then((items) => !cancelled && add(items), () => undefined);
+      },
+      onRetry: () => setLink('retrying'),
+      onClosed: () => setLink('closed'),
+      onEvent: (raw) => {
+        const data: unknown = JSON.parse(raw);
+        // A live room's stream resumes by itself (Last-Event-ID) and says when to start over.
+        if (liveRooms) setFeed((f) => applyEvent(f, data as RoomEvent));
+        else add([data as FeedItem]);
+        refresh();
+      },
     });
     return () => {
       cancelled = true;
       clearTimeout(pending);
-      es.close();
+      stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);

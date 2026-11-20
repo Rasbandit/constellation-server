@@ -3,8 +3,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin, ProxyOptions } from 'vite';
 
 // Sends the upload routes to the server's admin API instead of the stub, when configured:
-//   CONSTELLATION_ADMIN_URL    the admin listener, e.g. http://127.0.0.1:8081 (see the server's
-//                              `admin api addr=` log line, or an SSH tunnel to it)
+//   CONSTELLATION_ADMIN_URL    the server's port, e.g. http://127.0.0.1:38281 (the admin API
+//                              shares it; or an SSH tunnel to it)
 //   CONSTELLATION_ADMIN_TOKEN  the admin token, or CONSTELLATION_ADMIN_TOKEN_FILE a file holding it
 // The token is added here, in the dev server, so it never reaches the browser.
 

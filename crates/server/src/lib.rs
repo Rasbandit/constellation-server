@@ -63,13 +63,12 @@ pub struct Args {
     pub port: u16,
     /// Address to bind.
     pub host: IpAddr,
-    /// Folder for uploads and generated seeds; turns on the admin API (needs the admin token).
+    /// Folder for uploads and generated seeds; turns on the admin API on the same port, under
+    /// `/api` (needs the admin token, and every request must carry it).
     pub data_dir: Option<PathBuf>,
-    /// Address of the admin API's own listener (default loopback: it runs uploaded code, so it
-    /// is never on the room's port; reach it through SSH or a TLS proxy).
-    pub admin_host: IpAddr,
-    /// Port of the admin API; 0 picks a free one (logged as `admin api addr=`).
-    pub admin_port: u16,
+    /// Header a trusted reverse proxy sets to the client address (for example `X-Forwarded-For`);
+    /// the admin API counts wrong tokens per that address. None (default): the peer address.
+    pub trusted_proxy_header: Option<axum::http::HeaderName>,
     /// The host name clients reach this server by; a room's join address is
     /// `{public_host}:{port}/{room_key}` (default `localhost`).
     pub public_host: String,
@@ -80,11 +79,12 @@ pub struct Args {
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
      --port <port> [--host <ip>] [--public-host <name>] \
-     [--web-dir <path>] [--data-dir <path> [--admin-host <ip>] [--admin-port <port>]] \
+     [--web-dir <path>] [--data-dir <path> [--trusted-proxy-header <name>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
-     needs CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE, CONSTELLATION_AP_DIR, \
-     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT)";
+     needs CONSTELLATION_AP_DIR, \
+     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; CONSTELLATION_ADMIN_TOKEN or \
+     CONSTELLATION_ADMIN_TOKEN_FILE requires a token on /api, else it is open)";
 
 impl Args {
     /// Parse the arguments after the program name.
@@ -93,7 +93,7 @@ impl Args {
     /// A message naming the bad or missing argument.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let (mut source, mut port, mut host, mut data_dir) = (None, None, None, None);
-        let (mut admin_host, mut admin_port, mut public_host) = (None, None, None);
+        let (mut trusted_proxy_header, mut public_host) = (None, None);
         let mut web_dir = None;
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
@@ -113,11 +113,12 @@ impl Args {
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
                 "--public-host" => public_host = Some(value()?),
                 "--web-dir" => web_dir = Some(PathBuf::from(value()?)),
-                "--admin-host" => {
-                    admin_host = Some(value()?.parse().map_err(|_| "--admin-host needs an IP")?);
-                }
-                "--admin-port" => {
-                    admin_port = Some(value()?.parse().map_err(|_| "--admin-port needs a number")?);
+                "--trusted-proxy-header" => {
+                    trusted_proxy_header = Some(
+                        value()?
+                            .parse()
+                            .map_err(|_| "--trusted-proxy-header needs a header name")?,
+                    );
                 }
                 other => return Err(format!("unknown argument {other:?}")),
             }
@@ -127,8 +128,7 @@ impl Args {
             port: port.ok_or("--port is required")?,
             host: host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             data_dir,
-            admin_host: admin_host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            admin_port: admin_port.unwrap_or(0),
+            trusted_proxy_header,
             public_host: public_host.unwrap_or_else(|| "localhost".to_owned()),
             web_dir,
         })
@@ -222,8 +222,8 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The admin API for `--data-dir`, or why it cannot start: it needs the admin token and the
-/// generation paths. Checked before the port is bound or the room claimed.
+/// The admin API for `--data-dir`, or why it cannot start: it needs the generation paths. With
+/// no token it is open (see [`open_mode_warning`]). Checked before the port is bound or the room claimed.
 fn worlds_api(
     data_dir: Option<&std::path::Path>,
     token: Option<&str>,
@@ -231,15 +231,39 @@ fn worlds_api(
     limits: Limits,
 ) -> Result<Option<worlds::Worlds>, String> {
     let Some(dir) = data_dir else { return Ok(None) };
-    let token = token.ok_or(
-        "--data-dir serves an admin API that runs uploaded code; set \
-         CONSTELLATION_ADMIN_TOKEN or CONSTELLATION_ADMIN_TOKEN_FILE",
-    )?;
     let generation = generation.ok_or(
         "--data-dir needs CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
          CONSTELLATION_AP_GEN_SCRIPT",
     )?;
     worlds::open(dir, token, generation, limits).map(Some)
+}
+
+/// The startup warning when the admin API is served without a token.
+fn open_mode_warning(api_on: bool, token: Option<&str>) -> Option<&'static str> {
+    (api_on && token.is_none()).then_some(
+        "admin API is open: anyone who can reach this port can upload and run world code; \
+         set CONSTELLATION_ADMIN_TOKEN to require a token",
+    )
+}
+
+/// The admin API (`/api/*`, token-gated) on the room router, ahead of the WebSocket upgrade and
+/// the web UI, which only take what `/healthz`, `/version` and `/api` did not. No admin API
+/// without `--data-dir`.
+fn mount_admin(
+    router: Router,
+    api: Option<worlds::Worlds>,
+    host: &Host,
+    public_addr: String,
+    proxy_header: Option<axum::http::HeaderName>,
+) -> Router {
+    match api {
+        Some(w) => router.merge(w.router(
+            host.waker(),
+            host.folder().map(|f| (f, public_addr)),
+            proxy_header,
+        )),
+        None => router,
+    }
 }
 
 pub use seed_bundle::bundle_hash;
@@ -734,23 +758,20 @@ pub async fn run(
         )
         .await?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        let published = |f| (f, format!("{}:{}", args.public_host, addr.port()));
-        let admin = match api.map(|w| w.router(host.waker(), host.folder().map(published))) {
-            Some(api) => {
-                let at = SocketAddr::new(args.admin_host, args.admin_port);
-                let l = tokio::net::TcpListener::bind(at)
-                    .await
-                    .map_err(|e| format!("bind the admin API: {e}"))?;
-                let addr = l.local_addr().map_err(|e| e.to_string())?;
-                tracing::info!(%addr, "admin api");
-                Some((l, api))
-            }
-            None => None,
-        };
+        if let Some(w) = open_mode_warning(api.is_some(), secrets.admin_token.as_deref()) {
+            tracing::warn!("{w}");
+        }
+        let router = mount_admin(
+            router,
+            api,
+            &host,
+            format!("{}:{}", args.public_host, addr.port()),
+            args.trusted_proxy_header,
+        );
         tracing::info!(%addr, rooms = host.len(), "listening");
-        Ok::<_, RunError>((listener, router, host, admin))
+        Ok::<_, RunError>((listener, router, host))
     };
-    let (listener, router, mut host, admin) = tokio::select! {
+    let (listener, router, mut host) = tokio::select! {
         r = startup => r?,
         () = &mut stop => {
             tracing::info!("stopped before listening");
@@ -759,16 +780,8 @@ pub async fn run(
     };
     let serve = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(stop);
-    // The admin API ends with the room's listener (dropped by the select below).
-    let admin = async {
-        match admin {
-            Some((l, api)) => axum::serve(l, api).await,
-            None => std::future::pending().await,
-        }
-    };
     tokio::select! {
         r = serve => r.map_err(|e| e.to_string())?,
-        r = admin => return Err(RunError::Failed(format!("the admin API stopped: {r:?}"))),
         fatal = host.supervise() => return Err(fatal),
     }
     host.stop().await;
@@ -828,10 +841,7 @@ mod tests {
         let a = parse("--bundle b.json --port 0").unwrap();
         assert_eq!(a.source, Source::Bundle(PathBuf::from("b.json")));
         assert_eq!((a.port, a.host), (0, IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert_eq!(
-            (a.data_dir, a.admin_host, a.admin_port),
-            (None, IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-        );
+        assert_eq!((a.data_dir, a.trusted_proxy_header), (None, None));
         let a = parse("--port 38281 --host 0.0.0.0 --bundle x --data-dir /d").unwrap();
         assert_eq!((a.port, a.host), (38281, IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert_eq!(a.data_dir, Some(PathBuf::from("/d")));
@@ -840,8 +850,8 @@ mod tests {
             parse("--bundle x --port 1 --public-host play.example").unwrap().public_host,
             "play.example"
         );
-        let a = parse("--bundle x --port 1 --data-dir /d --admin-host ::1 --admin-port 9").unwrap();
-        assert_eq!((a.admin_host, a.admin_port), ("::1".parse().unwrap(), 9));
+        let a = parse("--bundle x --port 1 --trusted-proxy-header X-Forwarded-For").unwrap();
+        assert_eq!(a.trusted_proxy_header.unwrap().as_str(), "x-forwarded-for");
         let a = parse("--rooms seeds --port 1").unwrap();
         assert_eq!(a.source, Source::Rooms(PathBuf::from("seeds")));
         let a = parse("--bundle b --port 1 --rooms r --bundle c").unwrap();
@@ -860,8 +870,9 @@ mod tests {
             ("--bundle b --port 1 --verbose", "unknown argument"),
             ("--bundle b --port 1 --password pw", "unknown argument"),
             ("--bundle b --port 1 --data-dir", "--data-dir needs a value"),
-            ("--bundle b --port 1 --admin-port x", "--admin-port needs a number"),
-            ("--bundle b --port 1 --admin-host x", "--admin-host needs an IP"),
+            ("--bundle b --port 1 --admin-port 9", "unknown argument"),
+            ("--bundle b --port 1 --admin-host ::1", "unknown argument"),
+            ("--bundle b --port 1 --trusted-proxy-header a/b", "needs a header name"),
         ] {
             assert!(parse(args).unwrap_err().contains(want), "{args:?}");
         }
@@ -973,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_api_is_off_without_a_data_dir_and_refused_without_its_token() {
+    fn the_admin_api_is_off_without_a_data_dir_and_open_without_a_token() {
         let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
         let g = || Some(fake_generation(&root));
         assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
@@ -981,8 +992,7 @@ mod tests {
         let dir = root.join("data");
         // A temporary upload a previous process left behind is cleared at start.
         std::fs::create_dir_all(dir.join("tmp/left-behind")).unwrap();
-        let e = worlds_api(Some(&dir), None, g(), Limits::DESIGN).unwrap_err();
-        assert!(e.contains("CONSTELLATION_ADMIN_TOKEN"), "{e}");
+        assert!(worlds_api(Some(&dir), None, g(), Limits::DESIGN).unwrap().is_some(), "open mode");
         let e = worlds_api(Some(&dir), Some("t"), None, Limits::DESIGN).unwrap_err();
         assert!(e.contains("CONSTELLATION_AP_DIR"), "{e}");
         assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
@@ -1019,32 +1029,215 @@ mod tests {
         String::from_utf8_lossy(&first[9..12]).parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn the_room_view_routes_need_the_admin_token() {
-        let root = std::env::temp_dir().join(format!("server-view-auth-{}", std::process::id()));
+    /// The whole router as `run` builds it: rooms, the admin API under `/api`, and the UI when
+    /// `dist` is given. Listens on a free loopback port.
+    async fn serve_with_admin(
+        name: &str,
+        limits: Limits,
+        dist: Option<&std::path::Path>,
+        proxy_header: Option<&str>,
+    ) -> (PathBuf, SocketAddr) {
+        serve_admin_mode(name, limits, dist, proxy_header, Some(TOKEN)).await
+    }
+
+    async fn serve_admin_mode(
+        name: &str,
+        limits: Limits,
+        dist: Option<&std::path::Path>,
+        proxy_header: Option<&str>,
+        token: Option<&str>,
+    ) -> (PathBuf, SocketAddr) {
+        let root = std::env::temp_dir().join(format!("server-{name}-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(root.join("rooms")).unwrap();
-        let (_, host) =
-            app(&Source::Rooms(root.join("rooms")), None, None, Limits::DESIGN).await.unwrap();
-        let worlds = worlds_api(
-            Some(&root.join("data")),
-            Some("s3cret"),
-            Some(fake_generation(&root)),
-            Limits::DESIGN,
-        )
-        .unwrap()
-        .unwrap();
-        let api = worlds.router(host.waker(), host.folder().map(|f| (f, "localhost:1".to_owned())));
+        let (router, host) =
+            app_with_web(&Source::Rooms(root.join("rooms")), None, None, limits, dist)
+                .await
+                .unwrap();
+        let api = worlds_api(Some(&root.join("data")), token, Some(fake_generation(&root)), limits)
+            .unwrap();
+        let router = mount_admin(
+            router,
+            api,
+            &host,
+            "localhost:1".to_owned(),
+            proxy_header.map(|h| h.parse().unwrap()),
+        );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(l, api).await });
+        tokio::spawn(async move {
+            let _host = host;
+            axum::serve(l, router.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        (root, addr)
+    }
+
+    const TOKEN: &str = "s3cret-s3cret-s3cret-s3cret-s3cr";
+
+    #[tokio::test]
+    async fn the_admin_routes_on_the_room_port_need_the_admin_token() {
+        let (root, addr) = serve_with_admin("view-auth", Limits::DESIGN, None, None).await;
         let id = "a".repeat(64);
         for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
             assert_eq!(status_of(addr, &path, None).await, 401, "{path} without the token");
             assert_eq!(status_of(addr, &path, Some("wrong")).await, 401, "{path}, wrong token");
-            assert_eq!(status_of(addr, &path, Some("s3cret")).await, 404, "{path}: no such world");
+            assert_eq!(status_of(addr, &path, Some(TOKEN)).await, 404, "{path}: no such world");
         }
         drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// `/api`, any path under it, and the real routes: 401 without the token (never the UI's
+    /// 404 or its `index.html`), 200 with it; the web folder never answers under `/api`.
+    #[tokio::test]
+    async fn api_is_the_token_gate_and_never_served_from_the_web_folder() {
+        let (root, dist) = web_fixture("api-gate");
+        std::fs::write(dist.join("api"), "from the web dir").unwrap();
+        std::fs::create_dir_all(dist.join("api-dir")).unwrap();
+        let (_, addr) = serve_with_admin(
+            "api-gate",
+            Limits { admin_auth_fail_burst: 100, ..Limits::DESIGN },
+            Some(&dist),
+            None,
+        )
+        .await;
+        for path in ["/api", "/api/", "/api/games", "/api/yamls", "/api/nope/deeper", "/api/assets"]
+        {
+            assert_eq!(status_of(addr, path, None).await, 401, "{path} without the token");
+            assert_eq!(status_of(addr, path, Some("wrong")).await, 401, "{path}, wrong token");
+        }
+        assert_eq!(status_of(addr, "/api/yamls", Some(TOKEN)).await, 200);
+        assert_eq!(status_of(addr, "/api/nope", Some(TOKEN)).await, 404, "unknown route, token");
+        let bare = raw(addr, "/api/yamls", "").await;
+        assert!(bare.to_lowercase().contains("content-length: 0"), "no detail in the 401: {bare}");
+        // The UI and the probes are untouched.
+        assert!(raw(addr, "/create", "").await.starts_with("HTTP/1.1 200"));
+        assert!(raw(addr, "/healthz", "").await.ends_with("ok"));
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// No token configured: `/api` is open, nothing is counted, and `/api/auth` says so. With a
+    /// token, `/api/auth` is still open and says a token is needed.
+    #[tokio::test]
+    async fn without_a_token_the_api_is_open_and_with_one_it_is_not() {
+        let limits = Limits { admin_auth_fail_burst: 1, ..Limits::DESIGN };
+        let (root, open) = serve_admin_mode("open", limits, None, None, None).await;
+        for _ in 0..4 {
+            assert_eq!(status_of(open, "/api/yamls", None).await, 200);
+        }
+        assert_eq!(status_of(open, "/api/nope", None).await, 404, "no gate, no such route");
+        let auth = raw(open, "/api/auth", "").await;
+        assert!(auth.ends_with("{\"token_required\":false}"), "{auth}");
+        let (root2, shut) = serve_admin_mode("shut", limits, None, None, Some(TOKEN)).await;
+        let auth = raw(shut, "/api/auth", "").await;
+        assert!(
+            auth.starts_with("HTTP/1.1 200") && auth.ends_with("{\"token_required\":true}"),
+            "{auth}"
+        );
+        assert_eq!(status_of(shut, "/api/yamls", None).await, 401);
+        for r in [root, root2] {
+            drop(std::fs::remove_dir_all(&r));
+        }
+    }
+
+    #[test]
+    fn open_mode_warns_loudly_and_a_token_or_no_api_does_not() {
+        let w = open_mode_warning(true, None).unwrap();
+        assert!(w.contains("admin API is open") && w.contains("CONSTELLATION_ADMIN_TOKEN"), "{w}");
+        assert!(open_mode_warning(true, Some("t")).is_none());
+        assert!(open_mode_warning(false, None).is_none());
+    }
+
+    /// What an attacker can try against a token-mode server: other methods, odd spellings of
+    /// the path, and an oversize chunked upload. None reaches an admin handler without the token.
+    #[tokio::test]
+    async fn odd_requests_never_reach_an_admin_handler_without_the_token() {
+        let (root, dist) = web_fixture("odd");
+        let limits = Limits { admin_auth_fail_burst: 100, apworld_max_bytes: 8, ..Limits::DESIGN };
+        let (_, addr) = serve_with_admin("odd", limits, Some(&dist), None).await;
+        for method in ["HEAD", "OPTIONS", "POST", "DELETE"] {
+            let r = raw_method(addr, method, "/api/yamls", "").await;
+            assert!(r.starts_with("HTTP/1.1 401"), "{method}: {r}");
+        }
+        for path in
+            ["//api/yamls", "/API/yamls", "/%61pi/yamls", "/api/%2e%2e/yamls", "/api/./yamls"]
+        {
+            let r = raw(addr, path, "").await;
+            assert!(
+                !r.starts_with("HTTP/1.1 200") || r.contains("<title>UI</title>"),
+                "{path}: {r}"
+            );
+            assert!(!r.contains("\"apworlds\"") && !r.contains('['), "{path}: {r}");
+        }
+        // Chunked, over the cap, with the token: refused by the size cap; without it, 401 first.
+        let chunked = |auth: &str| {
+            format!(
+                "{auth}Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                64,
+                "x".repeat(64)
+            )
+        };
+        let mut head = chunked(&format!("Authorization: Bearer {TOKEN}\r\n"));
+        let big = raw_method(addr, "PUT", "/api/apworlds?name=a.apworld", &head).await;
+        assert!(big.starts_with("HTTP/1.1 413"), "{big}");
+        head = chunked("");
+        let anon = raw_method(addr, "PUT", "/api/apworlds?name=a.apworld", &head).await;
+        assert!(anon.starts_with("HTTP/1.1 401"), "{anon}");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[tokio::test]
+    async fn wrong_tokens_are_rate_limited_per_client_and_a_right_one_never_is() {
+        let limits = Limits {
+            admin_auth_fail_burst: 3,
+            admin_auth_fail_refill_milli_per_sec: 1,
+            ..Limits::DESIGN
+        };
+        let (root, addr) = serve_with_admin("rate", limits, None, None).await;
+        for n in 1..=3 {
+            assert_eq!(status_of(addr, "/api/yamls", Some("wrong")).await, 401, "failure {n}");
+        }
+        let limited = raw(addr, "/api/yamls", "Authorization: Bearer wrong\r\n").await;
+        assert!(limited.starts_with("HTTP/1.1 429"), "{limited}");
+        assert!(limited.to_lowercase().contains("retry-after: 1000"), "{limited}");
+        assert_eq!(status_of(addr, "/api/yamls", None).await, 429, "no token counts as wrong");
+        assert_eq!(status_of(addr, "/api/yamls", Some(TOKEN)).await, 200, "never locks out");
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    /// The proxy header is ignored unless configured, and then only its last entry counts, so a
+    /// client cannot dodge the limit by sending its own `X-Forwarded-For`.
+    #[tokio::test]
+    async fn the_proxy_header_counts_only_when_trusted_and_by_its_last_entry() {
+        let limits = Limits {
+            admin_auth_fail_burst: 1,
+            admin_auth_fail_refill_milli_per_sec: 1,
+            ..Limits::DESIGN
+        };
+        let fwd = |ip: &str| format!("Authorization: Bearer wrong\r\nX-Forwarded-For: {ip}\r\n");
+        let (root, off) = serve_with_admin("proxy-off", limits, None, None).await;
+        assert!(raw(off, "/api/yamls", &fwd("9.9.9.1")).await.starts_with("HTTP/1.1 401"));
+        let again = raw(off, "/api/yamls", &fwd("9.9.9.2")).await;
+        assert!(again.starts_with("HTTP/1.1 429"), "header ignored by default: {again}");
+        let (root3, split) =
+            serve_with_admin("proxy-split", limits, None, Some("x-forwarded-for")).await;
+        // The client's own line comes first; the proxy's line is the last one and is the key.
+        let two = |own: &str| {
+            format!(
+                "Authorization: Bearer wrong\r\nX-Forwarded-For: {own}\r\nX-Forwarded-For: 9.9.9.1\r\n"
+            )
+        };
+        assert!(raw(split, "/api/yamls", &two("1.1.1.1")).await.starts_with("HTTP/1.1 401"));
+        let again = raw(split, "/api/yamls", &two("2.2.2.2")).await;
+        assert!(again.starts_with("HTTP/1.1 429"), "a forged first line is not the key: {again}");
+        let (root2, on) = serve_with_admin("proxy-on", limits, None, Some("x-forwarded-for")).await;
+        assert!(raw(on, "/api/yamls", &fwd("1.1.1.1, 9.9.9.1")).await.starts_with("HTTP/1.1 401"));
+        let spoof = raw(on, "/api/yamls", &fwd("2.2.2.2, 9.9.9.1")).await;
+        assert!(spoof.starts_with("HTTP/1.1 429"), "same proxy-added entry: {spoof}");
+        let other = raw(on, "/api/yamls", &fwd("1.1.1.1, 9.9.9.2")).await;
+        assert!(other.starts_with("HTTP/1.1 401"), "another client: {other}");
+        for r in [root, root2, root3] {
+            drop(std::fs::remove_dir_all(&r));
+        }
     }
 
     async fn reply(r: Response) -> (StatusCode, String) {
