@@ -12,9 +12,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
-  packages: write
 jobs:
   image:
+    permissions:
+      contents: read
+      packages: ${{ github.event_name == 'pull_request' && 'none' || 'write' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -30,17 +32,33 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/constellation-server
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=sha,enable=${{ github.event_name != 'push' }}
       - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # PR only: run the built image under compose (uid, secret read, healthcheck, Postgres 19 volume).
+      - if: github.event_name == 'pull_request'
+        env: { TAGS: "${{ steps.meta.outputs.tags }}" }
+        run: |
+          docker tag "$(head -n1 <<< "$TAGS")" ghcr.io/rasbandit/constellation-server:ci
+          mkdir secrets
+          echo ci-password > secrets/postgres_password
+          echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
+          sudo chown 10001 secrets/database_url && chmod 400 secrets/database_url
+          CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
+      - if: failure() && github.event_name == 'pull_request'
+        run: docker compose logs
+      - if: always() && github.event_name == 'pull_request'
+        run: docker compose down -v

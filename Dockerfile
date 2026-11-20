@@ -17,10 +17,12 @@ RUN apt-get update \
     && useradd --system --uid 10001 --no-create-home constellation \
     && mkdir -p /data/rooms && chown -R constellation /data
 COPY --from=build /constellation-server /usr/local/bin/constellation-server
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 USER 10001
 EXPOSE 38281
 # No curl in slim: bash opens the socket itself and checks for a 200.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/38281 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
-ENTRYPOINT ["constellation-server"]
+# The wrapper forwards signals and maps exit 3 (fenced) to 0 so the container is not restarted.
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["--host", "0.0.0.0", "--port", "38281", "--rooms", "/data/rooms"]

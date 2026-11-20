@@ -3,7 +3,7 @@ services:
   server:
     image: ghcr.io/rasbandit/constellation-server:${CONSTELLATION_TAG:-latest}
     build: .
-    # Never `always`: exit code 3 means a newer owner fenced this process, and a restart would fight it.
+    # Restart only on failure. A fenced server (exit 3) is mapped to 0 by the image entrypoint, so it stays down.
     restart: on-failure
     depends_on:
       postgres:
@@ -16,15 +16,16 @@ services:
     volumes:
       - rooms:/data/rooms
   postgres:
-    image: postgres:16
+    image: postgres:19
     restart: unless-stopped
     environment:
       POSTGRES_USER: constellation
       POSTGRES_DB: constellation
+      PGDATA: /var/lib/postgresql/19/docker
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets: [postgres_password]
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U constellation -d constellation"]
       interval: 5s

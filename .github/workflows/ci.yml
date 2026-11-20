@@ -65,6 +65,8 @@ jobs:
         with:
           dockerfile: Dockerfile
           ignore: DL3008 # apt packages are not version-pinned: bookworm-slim security updates matter more
+      - run: sh docker/test-entrypoint.sh
+      - run: shellcheck docker/*.sh
       # The secret files only need to exist for the config check.
       - run: |
           mkdir secrets && touch secrets/database_url secrets/postgres_password

@@ -105,7 +105,7 @@ We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo de
 ## Testing
 Rules, layers and the end-to-end plan: [`docs/TESTING.md`](docs/TESTING.md).
 - `just check`: the gate (fmt, clippy, typos, every test that needs no database including the end-to-end scenarios, docs, cargo-deny).
-- `just test-pg`: adds the Postgres tests (the store contract suite on Postgres, the gate G-DB fence race and cancel tests, and the `kill -9` restart scenarios in `crates/server/tests/restart.rs`). Needs `CONSTELLATION_DATABASE_URL`; each test makes its own schema. Without the URL they fail, they never skip. The manual `nightly` workflow runs them against a Postgres 18 service container.
+- `just test-pg`: adds the Postgres tests (the store contract suite on Postgres, the gate G-DB fence race and cancel tests, and the `kill -9` restart scenarios in `crates/server/tests/restart.rs`). Needs `CONSTELLATION_DATABASE_URL`; each test makes its own schema. Without the URL they fail, they never skip. The manual `nightly` workflow runs them against a Postgres 19 service container.
 - `just bench-pg`: the gate G-DB throughput benchmark (the manual `nightly` workflow; not for a shared developer box).
 - `just e2e`: the end-to-end scenarios alone (`cargo test -p server --test compat`).
 - `just e2e-ap`: the `archipelago_rs` interop scenario; needs `../Archipela-Go`. It builds the server in the main workspace and passes its path at compile time (`CONSTELLATION_SERVER_BIN`).
