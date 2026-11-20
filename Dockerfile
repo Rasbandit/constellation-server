@@ -29,8 +29,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p server --bin constellation-server \
     && cp target/release/constellation-server /constellation-server
 
-# The generator checkout and a venv with what the sidecar and generator need. The venv is built on
-# the runtime's own distro so its python matches.
+# The generator checkout and a venv with what the sidecar, the generator and each bundled world need.
+# A world missing a package is skipped at load, so its game fails with "No world found". `requests`
+# is imported by four worlds but declared by none. The venv is built on the runtime's own distro so
+# its python matches.
 FROM debian:bookworm-slim AS gen
 ARG GEN_REPO_URL
 ARG GEN_REPO_REF
@@ -45,7 +47,9 @@ RUN if [ -z "$GEN_REPO_URL" ] || [ -z "$GEN_REPO_REF" ]; then \
     && mkdir -p custom_worlds && rm -rf .git \
     && grep -viE '^(kivy|pyshortcuts|#|[[:space:]]*$)' requirements.txt > /tmp/requirements.txt \
     && python3 -m venv /opt/gen/venv \
-    && /opt/gen/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+    && /opt/gen/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt requests \
+    && for r in worlds/*/requirements.txt; do \
+         /opt/gen/venv/bin/pip install --no-cache-dir -r "$r" || exit 1; done
 
 # sqlx uses rustls with the system root certificates, so ca-certificates is the only runtime dependency.
 FROM debian:bookworm-slim
