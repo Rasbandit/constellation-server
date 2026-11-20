@@ -291,6 +291,19 @@ impl Ctx {
     }
 }
 
+/// How many players the adapter reports (1 when it says nothing). The number comes from another
+/// program, so it is checked against the room limit before any instance is fetched.
+fn players_of(hello: &Value) -> R<u64> {
+    let n = hello["players"].as_u64().unwrap_or(1);
+    if n == 0 || n > config::ROOM_MAX_PLAYERS as u64 {
+        return Err(format!(
+            "adapter reports {n} players; a room takes 1 to {}",
+            config::ROOM_MAX_PLAYERS
+        ));
+    }
+    Ok(n)
+}
+
 /// A request for one player of a room (`player` from 1); a single-player world sends none.
 fn for_player(mut req: Value, player: Option<u64>) -> Value {
     if let (Some(p), Some(o)) = (player, req.as_object_mut()) {
@@ -471,7 +484,7 @@ fn run(a: &Args) -> R<Value> {
         engine_seconds: 0.0,
         work: (Stats::default(), 0, 0),
     };
-    let players = hello["players"].as_u64().unwrap_or(1);
+    let players = players_of(&hello)?;
     if players > 1 {
         return room::run(a, &world, &mut legacy, &mut cx, hello, players, t_all);
     }
@@ -637,5 +650,24 @@ fn main() -> ExitCode {
             eprintln!("port-check: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_players_an_adapter_reports_are_checked_before_any_fetch() {
+        let n = |v: Value| players_of(&json!({"players": v}));
+        assert_eq!(players_of(&json!({})), Ok(1));
+        assert_eq!(n(json!(3)), Ok(3));
+        let max = config::ROOM_MAX_PLAYERS as u64;
+        assert_eq!(n(json!(max)), Ok(max));
+        for bad in [json!(0), json!(max + 1), json!(u64::MAX)] {
+            assert!(n(bad.clone()).is_err(), "{bad}");
+        }
+        // Not a number: no players reported, a single-player world.
+        assert_eq!(n(json!("many")), Ok(1));
     }
 }

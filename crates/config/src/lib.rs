@@ -204,6 +204,10 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
+/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
+/// value).
+pub const FILL_MAX_WORKERS: usize = 64;
+
 /// Most players one room's fill takes (a design value; player numbers are 16 bits).
 pub const ROOM_MAX_PLAYERS: usize = 1024;
 

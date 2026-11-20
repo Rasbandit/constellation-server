@@ -93,7 +93,7 @@ fn main() -> Result<(), String> {
     });
     let (f, sp) = filled.map_err(|x| format!("{x:?}"))?;
     // Times without the counting allocator's bookkeeping in the closure: the median of five fills.
-    let mut times: Vec<f64> = (0..5)
+    let mut times: Vec<f64> = (0..5u8)
         .map(|k| {
             let t = Instant::now();
             drop(fill_room_spheres(
@@ -106,6 +106,7 @@ fn main() -> Result<(), String> {
         .collect();
     times.sort_by(f64::total_cmp);
     let share: Vec<f64> = data_fill::room::cross_world_share(&seats, &f.placed)
+        .map_err(|x| format!("{x:?}"))?
         .iter()
         .map(|(x, all)| *x as f64 / (*all).max(1) as f64)
         .collect();

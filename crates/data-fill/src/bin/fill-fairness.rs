@@ -81,7 +81,8 @@ fn room_report(
         .collect();
     let flat = Flat::new(&seats)?;
     let t = Instant::now();
-    let s = sample_room(&seats, &flat, seeds, baseline, max_attempts);
+    let s =
+        sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(|e| format!("{e:?}"))?;
     let mut r = report_named(&|i| flat.item(i), &|l| flat.loc(l), &s);
     r["players"] = json!(seats.len());
     finish(r, s.failed == 0, t, m)

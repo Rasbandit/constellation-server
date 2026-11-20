@@ -397,16 +397,19 @@ impl Flat {
 /// [`sample`] for a room: `seeds` room fills, and up to `baseline` accepted uniform placements
 /// of every player's pool over every player's free locations (kept only if the placement
 /// rules hold, every goal is reachable and every progression item can be collected).
-#[must_use]
+///
+/// # Errors
+/// [`crate::FillError::Instance`] when the seats do not fit the room.
 pub fn sample_room(
     seats: &[crate::Seat<'_>],
     flat: &Flat,
     seeds: u64,
     baseline: u64,
     max_attempts: u64,
-) -> Sampled {
-    use crate::room::{Given, fill_room, locked_placed, permits};
+) -> Result<Sampled, crate::FillError> {
+    use crate::room::{Given, check_placed, fill_room, locked_placed, permits};
     let mut out = Sampled::default();
+    check_placed(seats, &locked_placed(seats))?;
     for s in 1..=seeds {
         match fill_room(seats, &mut seeded(s, b"fill\0\0\0\0"), config::FILL_MAX_ATTEMPTS) {
             Ok(filled) => {
@@ -445,7 +448,7 @@ pub fn sample_room(
         if !ok {
             continue;
         }
-        let s = crate::spheres::room_spheres(seats, &placed);
+        let s = crate::spheres::room_spheres(seats, &placed)?;
         let stranded = s.unreachable.iter().any(|(p, l)| {
             placed[usize::from(*p)][*l as usize]
                 .is_some_and(|g| seats[usize::from(g.to)].progression[usize::from(g.item)])
@@ -455,5 +458,5 @@ pub fn sample_room(
             out.baseline.add(&flat.placed(&placed), |_| true);
         }
     }
-    out
+    Ok(out)
 }

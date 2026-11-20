@@ -55,6 +55,7 @@ pub struct Given {
 /// # Errors
 /// [`FillError::Instance`] naming the player.
 pub fn plans(players: &[(&World, &Instance)], workers: usize) -> Result<Vec<Plan>, FillError> {
+    too_many(players.len())?;
     map_ordered(players, workers, |(w, inst)| Plan::new(w, inst))
         .into_iter()
         .enumerate()
@@ -67,6 +68,7 @@ pub fn plans(players: &[(&World, &Instance)], workers: usize) -> Result<Vec<Plan
 /// # Errors
 /// The first failing player's message, by player index.
 pub fn worlds(manifests: &[&serde_json::Value], workers: usize) -> Result<Vec<World>, String> {
+    too_many(manifests.len()).map_err(|e| format!("{e:?}"))?;
     map_ordered(manifests, workers, |m| World::load(m))
         .into_iter()
         .enumerate()
@@ -79,12 +81,27 @@ pub fn worlds(manifests: &[&serde_json::Value], workers: usize) -> Result<Vec<Wo
 /// # Errors
 /// A value that is not an instance, naming the player.
 pub fn instances(raw: &[serde_json::Value]) -> Result<Vec<Instance>, String> {
+    too_many(raw.len()).map_err(|e| format!("{e:?}"))?;
     raw.iter()
         .enumerate()
         .map(|(p, v)| {
             Instance::deserialize(v).map_err(|e| format!("player {}: instance: {e}", p + 1))
         })
         .collect()
+}
+
+/// A room takes 1 to `config::ROOM_MAX_PLAYERS` players.
+///
+/// # Errors
+/// [`FillError::Instance`] outside that range.
+pub fn too_many(players: usize) -> Result<(), FillError> {
+    if players == 0 || players > config::ROOM_MAX_PLAYERS {
+        return Err(FillError::Instance(format!(
+            "a room takes 1 to {} players, got {players}",
+            config::ROOM_MAX_PLAYERS
+        )));
+    }
+    Ok(())
 }
 
 fn prefix(p: usize, e: FillError) -> FillError {
@@ -149,22 +166,33 @@ pub fn fill_room_spheres(
 
 /// Play the room from the start items: per player, is the goal reached and how many existing
 /// locations (what [`RoomFilled`] reports, from a fresh solve).
-#[must_use]
-pub fn validate_room(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> (Vec<bool>, Vec<usize>) {
+///
+/// # Errors
+/// [`FillError::Instance`] for seats or placements that do not fit the room (see [`check_placed`]).
+pub fn validate_room(
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<Given>>],
+) -> Result<(Vec<bool>, Vec<usize>), FillError> {
+    check_placed(seats, placed)?;
     let mut room = Linked::new(seats);
     room.solve(&vec![Vec::new(); seats.len()], placed);
-    room.report()
+    Ok(room.report())
 }
 
 /// Whether the placement rules let `g` sit at `loc` of `player`'s world (logic is not
 /// consulted): an item with a placement group stays in its owner's world and group, and no
 /// progression goes on an excluded location.
 #[must_use]
+///
+/// `false` for a player, owner or location that is not in the room.
 pub fn permits(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
-    let progression =
-        seats[usize::from(g.to)].progression.get(usize::from(g.item)).copied().unwrap_or(false);
-    confined_ok(seats, g, player, loc)
-        && !(progression && seats[usize::from(player)].plan.excluded[loc as usize])
+    let (Some(owner), Some(here)) = (seats.get(usize::from(g.to)), seats.get(usize::from(player)))
+    else {
+        return false;
+    };
+    let Some(excluded) = here.plan.excluded.get(loc as usize) else { return false };
+    let progression = owner.progression.get(usize::from(g.item)).copied().unwrap_or(false);
+    confined_ok(seats, g, player, loc) && !(progression && *excluded)
 }
 
 /// Per player's world, per location: the locked item (owned by that player).
@@ -186,17 +214,20 @@ pub fn locked_placed(seats: &[Seat<'_>]) -> Vec<Vec<Option<Given>>> {
 /// The room as seed-bundle placements, one list per slot (player order, locations ascending):
 /// `receiver` is the owner's slot (from 1), `item` an id in the owner's world, `sphere` the
 /// round of `spheres` that reached the location (from 0) when given.
-#[must_use]
+///
+/// # Errors
+/// [`FillError::Instance`] for seats or placements that do not fit the room (see [`check_placed`]).
 pub fn placements(
     seats: &[Seat<'_>],
     placed: &[Vec<Option<Given>>],
     spheres: Option<&RoomSpheres>,
-) -> Vec<Vec<seed_bundle::Placed>> {
+) -> Result<Vec<Vec<seed_bundle::Placed>>, FillError> {
+    check_placed(seats, placed)?;
     let mut round = std::collections::HashMap::new();
     for (k, s) in spheres.iter().flat_map(|s| s.spheres.iter()).enumerate() {
         round.extend(s.iter().map(|x| (*x, u32::try_from(k).unwrap_or(u32::MAX))));
     }
-    placed
+    Ok(placed
         .iter()
         .enumerate()
         .map(|(p, row)| {
@@ -217,13 +248,19 @@ pub fn placements(
                 })
                 .collect()
         })
-        .collect()
+        .collect())
 }
 
 /// Per owner: progression items lying in other players' worlds, and all their progression
 /// items placed (locked ones included).
-#[must_use]
-pub fn cross_world_share(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> Vec<(usize, usize)> {
+///
+/// # Errors
+/// [`FillError::Instance`] for seats or placements that do not fit the room (see [`check_placed`]).
+pub fn cross_world_share(
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<Given>>],
+) -> Result<Vec<(usize, usize)>, FillError> {
+    check_placed(seats, placed)?;
     let mut out = vec![(0, 0); seats.len()];
     for (p, row) in placed.iter().enumerate() {
         for g in row.iter().flatten() {
@@ -235,16 +272,67 @@ pub fn cross_world_share(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> V
             }
         }
     }
-    out
+    Ok(out)
 }
 
+/// The seats fit together: a room's size, and each plan and progression list belong to the
+/// seat's world (so no index a state later takes from them can be out of range).
 fn check(seats: &[Seat<'_>]) -> Result<(), FillError> {
-    if seats.is_empty() || seats.len() > config::ROOM_MAX_PLAYERS {
-        return Err(FillError::Instance(format!(
-            "a room takes 1 to {} players, got {}",
-            config::ROOM_MAX_PLAYERS,
-            seats.len()
-        )));
+    too_many(seats.len())?;
+    let bad = |p: usize, what: &str| {
+        Err(FillError::Instance(format!("player {}: {what} does not fit the world", p + 1)))
+    };
+    for (p, s) in seats.iter().enumerate() {
+        let (items, locs) = (s.w.items(), s.w.locations());
+        let item = |i: &u16| usize::from(*i) < items;
+        if s.progression.len() != items {
+            return bad(p, "progression list");
+        }
+        let plan = s.plan;
+        if !plan.included.iter().all(|l| (*l as usize) < locs)
+            || plan.excluded.len() != locs
+            || !plan.progression.iter().chain(&plan.rest).all(item)
+            || !plan.locked.iter().all(|(l, i)| (*l as usize) < locs && item(i))
+        {
+            return bad(p, "plan");
+        }
+    }
+    Ok(())
+}
+
+/// The placements fit the seats: one row per seat of its world's size, owners in the room,
+/// items in the owner's world.
+///
+/// # Errors
+/// [`FillError::Instance`] naming the first thing that does not fit.
+pub fn check_placed(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> Result<(), FillError> {
+    check(seats)?;
+    let err = |m: String| Err(FillError::Instance(m));
+    if placed.len() != seats.len() {
+        return err(format!("placements for {} slots, the room has {}", placed.len(), seats.len()));
+    }
+    for (p, row) in placed.iter().enumerate() {
+        if row.len() != seats[p].w.locations() {
+            return err(format!(
+                "slot {}: {} locations, the world has {}",
+                p + 1,
+                row.len(),
+                seats[p].w.locations()
+            ));
+        }
+        for g in row.iter().flatten() {
+            match seats.get(usize::from(g.to)) {
+                Some(o) if usize::from(g.item) < o.w.items() => {}
+                _ => {
+                    return err(format!(
+                        "slot {}: item {} of player {} is not in the room",
+                        p + 1,
+                        g.item,
+                        u32::from(g.to) + 1
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -746,10 +834,14 @@ mod tests {
             assert_eq!(a.attempts, b.attempts, "seed {seed}");
             assert_eq!(
                 (a.beatable.clone(), a.reached.clone()),
-                validate_room(&seats, &a.placed),
+                validate_room(&seats, &a.placed).unwrap(),
                 "seed {seed}"
             );
-            assert_eq!(sa, Some(crate::spheres::room_spheres(&seats, &a.placed)), "seed {seed}");
+            assert_eq!(
+                sa,
+                Some(crate::spheres::room_spheres(&seats, &a.placed).unwrap()),
+                "seed {seed}"
+            );
             with += a.solves;
             without += b.solves;
             rederived += a.rederived;

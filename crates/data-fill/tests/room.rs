@@ -112,13 +112,13 @@ fn an_item_in_another_world_opens_the_door_for_a_third_player() {
     let r = Room::new(3, 1);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
-    let (beatable, reached) = validate_room(&seats, &placed);
+    let (beatable, reached) = validate_room(&seats, &placed).unwrap();
     assert_eq!(beatable, [true, true, true], "linked, every player finishes");
     assert_eq!(reached, [6, 6, 5]);
     // Hand calculation: round 1 is the free locations of every world; each key found there
     // opens a hall; the hall holds the other keys, then the vaults; player 1's last location
     // needs the lamp that lies in its vault.
-    let sp = room_spheres(&seats, &placed);
+    let sp = room_spheres(&seats, &placed).unwrap();
     let key = |s: &Vec<(u16, u32)>| -> Vec<String> {
         s.iter()
             .map(|(p, l)| format!("{}:{}", p + 1, seats[usize::from(*p)].w.loc_key(*l)))
@@ -143,7 +143,7 @@ fn an_item_in_another_world_opens_the_door_for_a_third_player() {
         }
         let alone = [Seat { ..*s }];
         let row = vec![own[p].iter().map(|g| g.map(|g| Given { to: 0, ..g })).collect::<Vec<_>>()];
-        assert!(!validate_room(&alone, &row).0[0], "player {} alone", p + 1);
+        assert!(!validate_room(&alone, &row).unwrap().0[0], "player {} alone", p + 1);
     }
 }
 
@@ -157,7 +157,7 @@ fn an_item_behind_its_own_door_strands_only_its_owner() {
     list.iter_mut().find(|x| (x.0, x.1) == (1, "l5")).unwrap().3 = "key_a";
     list.iter_mut().find(|x| (x.0, x.1) == (3, "l1")).unwrap().3 = "lamp";
     let placed = hand(&seats, &list);
-    let (beatable, _) = validate_room(&seats, &placed);
+    let (beatable, _) = validate_room(&seats, &placed).unwrap();
     assert_eq!(beatable, [false, true, true]);
 }
 
@@ -175,8 +175,11 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
         assert!(sp.all_beatable(), "seed {seed}");
         assert!(sp.unreachable.is_empty(), "seed {seed}: every placed item is reachable");
         // The report read off the fill's states is a fresh sweep's.
-        assert_eq!(sp, room_spheres(&seats, &f.placed), "seed {seed}");
-        assert_eq!((f.beatable.clone(), f.reached.clone()), validate_room(&seats, &f.placed));
+        assert_eq!(sp, room_spheres(&seats, &f.placed).unwrap(), "seed {seed}");
+        assert_eq!(
+            (f.beatable.clone(), f.reached.clone()),
+            validate_room(&seats, &f.placed).unwrap()
+        );
         // Everything is placed, each item once, and nothing leaves its owner's pool.
         let mut per_owner = [0usize; 3];
         for (p, row) in f.placed.iter().enumerate() {
@@ -302,8 +305,8 @@ fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
     let r = Room::new(3, 1);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
-    let sp = room_spheres(&seats, &placed);
-    let out = room::placements(&seats, &placed, Some(&sp));
+    let sp = room_spheres(&seats, &placed).unwrap();
+    let out = room::placements(&seats, &placed, Some(&sp)).unwrap();
     assert_eq!(out.iter().map(Vec::len).collect::<Vec<_>>(), [6, 6, 5], "one list per slot");
     // Slot 1, location l1 (id 1) holds player 2's key_a (id 1): receiver 2, progression,
     // found in the first round.
@@ -316,7 +319,72 @@ fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
     assert_eq!((coin.location, coin.item, coin.receiver, coin.flags), (6, 4, 3, 0));
     assert_eq!(coin.sphere, Some(1));
     // Without spheres none is recorded.
-    assert!(room::placements(&seats, &placed, None).iter().flatten().all(|p| p.sphere.is_none()));
+    assert!(
+        room::placements(&seats, &placed, None)
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|p| p.sphere.is_none())
+    );
     // Progression of each owner lying in other worlds, over all they own.
-    assert_eq!(room::cross_world_share(&seats, &placed), [(1, 3), (2, 3), (1, 3)]);
+    assert_eq!(room::cross_world_share(&seats, &placed).unwrap(), [(1, 3), (2, 3), (1, 3)]);
+}
+
+#[test]
+fn placements_that_do_not_fit_the_room_are_refused_not_indexed() {
+    let r = Room::new(3, 1);
+    let seats = r.seats();
+    let good = hand(&seats, CHAIN);
+    let bad = |placed: &[Vec<Option<Given>>]| {
+        // Every entry point that takes placements refuses them the same way.
+        let a = validate_room(&seats, placed).is_err();
+        let b = room_spheres(&seats, placed).is_err();
+        let c = room::placements(&seats, placed, None).is_err();
+        let d = room::cross_world_share(&seats, placed).is_err();
+        assert!(a && b && c && d, "{a} {b} {c} {d}");
+    };
+    let mut owner = good.clone();
+    owner[0][0] = Some(Given { to: 3, item: 0 });
+    bad(&owner);
+    let mut item = good.clone();
+    item[0][0] = Some(Given { to: 0, item: 99 });
+    bad(&item);
+    let mut row = good.clone();
+    row[1].pop();
+    bad(&row);
+    bad(&good[..2]);
+    assert!(validate_room(&seats, &good).is_ok());
+    // No seat, and a seat whose lists belong to another world.
+    assert!(validate_room(&[], &[]).is_err());
+    let (m, insts) = load();
+    let w = World::load(&m).unwrap();
+    let plan = Plan::new(&w, &insts[0]).unwrap();
+    let short = [true];
+    let odd = [Seat { w: &w, plan: &plan, progression: &short }];
+    assert!(validate_room(&odd, &[vec![None; w.locations()]]).is_err());
+    // A location, owner or player outside the room is simply not permitted.
+    let g = Given { to: 0, item: 0 };
+    assert!(!room::permits(&seats, Given { to: 9, ..g }, 0, 0));
+    assert!(!room::permits(&seats, g, 9, 0));
+    assert!(!room::permits(&seats, g, 0, 99));
+}
+
+#[test]
+fn a_room_is_capped_in_players_and_setup_in_threads() {
+    let (m, insts) = load();
+    let n = config::ROOM_MAX_PLAYERS + 1;
+    let manifests: Vec<&Value> = vec![&m; n];
+    assert!(room::worlds(&manifests, 1).is_err());
+    let w = World::load(&m).unwrap();
+    let pairs: Vec<(&World, &Instance)> = vec![(&w, &insts[0]); n];
+    assert!(matches!(room::plans(&pairs, 1), Err(data_fill::FillError::Instance(_))));
+    assert!(room::instances(&vec![Value::Null; n]).is_err());
+    assert!(room::plans(&[], 1).is_err());
+    // However many workers are asked for, no more threads than the limit run.
+    let ids = std::sync::Mutex::new(std::collections::HashSet::new());
+    let items = vec![0u8; 4 * config::FILL_MAX_WORKERS];
+    data_fill::par::map_ordered(&items, usize::MAX, |_| {
+        ids.lock().unwrap().insert(std::thread::current().id());
+    });
+    assert!(ids.lock().unwrap().len() <= config::FILL_MAX_WORKERS);
 }

@@ -77,10 +77,16 @@ pub(crate) fn from_state(
 }
 
 /// The spheres of a room's placements (`placed[player][location]`), from fresh states.
-#[must_use]
-pub fn room_spheres(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> RoomSpheres {
+///
+/// # Errors
+/// [`crate::FillError::Instance`] for seats or placements that do not fit the room.
+pub fn room_spheres(
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<Given>>],
+) -> Result<RoomSpheres, crate::FillError> {
+    crate::room::check_placed(seats, placed)?;
     let mut models: Vec<Reach<'_>> = seats.iter().map(|s| s.plan.base(s.w, &[])).collect();
-    collect(seats, &mut models, &|p, l| placed[usize::from(p)][l as usize])
+    Ok(collect(seats, &mut models, &|p, l| placed[usize::from(p)][l as usize]))
 }
 
 /// [`room_spheres`] from the states of a finished fill (the `only_what_holds` shortcut).

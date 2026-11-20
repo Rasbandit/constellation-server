@@ -129,7 +129,7 @@ fn a_room_is_measured_against_the_same_baseline() {
     let seats: Vec<Seat<'_>> =
         (0..3).map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &prog[p] }).collect();
     let flat = Flat::new(&seats).expect("flat");
-    let s = sample_room(&seats, &flat, 400, 400, 100_000);
+    let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
     assert_eq!((s.fill.samples, s.failed, s.baseline.samples), (400, 0, 400));
     assert!(s.accepted < s.attempts, "some uniform rooms must be rejected");
     // A player's first key opens the door of their own hall: it can never lie behind it, in

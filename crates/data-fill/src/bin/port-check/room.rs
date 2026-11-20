@@ -209,11 +209,12 @@ fn means(rows: &[Vec<f64>], players: usize) -> Vec<f64> {
         .collect()
 }
 
-fn shares(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> Vec<f64> {
-    cross_world_share(seats, placed)
+fn shares(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> R<Vec<f64>> {
+    Ok(cross_world_share(seats, placed)
+        .map_err(|e| format!("{e:?}"))?
         .iter()
         .map(|(x, all)| *x as f64 / (*all).max(1) as f64)
-        .collect()
+        .collect())
 }
 
 #[allow(clippy::too_many_lines)] // the run is one sequence of checks
@@ -270,13 +271,13 @@ pub(super) fn run(
             &json!({"op": "room_spheres", "seed": seed, "placements": slot_map(&their_slots)}),
         )?;
         let t = Instant::now();
-        let mine = room_spheres(&seats, &theirs);
+        let mine = room_spheres(&seats, &theirs).map_err(|e| format!("{e:?}"))?;
         cx.engine_seconds += t.elapsed().as_secs_f64();
         let (ok, detail, lkeys, lbeat) = spheres_check(&room, seed, &their_slots, &lsph, &mine);
         replay.record(ok, || detail.unwrap_or_default());
         replay_beatable += u64::from(lbeat);
         room.shape(&mut shape_legacy, cx, &lkeys, &their_slots);
-        share_legacy.push(shares(&seats, &theirs));
+        share_legacy.push(shares(&seats, &theirs)?);
 
         // (3) + (4) Our room: three fills give the same bytes, then the legacy side judges it.
         if n < a.ours {
@@ -309,12 +310,15 @@ pub(super) fn run(
             let lsph = legacy.call(
                 &json!({"op": "room_spheres", "seed": seed, "placements": slot_map(&our_slots)}),
             )?;
-            let model = model.unwrap_or_else(|| room_spheres(&seats, &ours));
+            let model = match model {
+                Some(m) => m,
+                None => room_spheres(&seats, &ours).map_err(|e| format!("{e:?}"))?,
+            };
             let (ok, detail, lkeys, lbeat) = spheres_check(&room, seed, &our_slots, &lsph, &model);
             judged.record(ok, || detail.unwrap_or_default());
             judged_beatable += u64::from(lbeat);
             room.shape(&mut shape_ours, cx, &lkeys, &our_slots);
-            share_ours.push(shares(&seats, &ours));
+            share_ours.push(shares(&seats, &ours)?);
         }
     }
     let checks = json!({
