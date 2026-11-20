@@ -17,7 +17,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --no-create-home constellation \
     && mkdir -p /data/rooms && chown -R constellation /data
 COPY --from=build /constellation-server /usr/local/bin/constellation-server
-USER constellation
+USER 10001
 EXPOSE 38281
 # No curl in slim: bash opens the socket itself and checks for a 200.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
