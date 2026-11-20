@@ -1,21 +1,21 @@
 name: release
-# A tag vX.Y.Z (equal to the Cargo.toml version) builds and pushes linux/amd64 to GHCR. A PR that
-# touches the packaging builds the image without pushing and runs it under compose, so a broken
-# Dockerfile fails before the tag.
+# The image is built on main and on tags, never on PRs (packaging PRs get the seconds-long
+# container-lint workflow). A push to main builds it and runs it under compose; a tag
+# vX.Y.Z (equal to the Cargo.toml version) builds and pushes linux/amd64 to GHCR. A manual run
+# (workflow_dispatch) builds and runs it on any branch without pushing.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
-  pull_request:
-    paths: [Dockerfile, .dockerignore, docker/**, Cargo.toml, Cargo.lock, rust-toolchain.toml, .github/workflows/release.yml]
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 permissions:
   contents: read
 jobs:
   smoke:
-    if: github.event_name == 'pull_request'
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -42,7 +42,7 @@ jobs:
       - if: always()
         run: docker compose down -v
   push:
-    if: github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -50,8 +50,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
-      # On a tag: the tag must be v<Cargo version> and web/package.json must agree.
-      - run: sh tools/version-check/check.sh ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+      # The tag must be v<Cargo version> and web/package.json must agree.
+      - run: sh tools/version-check/check.sh ${{ github.ref_name }}
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -66,8 +66,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-            type=sha,enable=${{ github.event_name != 'push' }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - uses: docker/build-push-action@v7
         with:
           context: .
@@ -75,7 +74,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # A release build carries the bare version; a manual build adds +<short sha>.
-          build-args: BUILD_SHA=${{ startsWith(github.ref, 'refs/tags/v') && '' || github.sha }}
+          # A release build carries the bare version (no BUILD_SHA).
           cache-from: type=gha
           cache-to: type=gha,mode=max
