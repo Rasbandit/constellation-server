@@ -40,6 +40,7 @@ services:
     security_opt:
       - seccomp=./docker/seccomp-bwrap.json
       - apparmor=unconfined
+      - systempaths=unconfined
     ports:
       - "${CONSTELLATION_PORT:-38281}:38281"
       # The admin API runs uploaded code: loopback on the host only. Reach it by SSH or a proxy.
