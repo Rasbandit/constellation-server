@@ -683,7 +683,7 @@ pub async fn run(
     let mut stop = shutdown();
     let startup = async {
         if args.data_dir.is_some() {
-            sandbox::check_host(&limits)?;
+            sandbox::check_host(generation.as_ref().is_some_and(|g| g.container_mode), &limits)?;
         }
         let api = worlds_api(
             args.data_dir.as_deref(),
@@ -959,6 +959,7 @@ mod tests {
             python: "/usr/bin/python3".into(),
             sidecar: root.join("tools/ap-gen/ap_gen.py"),
             private: vec![],
+            container_mode: false,
         }
     }
 
