@@ -410,7 +410,9 @@ impl<'a, 'w> Linked<'a, 'w> {
         self.touched.fill(false);
         self.touched[o] = true;
         // Check suspects lowest rank first over all states: a check at rank k needs every
-        // retraction below k done, in whichever state it happened.
+        // retraction below k done, in whichever state it happened. (A check made too early is
+        // queued again when a lower fact is retracted, so the order is for cost, not for
+        // exactness; the ranks themselves are what exactness rests on, see the cycle test.)
         while let Some((p, _)) = self
             .models
             .iter()
@@ -668,6 +670,46 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    /// Each player's hall door needs their own key, and that key lies in the next player's hall:
+    /// a cycle through three worlds whose only support is the start copies. Taking the three
+    /// copies back one by one must end with every hall closed in every state, though each fact
+    /// is supported by another state's fact of lower rank only through the cycle.
+    #[test]
+    fn removal_does_not_keep_support_that_runs_through_other_players() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/room_world.json")).unwrap();
+        let w = World::load(&doc["manifest"]).unwrap();
+        let inst: Instance = serde_json::from_value(doc["instances"][0].clone()).unwrap();
+        let plans: Vec<Plan> = (0..3).map(|_| Plan::new(&w, &inst).unwrap()).collect();
+        let prog = inst.progression(&w);
+        let seats: Vec<Seat<'_>> =
+            plans.iter().map(|plan| Seat { w: &w, plan, progression: &prog }).collect();
+        let (key, l3) = (w.item("key_a").unwrap(), w.loc("l3").unwrap());
+        let mut placed = locked_placed(&seats);
+        for p in 0..3u16 {
+            placed[usize::from(p)][l3 as usize] = Some(Given { to: (p + 1) % 3, item: key });
+        }
+        let mut held: Vec<Vec<u16>> = vec![w.item("key_b").map(|b| vec![key, b]).unwrap(); 3];
+        let mut room = Linked::new(&seats);
+        room.solve(&held, &placed);
+        assert!(room.models.iter().all(|m| m.reached(l3)), "all halls open with every key held");
+        for p in 0..3u16 {
+            held[usize::from(p)].remove(0);
+            room.take_back(p, key);
+            let mut fresh = Linked::new(&seats);
+            fresh.solve(&held, &placed);
+            for (q, m) in room.models.iter().enumerate() {
+                assert_same(
+                    &w,
+                    m,
+                    &fresh.models[q],
+                    &format!("after taking back player {p}'s key, state {q}"),
+                );
+            }
+        }
+        assert!(room.models.iter().all(|m| !m.reached(l3)), "the cycle supports nothing");
     }
 
     #[test]
