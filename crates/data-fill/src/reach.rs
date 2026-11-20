@@ -685,7 +685,8 @@ impl<'w> Reach<'w> {
 
     fn start(&mut self) {
         let start_mask = if self.plan.clocks {
-            self.owned = self.compute_owned();
+            // The clocks the start inventory owns (not the assumed items): they hold from rank 0.
+            self.owned = self.plan.owned_start;
             self.owned0 = self.owned;
             self.owned
         } else {
@@ -1500,7 +1501,8 @@ impl<'w> Reach<'w> {
         out
     }
 
-    fn compute_owned(&self) -> u64 {
+    /// The clocks owned with the start inventory held (see [`Plan::owned_start`]).
+    pub(crate) fn compute_owned(&self) -> u64 {
         let w = self.w;
         let Some(o) = w.time.owned.filter(|_| self.plan.clocks) else { return w.time.all };
         let env = self.env();
@@ -1530,6 +1532,51 @@ mod tests {
     use super::*;
     use crate::fill::Instance;
     use serde_json::json;
+
+    /// A clock world of two slices where `dawn` owns the first and `dusk` the second (none
+    /// owned: the first, as the solver starts).
+    fn clock_world(start: &[&str]) -> (World, Instance) {
+        let m = json!({
+            "options": [],
+            "items": [{"key": "dawn", "id": 1}, {"key": "dusk", "id": 2}],
+            "locations": [{"key": "l", "id": 1}],
+            "start": "a",
+            "x.time": {"slices": 2, "start_mask": 1, "owned": {
+                "when": {"true": {}}, "none_owned_mask": 1,
+                "half_days": [{"first": 0, "last": 0, "rule": {"has": "dawn"}},
+                              {"first": 1, "last": 1, "rule": {"has": "dusk"}}]}},
+            "defs": {},
+            "regions": [{"key": "a", "can_stay": false,
+                         "checks": [{"loc": "l", "rule": {"true": {}}}],
+                         "exits": [], "events": [], "stays": []}],
+            "goal": {"reach": "region:a"}
+        });
+        let inst = Instance {
+            locations: vec!["l".to_owned()],
+            start_inventory: start.iter().map(|k| (*k).to_owned()).collect(),
+            ..Instance::default()
+        };
+        (World::load(&m).unwrap(), inst)
+    }
+
+    /// The solver's start state owns the union of the owned half-days, or the first slice only
+    /// when none is owned: a start item that owns only the later slice leaves the first one out.
+    #[test]
+    fn a_start_clock_that_leaves_out_the_first_slice_does_not_own_it() {
+        for (start, extra, want) in [
+            (&[][..], &[][..], 0b01u64),
+            (&["dawn"][..], &[][..], 0b01),
+            (&["dusk"][..], &[][..], 0b10),
+            (&["dusk"][..], &["dawn"][..], 0b11),
+            (&[][..], &["dawn", "dusk"][..], 0b11),
+        ] {
+            let (w, inst) = clock_world(start);
+            let plan = Plan::new(&w, &inst).unwrap();
+            let extra: Vec<u16> = extra.iter().map(|k| w.item(k).unwrap()).collect();
+            let r = plan.solve(&w, &extra);
+            assert_eq!(r.masks[w.start as usize], want, "start {start:?}, held {extra:?}");
+        }
+    }
 
     /// Support that exists only through the fact itself: `a` opens with `key` or with the `gem`
     /// found in `b`, which is reached only through `a`; an event in `a` lights a counter that

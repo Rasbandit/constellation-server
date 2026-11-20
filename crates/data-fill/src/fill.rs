@@ -77,6 +77,10 @@ pub struct Plan {
     saturated: Vec<i64>,
     /// Per item: copies that exist this seed (pool, locked, self-granting checks, start).
     copies: Vec<i64>,
+    /// Clock slices the start inventory alone owns (all slices when clocks do not restrict).
+    /// A state starts from these, not from what an empty inventory owns: a start item that
+    /// owns only a later slice must leave the first one out, as the solver does.
+    pub(crate) owned_start: u64,
 }
 
 /// A map's entries in key order, so the first bad key an error names does not depend on the
@@ -207,7 +211,12 @@ impl Plan {
             loc_group,
             saturated: vec![i64::MAX; w.items()],
             copies: Vec::new(),
+            owned_start: w.time.all,
         };
+        if plan.clocks {
+            // A state reads this while it is built, and the first one is this very probe.
+            plan.owned_start = plan.base(w, &[]).compute_owned();
+        }
         // Bound the search by every copy that can exist this seed.
         let mut copies = vec![0i64; w.items()];
         let placed = plan.progression.iter().chain(&plan.rest);
