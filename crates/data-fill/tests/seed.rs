@@ -97,3 +97,47 @@ fn a_manifest_without_a_game_or_players_without_names_are_refused() {
     assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("name"));
     assert!(generate(&m, "s", &[], 1, 1).is_err());
 }
+
+#[test]
+fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
+    let (m, p) = players();
+    let direct = generate(&m, "seed-one", &p, 7, 1).unwrap();
+    let players: Vec<Value> = p
+        .iter()
+        .map(|x| {
+            let mut v = json!({"name": x.name});
+            v["instance"] = json!({
+                "options": x.instance.options, "locations": x.instance.locations,
+                "pool": x.instance.pool, "pool_class": x.instance.pool_class,
+                "start_inventory": x.instance.start_inventory,
+            });
+            v
+        })
+        .collect();
+    let req = json!({"manifest": m, "seed_name": "seed-one", "players": players, "rng_seed": 7, "workers": 1});
+    let out = data_fill::job::generate(req.to_string().as_bytes()).unwrap();
+    let back: SeedBundle = serde_json::from_slice(&out).unwrap();
+    assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
+    assert!(data_fill::job::generate(b"{").unwrap_err().contains("bad fill request"));
+
+    let found = data_fill::job::inspect(m.to_string().as_bytes()).unwrap();
+    let found: Value = serde_json::from_slice(&found).unwrap();
+    assert_eq!(
+        (&found["game"], &found["version"], &found["items"]),
+        (&json!("Fixture"), &json!("1"), &json!(4))
+    );
+    let mut padded = m.clone();
+    padded["game"] = json!("  Fixture ");
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &data_fill::job::inspect(padded.to_string().as_bytes()).unwrap()
+        )
+        .unwrap()["game"],
+        "Fixture"
+    );
+    padded.as_object_mut().unwrap().remove("version");
+    assert!(
+        data_fill::job::inspect(padded.to_string().as_bytes()).unwrap_err().contains("version")
+    );
+    assert!(data_fill::job::inspect(b"[]").is_err());
+}

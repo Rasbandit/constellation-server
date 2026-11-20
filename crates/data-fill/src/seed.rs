@@ -14,19 +14,26 @@ use crate::room::{self, Seat};
 use crate::spheres::RoomSpheres;
 use crate::world::World;
 
-/// The generator version a seed records (the one clients of the compatible protocol expect).
-const GENERATOR_VERSION: Version = Version { major: 0, minor: 6, build: 8 };
-/// Server options a generated seed starts with (hint cost percent, points per checked location).
-const HINT_COST: u8 = 10;
-const CHECK_POINTS: u32 = 1;
-
 /// One player: the slot name and the resolved instance of their world.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Player {
     /// The slot's name, which is also its connect name.
     pub name: String,
     /// Options, locations, pool and start items for this player.
     pub instance: Instance,
+}
+
+/// The manifest's game name, trimmed: the one reading of it (the upload record, the folder and
+/// the seed all use this).
+///
+/// # Errors
+/// When the manifest has no game, or an empty one.
+pub fn manifest_game(manifest: &Value) -> Result<&str, String> {
+    manifest["game"]
+        .as_str()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| "the manifest needs a \"game\" name".to_owned())
 }
 
 /// Fill a room of `players`, all playing the world `manifest` describes (its `game` key names
@@ -44,10 +51,7 @@ pub fn generate(
     rng_seed: u64,
     workers: usize,
 ) -> Result<SeedBundle, String> {
-    let game = manifest["game"]
-        .as_str()
-        .filter(|g| !g.trim().is_empty())
-        .ok_or("the manifest has no game name")?;
+    let game = manifest_game(manifest)?;
     for (k, p) in players.iter().enumerate() {
         if p.name.trim().is_empty() {
             return Err(format!("player {} has no name", k + 1));
@@ -117,11 +121,15 @@ fn assemble(
     Ok(SeedBundle {
         format: seed_bundle::FORMAT,
         seed_name: seed_name.to_owned(),
-        generator_version: GENERATOR_VERSION,
+        generator_version: Version {
+            major: config::SEED_GENERATOR_VERSION.0,
+            minor: config::SEED_GENERATOR_VERSION.1,
+            build: config::SEED_GENERATOR_VERSION.2,
+        },
         server_options: ServerOptions {
             password: None,
-            hint_cost: HINT_COST,
-            location_check_points: CHECK_POINTS,
+            hint_cost: config::SEED_HINT_COST_PCT,
+            location_check_points: config::SEED_CHECK_POINTS,
             release_mode: Mode::Auto,
             collect_mode: Mode::Goal,
             remaining_mode: Mode::Goal,
