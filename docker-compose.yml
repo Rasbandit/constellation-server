@@ -1,0 +1,40 @@
+# Room server plus Postgres. Copy .env.example to .env first. No reverse proxy here.
+services:
+  server:
+    image: ghcr.io/rasbandit/constellation-server:${CONSTELLATION_TAG:-latest}
+    build: .
+    # Never `always`: exit code 3 means a newer owner fenced this process, and a restart would fight it.
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CONSTELLATION_DATABASE_URL_FILE: /run/secrets/database_url
+    secrets: [database_url]
+    ports:
+      - "${CONSTELLATION_PORT:-38281}:38281"
+    volumes:
+      - rooms:/data/rooms
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: constellation
+      POSTGRES_DB: constellation
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U constellation -d constellation"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  rooms:
+  pgdata:
+secrets:
+  database_url:
+    file: ${CONSTELLATION_DATABASE_URL_FILE:-./secrets/database_url}
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:-./secrets/postgres_password}

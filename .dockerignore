@@ -1,0 +1,9 @@
+target
+.git
+.github
+web
+docs
+tools
+**/node_modules
+**/__pycache__
+.env
