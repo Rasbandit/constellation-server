@@ -26,6 +26,12 @@
 //! bad bundle is skipped with a warning, and a room whose task fails goes cold, so its next
 //! connect loads it again from its log. Only a fence ends the process, because then another
 //! process owns the database.
+//!
+//! A room that fails quickly (its load fails, or its task ends within `room_healthy_secs` of
+//! its load) waits before it loads again: `room_retry_first_ms`, doubled for each quick
+//! failure in a row, at most `room_retry_max_ms` (#64). Until then a connect is refused
+//! without a load. Its count is forgotten once it has been in memory for `room_healthy_secs`.
+//! A room that fails on every load, whatever the wait, is frozen instead in #96.
 
 use crate::rooms::{Activity, Listing, Moment, RoomKey, Rooms, read, write};
 use crate::{
@@ -42,6 +48,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 /// Where the directory and the rooms' logs live.
 enum Store {
@@ -59,6 +66,22 @@ struct Running {
     /// Tells this load of the room from an earlier one under the same key.
     run: u64,
     task: AbortHandle,
+    /// When it loaded, to tell a quick failure from a healthy run.
+    since: Instant,
+}
+
+/// A room whose last loads failed quickly: how many in a row, and when it may load again.
+struct Failing {
+    count: u32,
+    until: Instant,
+}
+
+/// How long a room waits before its next load after `count` quick failures in a row: the
+/// first wait, doubled for each failure after the first, at most the longest.
+fn retry_wait(limits: &Limits, count: u32) -> Duration {
+    let first = limits.room_retry_first_ms;
+    let doubled = first.saturating_mul(1 << count.saturating_sub(1).min(32));
+    Duration::from_millis(doubled.min(limits.room_retry_max_ms.max(first)))
 }
 
 /// What a room task's end is reported with: its key, which load it was, and why it ended.
@@ -303,6 +326,8 @@ pub struct Host {
     loads: JoinSet<LoadEnd>,
     /// The wakes waiting on each running load.
     waiting: BTreeMap<RoomKey, Vec<oneshot::Sender<Result<(), String>>>>,
+    /// The rooms that failed quickly, at most one entry per listed room.
+    failing: BTreeMap<RoomKey, Failing>,
     /// Imports and exports from the generation API, apart from the loop like loads.
     imports: JoinSet<ImportEnd>,
     exports: JoinSet<()>,
@@ -354,6 +379,7 @@ impl Host {
             waker: Waker(tx),
             loads: JoinSet::new(),
             waiting: BTreeMap::new(),
+            failing: BTreeMap::new(),
             imports: JoinSet::new(),
             exports: JoinSet::new(),
         };
@@ -547,9 +573,10 @@ impl Host {
     pub(crate) async fn wake(&mut self, key: &RoomKey) -> Result<(), String> {
         match self.load(key)? {
             Some(load) => {
+                self.backing_off(key)?;
                 self.make_space()?;
                 let loaded = load.await;
-                self.install(key, loaded)
+                self.settle(key, loaded)
             }
             None => Ok(()),
         }
@@ -642,8 +669,64 @@ impl Host {
         let run = self.runs;
         let ended = key.clone();
         self.tasks.spawn(async move { (ended, run, handle.await) });
-        self.running.insert(key.clone(), Running { run, task });
+        self.running.insert(key.clone(), Running { run, task, since: Instant::now() });
         Ok(())
+    }
+
+    /// Put a finished load in place ([`Host::install`]); a failed load counts toward its
+    /// room's wait before the next.
+    fn settle(&mut self, key: &RoomKey, loaded: Result<Ready, String>) -> Result<(), String> {
+        if let Err(why) = &loaded {
+            let (failures, wait) = self.failed(key);
+            tracing::warn!(
+                %key,
+                failures,
+                retry_in_ms = wait.as_millis(),
+                "room not loaded: {why}"
+            );
+            return Err(why.clone());
+        }
+        let woke = self.install(key, loaded);
+        if let Err(why) = &woke {
+            tracing::warn!(%key, "room not loaded: {why}");
+        }
+        woke
+    }
+
+    /// Count a quick failure of room `key`: its next load waits ([`retry_wait`]). How many
+    /// in a row, and the wait.
+    fn failed(&mut self, key: &RoomKey) -> (u32, Duration) {
+        let now = Instant::now();
+        let f = self.failing.entry(key.clone()).or_insert(Failing { count: 0, until: now });
+        f.count = f.count.saturating_add(1);
+        let wait = retry_wait(&self.limits, f.count);
+        f.until = now + wait;
+        (f.count, wait)
+    }
+
+    /// Refuse a load of room `key` while it waits after quick failures.
+    ///
+    /// # Errors
+    /// While the wait runs.
+    fn backing_off(&self, key: &RoomKey) -> Result<(), String> {
+        let Some(f) = self.failing.get(key) else { return Ok(()) };
+        let left = f.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        Err(format!(
+            "room {key}: {} quick failures in a row; it may load again in {} ms",
+            f.count,
+            left.as_millis()
+        ))
+    }
+
+    /// Forget the failures of every room in memory for `room_healthy_secs`.
+    fn forget_healthy(&mut self) {
+        let healthy = Duration::from_secs(self.limits.room_healthy_secs);
+        let running = &self.running;
+        self.failing
+            .retain(|key, _| !running.get(key).is_some_and(|r| r.since.elapsed() >= healthy));
     }
 
     /// Make space under `max_resident_rooms` for one more room, before its load starts. Loads
@@ -695,6 +778,12 @@ impl Host {
         }
         match self.load(&key) {
             Ok(Some(load)) => {
+                if let Err(why) = self.backing_off(&key) {
+                    // Each connect attempt asks; the failure itself was logged once.
+                    tracing::debug!(%key, "room not loaded: {why}");
+                    drop(done.send(Err(why)));
+                    return;
+                }
                 if let Err(why) = self.make_space() {
                     tracing::warn!(%key, "room not loaded: {why}");
                     drop(done.send(Err(why)));
@@ -719,10 +808,7 @@ impl Host {
 
     /// A load started by [`Host::request`] ended: put it in place and answer its wakes.
     fn loaded(&mut self, (key, loaded): LoadEnd) {
-        let woke = self.install(&key, loaded);
-        if let Err(why) = &woke {
-            tracing::warn!(%key, "room not loaded: {why}");
-        }
+        let woke = self.settle(&key, loaded);
         for done in self.waiting.remove(&key).unwrap_or_default() {
             drop(done.send(woke.clone()));
         }
@@ -772,6 +858,7 @@ impl Host {
     /// One supervisor tick: unload idle rooms, record when rooms were last used, end
     /// abandoned ones and rescan the rooms folder.
     async fn tick(&mut self) {
+        self.forget_healthy();
         self.unload_idle();
         self.record_use(false).await;
         self.end_abandoned().await;
@@ -825,11 +912,23 @@ impl Host {
         if self.folder.is_none() || matches!(why, Ok(Stopped::Fenced { .. })) {
             return Some(room_ended(why));
         }
-        self.running.remove(&key);
+        let ran = self.running.remove(&key).map(|r| r.since.elapsed());
         if let Some(listing) = write(&self.rooms).get_mut(&key) {
             listing.room = None;
         }
-        tracing::error!(%key, ?why, "room stopped; its next connect loads it again from its log");
+        if ran.is_some_and(|ran| ran >= Duration::from_secs(self.limits.room_healthy_secs)) {
+            self.failing.remove(&key);
+            tracing::error!(%key, ?why, "room stopped; its next connect loads it again from its log");
+        } else {
+            let (failures, wait) = self.failed(&key);
+            tracing::error!(
+                %key,
+                ?why,
+                failures,
+                retry_in_ms = wait.as_millis(),
+                "room stopped soon after it loaded; its next load waits"
+            );
+        }
         None
     }
 
@@ -904,6 +1003,7 @@ impl Host {
             }
             write(&self.rooms).remove(&key);
             self.recorded.remove(&key);
+            self.failing.remove(&key);
             if let Some(r) = self.running.remove(&key) {
                 r.task.abort();
             }
@@ -1589,7 +1689,7 @@ mod tests {
         assert!(in_memory(&host, &key));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_room_alone_goes_cold_and_loads_again_under_its_key() {
         let dir = TempDir::new("failed");
         dir.bundle("a.json", "alpha");
@@ -1601,11 +1701,94 @@ mod tests {
         let run = host.running[&alpha].run;
         assert!(host.ended((alpha.clone(), run, Ok(Stopped::Failed))).is_none());
         assert!(!in_memory(&host, &alpha) && in_memory(&host, &beta));
+        // It stopped right after it loaded, so it waits the first retry time (#64).
+        tokio::time::advance(Duration::from_secs(1)).await;
         host.wake(&alpha).await.unwrap();
         assert!(in_memory(&host, &alpha));
         // The end of a load this host already replaced is ignored.
         assert!(host.ended((alpha.clone(), run, Ok(Stopped::Failed))).is_none());
         assert!(in_memory(&host, &alpha));
+    }
+
+    #[test]
+    fn the_retry_wait_doubles_from_one_second_up_to_a_minute() {
+        let waits: Vec<u64> = (1..=9).map(|n| retry_wait(&Limits::DESIGN, n).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(retry_wait(&Limits::DESIGN, u32::MAX), Duration::from_secs(60));
+    }
+
+    /// A load that fails is not tried again until its wait ends, and each failure in a row
+    /// doubles the wait (#64).
+    #[tokio::test(start_paused = true)]
+    async fn a_room_that_fails_to_load_waits_longer_after_each_failure() {
+        let dir = TempDir::new("retry-load");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let loaded = own_game("retry-load", "bad");
+        let keys = seed_bundle::v2::package_keys(loaded.bundle.bytes()).unwrap();
+        let key = host.import(loaded).await.unwrap();
+        mem(&host).tamper_blob(keys[0], b"not this package");
+        let load_fails = |e: String| assert!(e.contains("does not match its key"), "{e}");
+        let waits = |e: String| assert!(e.contains("1 quick failures in a row"), "{e}");
+        load_fails(host.wake(&key).await.unwrap_err());
+        waits(host.wake(&key).await.unwrap_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        load_fails(host.wake(&key).await.unwrap_err());
+        // Two in a row: two seconds now.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let e = host.wake(&key).await.unwrap_err();
+        assert!(e.contains("2 quick failures in a row"), "{e}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        load_fails(host.wake(&key).await.unwrap_err());
+        assert_eq!(host.failing[&key].count, 3);
+    }
+
+    /// A room that stops soon after it loads waits before the router can load it again; the
+    /// refused wake starts no load. Other rooms load as before (#64).
+    #[tokio::test(start_paused = true)]
+    async fn a_room_that_stops_soon_after_it_loads_is_not_loaded_again_at_once() {
+        let dir = TempDir::new("retry-quick");
+        dir.bundle("a.json", "alpha");
+        dir.bundle("b.json", "beta");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let (alpha, beta) = (key_of(&host, "alpha"), key_of(&host, "beta"));
+        host.wake(&alpha).await.unwrap();
+        let run = host.running[&alpha].run;
+        assert!(host.ended((alpha.clone(), run, Ok(Stopped::Failed))).is_none());
+        let (refused, other) = (ask(&host, &alpha), ask(&host, &beta));
+        let both = async { (refused.await.unwrap(), other.await.unwrap()) };
+        let (refused, other) = tokio::select! {
+            fatal = host.supervise() => panic!("the host ended: {}", fatal.exit_code()),
+            woke = both => woke,
+        };
+        assert!(refused.unwrap_err().contains("may load again"));
+        assert_eq!(other, Ok(()));
+        assert!(!in_memory(&host, &alpha) && in_memory(&host, &beta));
+        assert_eq!(host.runs, 2, "no load of alpha was started");
+    }
+
+    /// A room that stopped after a healthy run loads again at once, and a healthy run
+    /// forgets the quick failures before it (#64).
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_run_forgets_the_failures_before_it() {
+        let dir = TempDir::new("retry-healthy");
+        dir.bundle("a.json", "alpha");
+        let mut host = host(&dir, Limits::DESIGN).await;
+        let key = key_of(&host, "alpha");
+        let healthy = Duration::from_secs(Limits::DESIGN.room_healthy_secs);
+        let stop = |host: &mut Host| {
+            let run = host.running[&key].run;
+            assert!(host.ended((key.clone(), run, Ok(Stopped::Failed))).is_none());
+        };
+        host.wake(&key).await.unwrap();
+        stop(&mut host);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        host.wake(&key).await.unwrap();
+        tokio::time::advance(healthy).await;
+        host.forget_healthy();
+        assert!(host.failing.is_empty(), "forgotten while it runs");
+        stop(&mut host);
+        host.wake(&key).await.unwrap();
+        assert!(in_memory(&host, &key));
     }
 
     #[tokio::test]

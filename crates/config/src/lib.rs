@@ -60,6 +60,16 @@ pub struct Limits {
     /// `CONSTELLATION_ROOM_TOUCH_SECS`). A room leaving memory, and a clean stop, write it
     /// at once.
     pub room_touch_secs: u64,
+    /// A room that fails to load, or whose task ends within `room_healthy_secs` of its load,
+    /// waits this long before it loads again, doubled for each such failure in a row up to
+    /// `room_retry_max_ms` (#64). Doc 01 D1.7's reconnect backoff numbers: 1 s, then
+    /// doubling, at most 60 s, reset after 30 s healthy (`CONSTELLATION_ROOM_RETRY_FIRST_MS`).
+    pub room_retry_first_ms: u64,
+    /// The longest wait between loads of a failing room (`CONSTELLATION_ROOM_RETRY_MAX_MS`).
+    pub room_retry_max_ms: u64,
+    /// A room in memory this long is healthy: its failures in a row are forgotten
+    /// (`CONSTELLATION_ROOM_HEALTHY_SECS`).
+    pub room_healthy_secs: u64,
     /// Draws of a new room key before a new room gives up until the next scan; each draw
     /// collides with an existing key only with odds of about one in 2^50 per stored room.
     pub room_key_draws: usize,
@@ -232,6 +242,9 @@ impl Limits {
         room_idle_secs: 15 * 60,
         room_abandon_secs: 30 * 24 * 60 * 60,
         room_touch_secs: 60,
+        room_retry_first_ms: 1_000,
+        room_retry_max_ms: 60_000,
+        room_healthy_secs: 30,
         room_key_draws: 3,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
@@ -324,6 +337,9 @@ pub fn load() -> Limits {
         ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
         ("CONSTELLATION_ROOM_ABANDON_SECS", &mut l.room_abandon_secs),
         ("CONSTELLATION_ROOM_TOUCH_SECS", &mut l.room_touch_secs),
+        ("CONSTELLATION_ROOM_RETRY_FIRST_MS", &mut l.room_retry_first_ms),
+        ("CONSTELLATION_ROOM_RETRY_MAX_MS", &mut l.room_retry_max_ms),
+        ("CONSTELLATION_ROOM_HEALTHY_SECS", &mut l.room_healthy_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
@@ -554,6 +570,8 @@ mod tests {
         assert_eq!(l.rooms_scan_ms, 2_000);
         assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
         assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
+        assert_eq!((l.room_retry_first_ms, l.room_retry_max_ms), (1_000, 60_000));
+        assert_eq!(l.room_healthy_secs, 30);
     }
 
     #[test]
