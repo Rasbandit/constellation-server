@@ -65,13 +65,33 @@ jobs:
         run: docker compose logs
       - if: always()
         run: docker compose down -v
-  push:
+  # A re-run of an old main run must not overwrite `main` with an older image: publish only
+  # while this commit is still the head of main (otherwise a green no-op).
+  fresh:
     needs: smoke
-    # A tag (the smoke is skipped there) or a main push whose smoke passed.
-    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.smoke.result == 'success')) }}
-    # One publish at a time and never cancelled mid-push; a newer queued run replaces an older queued one.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.smoke.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ok: ${{ steps.head.outputs.ok }}
+    steps:
+      - id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          [ "$(gh api "repos/$REPO/commits/main" --jq .sha)" = "$SHA" ] && ok=true || ok=false
+          [ "$ok" = true ] || echo "$SHA is not the head of main any more; not publishing"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+  push:
+    needs: [smoke, fresh]
+    # A tag (the smoke is skipped there) or a main push whose smoke passed and is still the head.
+    if: ${{ !cancelled() && github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && needs.smoke.result == 'success' && needs.fresh.outputs.ok == 'true')) }}
+    # One publish at a time per ref and never cancelled mid-push; a newer queued run replaces an
+    # older queued one, and a main merge never replaces a queued tag publish.
     concurrency:
-      group: publish
+      group: publish-${{ github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
