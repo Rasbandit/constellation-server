@@ -61,6 +61,17 @@ jobs:
           cat up.out; echo " (HTTP $code)"
           test "$code" = 201
           docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
+      # The one public port serves the UI and the version: `/` is the app, a missing asset is a
+      # 404, /version carries the build, and the admin API is not on this port.
+      - run: |
+          P=http://127.0.0.1:38281
+          curl -sf $P/ | grep -qi '<div id="root">'
+          curl -sf -H 'Accept: text/html' $P/abcdefgh23 | grep -qi '<div id="root">'
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/assets/missing.js)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/yamls)" = 404
+          curl -sf $P/version | grep -q '"version":"'
+          js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
+          curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'
       - if: failure()
         run: docker compose logs
       - if: always()

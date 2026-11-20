@@ -1,4 +1,4 @@
-# Room server plus Postgres. Copy .env.example to .env first. No reverse proxy here.
+# Room server (rooms and the web UI, both on 38281) plus Postgres. Copy .env.example to .env first. No reverse proxy here.
 services:
   server:
     image: ghcr.io/rasbandit/constellation-server:${CONSTELLATION_TAG:-latest}
@@ -19,6 +19,8 @@ services:
       - "38281"
       - --rooms
       - /data/rooms
+      - --web-dir
+      - /opt/constellation/web
       - --data-dir
       - /data
       - --admin-host

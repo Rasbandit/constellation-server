@@ -1,6 +1,18 @@
-# Room server plus the upload and generation API (--data-dir): python, bubblewrap and the generator
-# checkout. No web UI. GEN_REPO_URL and GEN_REPO_REF are required build args (docs/container.md).
+# Room server, the web UI it serves on the same port (--web-dir), and the upload and generation API
+# (--data-dir): python, bubblewrap and the generator checkout. GEN_REPO_URL and GEN_REPO_REF are required build args (docs/container.md).
 # The rust-toolchain.toml channel is `stable`, so the builder image tracks stable too.
+# The web UI: built from the lockfile only, then compressed once here so the server never has to.
+# Only /web/dist reaches the runtime image (no bun, no node_modules). The manifest and lockfile are
+# copied first so the dependency layer is cached until they change.
+FROM oven/bun:1.4.5-slim AS web
+WORKDIR /web
+COPY web/package.json web/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY web/ ./
+# The server answers /api through an operator proxy (docs/container.md), so the build calls it.
+ENV CONSTELLATION_WEB_ADMIN_API=1
+RUN bun --bun run build && bun scripts/precompress.mjs
+
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
@@ -40,6 +52,7 @@ RUN apt-get update \
     && mkdir -p /data/rooms && chown -R constellation /data
 COPY --from=build /constellation-server /usr/local/bin/constellation-server
 COPY --from=gen /opt/gen /opt/gen
+COPY --from=web /web/dist /opt/constellation/web
 COPY tools/ap-gen /opt/constellation/tools/ap-gen
 COPY tools/ap-import /opt/constellation/tools/ap-import
 ENV CONSTELLATION_AP_DIR=/opt/gen/ap \
@@ -53,4 +66,4 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/38281 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
 # The wrapper forwards signals and maps exit 3 (fenced) to 0 so the container is not restarted.
 ENTRYPOINT ["entrypoint.sh"]
-CMD ["--host", "0.0.0.0", "--port", "38281", "--rooms", "/data/rooms"]
+CMD ["--host", "0.0.0.0", "--port", "38281", "--rooms", "/data/rooms", "--web-dir", "/opt/constellation/web"]

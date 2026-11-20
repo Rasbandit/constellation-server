@@ -1,6 +1,6 @@
 # Running the room server in a container
 
-The image holds the room server and its upload and generation API (no web UI). Flags and environment variables are in the README; the compose file runs `constellation-server --host 0.0.0.0 --port 38281 --rooms /data/rooms --data-dir /data` plus the admin listener (the image's own default is the same without `--data-dir`).
+The image holds the room server, the web UI and the upload and generation API. Rooms and the UI share the one public port, 38281: `/` is the UI, a WebSocket upgrade on `/<key>` is a room. Flags and environment variables are in the README; the compose file runs `constellation-server --host 0.0.0.0 --port 38281 --rooms /data/rooms --data-dir /data` plus the admin listener (the image's own default is the same without `--data-dir`; its default command already has `--web-dir`).
 
 ```sh
 cp .env.example .env   # set GEN_REPO_URL and GEN_REPO_REF too (see Building)
@@ -24,6 +24,24 @@ A client reaches a room at `<host>:<port>/<key>` (the path is the room key). One
 
 ## Building
 Generation needs the generator's source, which is not in this repo and whose URL is not committed. Pass it as build args `GEN_REPO_URL` and `GEN_REPO_REF` (a pinned commit SHA); the build fails with a message when either is empty. Compose reads them from `.env`; the release workflow reads `GEN_REPO_REF` from a repository variable (a SHA is harmless) and `GEN_REPO_URL` from a repository secret, so the URL is masked in public logs; the push job also turns off the build attestation, which would embed it. The image also holds python with the generator's dependencies, bubblewrap and `prlimit`.
+
+## Web UI
+The web stage of the Dockerfile builds `web/` from `bun.lock` (`bun install --frozen-lockfile`), runs the type check and `vite build`, and compresses every text file once (`.gz` and `.br` next to it, `web/scripts/precompress.mjs`). Only `dist/` reaches the runtime image, in `/opt/constellation/web`; no bun, node or dev dependency does.
+
+The server (`--web-dir`) answers, in order: `/healthz`, `/version`, a WebSocket upgrade at `/<key>` (the room; with `--bundle` any path), then the UI for every other GET and HEAD: an existing file, else `index.html` for a page load (no extension, not under `/assets/`, `Accept` takes HTML). A missing file, a missing `/assets/*` path or a request that does not want HTML is a 404, never the app. So a plain GET of `/<key>` loads the UI (its `/c/:code` and room pages) and an upgrade of the same URL joins the room. Files carry `ETag` and `Last-Modified`; `/assets/*` (hashed names) is `public, max-age=31536000, immutable`, everything else `no-cache`; the client's `Accept-Encoding` picks the stored `.br` or `.gz`. Every answer has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and a CSP (`default-src 'self'`, `frame-ancestors 'none'`). Paths are not decoded and the resolved file must lie inside the folder, so `..`, encoded `..` and a symlink out all get the app or a 404. The UI's version badge reads `GET /version` from its own origin.
+
+### The admin API behind the UI
+The UI calls `/api/...` on its own origin, but the admin API listens on the separate admin port (`38282`, loopback on the host) because it runs uploaded code, and it needs `Authorization: Bearer <token>`. The server does not proxy it, and the browser never gets the token. To use the UI's create and upload pages, put a reverse proxy in front that does both jobs: forward `/` and WebSocket upgrades to `127.0.0.1:38281`, forward `/api/` to `127.0.0.1:38282` with the token added by the proxy, and require its own login (basic auth, SSO or an IP allow-list) on `/api/`, since whoever reaches it holds the admin token. For example in Caddy:
+
+```
+play.example.com {
+    basicauth /api/* { admin <bcrypt hash> }
+    reverse_proxy /api/* 127.0.0.1:38282 { header_up Authorization "Bearer <admin token>" }
+    reverse_proxy 127.0.0.1:38281
+}
+```
+
+Without that proxy the UI loads, shows the version badge and serves as the join page, but its `/api` calls get a 404 from the public port.
 
 ## Uploads
 The admin API (`--data-dir /data`, port 38282) stores uploaded files as `/data/<kind>/<game>/<sha256>.<ext>` (`/data/apworlds/...`, `/data/yamls/...`; layout in the README). Game manifests will land in `/data/manifests/<game>/` once their upload route ships (#101). Back up the `data` volume and the `pgdata` volume together: uploads are files, the room logs and finished seeds are in Postgres.
