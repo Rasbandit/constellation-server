@@ -22,3 +22,5 @@ A client reaches a room at `<key>.<host>:<port>` (the first label of the `Host` 
 ## Releases
 
 Pushing a tag `v*` runs `.github/workflows/release.yml`, which pushes `linux/amd64` to `ghcr.io/<owner>/constellation-server`.
+
+A merge to `main` publishes `:main` and `:sha-xxxxxxx`; FastRaid deploys `:main`.
