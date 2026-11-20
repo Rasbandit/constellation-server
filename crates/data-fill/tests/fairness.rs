@@ -148,3 +148,31 @@ fn a_room_is_measured_against_the_same_baseline() {
     assert!(r["baseline"]["max_deviation"]["value"].as_f64().is_some_and(|d| d < 0.25), "{r}");
     assert_eq!(r["independence"]["flag"], Value::Bool(false));
 }
+
+#[test]
+fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
+    use data_fill::fairness::{Flat, sample_room};
+    use data_fill::room::{self, Seat};
+    let v: Value =
+        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
+    let w = World::load(&v["manifest"]).expect("world");
+    let mut inst: Instance = serde_json::from_value(v["instances"][0].clone()).expect("instance");
+    inst.locked.insert("l6".to_owned(), "coin".to_owned());
+    inst.pool.retain(|k| k != "coin");
+    let plan = Plan::new(&w, &inst).expect("plan");
+    // The plan locks the sixth location of a world that has one.
+    let tiny = World::load(&serde_json::json!({
+        "options": [], "items": [{"key": "coin", "id": 1}],
+        "locations": [{"key": "a", "id": 1}], "start": "r",
+        "x.time": {"slices": 1, "start_mask": 1}, "defs": {},
+        "regions": [{"key": "r", "can_stay": false, "checks": [{"loc": "a", "rule": {"true": {}}}],
+                     "exits": [], "events": [], "stays": []}],
+        "goal": {"reach": "region:r"}
+    }))
+    .expect("tiny world");
+    let prog = vec![false];
+    let seats = [Seat { w: &tiny, plan: &plan, progression: &prog }];
+    let flat = Flat::new(&seats).expect("flat");
+    assert!(room::check_placed(&seats, &[vec![None]]).is_err());
+    assert!(sample_room(&seats, &flat, 1, 0, 0).is_err());
+}

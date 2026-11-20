@@ -409,6 +409,7 @@ pub fn sample_room(
 ) -> Result<Sampled, crate::FillError> {
     use crate::room::{Given, check_placed, fill_room, locked_placed, permits};
     let mut out = Sampled::default();
+    crate::room::check(seats)?;
     check_placed(seats, &locked_placed(seats))?;
     for s in 1..=seeds {
         match fill_room(seats, &mut seeded(s, b"fill\0\0\0\0"), config::FILL_MAX_ATTEMPTS) {

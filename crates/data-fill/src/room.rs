@@ -185,9 +185,9 @@ pub fn validate_room(
 /// Whether the placement rules let `g` sit at `loc` of `player`'s world (logic is not
 /// consulted): an item with a placement group stays in its owner's world and group, and no
 /// progression goes on an excluded location.
-#[must_use]
 ///
 /// `false` for a player, owner or location that is not in the room.
+#[must_use]
 pub fn permits(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
     let (Some(owner), Some(here)) = (seats.get(usize::from(g.to)), seats.get(usize::from(player)))
     else {
@@ -280,7 +280,7 @@ pub fn cross_world_share(
 
 /// The seats fit together: a room's size, and each plan and progression list belong to the
 /// seat's world (so no index a state later takes from them can be out of range).
-fn check(seats: &[Seat<'_>]) -> Result<(), FillError> {
+pub(crate) fn check(seats: &[Seat<'_>]) -> Result<(), FillError> {
     too_many(seats.len())?;
     let bad = |p: usize, what: &str| {
         Err(FillError::Instance(format!("player {}: {what} does not fit the world", p + 1)))
@@ -471,9 +471,13 @@ impl<'a, 'w> Linked<'a, 'w> {
     /// Run states and pass their messages on until nothing is left to do.
     fn settle(&mut self) {
         loop {
-            while let Some(p) = self.outboxes.pop() {
-                self.deliver(p);
+            // Ascending by player, as every delivery has always been: ranks and counters follow.
+            self.outboxes.sort_unstable();
+            self.outboxes.dedup();
+            for i in 0..self.outboxes.len() {
+                self.deliver(self.outboxes[i]);
             }
+            self.outboxes.clear();
             let Some(Reverse(p)) = self.ready.pop() else { return };
             self.queued[p] = false;
             if !self.models[p].idle() {
@@ -562,6 +566,8 @@ impl<'a, 'w> Linked<'a, 'w> {
         }
         self.models[o].end_cascade(before);
         self.rederiving = true;
+        // Ascending by player: re-deriving hands out ranks.
+        self.touched_list.sort_unstable();
         for i in 0..self.touched_list.len() {
             let p = self.touched_list[i];
             if !std::mem::replace(&mut self.gated[p], true) {
