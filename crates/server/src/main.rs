@@ -7,8 +7,23 @@
 
 use std::process::ExitCode;
 
+fn main() -> ExitCode {
+    // The child side of a manifest fill or check: no logging, no runtime, one job from stdin.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("fill-job") {
+        return match server::fill_job(&args.next().unwrap_or_default()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn serve() -> ExitCode {
     server::init_logging();
     let args = match server::Args::parse(std::env::args().skip(1)) {
         Ok(a) => a,

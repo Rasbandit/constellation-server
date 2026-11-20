@@ -12,11 +12,13 @@
 //! With `--data-dir` it also serves the admin API for uploads and seed generation
 //! ([`worlds`], run in [`sandbox`]).
 
+mod manifests;
 mod room_view;
 mod sandbox;
 mod web;
 mod worlds;
 
+pub use sandbox::fill_job;
 pub mod host;
 pub mod rooms;
 
@@ -261,6 +263,7 @@ fn mount_admin(
             host.waker(),
             host.folder().map(|f| (f, public_addr)),
             proxy_header,
+            host.manifest_db(),
         )),
         None => router,
     }

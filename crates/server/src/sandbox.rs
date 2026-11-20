@@ -223,34 +223,97 @@ impl Sandbox {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Vec<u8>, Failure> {
-        exec(&self.argv(with_ap, mounts, args), &self.limits, timeout).await
+        exec(&self.argv(with_ap, mounts, args), &[], &self.limits, timeout).await
     }
 }
 
-/// Run `argv` (program first) with no input, and return its stdout (at most
+/// The command line of a data-only job: this very executable in `job` mode (`fill-job`, see
+/// [`fill_job`]), under `prlimit` caps on address space, CPU time, open files and file size. No
+/// sandbox: the job reads data, never code; the caps and the wall-clock kill bound what a huge
+/// or hostile manifest can cost.
+#[must_use]
+pub fn job_argv(exe: &Path, job: &str, l: &Limits) -> Vec<OsString> {
+    let caps = [
+        format!("--as={}", l.fill_memory_bytes),
+        format!("--cpu={}", l.fill_cpu_secs),
+        format!("--nofile={}", l.gen_max_open_files),
+        "--fsize=0".to_owned(),
+    ];
+    let mut a: Vec<OsString> = vec!["/usr/bin/prlimit".into()];
+    a.extend(caps.into_iter().map(OsString::from));
+    a.extend(["--".into(), exe.into(), "fill-job".into(), job.into()]);
+    a
+}
+
+/// Run a data-only job (`generate` or `inspect`) in a capped child process: `input` on its
+/// stdin, its stdout back. A child past `timeout` is killed and reaped before this returns.
+///
+/// # Errors
+/// As [`Sandbox::run`].
+pub async fn run_job(
+    job: &str,
+    input: &[u8],
+    l: &Limits,
+    timeout: Duration,
+) -> Result<Vec<u8>, Failure> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Failure::Broken(format!("cannot find this executable: {e}")))?;
+    exec(&job_argv(&exe, job, l), input, l, timeout).await
+}
+
+/// The child side of [`run_job`]: read stdin, run the job, print the result.
+///
+/// # Errors
+/// What the job refused, or an IO error on the pipes.
+pub fn fill_job(job: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
+    let out = match job {
+        "generate" => data_fill::job::generate(&input)?,
+        "inspect" => data_fill::job::inspect(&input)?,
+        other => return Err(format!("unknown job {other:?}")),
+    };
+    std::io::stdout().write_all(&out).map_err(|e| e.to_string())
+}
+
+/// Run `argv` (program first) with `input` on its stdin, and return its stdout (at most
 /// `Limits::gen_stdout_max_bytes`); see [`Sandbox::run`].
-async fn exec(argv: &[OsString], l: &Limits, timeout: Duration) -> Result<Vec<u8>, Failure> {
+async fn exec(
+    argv: &[OsString],
+    input: &[u8],
+    l: &Limits,
+    timeout: Duration,
+) -> Result<Vec<u8>, Failure> {
     let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
     let mut child = tokio::process::Command::new(program)
         .args(rest)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Dropping the child on timeout kills bwrap; `--die-with-parent` takes the rest.
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| Failure::Broken(format!("cannot start the sandbox (is bwrap installed?): {e}")))?;
+    let mut stdin = child.stdin.take();
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(Failure::Broken("no pipes to the sandbox".into()));
     };
+    let feed = async move {
+        // A child that stops reading closes the pipe: its exit status says why.
+        if let Some(mut pipe) = stdin.take() {
+            drop(tokio::io::AsyncWriteExt::write_all(&mut pipe, input).await);
+        }
+    };
     let all = async {
         tokio::join!(
+            feed,
             drain(out, l.gen_stdout_max_bytes, Keep::Head),
             drain(err, l.gen_error_max_bytes, Keep::Tail),
             child.wait()
         )
     };
-    let Ok((out, err, status)) = tokio::time::timeout(timeout, all).await else {
+    let Ok(((), out, err, status)) = tokio::time::timeout(timeout, all).await else {
         // Kill bwrap and reap it before reporting; its sandbox goes with it.
         if let Err(e) = child.kill().await {
             tracing::warn!(error = %e, "could not kill a timed-out sandbox");
@@ -584,8 +647,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_result_of_exactly_the_stdout_cap_is_kept_and_one_byte_more_is_refused() {
         let l = Limits { gen_stdout_max_bytes: 5, ..Limits::DESIGN };
-        assert_eq!(exec(&sh("printf 12345"), &l, NEVER).await.unwrap(), b"12345");
-        let e = exec(&sh("printf 123456"), &l, NEVER).await.unwrap_err();
+        assert_eq!(exec(&sh("printf 12345"), &[], &l, NEVER).await.unwrap(), b"12345");
+        let e = exec(&sh("printf 123456"), &[], &l, NEVER).await.unwrap_err();
         assert_eq!(e, Failure::Broken("the sidecar printed more than 5 bytes".into()));
     }
 
@@ -593,8 +656,33 @@ pub(crate) mod tests {
     async fn a_sidecar_that_fails_is_refused_with_the_end_of_its_error_output() {
         let l = Limits { gen_error_max_bytes: 4, ..Limits::DESIGN };
         let fails = sh("printf out; printf 'long reason' >&2; exit 3");
-        let e = exec(&fails, &l, NEVER).await.unwrap_err();
+        let e = exec(&fails, &[], &l, NEVER).await.unwrap_err();
         assert_eq!(e, Failure::Refused("ason (exit status: 3)".into()));
+    }
+
+    #[tokio::test]
+    async fn input_reaches_the_child_and_a_child_past_its_time_is_killed_not_left_running() {
+        let l = Limits::DESIGN;
+        assert_eq!(exec(&sh("cat"), b"fed in", &l, NEVER).await.unwrap(), b"fed in");
+        let root = temp("kill");
+        let pidfile = root.join("pid");
+        let hang = sh(&format!("echo $$ > {}; exec sleep 30", pidfile.display()));
+        let e = exec(&hang, &[], &l, Duration::from_millis(300)).await.unwrap_err();
+        assert!(matches!(&e, Failure::Broken(m) if m.contains("killed")), "{e:?}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the child {pid} is gone");
+    }
+
+    #[test]
+    fn a_job_child_runs_this_executable_under_the_fill_caps() {
+        let l = Limits { fill_memory_bytes: 7, fill_cpu_secs: 3, ..Limits::DESIGN };
+        let a: Vec<String> = job_argv(Path::new("/x/server"), "generate", &l)
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(a[0], "/usr/bin/prlimit");
+        assert!(a.contains(&"--as=7".to_owned()) && a.contains(&"--cpu=3".to_owned()), "{a:?}");
+        assert_eq!(a[a.len() - 3..], ["/x/server", "fill-job", "generate"]);
     }
 
     #[test]
