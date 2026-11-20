@@ -48,7 +48,7 @@ jobs:
       # (bubblewrap under the seccomp profile) and must land under /data/yamls/<game>/.
       - run: |
           A=http://127.0.0.1:38282
-          T=$(cat secrets/admin_token)
+          T=$(sudo cat secrets/admin_token)
           test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
           test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
           printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml

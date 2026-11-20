@@ -31,7 +31,7 @@ The admin API (`--data-dir /data`, port 38282) stores uploaded files as `/data/<
 The API runs uploaded code, so the compose file publishes it on `127.0.0.1` only. Reach it by SSH (`ssh -L 38282:127.0.0.1:38282 host`) or through a TLS proxy. Every route needs `Authorization: Bearer <token>`; the token is the Docker secret `secrets/admin_token` (at least 32 bytes: `openssl rand -hex 16 > secrets/admin_token`; `chmod 400` and `sudo chown 10001` it like the database URL).
 
 ```sh
-TOKEN=$(cat secrets/admin_token)
+TOKEN=$(sudo cat secrets/admin_token)
 curl -H "Authorization: Bearer $TOKEN" --data-binary @player.yaml \
   "http://127.0.0.1:38282/api/yamls?name=player.yaml"
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:38282/api/yamls
