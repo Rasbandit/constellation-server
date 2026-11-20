@@ -29,11 +29,11 @@ CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHO
     --port 0 --data-dir "$work/data" 2>"$work/log" &
 pid=$!
 for _ in $(seq 100); do
-    # The admin API has its own listener (loopback); its line comes before the room's.
+    # The admin API is on the room's port.
     grep -q 'listening addr=' "$work/log" && break
     sleep 0.1
 done
-addr=$(grep -o 'admin api addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
+addr=$(grep -o 'listening addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
 [ -n "${addr:-}" ] || { cat "$work/log"; exit 1; }
 
 api() { curl -sS --fail-with-body -H @"$work/auth" "$@"; }

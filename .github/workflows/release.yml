@@ -49,11 +49,13 @@ jobs:
           chmod 400 secrets/database_url secrets/admin_token
           sudo chown 10001 secrets/database_url secrets/admin_token
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
-      # The admin API: 401 without the token, 200 with it. Then a yaml upload runs the sandbox
-      # (bubblewrap under the seccomp profile) and must land under /data/yamls/<game>/.
+      # The admin API is on the one public port: 401 without the token, 200 with it. Then a yaml
+      # upload runs the sandbox (bubblewrap under the seccomp profile) and must land under
+      # /data/yamls/<game>/. The token is masked so it cannot show in the log.
       - run: |
-          A=http://127.0.0.1:38282
+          A=http://127.0.0.1:38281
           T=$(sudo cat secrets/admin_token)
+          echo "::add-mask::$T"
           test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
           test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
           printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
@@ -62,13 +64,13 @@ jobs:
           test "$code" = 201
           docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
       # The one public port serves the UI and the version: `/` is the app, a missing asset is a
-      # 404, /version carries the build, and the admin API is not on this port.
+      # 404, /version carries the build, and /api without the token is a 401, not the app.
       - run: |
           P=http://127.0.0.1:38281
           curl -sf $P/ | grep -qi '<div id="root">'
           curl -sf -H 'Accept: text/html' $P/abcdefgh23 | grep -qi '<div id="root">'
           test "$(curl -s -o /dev/null -w '%{http_code}' $P/assets/missing.js)" = 404
-          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/yamls)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/yamls)" = 401
           curl -sf $P/version | grep -q '"version":"'
           js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
           curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'

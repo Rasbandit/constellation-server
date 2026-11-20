@@ -23,10 +23,6 @@ services:
       - /opt/constellation/web
       - --data-dir
       - /data
-      - --admin-host
-      - 0.0.0.0
-      - --admin-port
-      - "38282"
       - --public-host
       - ${CONSTELLATION_PUBLIC_HOST:-localhost}
     environment:
@@ -46,8 +42,6 @@ services:
       - systempaths=unconfined
     ports:
       - "${CONSTELLATION_PORT:-38281}:38281"
-      # The admin API runs uploaded code: loopback on the host only. Reach it by SSH or a proxy.
-      - "127.0.0.1:${CONSTELLATION_ADMIN_PORT:-38282}:38282"
     volumes:
       - data:/data
   postgres:
