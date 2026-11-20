@@ -1076,6 +1076,9 @@ mod tests {
         std::fs::write(dist.join("index.html"), "<!doctype html><title>UI</title>").unwrap();
         std::fs::write(dist.join("assets/app-abc123.js"), "console.log(1)").unwrap();
         std::fs::write(root.join("secret.txt"), "TOP SECRET").unwrap();
+        std::fs::write(dist.join(".env"), "TOP SECRET dotfile").unwrap();
+        std::fs::create_dir_all(dist.join(".git")).unwrap();
+        std::fs::write(dist.join(".git/config"), "TOP SECRET dotfile").unwrap();
         std::os::unix::fs::symlink(root.join("secret.txt"), dist.join("leak.txt")).unwrap();
         std::os::unix::fs::symlink(&root, dist.join("outside")).unwrap();
         (root, dist)
@@ -1152,9 +1155,18 @@ mod tests {
             );
         }
         // A missing file with an extension, or anything under /assets, is a 404, not the app.
-        for path in
-            ["/assets/gone.js", "/assets/gone", "/favicon.ico", "/x.map", "/api/yamls", "/api"]
-        {
+        for path in [
+            "/assets/gone.js",
+            "/assets/gone",
+            "/favicon.ico",
+            "/x.map",
+            "/api/yamls",
+            "/api",
+            "//assets/gone",
+            "/%61ssets/gone",
+            "/.env",
+            "/.git/config",
+        ] {
             assert!(raw(addr, path, "").await.starts_with("HTTP/1.1 404"), "{path}");
         }
         // The app only for a request that accepts HTML.
@@ -1162,6 +1174,16 @@ mod tests {
         assert!(json.starts_with("HTTP/1.1 404"), "{json}");
         let page = raw(addr, "/create", "Accept: text/html,application/xhtml+xml;q=0.9\r\n").await;
         assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        // Query strings, a trailing slash, a direct index.html and a doubled slash before a real
+        // asset all work, and the asset stays immutable.
+        for path in ["/?x=1", "/create/", "/index.html", "/assets/app-abc123.js?v=1"] {
+            assert!(raw(addr, path, "").await.starts_with("HTTP/1.1 200"), "{path}");
+        }
+        let dbl = raw(addr, "//assets/app-abc123.js", "").await;
+        assert!(dbl.starts_with("HTTP/1.1 200") && dbl.contains("console.log(1)"), "{dbl}");
+        assert!(dbl.contains("immutable"), "{dbl}");
+        let head = raw_method(addr, "HEAD", "/assets/app-abc123.js", "").await;
+        assert!(head.starts_with("HTTP/1.1 200") && !head.contains("console.log"), "{head}");
         // A directory is not a file.
         assert!(raw(addr, "/assets", "").await.starts_with("HTTP/1.1 404"));
         // The probes keep working.
@@ -1196,6 +1218,18 @@ mod tests {
         let again =
             raw(addr, js, &format!("Accept-Encoding: gzip, br\r\nIf-None-Match: {etag}\r\n")).await;
         assert!(again.starts_with("HTTP/1.1 304") && !again.contains("BROTLI"), "{again}");
+        // A list, a weak form and `*` match too; another tag does not.
+        for m in [
+            format!("W/\"nope\", {etag}"),
+            etag.trim_start_matches("W/").to_owned(),
+            "*".to_owned(),
+        ] {
+            let r = raw(addr, js, &format!("Accept-Encoding: gzip, br\r\nIf-None-Match: {m}\r\n"))
+                .await;
+            assert!(r.starts_with("HTTP/1.1 304"), "{m}: {r}");
+        }
+        let other = raw(addr, js, "Accept-Encoding: gzip, br\r\nIf-None-Match: \"nope\"\r\n").await;
+        assert!(other.starts_with("HTTP/1.1 200"), "{other}");
         // HEAD: the headers of the GET, no body.
         let head = raw_method(addr, "HEAD", "/create", "").await;
         assert!(head.starts_with("HTTP/1.1 200") && !head.contains("<title>"), "{head}");
@@ -1248,9 +1282,18 @@ mod tests {
             "/leak.txt",
             "/outside/secret.txt",
             "/outside/dist/../secret.txt",
+            "/.env",
+            "/.git/config",
+            "/assets/.env",
         ] {
             let r = raw(addr, path, "").await;
             assert!(!r.contains("TOP SECRET"), "{path} leaked: {r}");
+            // Refused (404, or 400 for a path hyper rejects), or just the app: never a 5xx.
+            let ok = r.starts_with("HTTP/1.1 404") || r.starts_with("HTTP/1.1 400");
+            assert!(
+                ok || (r.starts_with("HTTP/1.1 200") && r.contains("<title>UI</title>")),
+                "{path}: {r}"
+            );
         }
         drop(std::fs::remove_dir_all(&root));
     }

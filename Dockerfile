@@ -15,7 +15,11 @@ RUN bun --bun run build && bun scripts/precompress.mjs
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY . .
+# Only what cargo reads: the web/ folder never reaches this stage, so a web-only edit leaves this
+# layer and the cargo build cached (and the other way round for the web stage).
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY migrations migrations
+COPY crates crates
 # Empty on a release build; any other build shows `<version>+<short sha>` at GET /version.
 ARG BUILD_SHA=""
 ENV CONSTELLATION_BUILD_SHA=$BUILD_SHA

@@ -45,9 +45,13 @@ impl WebDir {
 
     /// The answer to a GET or HEAD of `path`.
     pub(crate) async fn serve(&self, method: &Method, path: &str, h: &HeaderMap) -> Response {
-        let target = if self.is_file(path).await {
-            path
-        } else if falls_back(method, path, h) {
+        // One normal form (no empty segments) for every decision below and for `ServeDir`, so
+        // `//assets/x` is `/assets/x` everywhere. It is not percent-decoded.
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let normal = format!("/{}", parts.join("/"));
+        let target = if self.is_file(&parts).await {
+            normal.as_str()
+        } else if falls_back(method, path, &parts, h) {
             "/index.html"
         } else {
             return StatusCode::NOT_FOUND.into_response();
@@ -65,13 +69,13 @@ impl WebDir {
         finish(res.map(Body::new), target, h)
     }
 
-    /// `path` names a regular file inside the folder. The path is not percent-decoded, so `%2e%2e`
-    /// is just a name that does not exist; `..` is refused here, and a symlink out is refused by
-    /// the check on the resolved path.
-    async fn is_file(&self, path: &str) -> bool {
+    /// The segments name a regular file inside the folder. They are not percent-decoded, so
+    /// `%2e%2e` is just a name that does not exist; `..` and dotfiles (`.env`, `.git/`) are
+    /// refused here, and a symlink out is refused by the check on the resolved path.
+    async fn is_file(&self, parts: &[&str]) -> bool {
         let mut file = self.root.clone();
-        for part in path.split('/').filter(|p| !p.is_empty()) {
-            if matches!(part, "." | "..") || part.contains(['\\', '\0']) {
+        for part in parts {
+            if part.starts_with('.') || part.contains(['\\', '\0']) {
                 return false;
             }
             file.push(part);
@@ -84,17 +88,19 @@ impl WebDir {
 }
 
 /// May this missing path be answered with the app? Only a page load: a GET or HEAD that accepts
-/// HTML (no `Accept` counts), for a name without an extension outside `/assets/`.
-fn falls_back(method: &Method, path: &str, h: &HeaderMap) -> bool {
+/// HTML (no `Accept` counts), for a name without an extension, dot segment or `%` escape, outside `/assets/`
+/// and `/api/` (the admin API is never on this port).
+fn falls_back(method: &Method, path: &str, parts: &[&str], h: &HeaderMap) -> bool {
     let accepts_html = h.get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_none_or(|a| {
         a.split(',')
             .any(|t| matches!(t.split(';').next().map(str::trim), Some("text/html" | "*/*")))
     });
-    let last = path.rsplit('/').next().unwrap_or_default();
     matches!(*method, Method::GET | Method::HEAD)
         && accepts_html
-        && !last.contains('.')
-        && ["/assets", "/api"].iter().all(|d| path != *d && !path.starts_with(&format!("{d}/")))
+        && !path.contains('%')
+        && parts.iter().all(|p| !p.starts_with('.'))
+        && parts.last().is_none_or(|last| !last.contains('.'))
+        && parts.first().is_none_or(|first| !matches!(*first, "assets" | "api"))
 }
 
 /// The headers every UI answer carries, and a weak `ETag` (size and mtime, per encoding) with
@@ -117,7 +123,7 @@ fn finish(mut res: Response, target: &str, req: &HeaderMap) -> Response {
     }
     let tag = etag(res.headers());
     if let Some(tag) = tag.and_then(|t| HeaderValue::from_str(&t).ok()) {
-        let same = req.get(header::IF_NONE_MATCH).is_some_and(|m| m.as_bytes() == tag.as_bytes());
+        let same = req.get(header::IF_NONE_MATCH).is_some_and(|m| matches_tag(m, &tag));
         res.headers_mut().insert(header::ETAG, tag);
         if same {
             *res.body_mut() = Body::empty();
@@ -134,4 +140,15 @@ fn etag(h: &HeaderMap) -> Option<String> {
     let secs = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
     let enc = h.get(header::CONTENT_ENCODING).and_then(|e| e.to_str().ok()).unwrap_or("id");
     Some(format!("W/\"{len}-{secs:x}-{enc}\""))
+}
+
+/// `If-None-Match` holds `*` or a list of tags; a weak tag matches its strong form.
+fn matches_tag(header: &HeaderValue, tag: &HeaderValue) -> bool {
+    let strong = |t: &[u8]| t.strip_prefix(b"W/").unwrap_or(t).to_vec();
+    let ours = strong(tag.as_bytes());
+    header
+        .as_bytes()
+        .split(|b| *b == b',')
+        .map(<[u8]>::trim_ascii)
+        .any(|t| t == b"*" || strong(t) == ours)
 }
