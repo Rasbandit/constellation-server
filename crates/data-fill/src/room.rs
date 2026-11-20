@@ -507,10 +507,10 @@ impl Steps<'_, '_> {
         rng.shuffle(&mut prog);
         let mut locs = free.clone();
         rng.shuffle(&mut locs);
-        let mut prev = None;
-        self.restrictive(&mut confined, &prog, &mut locs, &mut placed, &mut prev)?;
+        let mut prev = Vec::new();
+        self.restrictive(&groups(confined, false), &prog, &mut locs, &mut placed, &mut prev)?;
         locs.retain(|(p, l)| !seats[usize::from(*p)].plan.excluded[*l as usize]);
-        self.restrictive(&mut prog, &[], &mut locs, &mut placed, &mut prev)?;
+        self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
         // Everything else goes anywhere left, excluded locations included.
         rng.shuffle(&mut rest);
         let mut left: Vec<(u16, u32)> = free
@@ -524,8 +524,8 @@ impl Steps<'_, '_> {
         // The finished room, for the beatability check: collect the last placed item and the
         // rest, which only adds to the fixed point.
         let room = &mut self.room;
-        match prev {
-            Some(_) if self.extend => {
+        match prev.is_empty() {
+            false if self.extend => {
                 room.reset_stats();
                 for (p, row) in placed.iter().enumerate() {
                     for (l, g) in row.iter().enumerate() {
@@ -545,51 +545,88 @@ impl Steps<'_, '_> {
         Ok(placed)
     }
 
+    /// Place each group in turn against a state that holds none of the group (but everything
+    /// not yet placed outside it, and everything placed): every item goes to the first location
+    /// of `locs` that is reached in that state and allows it.
     fn restrictive(
         &mut self,
-        items: &mut Vec<Given>,
+        groups: &[Vec<Given>],
         also_held: &[Given],
         locs: &mut Vec<(u16, u32)>,
         placed: &mut [Vec<Option<Given>>],
-        prev: &mut Option<((u16, u32), Given)>,
+        prev: &mut Vec<((u16, u32), Given)>,
     ) -> Result<(), FillError> {
         let seats = self.room.seats;
-        while let Some(item) = items.pop() {
-            let carried = match *prev {
-                Some(((p, l), g)) if self.extend => {
-                    self.room.reset_stats();
-                    self.room.place(usize::from(p), l, g);
-                    let removed = self.room.take_back(item.to, item.item);
-                    self.rederived += u32::from(removed);
-                    self.room.absorb(&mut self.stats);
-                    true
+        for (k, group) in groups.iter().enumerate() {
+            let carried = if !prev.is_empty() && self.extend {
+                // The last group goes where it was put, then this group is taken back.
+                self.room.reset_stats();
+                for ((p, l), g) in prev.drain(..) {
+                    self.room.hold(usize::from(p), l, g);
                 }
-                _ => false,
+                self.room.settle();
+                for g in group {
+                    self.rederived += u32::from(self.room.take_back(g.to, g.item));
+                }
+                self.room.absorb(&mut self.stats);
+                true
+            } else {
+                false
             };
             if !carried {
                 self.held.iter_mut().for_each(Vec::clear);
-                for g in items.iter().chain(also_held) {
+                for g in groups[k + 1..].iter().flatten().chain(also_held) {
                     self.held[usize::from(g.to)].push(g.item);
                 }
                 self.room.solve(&self.held, placed);
                 self.solves += 1;
                 self.room.absorb(&mut self.stats);
             }
-            let pos = locs.iter().position(|(p, l)| {
-                self.room.models[usize::from(*p)].reached(*l) && confined_ok(seats, item, *p, *l)
-            });
-            let Some(pos) = pos else {
-                let w = seats[usize::from(item.to)].w;
-                return Err(FillError::Stuck {
-                    item: w.item_key(item.item).to_owned(),
-                    attempts: 1,
+            prev.clear();
+            for item in group {
+                let pos = locs.iter().position(|(p, l)| {
+                    self.room.models[usize::from(*p)].reached(*l)
+                        && confined_ok(seats, *item, *p, *l)
                 });
-            };
-            let (p, l) = locs.remove(pos);
-            placed[usize::from(p)][l as usize] = Some(item);
-            *prev = Some(((p, l), item));
+                let Some(pos) = pos else {
+                    let w = seats[usize::from(item.to)].w;
+                    return Err(FillError::Stuck {
+                        item: w.item_key(item.item).to_owned(),
+                        attempts: 1,
+                    });
+                };
+                let (p, l) = locs.remove(pos);
+                placed[usize::from(p)][l as usize] = Some(*item);
+                prev.push(((p, l), *item));
+            }
         }
         Ok(())
+    }
+}
+
+/// The order items are placed in, each inner list placed together. One at a time, last of the
+/// pool first; or `per_player`: rounds that take the last item of every player's own pile, the
+/// piles in the order players first appear in the pool (the reference multiplayer fill's
+/// default). The items of a round are placed against a state that holds none of them, which
+/// favours earlier locations; with one player a round is one item.
+fn groups(pool: Vec<Given>, per_player: bool) -> Vec<Vec<Given>> {
+    if !per_player {
+        return pool.into_iter().rev().map(|g| vec![g]).collect();
+    }
+    let mut piles: Vec<(u16, Vec<Given>)> = Vec::new();
+    for g in pool {
+        match piles.iter_mut().find(|(o, _)| *o == g.to) {
+            Some((_, v)) => v.push(g),
+            None => piles.push((g.to, vec![g])),
+        }
+    }
+    let mut out = Vec::new();
+    loop {
+        let round: Vec<Given> = piles.iter_mut().filter_map(|(_, v)| v.pop()).collect();
+        if round.is_empty() {
+            return out;
+        }
+        out.push(round);
     }
 }
 
@@ -639,6 +676,26 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn rounds_take_the_last_item_of_each_players_pile() {
+        let g = |to, item| Given { to, item };
+        let pool = vec![g(1, 10), g(0, 1), g(1, 11), g(0, 2), g(1, 12)];
+        // Piles in order of first appearance: player 1 [10, 11, 12], player 0 [1, 2].
+        assert_eq!(
+            groups(pool.clone(), true),
+            vec![vec![g(1, 12), g(0, 2)], vec![g(1, 11), g(0, 1)], vec![g(1, 10)]]
+        );
+        // One at a time: the pool from its end.
+        assert_eq!(
+            groups(pool, false).concat(),
+            vec![g(1, 12), g(0, 2), g(1, 11), g(0, 1), g(1, 10)]
+        );
+        assert!(groups(Vec::new(), true).is_empty());
+        // One player: a round is one item, the same order as one at a time.
+        let one = vec![g(0, 5), g(0, 6), g(0, 7)];
+        assert_eq!(groups(one.clone(), true), groups(one, false));
     }
 
     #[test]
