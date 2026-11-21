@@ -1,8 +1,8 @@
 name: ci
-# POC mode: fmt, the unit tests and the data-fill integration tests. Docs-only PRs still run
-# `check` (it is a required check) but skip every step after the scope test. No database, no
-# end-to-end.
-# The full suite with Postgres is the manual `properties` job in nightly.yml; locally `just check`.
+# One job: fmt, the unit tests, the data-fill integration tests, the Python tools, the web app,
+# the version check and the Postgres tests. Sandbox (bwrap) and mutation tests are not run in
+# CI for now (see #185). Docs-only PRs still run `check` (it is a required check) but skip every
+# step after the scope test.
 # The push to main keeps the build cache warm; PRs only restore it.
 on:
   pull_request:
@@ -20,7 +20,16 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
+    # A throwaway Postgres for the `pg-tests` feature; the password is not a secret.
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: constellation_test }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      CONSTELLATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/constellation_test
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
@@ -55,3 +64,19 @@ jobs:
         run: python -m pip install pyyaml
       - if: steps.scope.outputs.code != 'false'
         run: python -m unittest discover -s tools/ap-gen && python -m unittest discover -s tools/ap-import && python -m unittest discover -s tools/port-check
+      - if: steps.scope.outputs.code != 'false'
+        uses: oven-sh/setup-bun@v2
+      # Not frozen: bun.lock is from an older bun and a frozen install fails on it.
+      - if: steps.scope.outputs.code != 'false'
+        working-directory: web
+        run: bun install && bun --bun run typecheck && bun --bun run test
+      # One version for server, web and image: Cargo.toml's workspace version. The test feeds
+      # the script mismatched fixtures.
+      - if: steps.scope.outputs.code != 'false'
+        run: shellcheck tools/version-check/*.sh && sh tools/version-check/test.sh && sh tools/version-check/check.sh
+      # The log store contract suite and G-DB race tests on Postgres, then the server's tests with
+      # Postgres (the restart scenarios). `--manifest-path`: `-p log` also names the crates.io crate.
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test --manifest-path crates/log/Cargo.toml --features pg-tests --lib --locked
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p server --features pg-tests --locked

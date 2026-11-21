@@ -1,6 +1,6 @@
 name: release
-# The image is built on main and on tags, never on PRs (packaging PRs get the seconds-long
-# container-lint workflow). A push to main builds it, runs it under compose and, if that passes,
+# The image is built on main and on tags, never on PRs. The smoke job lints the packaging first
+# (hadolint, shellcheck, the entrypoint and db-roles tests, the compose config). A push to main builds it, runs it under compose and, if that passes,
 # publishes it to GHCR as `main` and `sha-<short sha>`. A tag vX.Y.Z (equal to the Cargo.toml
 # version) publishes the version tags and `latest`. A manual run (workflow_dispatch) builds and
 # runs it on any branch without pushing.
@@ -22,6 +22,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008 # apt packages are not version-pinned: bookworm-slim security updates matter more
+      - run: shellcheck docker/*.sh
+      # Exit 3 -> 0, other codes pass through, SIGTERM is forwarded.
+      - run: sh docker/test-entrypoint.sh
+      - run: sh docker/test-db-roles.sh
+      # The secret files only need to exist for the config check (the smoke step fills them).
+      - run: |
+          mkdir -p secrets && touch secrets/database_url secrets/migrate_database_url secrets/postgres_password secrets/app_password secrets/migrate_password
+          GEN_REPO_URL=x GEN_REPO_REF=x docker compose config -q
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
         with:
@@ -42,7 +54,7 @@ jobs:
           GEN_REPO_REF: ${{ vars.GEN_REPO_REF }}
       # Run the built image under compose: uid, secret read, healthcheck, Postgres 18 volume.
       - run: |
-          mkdir secrets
+          mkdir -p secrets
           echo ci-password > secrets/postgres_password
           echo ci-app-password > secrets/app_password
           echo ci-migrate-password > secrets/migrate_password

@@ -1,7 +1,0 @@
-#!/bin/sh
-# Cargo target runner for the nightly mutants job: runs one test binary (nextest starts one
-# per test) in its own systemd scope with a memory cap and no swap. A mutant that allocates
-# without end gets that one process killed (the mutant counts as caught); cargo-mutants,
-# cargo and rustc stay outside every cap. Needs .github/actions/user-systemd first.
-exec systemd-run --user --scope --quiet --collect \
-  -p "MemoryMax=${TEST_MEMORY_MAX:-3G}" -p MemorySwapMax=0 -- "$@"
