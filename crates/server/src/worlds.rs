@@ -455,12 +455,25 @@ impl Worlds {
         let Ok(entries) = std::fs::read_dir(self.dir.join("worlds")) else { return };
         let mut moved = 0_usize;
         for world in entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()) {
-            // A job's copies of its inputs, left by a process that stopped mid-job.
-            for sub in [Kind::Apworld.folder(), Kind::Yaml.folder()] {
-                drop(std::fs::remove_dir_all(world.join(sub)));
-            }
             let file = world.join("status.json");
-            if let Some(mut status) = read_json(&file) {
+            let found = read_json(&file);
+            // A job's copies of its inputs, left by a process that stopped mid-job: said in the
+            // log (which world, how far it got, what it held) before they go.
+            let inputs = [Kind::Apworld.folder(), Kind::Yaml.folder()].map(|sub| world.join(sub));
+            if inputs.iter().any(|d| d.exists()) {
+                let name = world.file_name().map(|n| n.to_string_lossy().into_owned());
+                let state = found.as_ref().and_then(|s| s["status"].as_str()).unwrap_or("unknown");
+                tracing::warn!(
+                    world = name.as_deref().unwrap_or(""),
+                    state,
+                    held = folder_contents(&world),
+                    "a stopped server left this job folder; its copies of the inputs are removed"
+                );
+                for dir in &inputs {
+                    drop(std::fs::remove_dir_all(dir));
+                }
+            }
+            if let Some(mut status) = found {
                 if matches!(status["status"].as_str(), Some("queued" | "running")) {
                     status["status"] = json!(JobState::Failed.as_str());
                     status["error"] = json!("the server restarted before this generation finished");
@@ -505,6 +518,39 @@ impl Worlds {
             }
         }
         Ok(())
+    }
+}
+
+/// Most files a job folder's log line names; past it the line says how many more.
+const LOGGED_FILES: usize = 32;
+
+/// What a job folder holds, for its log line: each file under it with its size, in name order.
+/// Links are named, never followed.
+fn folder_contents(dir: &Path) -> String {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.filter_map(Result::ok) {
+            let (path, kind) = (e.path(), e.file_type());
+            let name = path.strip_prefix(dir).unwrap_or(&path).display().to_string();
+            match kind {
+                Ok(k) if k.is_dir() => stack.push(path),
+                Ok(k) if k.is_file() => {
+                    let bytes = e.metadata().map_or(0, |m| m.len());
+                    found.push(format!("{name} ({bytes} bytes)"));
+                }
+                _ => found.push(format!("{name} (not a file)")),
+            }
+        }
+    }
+    found.sort();
+    let more = found.len().saturating_sub(LOGGED_FILES);
+    found.truncate(LOGGED_FILES);
+    match (found.is_empty(), more) {
+        (true, _) => "nothing".to_owned(),
+        (false, 0) => found.join(", "),
+        (false, n) => format!("{}, and {n} more", found.join(", ")),
     }
 }
 
@@ -1041,13 +1087,17 @@ impl GenOut {
 /// record how it ended.
 async fn generate(w: Arc<Worlds>, world: Option<PathBuf>, status: Value, slot: JobSlot) {
     let id = status["id"].as_str().unwrap_or("").to_owned();
-    let beat = tokio::spawn(heartbeat(Arc::clone(&w), id));
+    let beat = tokio::spawn(heartbeat(Arc::clone(&w), id.clone()));
     run_generation(&w, world.as_deref(), status, slot).await;
     beat.abort();
-    if let Some(world) = world
-        && let Err(e) = std::fs::remove_dir_all(&world)
-    {
-        tracing::warn!(world = %world.display(), error = %e, "job folder not cleaned up");
+    // Only copies of uploads (the store keeps them) and nothing the generator made, but its
+    // log line says what it held, should a job ever need looking into.
+    if let Some(world) = world {
+        let held = folder_contents(&world);
+        match std::fs::remove_dir_all(&world) {
+            Ok(()) => tracing::info!(world = %id, held, "job folder removed"),
+            Err(e) => tracing::warn!(world = %id, held, error = %e, "job folder not cleaned up"),
+        }
     }
 }
 
@@ -1081,11 +1131,14 @@ async fn run_generation(w: &Worlds, world: Option<&Path>, mut status: Value, _sl
     if let Err(e) = w.save_status(&status).await {
         tracing::error!(error = %e, "status write failed");
     }
-    // Logged after the status is stored: tests and operators wait on these lines.
+    // Logged after the status is stored: tests and operators wait on these lines. A failure's
+    // line holds its error (the sidecar's output within `gen_error_max_bytes`), as its status
+    // does.
     if done {
         tracing::info!(world = %id, "generation done");
     } else {
-        tracing::warn!(world = %id, "generation failed");
+        let error = status["error"].as_str().unwrap_or("");
+        tracing::warn!(world = %id, error, "generation failed");
     }
 }
 
@@ -1600,6 +1653,73 @@ mod tests {
         }
     }
 
+    /// What `run` logs, at debug and above, on this test's thread.
+    async fn logged(run: impl Future<Output = ()>) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let out = buf.clone();
+        let logs = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || out.clone())
+            .finish();
+        {
+            let _logs = tracing::subscriber::set_default(logs);
+            run.await;
+        }
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A job folder's log line names each file with its size, in order, and links without
+    /// following them; past its cap it says how many more.
+    #[test]
+    fn a_job_folders_contents_are_named_for_its_log_line() {
+        let dir = temp("contents");
+        assert_eq!(folder_contents(&dir), "nothing");
+        std::fs::create_dir_all(dir.join("yamls")).unwrap();
+        std::fs::write(dir.join("yamls/b.yaml"), b"bb").unwrap();
+        std::fs::write(dir.join("a.apworld"), b"a").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("link")).unwrap();
+        let held = folder_contents(&dir);
+        assert_eq!(held, "a.apworld (1 bytes), link (not a file), yamls/b.yaml (2 bytes)");
+        for i in 0..LOGGED_FILES {
+            std::fs::write(dir.join(format!("f{i:02}")), b"").unwrap();
+        }
+        assert!(folder_contents(&dir).ends_with(", and 3 more"), "{}", folder_contents(&dir));
+    }
+
+    /// A failed generation's log line holds its error, as its status does, so a log alone says
+    /// why it failed.
+    #[tokio::test]
+    async fn a_failed_generations_log_line_holds_its_error() {
+        let root = temp("failed-log");
+        let w = worlds(&root, Limits::DESIGN);
+        let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
+        let manifest_id = json_of(up).await["id"].clone();
+        let meta = json!({"name": "nameless.yaml", "players": [{"game": "Fixture Game"}]});
+        let nameless = stored(&w, Kind::Yaml, br#"{"game": "Fixture Game"}"#, meta).await;
+        let id = "e".repeat(64);
+        let status = json!({
+            "id": id, "status": "queued", "engine": ENGINE_DATA_ONLY,
+            "manifest": manifest_id, "yamls": [nameless["id"]],
+        });
+        let log = logged(run_generation(&w, None, status, w.admit().unwrap())).await;
+        let line = log.lines().find(|l| l.contains("generation failed")).expect("{log}");
+        assert!(line.contains(&id) && line.contains("the player file has no name"), "{line}");
+        let stored = read_status(&w, &id).await.unwrap();
+        assert!(stored["error"].as_str().unwrap().contains("no name"), "{stored}");
+    }
+
     /// The in-memory store under `w`, to age a job as if its process stopped.
     fn mem_store(w: &Worlds) -> Arc<log::MemLogStore> {
         match &w.uploads {
@@ -1622,8 +1742,13 @@ mod tests {
             let status = json!({"id": id(c), "status": state, "bundle": "/b"});
             std::fs::write(dir.join("status.json"), status.to_string()).unwrap();
         }
+        std::fs::write(worlds_dir.join(id('b')).join("apworlds/m.apworld"), b"zip").unwrap();
         let w = worlds(&root, Limits::DESIGN);
-        w.import_jobs(true).await;
+        let log = logged(w.import_jobs(true)).await;
+        // Each left folder is said in the log before it goes: which world, how far, what it held.
+        let left = log.lines().find(|l| l.contains(&id('b'))).expect("a line for the world");
+        assert!(left.contains("a stopped server left this job folder"), "{left}");
+        assert!(left.contains("running") && left.contains("m.apworld (3 bytes)"), "{left}");
         for c in ['a', 'b'] {
             let status = read_status(&w, &id(c)).await.unwrap();
             assert_eq!(status["status"], "failed", "{c}");

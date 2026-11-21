@@ -181,6 +181,9 @@ async fn upload_list_generate_poll_and_done() {
     let fixture_json: Value = serde_json::from_str(&fixture_text).unwrap();
     assert_eq!(back, fixture_json);
     // The status is in the store (#119), so the job folder, its copies of the inputs, is gone.
+    // Its log line says what the folder held: the chosen world by module and both yamls.
+    let removed = server.wait_for_log("job folder removed").unwrap();
+    assert!(removed.contains(&id) && removed.contains("apworlds/my_world.apworld"), "{removed}");
     let world_dir = setup.root.join("data/worlds").join(&id);
     assert!(!world_dir.exists(), "the job folder is removed when the job ends");
     // What the sandbox showed the sidecar, and what it let it do.
