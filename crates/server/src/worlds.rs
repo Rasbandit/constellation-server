@@ -25,6 +25,7 @@ use crate::host::{RoomsFolder, Waker};
 use crate::manifests::{self, Manifests};
 use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox, run_job};
+use crate::store;
 use crate::{Loaded, hex, parse_bundle};
 use axum::Router;
 use axum::body::Bytes;
@@ -60,8 +61,8 @@ pub(crate) struct Worlds {
     checks: Semaphore,
     /// Uploaded manifests: in the database, with a bounded cache.
     manifests: Manifests,
-    /// Uploaded world and player files: in the database.
-    uploads: manifests::Db,
+    /// The host's store: uploaded world and player files and the generations' statuses.
+    store: store::Db,
     /// How a manifest fill or check runs.
     jobs: JobRunner,
     /// Uploads and generation requests per client address (`admin_write_burst`).
@@ -206,7 +207,12 @@ fn internal(e: impl core::fmt::Display) -> (StatusCode, String) {
 
 /// A failed store call as a 500 that hides its detail (it is in the log).
 fn store_error(e: log::StoreError) -> (StatusCode, String) {
-    internal(format!("{e:?}"))
+    internal(store_failed(&e))
+}
+
+/// A failed store call as the text the upload and job paths return.
+fn store_failed(e: &log::StoreError) -> String {
+    format!("the store: {e:?}")
 }
 
 fn json_reply(status: StatusCode, v: &Value) -> Response {
@@ -247,8 +253,8 @@ pub(crate) fn open(
         queued: Arc::new(AtomicUsize::new(0)),
         checks: Semaphore::new(limits.manifest_check_concurrency.max(1)),
         // Until [`Worlds::router`] gives it the host's store.
-        manifests: Manifests::new(manifests::Db::Mem(Arc::clone(&mem)), &limits),
-        uploads: manifests::Db::Mem(mem),
+        manifests: Manifests::new(store::Db::Mem(Arc::clone(&mem)), &limits),
+        store: store::Db::Mem(mem),
         jobs: JobRunner::Child(crate::sandbox::exe_path()?),
         write_rate: edge_compat::RateTable::new(
             limits.admin_write_burst,
@@ -333,12 +339,12 @@ impl Worlds {
         importer: Waker,
         rooms: Option<(RoomsFolder, String)>,
         proxy_header: Option<HeaderName>,
-        db: manifests::Db,
+        db: store::Db,
     ) -> Router {
-        self.uploads = db.clone();
+        self.store = db.clone();
         self.manifests = Manifests::new(db, &self.limits);
-        self.import_files(self.uploads.is_durable()).await;
-        self.import_jobs(self.uploads.is_durable()).await;
+        self.import_files(self.store.is_durable()).await;
+        self.import_jobs(self.store.is_durable()).await;
         self.rooms = rooms;
         self.importer = Some(importer);
         self.proxy_header = proxy_header;
@@ -355,8 +361,8 @@ impl Worlds {
     /// The store failing, or a record that is not JSON.
     async fn upload_meta(&self, kind: Kind, id: &str) -> Result<Option<Value>, String> {
         let Some(key) = manifests::key_of(id) else { return Ok(None) };
-        let meta = self.uploads.upload_meta(kind.store(), &key).await;
-        let meta = meta.map_err(|e| format!("the store: {e:?}"))?;
+        let meta = self.store.upload_meta(kind.store(), &key).await;
+        let meta = meta.map_err(|e| store_failed(&e))?;
         meta.map(|m| serde_json::from_str(&m).map_err(|e| format!("upload {id}: bad record: {e}")))
             .transpose()
     }
@@ -370,13 +376,14 @@ impl Worlds {
     async fn intact_upload(&self, kind: Kind, id: &str) -> Result<Option<Value>, String> {
         let Some(meta) = self.upload_meta(kind, id).await? else { return Ok(None) };
         let key = manifests::key_of(id).ok_or(format!("bad id {id}"))?;
-        match self.uploads.upload_bytes(kind.store(), &key).await {
-            Ok(Some(_)) => Ok(Some(meta)),
-            Ok(None) | Err(log::StoreError::Corrupt(_)) => {
+        // Checked where the file is: its bytes (up to 64 MiB) do not travel.
+        match self.store.upload_intact(kind.store(), &key).await {
+            Ok(true) => Ok(Some(meta)),
+            Ok(false) => {
                 tracing::warn!(id, "stored upload is missing or torn; storing it again");
                 Ok(None)
             }
-            Err(e) => Err(format!("the store: {e:?}")),
+            Err(e) => Err(store_failed(&e)),
         }
     }
 
@@ -386,7 +393,7 @@ impl Worlds {
     /// No such upload, or the store failing.
     async fn upload_file(&self, kind: Kind, id: &str) -> Result<Vec<u8>, String> {
         let key = manifests::key_of(id).ok_or(format!("bad id {id}"))?;
-        let file = self.uploads.upload_bytes(kind.store(), &key).await;
+        let file = self.store.upload_bytes(kind.store(), &key).await;
         file.map_err(|e| format!("upload {id}: {e:?}"))?.ok_or(format!("no upload {id}"))
     }
 
@@ -399,28 +406,23 @@ impl Worlds {
         let (mut moved, mut kept) = (0_usize, 0_usize);
         for kind in [Kind::Apworld, Kind::Yaml] {
             let root = self.dir.join(kind.folder());
-            let Ok(games) = std::fs::read_dir(&root) else { continue };
-            let mut dirs = vec![root];
-            dirs.extend(games.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()));
-            for dir in &dirs {
-                let Ok(entries) = std::fs::read_dir(dir) else { continue };
-                let records = entries.filter_map(Result::ok).map(|e| e.path());
-                for record in records.filter(|p| p.extension().is_some_and(|x| x == "json")) {
-                    match self.import_file(kind, &record, remove).await {
-                        Ok(()) => moved += 1,
-                        Err(why) => {
-                            kept += 1;
-                            let file = record.display();
-                            tracing::warn!(%file, "old upload not moved into the store: {why}");
-                        }
+            let Some(Some((dirs, records))) = blocking(move || upload_records(&root)).await else {
+                continue;
+            };
+            for record in records {
+                match self.import_file(kind, &record, remove).await {
+                    Ok(()) => moved += 1,
+                    Err(why) => {
+                        kept += 1;
+                        let file = record.display();
+                        tracing::warn!(%file, "old upload not moved into the store: {why}");
                     }
                 }
             }
             if remove {
                 // Game folders first, then the kind's; only an empty folder is removed.
-                for dir in dirs.iter().rev() {
-                    drop(std::fs::remove_dir(dir));
-                }
+                blocking(move || dirs.iter().rev().for_each(|d| drop(std::fs::remove_dir(d))))
+                    .await;
             }
         }
         if moved + kept > 0 {
@@ -433,33 +435,43 @@ impl Worlds {
     /// # Errors
     /// A status without them, or the store failing.
     async fn save_status(&self, status: &Value) -> Result<(), String> {
-        let id = status["id"].as_str().filter(|i| valid_id(i)).ok_or("a status with a bad id")?;
-        let state = status["status"].as_str().and_then(JobState::parse);
-        let state = state.ok_or("a status with a bad state")?;
-        let text = status.to_string();
-        self.uploads.job_put(id, state, &text).await.map_err(|e| format!("the store: {e:?}"))
+        let (id, state, text) = job_row(status)?;
+        self.store.job_put(id, state, &text).await.map_err(|e| store_failed(&e))
+    }
+
+    /// [`Self::save_status`] for a job's last status, tried again with a growing wait while
+    /// the store is down: a finished job left `running` would be failed later by the sweep.
+    async fn save_final(&self, status: &Value) -> Result<(), String> {
+        let mut wait = FINAL_WRITE_WAIT;
+        for attempt in 1..FINAL_WRITE_TRIES {
+            let Err(e) = self.save_status(status).await else { return Ok(()) };
+            tracing::warn!(attempt, error = %e, "final status write failed; trying again");
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+        self.save_status(status).await
+    }
+
+    /// Write a status an older server kept as a file, only when the store has none for the job.
+    ///
+    /// # Errors
+    /// A status without an id and state, or the store failing.
+    async fn save_old_status(&self, status: &Value) -> Result<(), String> {
+        let (id, state, text) = job_row(status)?;
+        let put = self.store.job_put_if_absent(id, state, &text).await;
+        put.map(drop).map_err(|e| store_failed(&e))
     }
 
     /// Fail every queued or running job not marked alive for `gen_lost_secs`: the server
     /// running it is gone. A job its server marks alive meanwhile is left alone.
     async fn fail_stale(&self) {
         let older = Duration::from_secs(self.limits.gen_lost_secs);
-        let stale = match self.uploads.job_stale(older).await {
-            Ok(stale) => stale,
-            Err(e) => return tracing::warn!(error = ?e, "could not look for stopped generations"),
-        };
-        for (id, text) in stale {
-            let mut status: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
-            status["id"] = json!(id);
-            status["status"] = json!(JobState::Failed.as_str());
-            status["error"] = json!("the server running this generation stopped answering");
-            match self.uploads.job_fail_stale(&id, &status.to_string(), older).await {
-                Ok(true) => tracing::warn!(world = %id, "generation failed: its server stopped"),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(world = %id, error = ?e, "could not fail a stopped generation")
-                }
-            }
+        let error = "the server running this generation stopped answering";
+        match self.store.job_fail_all_stale(older, error).await {
+            Ok(ids) => ids.iter().for_each(|id| {
+                tracing::warn!(world = %id, "generation failed: its server stopped");
+            }),
+            Err(e) => tracing::warn!(error = ?e, "could not fail stopped generations"),
         }
     }
 
@@ -467,12 +479,12 @@ impl Worlds {
     /// host's process, so the job died with it (each instance has its own data folder). How
     /// far the job had got, for the log.
     async fn fail_left(&self, id: &str) -> Option<String> {
-        let (text, _) = self.uploads.job_status(id).await.ok()??;
+        let (text, _) = self.store.job_status(id).await.ok()??;
         let mut status: Value = serde_json::from_str(&text).ok()?;
         let was = status["status"].as_str().map(str::to_owned);
         status["status"] = json!(JobState::Failed.as_str());
         status["error"] = json!("the server restarted before this generation finished");
-        match self.uploads.job_fail_stale(id, &status.to_string(), Duration::ZERO).await {
+        match self.store.job_fail_stale(id, &status.to_string(), Duration::ZERO).await {
             Ok(true) => tracing::warn!(world = %id, "generation failed: its server restarted"),
             Ok(false) => {}
             Err(e) => tracing::warn!(world = %id, error = ?e, "could not fail a left generation"),
@@ -486,15 +498,24 @@ impl Worlds {
     /// `remove` (a durable store) each moved `status.json` goes, then every job folder left
     /// empty; an in-memory store keeps them, to read again on the next start.
     async fn import_jobs(&self, remove: bool) {
-        let Ok(entries) = std::fs::read_dir(self.dir.join("worlds")) else { return };
+        let root = self.dir.join("worlds");
+        let Some(Some(worlds)) = blocking(move || job_folders(&root)).await else { return };
+        let most = self.limits.job_log_files_max;
         let mut moved = 0_usize;
-        for world in entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()) {
+        for world in worlds {
             let file = world.join("status.json");
-            let found = read_json(&file);
-            // A job's copies of its inputs, left by a process that stopped mid-job: said in the
-            // log (which world, how far it got, what it held) before they go.
-            let inputs = [Kind::Apworld.folder(), Kind::Yaml.folder()].map(|sub| world.join(sub));
-            if inputs.iter().any(|d| d.exists()) {
+            let dir = world.clone();
+            let scan = blocking(move || {
+                let found = read_json(&dir.join("status.json"));
+                let inputs = [Kind::Apworld.folder(), Kind::Yaml.folder()].map(|sub| dir.join(sub));
+                let held = inputs.iter().any(|d| d.exists()) || found.is_none();
+                (found, inputs, held.then(|| folder_contents(&dir, most)))
+            });
+            let Some((found, inputs, held)) = scan.await else { continue };
+            // A job folder with its copies of the inputs, or with no status file (every job
+            // makes its folder when it starts): left by a process that stopped mid-job. Said in
+            // the log (which world, how far it got, what it held) before the copies go.
+            if let Some(held) = held {
                 let name = world.file_name().map(|n| n.to_string_lossy().into_owned());
                 let name = name.filter(|n| valid_id(n)).unwrap_or_default();
                 let stored = if found.is_none() { self.fail_left(&name).await } else { None };
@@ -502,23 +523,23 @@ impl Worlds {
                 tracing::warn!(
                     world = name,
                     state = state.or(stored.as_deref()).unwrap_or("unknown"),
-                    held = folder_contents(&world, self.limits.job_log_files_max),
+                    held,
                     "a stopped server left this job folder; its copies of the inputs are removed"
                 );
-                for dir in &inputs {
-                    drop(std::fs::remove_dir_all(dir));
-                }
+                blocking(move || inputs.iter().for_each(|d| drop(std::fs::remove_dir_all(d))))
+                    .await;
             }
             if let Some(mut status) = found {
                 if matches!(status["status"].as_str(), Some("queued" | "running")) {
                     status["status"] = json!(JobState::Failed.as_str());
                     status["error"] = json!("the server restarted before this generation finished");
                 }
-                match self.save_status(&status).await {
+                // Never over a row the store already has: a file is older than any row.
+                match self.save_old_status(&status).await {
                     Ok(()) => {
                         moved += 1;
-                        if remove && let Err(e) = std::fs::remove_file(&file) {
-                            tracing::warn!(file = %file.display(), error = %e, "old status left");
+                        if remove && let Err(e) = remove_files(vec![file.clone()]).await {
+                            tracing::warn!(error = %e, "old status left");
                         }
                     }
                     Err(why) => tracing::warn!(
@@ -527,7 +548,7 @@ impl Worlds {
                     ),
                 }
             }
-            drop(std::fs::remove_dir(&world));
+            blocking(move || drop(std::fs::remove_dir(&world))).await;
         }
         if moved > 0 {
             tracing::info!(moved, removed = remove, "old generation statuses moved into the store");
@@ -557,23 +578,68 @@ impl Worlds {
                 if self.intact_upload(kind, id).await?.is_none() {
                     return Err(format!("{}: {e}", file.display()));
                 }
-                return std::fs::remove_file(record)
-                    .map_err(|e| format!("{}: {e}", record.display()));
+                return remove_files(vec![record.to_owned()]).await;
             }
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
         let game = game_folder(kind, &meta);
         let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-        self.uploads.upload_put(&row, &bytes).await.map_err(|e| format!("the store: {e:?}"))?;
+        self.store.upload_put(&row, &bytes).await.map_err(|e| store_failed(&e))?;
         if remove {
             // The file first: a record without its file is finished on the next start (above).
-            for path in [&file, record] {
-                std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
+            remove_files(vec![file, record.to_owned()]).await?;
         }
         Ok(())
     }
 }
+
+/// Run blocking file work off the runtime's threads; `None` when it panicked (said in the log).
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| tracing::error!(error = %e, "file work stopped"))
+        .ok()
+}
+
+/// Remove `paths` in order, stopping at the first that will not go.
+async fn remove_files(paths: Vec<PathBuf>) -> Result<(), String> {
+    let gone = blocking(move || {
+        paths
+            .iter()
+            .try_for_each(|p| std::fs::remove_file(p).map_err(|e| format!("{}: {e}", p.display())))
+    });
+    gone.await.unwrap_or_else(|| Err("the removal stopped".to_owned()))
+}
+
+/// The folders under an upload kind's `root` (the root and its game folders), and every upload
+/// record (`*.json`) in them; none when there is no root.
+fn upload_records(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let games = std::fs::read_dir(root).ok()?;
+    let mut dirs = vec![root.to_owned()];
+    dirs.extend(games.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()));
+    let files = dirs.iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten();
+    let files = files.filter_map(Result::ok).map(|e| e.path());
+    let records = files.filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+    Some((dirs, records))
+}
+
+/// Every job folder under `root`; none when there is no root.
+fn job_folders(root: &Path) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(root).ok()?;
+    Some(entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
+}
+
+/// A status's job id, state and text, as the store keeps them.
+fn job_row(status: &Value) -> Result<(&str, JobState, String), String> {
+    let id = status["id"].as_str().filter(|i| valid_id(i)).ok_or("a status with a bad id")?;
+    let state = status["status"].as_str().and_then(JobState::parse);
+    Ok((id, state.ok_or("a status with a bad state")?, status.to_string()))
+}
+
+/// Writes of a job's last status: tries, and the wait after the first, doubling (a cost trade:
+/// about 15 s in all, one heartbeat, rides out a store restart).
+const FINAL_WRITE_TRIES: u32 = 6;
+const FINAL_WRITE_WAIT: Duration = Duration::from_millis(500);
 
 /// What a job folder holds, for its log line: each file under it with its size, in name order,
 /// at most `most` named. Links are named, never followed.
@@ -635,7 +701,7 @@ async fn heartbeat(w: Arc<Worlds>, id: String) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if let Err(e) = w.uploads.job_touch(&id).await {
+        if let Err(e) = w.store.job_touch(&id).await {
             tracing::warn!(world = %id, error = ?e, "could not mark a generation alive");
         }
     }
@@ -923,7 +989,7 @@ async fn inspect_and_store(
     let key = manifests::key_of(id).ok_or_else(|| internal("an upload id that is not hex"))?;
     let game = game_folder(kind, &meta);
     let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-    w.uploads.upload_put(&row, body).await.map_err(store_error)?;
+    w.store.upload_put(&row, body).await.map_err(store_error)?;
     Ok(meta)
 }
 
@@ -983,7 +1049,7 @@ async fn list_yamls(State(w): State<Arc<Worlds>>) -> Reply {
 }
 
 async fn list(w: &Worlds, kind: Kind) -> Reply {
-    let records = w.uploads.upload_list(kind.store()).await.map_err(store_error)?;
+    let records = w.store.upload_list(kind.store()).await.map_err(store_error)?;
     let mut all: Vec<Value> = records.iter().filter_map(|r| serde_json::from_str(r).ok()).collect();
     let key = |v: &Value| (v["name"].as_str().unwrap_or("").to_owned(), v["id"].to_string());
     all.sort_by_key(key);
@@ -1015,7 +1081,7 @@ async fn chosen(
 }
 
 /// Lay out a world folder: the chosen files, written from the store (apworlds named by
-/// module, as Archipelago loads them).
+/// module, as the generator loads them).
 async fn prepare(
     w: &Worlds,
     world: &Path,
@@ -1066,7 +1132,7 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
         return Err(internal(e));
     }
     let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
-    queue(&w, Some(world), status, slot).await
+    queue(&w, status, slot).await
 }
 
 fn ids(metas: &[Value]) -> Vec<Value> {
@@ -1082,16 +1148,21 @@ fn new_world_id(w: &Worlds, chosen: &[&Vec<Value>]) -> String {
     content_id(format!("{chosen:?}{nanos}-{}-{n}", std::process::id()).as_bytes())
 }
 
-/// Write the queued status and start the job: the one place every kind of world is queued.
-/// `world` is a legacy job's folder, removed when the job ends.
-async fn queue(w: &Arc<Worlds>, world: Option<PathBuf>, status: Value, slot: JobSlot) -> Reply {
-    if let Err(e) = w.save_status(&status).await {
-        if let Some(world) = &world {
-            drop(std::fs::remove_dir_all(world));
-        }
+/// Make the job's folder, write the queued status and start the job: the one place every kind
+/// of world is queued. The folder (a legacy job's copies of its inputs are in it) is made for
+/// every job, so a restart finds it and fails the job at once; it is removed when the job ends.
+async fn queue(w: &Arc<Worlds>, status: Value, slot: JobSlot) -> Reply {
+    let id = status["id"].clone();
+    let world = w.dir.join("worlds").join(id.as_str().unwrap_or_default());
+    let made = tokio::fs::create_dir_all(&world).await.map_err(|e| e.to_string());
+    let saved = match made {
+        Ok(()) => w.save_status(&status).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = saved {
+        drop(tokio::fs::remove_dir_all(&world).await);
         return Err(internal(e));
     }
-    let id = status["id"].clone();
     tracing::info!(world = %id, "generation queued");
     tokio::spawn(generate(Arc::clone(w), world, status, slot));
     Ok(json_reply(StatusCode::ACCEPTED, &json!({"id": id, "status": "queued"})))
@@ -1129,7 +1200,7 @@ async fn create_data_only_world(w: &Arc<Worlds>, req: &Value, slot: JobSlot) -> 
         "id": id, "status": "queued", "engine": ENGINE_DATA_ONLY,
         "manifest": manifest_id, "yamls": yaml_ids,
     });
-    queue(w, None, status, slot).await
+    queue(w, status, slot).await
 }
 
 /// What `ap_gen.py generate` prints. The bundle stays raw text (no tree of values in memory);
@@ -1149,30 +1220,28 @@ impl GenOut {
 
 /// Run one queued generation (one at a time), marked alive while it waits and runs, and
 /// record how it ended.
-async fn generate(w: Arc<Worlds>, world: Option<PathBuf>, status: Value, slot: JobSlot) {
+async fn generate(w: Arc<Worlds>, world: PathBuf, status: Value, slot: JobSlot) {
     let id = status["id"].as_str().unwrap_or("").to_owned();
     let beat = AbortOnDrop(tokio::spawn(heartbeat(Arc::clone(&w), id.clone())));
-    run_generation(&w, world.as_deref(), status, slot).await;
+    run_generation(&w, &world, status, slot).await;
     drop(beat);
     // Only copies of uploads (the store keeps them) and nothing the generator made, but its
     // log line says what it held, should a job ever need looking into.
-    if let Some(world) = world {
-        let most = w.limits.job_log_files_max;
-        let removed = tokio::task::spawn_blocking(move || {
-            let held = folder_contents(&world, most);
-            (std::fs::remove_dir_all(&world), held)
-        });
-        match removed.await {
-            Ok((Ok(()), held)) => tracing::info!(world = %id, held, "job folder removed"),
-            Ok((Err(e), held)) => {
-                tracing::warn!(world = %id, held, error = %e, "job folder not cleaned up");
-            }
-            Err(e) => tracing::warn!(world = %id, error = %e, "job folder not cleaned up"),
+    let most = w.limits.job_log_files_max;
+    let removed = tokio::task::spawn_blocking(move || {
+        let held = folder_contents(&world, most);
+        (std::fs::remove_dir_all(&world), held)
+    });
+    match removed.await {
+        Ok((Ok(()), held)) => tracing::info!(world = %id, held, "job folder removed"),
+        Ok((Err(e), held)) => {
+            tracing::warn!(world = %id, held, error = %e, "job folder not cleaned up");
         }
+        Err(e) => tracing::warn!(world = %id, error = %e, "job folder not cleaned up"),
     }
 }
 
-async fn run_generation(w: &Worlds, world: Option<&Path>, mut status: Value, _slot: JobSlot) {
+async fn run_generation(w: &Worlds, world: &Path, mut status: Value, _slot: JobSlot) {
     let Ok(_permit) = w.one_gen.acquire().await else { return };
     let id = status["id"].as_str().unwrap_or("").to_owned();
     status["status"] = json!("running");
@@ -1180,10 +1249,10 @@ async fn run_generation(w: &Worlds, world: Option<&Path>, mut status: Value, _sl
         tracing::error!(error = %e, "status write failed");
     }
     tracing::info!(world = %id, "generation running");
-    let result = match world {
-        _ if status["engine"] == ENGINE_DATA_ONLY => generate_data_only(w, &status).await,
-        Some(world) => generate_sandboxed(w, world).await,
-        None => Err("a legacy generation without its job folder".to_owned()),
+    let result = if status["engine"] == ENGINE_DATA_ONLY {
+        generate_data_only(w, &status).await
+    } else {
+        generate_sandboxed(w, world).await
     };
     let done = result.is_ok();
     match result {
@@ -1199,7 +1268,7 @@ async fn run_generation(w: &Worlds, world: Option<&Path>, mut status: Value, _sl
             status["error"] = json!(e);
         }
     }
-    if let Err(e) = w.save_status(&status).await {
+    if let Err(e) = w.save_final(&status).await {
         tracing::error!(error = %e, "status write failed");
     }
     // Logged after the status is stored: tests and operators wait on these lines. A failure's
@@ -1365,7 +1434,7 @@ fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
 /// before). Worked out here, never stored; past `gen_lost_secs` the sweep fails it.
 async fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCode, String)> {
     checked_id(id)?;
-    let found = w.uploads.job_status(id).await.map_err(store_error)?;
+    let found = w.store.job_status(id).await.map_err(store_error)?;
     let (text, ago) = found.ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))?;
     let mut status: Value = serde_json::from_str(&text)
         .map_err(|e| internal(format!("world {id}: bad status: {e}")))?;
@@ -1568,7 +1637,7 @@ mod tests {
         let key = manifests::key_of(&id).unwrap();
         let game = game_folder(kind, &meta);
         let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-        w.uploads.upload_put(&row, body).await.unwrap();
+        w.store.upload_put(&row, body).await.unwrap();
         meta
     }
 
@@ -1795,7 +1864,7 @@ mod tests {
             "id": id, "status": "queued", "engine": ENGINE_DATA_ONLY,
             "manifest": manifest_id, "yamls": [nameless["id"]],
         });
-        let log = logged(run_generation(&w, None, status, w.admit().unwrap())).await;
+        let log = logged(run_generation(&w, &root, status, w.admit().unwrap())).await;
         let line = log.lines().find(|l| l.contains("generation failed")).expect("{log}");
         assert!(line.contains(&id) && line.contains("the player file has no name"), "{line}");
         let stored = read_status(&w, &id).await.unwrap();
@@ -1804,9 +1873,9 @@ mod tests {
 
     /// The in-memory store under `w`, to age a job as if its process stopped.
     fn mem_store(w: &Worlds) -> Arc<log::MemLogStore> {
-        match &w.uploads {
-            manifests::Db::Mem(m) => Arc::clone(m),
-            manifests::Db::Pg(_) => unreachable!("these tests run in memory"),
+        match &w.store {
+            store::Db::Mem(m) => Arc::clone(m),
+            store::Db::Pg(_) => unreachable!("these tests run in memory"),
         }
     }
 
@@ -1892,7 +1961,7 @@ mod tests {
         assert_eq!(read_status(&w, &id('b')).await.unwrap()["status"], "running", "still alive");
         assert_eq!(read_status(&w, &id('c')).await.unwrap()["status"], "done");
         assert_eq!(read_status(&w, &id('d')).await.unwrap()["status"], "stalled", "not lost yet");
-        w.uploads.job_touch(&id('d')).await.unwrap();
+        w.store.job_touch(&id('d')).await.unwrap();
         assert_eq!(read_status(&w, &id('d')).await.unwrap()["status"], "queued", "came back");
     }
 
@@ -1916,6 +1985,68 @@ mod tests {
         assert!(log.contains("state=\"running\"") || log.contains("state=running"), "{log}");
         assert!(!dir.exists(), "its copies cleared");
         assert_eq!(read_status(&w, &id('b')).await.unwrap()["status"], "running");
+    }
+
+    /// A manifest world has no job folder of legacy inputs, yet a restart fails its job at
+    /// once, as it does a legacy one: every job makes its folder when it is queued (#119).
+    #[tokio::test]
+    async fn a_manifest_job_left_by_a_restart_fails_at_once() {
+        let root = temp("left-manifest-job");
+        let w = Arc::new(worlds(&root, Limits::DESIGN));
+        let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
+        let manifest_id = json_of(up).await["id"].clone();
+        let insts = fixture_instances();
+        let yaml = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await;
+        let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
+        // The one generation permit is taken, so the job waits queued, as one a restart cuts.
+        let _held = w.one_gen.acquire().await.unwrap();
+        let queued = create_world(State(Arc::clone(&w)), Bytes::from(req)).await.unwrap();
+        let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
+        // The restarted server: the same store and data folder, a new process.
+        let mut next = worlds(&root, Limits::DESIGN);
+        next.store = w.store.clone();
+        next.import_jobs(true).await;
+        let status = read_status(&next, &id).await.unwrap();
+        assert_eq!(status["status"], "failed", "{status}");
+        assert!(status["error"].as_str().unwrap().contains("restarted"), "{status}");
+        assert!(!root.join("data/worlds").join(&id).exists(), "its folder cleared");
+    }
+
+    /// The last status write is tried again while the store is down, so a finished job does
+    /// not stay `running` for the sweep to fail (#119).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_final_status_write_is_tried_again() {
+        let root = temp("final-write");
+        let w = Arc::new(worlds(&root, Limits::DESIGN));
+        let id = "e".repeat(64);
+        let queued = json!({"id": id, "status": "queued", "engine": ENGINE_DATA_ONLY});
+        w.save_status(&queued).await.unwrap();
+        // The "running" write fails, and so do two tries at the last one.
+        mem_store(&w).fail_job_puts_for_tests(3);
+        let slot = w.admit().unwrap();
+        run_generation(&w, &root, queued, slot).await;
+        let status = read_status(&w, &id).await.unwrap();
+        assert_eq!(status["status"], "failed", "the job's real end is stored: {status}");
+        // A store that stays down is given up on, said as an error and not hidden.
+        mem_store(&w).fail_job_puts_for_tests(usize::MAX);
+        assert!(w.save_final(&json!({"id": id, "status": "done"})).await.is_err());
+    }
+
+    /// A status file an older server kept never replaces a row the store already has (#119).
+    #[tokio::test]
+    async fn an_old_status_file_never_replaces_a_newer_row() {
+        let root = temp("old-status-newer-row");
+        let w = worlds(&root, Limits::DESIGN);
+        let id = "a".repeat(64);
+        let row = json!({"id": id, "status": "done", "slots": 2});
+        w.save_status(&row).await.unwrap();
+        let dir = root.join("data/worlds").join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status.json"), json!({"id": id, "status": "running"}).to_string())
+            .unwrap();
+        w.import_jobs(true).await;
+        assert_eq!(read_status(&w, &id).await.unwrap(), row);
+        assert!(!dir.exists(), "the file is dropped all the same");
     }
 
     /// A stored upload whose bytes were torn is not answered as stored, so the same upload
@@ -2136,7 +2267,7 @@ mod tests {
         let root = temp("manifest-heal");
         let store = Arc::new(log::MemLogStore::new());
         let mut w = worlds(&root, Limits::DESIGN);
-        w.manifests = Manifests::new(manifests::Db::Mem(Arc::clone(&store)), &Limits::DESIGN);
+        w.manifests = Manifests::new(store::Db::Mem(Arc::clone(&store)), &Limits::DESIGN);
         let body = manifest(|_| {});
         let first = upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
         assert_eq!(first.status(), StatusCode::CREATED);
@@ -2241,12 +2372,12 @@ mod tests {
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
             crate::app(&crate::Source::Rooms(rooms), None, None, Limits::DESIGN).await.unwrap();
-        let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.manifest_db());
+        let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.db());
         tokio::spawn(async move { host.supervise().await });
         let mut w = worlds(&root, Limits::DESIGN);
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
-        w.uploads = db.clone();
+        w.store = db.clone();
         w.manifests = Manifests::new(db, &Limits::DESIGN);
         let w = Arc::new(w);
 
@@ -2337,13 +2468,13 @@ mod tests {
     mod pg {
         use super::*;
 
-        async fn store() -> manifests::Db {
+        async fn store() -> store::Db {
             let url = config::load_secrets().unwrap().database_url.expect(
                 "pg-tests needs CONSTELLATION_DATABASE_URL (docs/TESTING.md rule 5: no silent skip)",
             );
             let db = log::testing::fresh_schema(&url).await.unwrap();
             let pg = log::PgLogStore::connect(&db, &Limits::DESIGN).await.unwrap();
-            manifests::Db::Pg(Arc::new(pg))
+            store::Db::Pg(Arc::new(pg))
         }
 
         /// On Postgres an old upload file is moved in and removed, a new upload is stored, and
@@ -2355,14 +2486,14 @@ mod tests {
             let old = old_file(&root, "yamls/clique", "yaml", b"old", json!({"name": "old"}));
             let db = store().await;
             let mut w = worlds(&root, Limits::DESIGN);
-            w.uploads = db.clone();
-            w.import_files(w.uploads.is_durable()).await;
+            w.store = db.clone();
+            w.import_files(w.store.is_durable()).await;
             assert!(!root.join("data/yamls").exists(), "moved in and removed");
             let new = stored(&w, Kind::Apworld, b"zip", json!({"module": "m"})).await;
             drop(w);
 
             let mut w = worlds(&root, Limits::DESIGN);
-            w.uploads = db;
+            w.store = db;
             let ids = json!({ "yamls": [old["id"]] });
             assert_eq!(
                 chosen(&w, &ids, "yamls", Kind::Yaml).await.unwrap(),
@@ -2385,13 +2516,13 @@ mod tests {
             let db = store().await;
             let id = |c: char| c.to_string().repeat(64);
             let mut first = worlds(&root, Limits::DESIGN);
-            first.uploads = db.clone();
+            first.store = db.clone();
             first.save_status(&json!({"id": id('a'), "status": "done", "slots": 2})).await.unwrap();
             first.save_status(&json!({"id": id('b'), "status": "running"})).await.unwrap();
             drop(first);
 
             let mut w = worlds(&root, Limits::DESIGN);
-            w.uploads = db.clone();
+            w.store = db.clone();
             let done = read_status(&w, &id('a')).await.unwrap();
             assert_eq!(done, json!({"id": id('a'), "status": "done", "slots": 2}));
             w.fail_stale().await;
@@ -2399,13 +2530,13 @@ mod tests {
             assert_eq!(alive["status"], "running", "marked alive just now");
             // Past the stale time it reads as stalled and is kept; past the lost time it fails.
             let mut stalled = worlds(&root, Limits { gen_stale_secs: 0, ..Limits::DESIGN });
-            stalled.uploads = db.clone();
+            stalled.store = db.clone();
             stalled.fail_stale().await;
             let kept = read_status(&stalled, &id('b')).await.unwrap();
             assert_eq!(kept["status"], "stalled", "{kept}");
             let lost = Limits { gen_stale_secs: 0, gen_lost_secs: 0, ..Limits::DESIGN };
             let mut later = worlds(&root, lost);
-            later.uploads = db;
+            later.store = db;
             later.fail_stale().await;
             let failed = read_status(&later, &id('b')).await.unwrap();
             assert_eq!(failed["status"], "failed", "{failed}");

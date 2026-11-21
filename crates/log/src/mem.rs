@@ -37,6 +37,8 @@ pub struct MemLogStore {
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
     uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
     jobs: Mutex<BTreeMap<String, Job>>,
+    /// How many of the next `job_put`s fail, as a store that is down for a while does.
+    job_put_failures: Mutex<usize>,
 }
 
 /// An upload's record and file.
@@ -387,6 +389,11 @@ impl crate::UploadStore for MemLogStore {
 }
 
 impl MemLogStore {
+    /// Fail the next `n` `job_put`s with [`StoreError::Unavailable`].
+    pub fn fail_job_puts_for_tests(&self, n: usize) {
+        *self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner) = n;
+    }
+
     /// Mark job `id` as last alive `by` ago, as if its process stopped then.
     pub fn age_job_for_tests(&self, id: &str, by: core::time::Duration) {
         let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
@@ -403,6 +410,12 @@ impl crate::JobStore for MemLogStore {
         state: crate::JobState,
         status: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut failures = self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let down = failures.checked_sub(1).inspect(|n| *failures = *n).is_some();
+        drop(failures);
+        if down {
+            return ready(Err(StoreError::Unavailable));
+        }
         let job = (state, status.to_owned(), std::time::Instant::now());
         self.jobs.lock().unwrap_or_else(PoisonError::into_inner).insert(id.to_owned(), job);
         ready(Ok(()))

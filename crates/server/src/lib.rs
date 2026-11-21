@@ -15,6 +15,7 @@
 mod manifests;
 mod room_view;
 mod sandbox;
+mod store;
 mod web;
 mod worlds;
 
@@ -264,7 +265,7 @@ async fn mount_admin(
                 host.waker(),
                 host.folder().map(|f| (f, public_addr)),
                 proxy_header,
-                host.manifest_db(),
+                host.db(),
             )
             .await,
         ),
