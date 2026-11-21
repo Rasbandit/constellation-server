@@ -1256,6 +1256,9 @@ fn fence_has_exactly_the_one_and_the_mutants_exclusion_names() {
     assert_eq!(body.matches("&&").count(), 1, "narrow the fence exclusion in nightly.yml");
 }
 
+/// A listed room as the owner query reads it: world id, seed name, key, owner, age.
+type OwnedRow = (Option<String>, String, String, Option<String>, i64);
+
 /// Accounts, logins and room ownership (migration 0007).
 impl crate::AccountStore for PgLogStore {
     async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
@@ -1352,14 +1355,14 @@ impl crate::AccountStore for PgLogStore {
     async fn room_claim(
         &self,
         room: RoomId,
-        owner: &str,
+        owner: Option<&str>,
         room_info: &crate::OwnedRoom,
     ) -> Result<(), StoreError> {
-        let (owner, world) = (owner.to_owned(), room_info.world_id.clone());
+        let (owner, world) = (owner.map(str::to_owned), room_info.world_id.clone());
         self.isolated(move |c| {
             Box::pin(async move {
                 sqlx::query(
-                    "UPDATE rooms SET owner = $2, world_id = $3 WHERE room_id = $1 AND owner IS NULL",
+                    "UPDATE rooms SET owner = $2, world_id = $3 WHERE room_id = $1 AND world_id IS NULL",
                 )
                 .bind(room_key(room))
                 .bind(&owner)
@@ -1375,7 +1378,7 @@ impl crate::AccountStore for PgLogStore {
 
     async fn rooms_owned(&self, owner: Option<&str>) -> Result<Vec<crate::OwnedRoom>, StoreError> {
         let owner = owner.map(str::to_owned);
-        let rows: Vec<(Option<String>, String, String, Option<String>, i64)> = self
+        let rows: Vec<OwnedRow> = self
             .isolated(move |c| {
                 Box::pin(async move {
                     sqlx::query_as(

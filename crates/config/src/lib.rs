@@ -163,6 +163,8 @@ pub struct Limits {
     pub password_min_chars: usize,
     /// Longest account password, in bytes: argon2 hashes all of it, so it is capped (design value).
     pub password_max_bytes: usize,
+    /// Shortest account name, in characters (design value).
+    pub account_name_min_chars: usize,
     /// Longest account name, in bytes (design value).
     pub account_name_max_bytes: usize,
     /// How long a login lasts without another one, seconds (design value: 14 days).
@@ -370,6 +372,7 @@ impl Limits {
         admin_auth_fail_refill_milli_per_sec: 100,
         password_min_chars: 10,
         password_max_bytes: 256,
+        account_name_min_chars: 3,
         account_name_max_bytes: 64,
         session_ttl_secs: 14 * 24 * 60 * 60,
         login_fail_burst: 5,

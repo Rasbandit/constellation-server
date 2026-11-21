@@ -491,50 +491,6 @@ impl crate::JobStore for MemLogStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{BlobStore, blob_key};
-
-    /// The read check, and a put healing the tampered row (the `PgLogStore` side is in the
-    /// server's restart tests).
-    #[tokio::test]
-    async fn a_tampered_blob_is_refused_on_read_and_healed_by_a_put() {
-        let s = MemLogStore::new();
-        let key = blob_key(b"package");
-        s.put(&key, b"package").await.unwrap();
-        s.tamper_blob(key, b"other bytes");
-        assert!(matches!(s.get(&key).await, Err(StoreError::Corrupt(_))));
-        s.put(&key, b"package").await.unwrap();
-        assert_eq!(s.get(&key).await.unwrap().as_deref(), Some(&b"package"[..]));
-    }
-
-    /// `blobs` counts distinct keys: a second put of the same bytes adds none.
-    #[tokio::test]
-    async fn blobs_counts_each_distinct_blob_once() {
-        let s = MemLogStore::new();
-        assert_eq!(s.blobs(), 0);
-        for b in [&b"one"[..], b"two", b"one"] {
-            s.put(&blob_key(b), b).await.unwrap();
-        }
-        assert_eq!(s.blobs(), 2);
-    }
-
-    /// `forget_seed` drops only that room's seed, and the room can then take another one.
-    #[tokio::test]
-    async fn forget_seed_drops_only_that_rooms_seed() {
-        let s = MemLogStore::new();
-        let (a, b) = (RoomId(1), RoomId(2));
-        s.seed_put(a, b"seed a").await.unwrap();
-        s.seed_put(b, b"seed b").await.unwrap();
-        s.forget_seed(a);
-        assert_eq!(s.seed_get(a).await.unwrap(), None);
-        assert_eq!(s.seed_get(b).await.unwrap().as_deref(), Some(&b"seed b"[..]));
-        s.seed_put(a, b"new seed").await.unwrap();
-        assert_eq!(s.seed_get(a).await.unwrap().as_deref(), Some(&b"new seed"[..]));
-    }
-}
-
 impl crate::AccountStore for MemLogStore {
     fn user_create(
         &self,
@@ -590,11 +546,11 @@ impl crate::AccountStore for MemLogStore {
     fn room_claim(
         &self,
         room: RoomId,
-        owner: &str,
+        owner: Option<&str>,
         room_info: &crate::OwnedRoom,
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
         let mut record = room_info.clone();
-        record.owner = Some(owner.to_owned());
+        record.owner = owner.map(str::to_owned);
         let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
         owned.entry(room).or_insert((record, std::time::Instant::now()));
         ready(Ok(()))
@@ -612,5 +568,49 @@ impl crate::AccountStore for MemLogStore {
             .collect();
         rooms.sort_by_key(|r| r.age_secs);
         ready(Ok(rooms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BlobStore, blob_key};
+
+    /// The read check, and a put healing the tampered row (the `PgLogStore` side is in the
+    /// server's restart tests).
+    #[tokio::test]
+    async fn a_tampered_blob_is_refused_on_read_and_healed_by_a_put() {
+        let s = MemLogStore::new();
+        let key = blob_key(b"package");
+        s.put(&key, b"package").await.unwrap();
+        s.tamper_blob(key, b"other bytes");
+        assert!(matches!(s.get(&key).await, Err(StoreError::Corrupt(_))));
+        s.put(&key, b"package").await.unwrap();
+        assert_eq!(s.get(&key).await.unwrap().as_deref(), Some(&b"package"[..]));
+    }
+
+    /// `blobs` counts distinct keys: a second put of the same bytes adds none.
+    #[tokio::test]
+    async fn blobs_counts_each_distinct_blob_once() {
+        let s = MemLogStore::new();
+        assert_eq!(s.blobs(), 0);
+        for b in [&b"one"[..], b"two", b"one"] {
+            s.put(&blob_key(b), b).await.unwrap();
+        }
+        assert_eq!(s.blobs(), 2);
+    }
+
+    /// `forget_seed` drops only that room's seed, and the room can then take another one.
+    #[tokio::test]
+    async fn forget_seed_drops_only_that_rooms_seed() {
+        let s = MemLogStore::new();
+        let (a, b) = (RoomId(1), RoomId(2));
+        s.seed_put(a, b"seed a").await.unwrap();
+        s.seed_put(b, b"seed b").await.unwrap();
+        s.forget_seed(a);
+        assert_eq!(s.seed_get(a).await.unwrap(), None);
+        assert_eq!(s.seed_get(b).await.unwrap().as_deref(), Some(&b"seed b"[..]));
+        s.seed_put(a, b"new seed").await.unwrap();
+        assert_eq!(s.seed_get(a).await.unwrap().as_deref(), Some(&b"new seed"[..]));
     }
 }

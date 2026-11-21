@@ -2,8 +2,8 @@
 //! generation statuses, over Postgres or memory. The one place that chooses between the two.
 
 use log::{
-    BlobKey, JobState, JobStore, ManifestRecord, ManifestStore, MemLogStore, PgLogStore,
-    StoreError, UploadKind, UploadRecord, UploadStore,
+    AccountStore, BlobKey, JobState, JobStore, ManifestRecord, ManifestStore, MemLogStore,
+    OwnedRoom, PgLogStore, StoreError, UploadKind, UploadRecord, UploadStore,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,5 +135,49 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<ManifestRecord>, StoreError> {
         on!(self, s => s.manifest_list(game, after, limit).await)
+    }
+
+    pub(crate) async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
+        on!(self, s => s.user_create(name, hash).await)
+    }
+
+    pub(crate) async fn user_hash(&self, name: &str) -> Result<Option<String>, StoreError> {
+        on!(self, s => s.user_hash(name).await)
+    }
+
+    pub(crate) async fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        on!(self, s => s.session_put(token_hash, name, ttl).await)
+    }
+
+    pub(crate) async fn session_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<String>, StoreError> {
+        on!(self, s => s.session_user(token_hash).await)
+    }
+
+    pub(crate) async fn session_delete(&self, token_hash: &[u8; 32]) -> Result<(), StoreError> {
+        on!(self, s => s.session_delete(token_hash).await)
+    }
+
+    pub(crate) async fn room_claim(
+        &self,
+        room: proto::RoomId,
+        owner: Option<&str>,
+        info: &OwnedRoom,
+    ) -> Result<(), StoreError> {
+        on!(self, s => s.room_claim(room, owner, info).await)
+    }
+
+    pub(crate) async fn rooms_owned(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<Vec<OwnedRoom>, StoreError> {
+        on!(self, s => s.rooms_owned(owner).await)
     }
 }

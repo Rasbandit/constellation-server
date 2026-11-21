@@ -538,15 +538,16 @@ pub trait AccountStore: Send + Sync + 'static {
         token_hash: &[u8; 32],
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Record `room` (just listed) as made by `owner`. Write once: a room that has an owner
-    /// keeps it. `room.owner` is ignored; Postgres reads the rest from the room's row.
+    /// Record `room` (just listed) as made by `owner` (None: the admin token, no account), and
+    /// the world it came from. Write once: a room already recorded keeps its owner. Only
+    /// `room_info.world_id` is read in Postgres, which has the rest in the room's row.
     ///
     /// # Errors
     /// The store failing.
     fn room_claim(
         &self,
         room: RoomId,
-        owner: &str,
+        owner: Option<&str>,
         room_info: &OwnedRoom,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 

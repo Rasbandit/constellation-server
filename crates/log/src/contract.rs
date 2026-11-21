@@ -602,7 +602,7 @@ async fn accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted<S: S
     assert_eq!(s.session_user(&[9; 32]).await.unwrap(), None);
 }
 
-/// Rooms 11 and 12 must be listed already (Postgres reads them from the directory).
+/// Rooms 11, 12 and 13 must be listed already (Postgres reads them from the directory).
 async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(s: &S) {
     let room = |n: u8| crate::OwnedRoom {
         world_id: Some(format!("w{n}")),
@@ -611,14 +611,17 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
         owner: None,
         age_secs: 0,
     };
-    s.room_claim(RoomId(11), "pw:a", &room(1)).await.unwrap();
-    s.room_claim(RoomId(12), "pw:b", &room(2)).await.unwrap();
-    s.room_claim(RoomId(11), "pw:b", &room(1)).await.unwrap();
+    s.room_claim(RoomId(11), Some("pw:a"), &room(1)).await.unwrap();
+    s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
+    s.room_claim(RoomId(11), Some("pw:b"), &room(1)).await.unwrap();
     let mine = s.rooms_owned(Some("pw:a")).await.unwrap();
     assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed1"]);
     assert_eq!(mine[0].owner.as_deref(), Some("pw:a"), "an owner is kept");
     assert!(s.rooms_owned(Some("pw:nobody")).await.unwrap().is_empty());
-    assert!(s.rooms_owned(None).await.unwrap().len() >= 2);
+    s.room_claim(RoomId(13), None, &room(3)).await.unwrap();
+    let all = s.rooms_owned(None).await.unwrap();
+    assert!(all.iter().any(|r| r.owner.is_none()), "the admin view lists rooms with no owner");
+    assert!(all.len() >= 3);
 }
 
 macro_rules! suite {
@@ -745,6 +748,7 @@ mod pg_only {
         let s = pg_store().await;
         open(&s, RoomId(11), &[1], "aaaaaaaaaa").await.unwrap();
         open(&s, RoomId(12), &[2], "bbbbbbbbbb").await.unwrap();
+        open(&s, RoomId(13), &[3], "cccccccccc").await.unwrap();
         a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&s).await;
     }
 
