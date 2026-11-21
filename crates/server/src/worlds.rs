@@ -1456,9 +1456,29 @@ async fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCode, String)
     Ok(status)
 }
 
+/// [`read_status`] for a caller: the world's requester, or anyone with a role on its listed room
+/// (`room_admins::role_on`), may see it; everyone else gets the same 404 as for no such world.
+async fn read_status_for(
+    w: &Worlds,
+    who: &Identity,
+    id: &str,
+) -> Result<Value, (StatusCode, String)> {
+    let status = read_status(w, id).await?;
+    let mut allowed = status["owner"].as_str() == Some(who.subject.as_str());
+    if let (false, Some((_, key, _))) = (allowed, hosted(w, &status)) {
+        let role = crate::room_admins::role_on(w.db(), who, key.as_str()).await;
+        allowed = role.map_err(|e| internal(format!("{e:?}")))?.is_some();
+    }
+    if allowed { Ok(status) } else { Err((StatusCode::NOT_FOUND, "no such world".to_owned())) }
+}
+
 /// The status, plus `room_key` and `address` once the host lists the world's room.
-async fn world_status(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let mut status = read_status(&w, &id).await?;
+async fn world_status(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let mut status = read_status_for(&w, &who, &id).await?;
     if let Some((_, key, address)) = hosted(&w, &status) {
         status["room_key"] = json!(key.as_str());
         status["address"] = json!(address);
@@ -1480,8 +1500,12 @@ fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) {
 /// cold room is loaded to answer, as a connection would load it.
 /// A finished world's seed, decoded from the store to its v1 JSON: the human view of what the
 /// server keeps as binary (`docs/seed-bundle-v2.md`).
-async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let status = read_status(&w, &id).await?;
+async fn world_bundle(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let status = read_status_for(&w, &who, &id).await?;
     let seed =
         status["seed_name"].as_str().ok_or((StatusCode::NOT_FOUND, "not done".to_owned()))?;
     let hash = status["bundle_hash"].as_str().unwrap_or_default().to_owned();
@@ -1490,8 +1514,12 @@ async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>
     Ok(json_text(StatusCode::OK, v1))
 }
 
-async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let status = read_status(&w, &id).await?;
+async fn room_summary(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let status = read_status_for(&w, &who, &id).await?;
     let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;
     let (room, _visit) = folder.enter(key.clone()).await.map_err(unavailable)?;
     let mut summary = room.summary().await.map_err(|e| unavailable(format!("{e:?}")))?;
@@ -1505,10 +1533,11 @@ async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>
 /// while someone watches it; at most `view_streams` are open at once.
 async fn room_events(
     State(w): State<Arc<Worlds>>,
+    who: Identity,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Reply {
-    let status = read_status(&w, &id).await?;
+    let status = read_status_for(&w, &who, &id).await?;
     let (folder, key, _) = hosted(&w, &status).ok_or_else(no_room)?;
     let permit = Arc::clone(&w.view_streams).try_acquire_owned().map_err(|_| {
         (StatusCode::SERVICE_UNAVAILABLE, "too many room views are open; try again".to_owned())
@@ -2528,6 +2557,30 @@ mod tests {
         assert_eq!(roles.len(), 2);
         assert!(roles.contains(&"admin") && roles.contains(&"owner"));
         assert_eq!(get_as(&app, "/api/rooms", None).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A world's status, bundle, room and event routes answer only its requester: another
+    /// account gets 404, like for an unknown id. Fails without `read_status_for`.
+    #[tokio::test]
+    async fn another_account_cannot_read_a_world_it_did_not_ask_for() {
+        let (w, app, [ann, bob, _]) = three_accounts().await;
+        let id = content_id(b"anns world");
+        let status = json!({"id": id, "status": "queued", "owner": "pw:ann"});
+        w.save_status(&status).await.unwrap();
+        for tail in ["", "/bundle", "/room", "/room/events"] {
+            let path = format!("/api/worlds/{id}{tail}");
+            let theirs = call(&app, "GET", &path, &bob, "").await.status();
+            assert_eq!(theirs, StatusCode::NOT_FOUND, "bob on {path}");
+            // Ann is let through: a queued world has no seed or room yet, a different 404.
+            let mine = call(&app, "GET", &path, &ann, "").await;
+            let text = String::from_utf8_lossy(
+                &axum::body::to_bytes(mine.into_body(), usize::MAX).await.unwrap(),
+            )
+            .into_owned();
+            assert!(!text.contains("no such world"), "ann on {path}: {text}");
+        }
+        let ok = call(&app, "GET", &format!("/api/worlds/{id}"), &ann, "").await;
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     async fn admins_of(app: &Router, key: &str, cookie: &str) -> Value {
