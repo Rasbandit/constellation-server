@@ -44,6 +44,8 @@ memory-harness = ["dep:allocation-counter"]
 [dependencies]
 # Counts allocations per thread for the memory harness only (feature `memory-harness`).
 allocation-counter = { version = "0.8", optional = true }
+# Account passwords: argon2id, memory-hard, the OWASP-recommended hash.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
 # Generation for a data-only manifest world, and its upload check (compile).

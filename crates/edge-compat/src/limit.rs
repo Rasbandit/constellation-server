@@ -97,13 +97,13 @@ impl<K: Hash + Eq> RateTable<K> {
     }
 
     /// Whether `key` may start a charge at `now` ([`Bucket::ready`]).
-    pub(crate) fn ready(&self, key: K, now: Instant) -> bool {
+    pub fn ready(&self, key: K, now: Instant) -> bool {
         self.with(key, now, |b| b.ready(now))
     }
 
     /// Charge `cost` tokens to `key` at `now` ([`Bucket::charge`]); a key the full table
     /// cannot track is not charged (it was refused by `ready` first).
-    pub(crate) fn charge(&self, key: K, cost: u64, now: Instant) {
+    pub fn charge(&self, key: K, cost: u64, now: Instant) {
         self.with(key, now, |b| {
             b.charge(cost, now);
             true

@@ -21,6 +21,7 @@
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
+use crate::accounts::{self, Authenticator, Caller, PasswordAuth, user_may};
 use crate::host::{RoomsFolder, Waker};
 use crate::manifests::{self, Manifests};
 use crate::rooms::RoomKey;
@@ -78,6 +79,8 @@ pub(crate) struct Worlds {
     rooms: Option<(RoomsFolder, String)>,
     /// The host's store, where every finished world's seed and packages go.
     importer: Option<Waker>,
+    /// Sign-up, login and sessions, on the host's store (set by [`Worlds::router`]).
+    accounts: Option<Arc<PasswordAuth>>,
     /// Wrong tokens per client address (`admin_auth_fail_burst`).
     auth_fails: edge_compat::RateTable<IpAddr>,
     /// Behind a reverse proxy: the header carrying the client address (`--trusted-proxy-header`).
@@ -266,6 +269,7 @@ pub(crate) fn open(
         seq: AtomicU64::new(0),
         rooms: None,
         importer: None,
+        accounts: None,
         auth_fails: edge_compat::RateTable::new(
             limits.admin_auth_fail_burst,
             limits.admin_auth_fail_refill_milli_per_sec,
@@ -342,11 +346,12 @@ impl Worlds {
         db: store::Db,
     ) -> Router {
         self.store = db.clone();
-        self.manifests = Manifests::new(db, &self.limits);
+        self.manifests = Manifests::new(db.clone(), &self.limits);
         self.import_files(self.store.is_durable()).await;
         self.import_jobs(self.store.is_durable()).await;
         self.rooms = rooms;
         self.importer = Some(importer);
+        self.accounts = Some(Arc::new(PasswordAuth::new(db, self.limits, proxy_header.clone())));
         self.proxy_header = proxy_header;
         let state = Arc::new(self);
         tokio::spawn(sweep(Arc::downgrade(&state)));
@@ -709,6 +714,7 @@ async fn heartbeat(w: Arc<Worlds>, id: String) {
 
 fn routes(state: Arc<Worlds>) -> Router {
     let l = state.limits;
+    let accounts = state.accounts.clone();
     // Each upload kind is cut off at its own cap while the body is read, not after it is held.
     let capped = |cap: usize| DefaultBodyLimit::max(cap);
     Router::new()
@@ -721,6 +727,7 @@ fn routes(state: Arc<Worlds>) -> Router {
             "/api/manifests",
             get(list_manifests).merge(put(put_manifest).layer(capped(l.manifest_max_bytes))),
         )
+        .route("/api/rooms", get(list_rooms))
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route("/api/worlds/{id}/room", get(room_summary))
@@ -737,11 +744,18 @@ fn routes(state: Arc<Worlds>) -> Router {
         // The world requests are small JSON.
         .layer(capped(l.yaml_max_bytes))
         .with_state(state)
+        // Open: sign-up, login, logout and who-am-I carry no token (their own limits apply).
+        .merge(accounts.map_or_else(Router::new, accounts::routes))
 }
 
-/// `GET /api/auth`: `{"token_required": bool}`, so the UI knows whether to ask for a token.
+/// `GET /api/auth`: `{"token_required": bool, "signup_open": bool}`, so the UI knows whether to
+/// ask for a token and whether to offer sign-up.
 async fn auth_mode(State(w): State<Arc<Worlds>>) -> impl IntoResponse {
-    let body = format!("{{\"token_required\":{}}}", w.token.is_some());
+    let body = format!(
+        "{{\"token_required\":{},\"signup_open\":{}}}",
+        w.token.is_some(),
+        w.limits.signup_open
+    );
     ([(header::CONTENT_TYPE, "application/json")], body)
 }
 
@@ -749,10 +763,25 @@ async fn auth_mode(State(w): State<Arc<Worlds>>) -> impl IntoResponse {
 /// `admin_auth_fail_burst` of them gets 429 until its bucket refills. A right token is never
 /// counted or refused, so nobody can lock the admin out by guessing from the same address (all
 /// clients share the proxy's address unless `--trusted-proxy-header` is set).
-async fn auth(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
+async fn auth(State(w): State<Arc<Worlds>>, mut req: Request, next: Next) -> Response {
     // Open mode (no token configured): everyone is admin, nothing is counted.
-    let Some(want) = &w.token else { return next.run(req).await };
+    let Some(want) = &w.token else {
+        req.extensions_mut().insert(Caller::Admin);
+        return next.run(req).await;
+    };
     if authorized(req.headers(), want) {
+        req.extensions_mut().insert(Caller::Admin);
+        return next.run(req).await;
+    }
+    // A signed-in account is no admin: it passes only where `user_may` says (not counted as a
+    // failure, it is who it says it is).
+    if let Some(a) = &w.accounts
+        && let Some(who) = a.identify(req.headers()).await
+    {
+        if !user_may(req.method(), req.uri().path()) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        req.extensions_mut().insert(Caller::User(who));
         return next.run(req).await;
     }
     let ip = client_ip(&req, w.proxy_header.as_ref());
@@ -795,7 +824,7 @@ fn busy(w: &Worlds, what: &str) -> Response {
 /// The address failures are counted under: the last entry of the last line of the trusted proxy
 /// header (what the proxy itself appended; earlier lines and entries are the client's to forge),
 /// else the peer's. An IPv6 address counts as its /64, since one host owns a whole /64.
-fn client_ip(req: &Request, proxy_header: Option<&HeaderName>) -> IpAddr {
+pub(crate) fn client_ip(req: &Request, proxy_header: Option<&HeaderName>) -> IpAddr {
     let ip = proxy_header
         .and_then(|name| req.headers().get_all(name).iter().next_back())
         .and_then(|v| v.to_str().ok())
@@ -1107,12 +1136,12 @@ async fn prepare(
     Ok(())
 }
 
-async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
+async fn create_world(State(w): State<Arc<Worlds>>, caller: Caller, body: Bytes) -> Reply {
     let Some(slot) = w.admit() else { return Ok(busy(&w, "too many generations are queued")) };
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
     let req: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("bad JSON: {e}")))?;
     if req.get("manifest").is_some() {
-        return create_data_only_world(&w, &req, slot).await;
+        return create_data_only_world(&w, &req, caller.owner(), slot).await;
     }
     let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).await?;
     let yamls = chosen(&w, &req, "yamls", Kind::Yaml).await?;
@@ -1131,8 +1160,18 @@ async fn create_world(State(w): State<Arc<Worlds>>, body: Bytes) -> Reply {
         drop(std::fs::remove_dir_all(&world));
         return Err(internal(e));
     }
-    let status = json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
+    let mut status =
+        json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
+    with_owner(&mut status, caller.owner());
     queue(&w, status, slot).await
+}
+
+/// Note who asked for the world, so its room is recorded as theirs once it is listed
+/// ([`claim_room`]). The admin token has no account: no owner.
+fn with_owner(status: &mut Value, owner: Option<&str>) {
+    if let Some(o) = owner {
+        status["owner"] = json!(o);
+    }
 }
 
 fn ids(metas: &[Value]) -> Vec<Value> {
@@ -1172,7 +1211,12 @@ async fn queue(w: &Arc<Worlds>, status: Value, slot: JobSlot) -> Reply {
 /// the engine in a capped child process (no world code runs). The player files are JSON
 /// documents with a `name`, a `game` (the manifest's) and the world's options, pool and start
 /// items (`data_fill::Instance`).
-async fn create_data_only_world(w: &Arc<Worlds>, req: &Value, slot: JobSlot) -> Reply {
+async fn create_data_only_world(
+    w: &Arc<Worlds>,
+    req: &Value,
+    owner: Option<&str>,
+    slot: JobSlot,
+) -> Reply {
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
     if req.get("apworlds").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
         return Err(bad("a manifest world takes no legacy world files".to_owned()));
@@ -1196,10 +1240,11 @@ async fn create_data_only_world(w: &Arc<Worlds>, req: &Value, slot: JobSlot) -> 
     }
     let yaml_ids = ids(&yamls);
     let id = new_world_id(w, &[&vec![json!(manifest_id)], &yaml_ids]);
-    let status = json!({
+    let mut status = json!({
         "id": id, "status": "queued", "engine": ENGINE_DATA_ONLY,
         "manifest": manifest_id, "yamls": yaml_ids,
     });
+    with_owner(&mut status, owner);
     queue(w, status, slot).await
 }
 
@@ -1262,6 +1307,7 @@ async fn run_generation(w: &Worlds, world: &Path, mut status: Value, _slot: JobS
             status["slots"] = json!(loaded.bundle.slots().len());
             status["bundle_hash"] = json!(hex(&loaded.hash));
             status["generation"] = report;
+            claim_room(w, &status).await;
         }
         Err(e) => {
             status["status"] = json!("failed");
@@ -1423,6 +1469,42 @@ fn hosted<'a>(w: &'a Worlds, status: &Value) -> Option<(&'a RoomsFolder, RoomKey
     let key = folder.key_of(status["seed_name"].as_str()?)?;
     let address = key.address(public);
     Some((folder, key, address))
+}
+
+/// Record the finished world's listed room under the account that asked for it (the admin's
+/// rooms are recorded with no owner), so `GET /api/rooms` finds it. A failure is logged: the
+/// world is made, only its listing under that account is missing.
+async fn claim_room(w: &Worlds, status: &Value) {
+    let (Some((_, key, _)), Some(seed)) = (hosted(w, status), status["seed_name"].as_str()) else {
+        return;
+    };
+    let info = log::OwnedRoom {
+        world_id: status["id"].as_str().map(str::to_owned),
+        seed_name: seed.to_owned(),
+        room_key: key.as_str().to_owned(),
+        owner: None,
+        age_secs: 0,
+    };
+    let owner = status["owner"].as_str();
+    if let Err(e) = w.store.room_claim(crate::room_id(seed), owner, &info).await {
+        tracing::error!(error = ?e, world = ?status["id"], "recording the room's owner failed");
+    }
+}
+
+/// `GET /api/rooms`: the rooms the caller made, newest first; the admin token sees every listed
+/// room, and the ones made before accounts have no `id` (no world to open them by).
+async fn list_rooms(State(w): State<Arc<Worlds>>, caller: Caller) -> Reply {
+    let rooms = w.store.rooms_owned(caller.owner()).await.map_err(store_error)?;
+    let rooms: Vec<Value> = rooms
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.world_id, "name": r.seed_name, "room_key": r.room_key,
+                "owner": r.owner, "age_secs": r.age_secs,
+            })
+        })
+        .collect();
+    Ok(json_reply(StatusCode::OK, &Value::Array(rooms)))
 }
 
 fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
@@ -1626,6 +1708,7 @@ mod tests {
         let mut w = open(&root.join("data"), Some("token"), paths, limits).unwrap();
         // The unit tests are not the server's executable: the jobs run in this process.
         w.jobs = JobRunner::InProcess;
+        w.accounts = Some(Arc::new(PasswordAuth::new(w.store.clone(), limits, None)));
         w
     }
 
@@ -1744,7 +1827,8 @@ mod tests {
         let two = stored(&w, Kind::Apworld, b"2", json!({"module": "clique"})).await;
         let yaml = stored(&w, Kind::Yaml, b"y", json!({})).await;
         let req = json!({"apworlds": [one["id"], two["id"]], "yamls": [yaml["id"]]});
-        let e = create_world(State(w), Bytes::from(req.to_string())).await.unwrap_err();
+        let e =
+            create_world(State(w), Caller::Admin, Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e, (StatusCode::BAD_REQUEST, "two apworlds have the same module name".into()));
         let worlds_dir = std::fs::read_dir(root.join("data/worlds")).unwrap();
         assert_eq!(worlds_dir.count(), 0, "no world folder was made");
@@ -2000,7 +2084,8 @@ mod tests {
         let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
         // The one generation permit is taken, so the job waits queued, as one a restart cuts.
         let _held = w.one_gen.acquire().await.unwrap();
-        let queued = create_world(State(Arc::clone(&w)), Bytes::from(req)).await.unwrap();
+        let queued =
+            create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req)).await.unwrap();
         let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
         // The restarted server: the same store and data folder, a new process.
         let mut next = worlds(&root, Limits::DESIGN);
@@ -2362,24 +2447,30 @@ mod tests {
         doc["instances"].as_array().unwrap().clone()
     }
 
-    /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
-    /// in a child (here in process), the seed stored in the host and its room listed and loaded.
-    /// Fails without `generate_data_only` (the world fails: it would run the legacy path).
-    #[tokio::test]
-    async fn a_manifest_world_is_generated_by_the_engine_and_hosted_as_a_room() {
-        let root = temp("data-only");
+    /// The API's state with a host listing rooms under `root/rooms`, as `--rooms` does.
+    async fn hosting(root: &Path) -> Arc<Worlds> {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
             crate::app(&crate::Source::Rooms(rooms), None, None, Limits::DESIGN).await.unwrap();
         let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.db());
         tokio::spawn(async move { host.supervise().await });
-        let mut w = worlds(&root, Limits::DESIGN);
+        let mut w = worlds(root, Limits::DESIGN);
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
         w.store = db.clone();
+        w.accounts = Some(Arc::new(PasswordAuth::new(db.clone(), Limits::DESIGN, None)));
         w.manifests = Manifests::new(db, &Limits::DESIGN);
-        let w = Arc::new(w);
+        Arc::new(w)
+    }
+
+    /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
+    /// in a child (here in process), the seed stored in the host and its room listed and loaded.
+    /// Fails without `generate_data_only` (the world fails: it would run the legacy path).
+    #[tokio::test]
+    async fn a_manifest_world_is_generated_by_the_engine_and_hosted_as_a_room() {
+        let root = temp("data-only");
+        let w = hosting(&root).await;
 
         let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
         let manifest_id = json_of(up).await["id"].clone();
@@ -2390,7 +2481,9 @@ mod tests {
         }
         let req = json!({"manifest": manifest_id, "yamls": yamls});
         let queued =
-            create_world(State(Arc::clone(&w)), Bytes::from(req.to_string())).await.unwrap();
+            create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.to_string()))
+                .await
+                .unwrap();
         assert_eq!(queued.status(), StatusCode::ACCEPTED);
         let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
         let mut status = read_status(&w, &id).await.unwrap();
@@ -2413,8 +2506,141 @@ mod tests {
         assert_eq!(w.queued.load(Ordering::Acquire), 0, "the job's slot is released");
         // A manifest world takes no legacy world files.
         let both = json!({"manifest": manifest_id, "yamls": yamls, "apworlds": ["x"]});
-        let e = create_world(State(w), Bytes::from(both.to_string())).await.unwrap_err();
+        let e =
+            create_world(State(w), Caller::Admin, Bytes::from(both.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A world made for an account is recorded as its room: its list has it, another account's
+    /// has not, and the admin's has it with its owner. Fails without `claim_room`.
+    #[tokio::test]
+    async fn a_room_made_for_an_account_is_listed_for_that_account_only() {
+        let root = temp("owned-world");
+        let w = hosting(&root).await;
+        let up = upload_manifest(&w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
+        let manifest_id = json_of(up).await["id"].clone();
+        let insts = fixture_instances();
+        let yaml = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await["id"].clone();
+        let req = json!({"manifest": manifest_id, "yamls": [yaml]});
+        let ann = Caller::User(accounts::Identity { subject: "pw:ann".into(), name: "ann".into() });
+        let queued = create_world(State(Arc::clone(&w)), ann, Bytes::from(req.to_string())).await;
+        let id = json_of(queued.unwrap()).await["id"].as_str().unwrap().to_owned();
+        let mut status = read_status(&w, &id).await.unwrap();
+        assert_eq!(status["owner"], "pw:ann");
+        for _ in 0..600 {
+            status = read_status(&w, &id).await.unwrap();
+            if status["status"] != "queued" && status["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status["status"], "done", "{status}");
+        let mine = w.store.rooms_owned(Some("pw:ann")).await.unwrap();
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert_eq!(mine[0].world_id.as_deref(), Some(id.as_str()));
+        assert_eq!(mine[0].owner.as_deref(), Some("pw:ann"));
+        assert!(w.store.rooms_owned(Some("pw:bo")).await.unwrap().is_empty());
+        assert_eq!(w.store.rooms_owned(None).await.unwrap().len(), 1);
+    }
+
+    /// Sign up on `app` and return the session cookie to send back.
+    async fn signed_up(app: &Router, name: &str) -> String {
+        use tower::ServiceExt;
+        let body = json!({"username": name, "password": "a long enough password"});
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/signup")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let r = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let c = r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        c.split(';').next().unwrap().to_owned()
+    }
+
+    async fn get_as(app: &Router, path: &str, auth: Option<(&str, &str)>) -> Response {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder().uri(path);
+        if let Some((name, value)) = auth {
+            req = req.header(name, value);
+        }
+        app.clone().oneshot(req.body(axum::body::Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// Each account lists its own rooms; the admin token lists all, an anonymous caller none.
+    /// Fails if the list ignores the caller (every account would see every room).
+    #[tokio::test]
+    async fn an_account_lists_only_its_rooms_and_the_admin_lists_all() {
+        let root = temp("room-list");
+        let w = Arc::new(worlds(&root, Limits { signup_burst: 10, ..Limits::DESIGN }));
+        let app = routes(Arc::clone(&w));
+        let (ann, bo) = (signed_up(&app, "ann").await, signed_up(&app, "bob").await);
+        let room = |n: u8| log::OwnedRoom {
+            world_id: Some(format!("{n:064x}")),
+            seed_name: format!("seed{n}"),
+            room_key: format!("key{n}"),
+            owner: None,
+            age_secs: 0,
+        };
+        let db = &w.store;
+        db.room_claim(proto::RoomId(1), Some("pw:ann"), &room(1)).await.unwrap();
+        db.room_claim(proto::RoomId(2), Some("pw:bob"), &room(2)).await.unwrap();
+        db.room_claim(proto::RoomId(3), None, &room(3)).await.unwrap();
+        let names = async |r: Response| -> Vec<String> {
+            assert_eq!(r.status(), StatusCode::OK);
+            let v = json_of(r).await;
+            v.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_owned()).collect()
+        };
+        let as_ann = get_as(&app, "/api/rooms", Some(("cookie", &ann))).await;
+        assert_eq!(names(as_ann).await, ["seed1"]);
+        let as_bo = get_as(&app, "/api/rooms", Some(("cookie", &bo))).await;
+        assert_eq!(names(as_bo).await, ["seed2"]);
+        let admin = get_as(&app, "/api/rooms", Some(("authorization", "Bearer token"))).await;
+        let mut all = names(admin).await;
+        all.sort();
+        assert_eq!(all, ["seed1", "seed2", "seed3"]);
+        assert_eq!(get_as(&app, "/api/rooms", None).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A new account (sign-up is open) may not reach anything that runs uploaded code or spends
+    /// the host's CPU: every route but its own room list is the admin token's. Fails if
+    /// the gate treats a session like the token.
+    #[tokio::test]
+    async fn a_new_account_cannot_reach_the_admin_routes() {
+        use tower::ServiceExt;
+        let root = temp("user-gate");
+        let w = Arc::new(worlds(&root, Limits::DESIGN));
+        let app = routes(Arc::clone(&w));
+        let cookie = signed_up(&app, "ann").await;
+        let zeros = "0".repeat(64);
+        for (method, path) in [
+            ("PUT", "/api/apworlds?name=x.apworld".to_owned()),
+            ("PUT", "/api/yamls?name=x.yaml".to_owned()),
+            ("PUT", "/api/manifests?name=m.json".to_owned()),
+            ("POST", "/api/worlds".to_owned()),
+            ("GET", format!("/api/worlds/{zeros}")),
+            ("GET", "/api/apworlds".to_owned()),
+            ("GET", "/api/manifests".to_owned()),
+            ("POST", "/api/rooms".to_owned()),
+            ("GET", "/api/nothing-here".to_owned()),
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(&path)
+                .header(header::COOKIE, &cookie)
+                .body(axum::body::Body::from("x"))
+                .unwrap();
+            let r = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let r = get_as(&app, "/api/rooms", Some(("cookie", &cookie))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        // With no login at all it is a plain 401, and a forged cookie is no login.
+        let forged = format!("constellation_session={zeros}");
+        for auth in [None, Some(("cookie", forged.as_str()))] {
+            let r = get_as(&app, "/api/manifests", auth).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     /// The API is the boundary: a player file for another game is refused before anything runs.
@@ -2428,7 +2654,8 @@ mod tests {
         let ok = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await;
         let other = player_yaml(&w, "Bo", "Other Game", &insts[1]).await;
         let req = json!({"manifest": manifest_id, "yamls": [ok["id"], other["id"]]});
-        let e = create_world(State(w), Bytes::from(req.to_string())).await.unwrap_err();
+        let e =
+            create_world(State(w), Caller::Admin, Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
         assert!(e.1.contains("Bo") && e.1.contains("Fixture Game"), "{}", e.1);
         let made = std::fs::read_dir(root.join("data/worlds")).unwrap().count();
@@ -2448,9 +2675,13 @@ mod tests {
         let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
         // The one generation permit is taken, so the first job waits queued.
         let held = w.one_gen.acquire().await.unwrap();
-        let first = create_world(State(Arc::clone(&w)), Bytes::from(req.clone())).await.unwrap();
+        let first = create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.clone()))
+            .await
+            .unwrap();
         assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let second = create_world(State(Arc::clone(&w)), Bytes::from(req.clone())).await.unwrap();
+        let second = create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.clone()))
+            .await
+            .unwrap();
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(second.headers().contains_key(header::RETRY_AFTER));
         drop(held);
@@ -2460,7 +2691,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let third = create_world(State(w), Bytes::from(req)).await.unwrap();
+        let third = create_world(State(w), Caller::Admin, Bytes::from(req)).await.unwrap();
         assert_eq!(third.status(), StatusCode::ACCEPTED, "the finished job gave its slot back");
     }
 

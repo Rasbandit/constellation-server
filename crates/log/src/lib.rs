@@ -471,6 +471,96 @@ pub trait JobStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
+/// A hosted room as the account listing shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRoom {
+    /// The generation the web UI opens the room by (None for a room made before accounts).
+    pub world_id: Option<String>,
+    /// The room's seed name.
+    pub seed_name: String,
+    /// The room's public key.
+    pub room_key: String,
+    /// Who made it: a provider-neutral subject (None: no owner, only the admin lists it).
+    pub owner: Option<String>,
+    /// Seconds since the room was made.
+    pub age_secs: u64,
+}
+
+/// Accounts, their logins and room ownership. Nothing here ever holds a password: `hash` is an
+/// argon2id PHC string, and a session is found by the SHA-256 of its cookie value.
+pub trait AccountStore: Send + Sync + 'static {
+    /// Add account `name` (already normalized: lowercase) with password `hash`; false when the
+    /// name is taken.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn user_create(
+        &self,
+        name: &str,
+        hash: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Account `name`'s password hash.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn user_hash(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
+    /// Start a login for `name`, found by `token_hash`, dead after `ttl`.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The account of a live (not expired) login.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn session_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
+    /// End a login.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn session_delete(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Record `room` (just listed) as made by `owner` (None: the admin token, no account), and
+    /// the world it came from. Write once: a room already recorded keeps its owner. Only
+    /// `room_info.world_id` is read in Postgres, which has the rest in the room's row.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn room_claim(
+        &self,
+        room: RoomId,
+        owner: Option<&str>,
+        room_info: &OwnedRoom,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The rooms `owner` made, newest first; with None, every listed room (the admin's view).
+    ///
+    /// # Errors
+    /// The store failing.
+    fn rooms_owned(
+        &self,
+        owner: Option<&str>,
+    ) -> impl Future<Output = Result<Vec<OwnedRoom>, StoreError>> + Send;
+}
+
 /// Whether an upload's `bytes` no longer hash to its `id` (a torn row).
 #[must_use]
 pub(crate) fn is_torn(bytes: &[u8], id: &BlobKey) -> bool {

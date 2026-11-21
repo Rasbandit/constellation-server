@@ -1255,3 +1255,155 @@ fn fence_has_exactly_the_one_and_the_mutants_exclusion_names() {
     let (body, _) = from_fence.split_once("\n}\n").expect("fence ends");
     assert_eq!(body.matches("&&").count(), 1, "narrow the fence exclusion in nightly.yml");
 }
+
+/// A listed room as the owner query reads it: world id, seed name, key, owner, age.
+type OwnedRow = (Option<String>, String, String, Option<String>, i64);
+
+/// Accounts, logins and room ownership (migration 0007).
+impl crate::AccountStore for PgLogStore {
+    async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
+        let (name, hash) = (name.to_owned(), hash.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO users (name, hash) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                    .bind(&name)
+                    .bind(&hash)
+                    .execute(&mut *c)
+                    .await
+                    .map(|done| done.rows_affected() == 1)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn user_hash(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let name = name.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT hash FROM users WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: core::time::Duration,
+    ) -> Result<(), StoreError> {
+        let (token, name, ttl) = (token_hash.to_vec(), name.to_owned(), secs(ttl));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // Dead sessions are swept as new ones are made, so the table stays small.
+                sqlx::query("DELETE FROM sessions WHERE expires_at <= now()")
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))?;
+                sqlx::query(
+                    "INSERT INTO sessions (token_hash, username, expires_at) \
+                     VALUES ($1, $2, now() + make_interval(secs => $3))",
+                )
+                .bind(&token)
+                .bind(&name)
+                .bind(ttl)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_user(&self, token_hash: &[u8; 32]) -> Result<Option<String>, StoreError> {
+        let token = token_hash.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT username FROM sessions WHERE token_hash = $1 AND expires_at > now()",
+                )
+                .bind(&token)
+                .fetch_optional(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_delete(&self, token_hash: &[u8; 32]) -> Result<(), StoreError> {
+        let token = token_hash.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+                    .bind(&token)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_claim(
+        &self,
+        room: RoomId,
+        owner: Option<&str>,
+        room_info: &crate::OwnedRoom,
+    ) -> Result<(), StoreError> {
+        let (owner, world) = (owner.map(str::to_owned), room_info.world_id.clone());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE rooms SET owner = $2, world_id = $3 WHERE room_id = $1 AND world_id IS NULL",
+                )
+                .bind(room_key(room))
+                .bind(&owner)
+                .bind(&world)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn rooms_owned(&self, owner: Option<&str>) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        let owner = owner.map(str::to_owned);
+        let rows: Vec<OwnedRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT world_id, seed_name, room_key, owner, \
+                         GREATEST(0, EXTRACT(EPOCH FROM now() - created_at))::bigint \
+                         FROM rooms WHERE room_key IS NOT NULL AND finished_at IS NULL \
+                         AND ($1::text IS NULL OR owner = $1) ORDER BY created_at DESC, room_id",
+                    )
+                    .bind(&owner)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(world_id, seed_name, room_key, owner, age)| {
+                Ok(crate::OwnedRoom {
+                    world_id,
+                    seed_name,
+                    room_key,
+                    owner,
+                    age_secs: stored(age, "room age")?,
+                })
+            })
+            .collect()
+    }
+}

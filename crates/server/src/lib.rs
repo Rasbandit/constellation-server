@@ -12,6 +12,7 @@
 //! With `--data-dir` it also serves the admin API for uploads and seed generation
 //! ([`worlds`], run in [`sandbox`]).
 
+mod accounts;
 mod manifests;
 mod room_view;
 mod sandbox;
@@ -1136,11 +1137,12 @@ mod tests {
         }
         assert_eq!(status_of(open, "/api/nope", None).await, 404, "no gate, no such route");
         let auth = raw(open, "/api/auth", "").await;
-        assert!(auth.ends_with("{\"token_required\":false}"), "{auth}");
+        assert!(auth.ends_with("{\"token_required\":false,\"signup_open\":true}"), "{auth}");
         let (root2, shut) = serve_admin_mode("shut", limits, None, None, Some(TOKEN)).await;
         let auth = raw(shut, "/api/auth", "").await;
         assert!(
-            auth.starts_with("HTTP/1.1 200") && auth.ends_with("{\"token_required\":true}"),
+            auth.starts_with("HTTP/1.1 200")
+                && auth.ends_with("{\"token_required\":true,\"signup_open\":true}"),
             "{auth}"
         );
         assert_eq!(status_of(shut, "/api/yamls", None).await, 401);

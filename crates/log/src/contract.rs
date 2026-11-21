@@ -18,7 +18,9 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore + ManifestStore + UploadStore + JobStore {
+trait Store:
+    LogStore + BlobStore + ManifestStore + UploadStore + JobStore + crate::AccountStore
+{
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
     /// Change a stored upload's file without its id: a torn row.
     fn tear_for_tests(
@@ -582,6 +584,46 @@ async fn a_job_put_if_absent_never_replaces_a_stored_status<S: Store>(s: Arc<S>)
     assert_eq!(status, "newer row");
 }
 
+async fn accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted<S: Store>(s: Arc<S>) {
+    let name = format!("ann-{}", s.bump(RoomId(1)).await.0);
+    assert!(s.user_create(&name, "hash-1").await.unwrap());
+    assert!(!s.user_create(&name, "hash-2").await.unwrap(), "a name is taken once");
+    assert_eq!(s.user_hash(&name).await.unwrap().as_deref(), Some("hash-1"));
+    assert_eq!(s.user_hash("nobody-here").await.unwrap(), None);
+    let (live, dead, gone) = ([1; 32], [2; 32], [3; 32]);
+    let hour = Duration::from_secs(3600);
+    s.session_put(&live, &name, hour).await.unwrap();
+    s.session_put(&dead, &name, Duration::ZERO).await.unwrap();
+    s.session_put(&gone, &name, hour).await.unwrap();
+    assert_eq!(s.session_user(&live).await.unwrap().as_deref(), Some(name.as_str()));
+    assert_eq!(s.session_user(&dead).await.unwrap(), None, "an expired login is dead");
+    s.session_delete(&gone).await.unwrap();
+    assert_eq!(s.session_user(&gone).await.unwrap(), None);
+    assert_eq!(s.session_user(&[9; 32]).await.unwrap(), None);
+}
+
+/// Rooms 11, 12 and 13 must be listed already (Postgres reads them from the directory).
+async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(s: &S) {
+    let room = |n: u8| crate::OwnedRoom {
+        world_id: Some(format!("w{n}")),
+        seed_name: format!("seed{n}"),
+        room_key: format!("key{n}"),
+        owner: None,
+        age_secs: 0,
+    };
+    s.room_claim(RoomId(11), Some("pw:a"), &room(1)).await.unwrap();
+    s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
+    s.room_claim(RoomId(11), Some("pw:b"), &room(1)).await.unwrap();
+    let mine = s.rooms_owned(Some("pw:a")).await.unwrap();
+    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed1"]);
+    assert_eq!(mine[0].owner.as_deref(), Some("pw:a"), "an owner is kept");
+    assert!(s.rooms_owned(Some("pw:nobody")).await.unwrap().is_empty());
+    s.room_claim(RoomId(13), None, &room(3)).await.unwrap();
+    let all = s.rooms_owned(None).await.unwrap();
+    assert!(all.iter().any(|r| r.owner.is_none()), "the admin view lists rooms with no owner");
+    assert!(all.len() >= 3);
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -620,6 +662,7 @@ macro_rules! contract {
                 uploads_are_deduplicated_by_kind_checked_and_listed,
                 jobs_are_read_back_and_only_stale_unfinished_ones_fail,
                 a_job_put_if_absent_never_replaces_a_stored_status,
+                accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,
@@ -634,6 +677,11 @@ async fn mem_store() -> MemLogStore {
 }
 
 contract!(mem, mem_store);
+
+#[tokio::test]
+async fn mem_hosts_list_only_their_own_rooms() {
+    a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&MemLogStore::new()).await;
+}
 
 #[cfg(feature = "pg-tests")]
 mod pg_only {
@@ -693,6 +741,15 @@ mod pg_only {
         key: &str,
     ) -> Result<String, OpenError> {
         s.open_room(room, "seed", 1, hash, key, World::V1(b"{}")).await.map(|o| o.key)
+    }
+
+    #[tokio::test]
+    async fn pg_hosts_list_only_their_own_rooms() {
+        let s = pg_store().await;
+        open(&s, RoomId(11), &[1], "aaaaaaaaaa").await.unwrap();
+        open(&s, RoomId(12), &[2], "bbbbbbbbbb").await.unwrap();
+        open(&s, RoomId(13), &[3], "cccccccccc").await.unwrap();
+        a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&s).await;
     }
 
     #[tokio::test]
