@@ -2613,9 +2613,12 @@ mod tests {
     }
 
     /// A hosted world, its room's key, and the router, with accounts ann, bob and cyd signed up.
-    async fn hosted_for_ann(limits: Limits) -> (Arc<Worlds>, Router, [String; 3], String, String) {
+    async fn hosted_for_ann(
+        name: &str,
+        limits: Limits,
+    ) -> (Arc<Worlds>, Router, [String; 3], String, String) {
         let limits = Limits { signup_burst: 10, ..limits };
-        let w = hosting_with(&temp("world-access"), limits).await;
+        let w = hosting_with(&temp(name), limits).await;
         let app = routes(Arc::clone(&w));
         let c = [
             signed_up(&app, "ann").await,
@@ -2634,7 +2637,7 @@ mod tests {
     /// sees the owner's account id. Each route fails without `read_status_for`.
     #[tokio::test]
     async fn another_account_cannot_read_a_world_it_did_not_ask_for() {
-        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann(Limits::DESIGN).await;
+        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann("read-routes", Limits::DESIGN).await;
         let paths: Vec<String> = ["", "/bundle", "/room", "/room/events"]
             .iter()
             .map(|t| format!("/api/worlds/{id}{t}"))
@@ -2678,7 +2681,7 @@ mod tests {
     #[tokio::test]
     async fn an_open_room_stream_ends_when_the_viewer_loses_access() {
         let limits = Limits { view_access_recheck_ms: 20, ..Limits::DESIGN };
-        let (w, app, [ann, bob, cyd], id, key) = hosted_for_ann(limits).await;
+        let (w, app, [ann, bob, cyd], id, key) = hosted_for_ann("stream-access", limits).await;
         for n in ["bob", "cyd"] {
             let r = call(&app, "PUT", &format!("/api/rooms/{key}/admins/{n}"), &ann, "").await;
             assert_eq!(r.status(), StatusCode::OK);
@@ -2696,6 +2699,115 @@ mod tests {
         ends(cyds).await;
         let owners = call(&app, "GET", &events, &ann, "").await;
         assert_eq!(owners.status(), StatusCode::OK, "the owner keeps hers");
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Class {
+        /// Open to everyone: no session needed.
+        Public,
+        /// Uploads: shared by every account until per-account trust exists (see #127).
+        Global,
+        /// Makes something owned by the caller; touches nobody else's data.
+        Own,
+        /// Reads or changes one room or world: only those with a role on it.
+        Scoped,
+        /// Answers 404 whatever it is asked.
+        CatchAll,
+    }
+
+    /// Every `/api` route of the router and what it may show another account. A route the
+    /// router has and this table lacks fails `no_route_escapes_the_cross_account_walk`.
+    const ROUTES: &[(&str, &[&str], Class)] = &[
+        ("/api/auth", &["GET"], Class::Public),
+        ("/api/signup", &["POST"], Class::Public),
+        ("/api/login", &["POST"], Class::Public),
+        ("/api/logout", &["POST"], Class::Public),
+        ("/api/me", &["GET"], Class::Public),
+        ("/api/apworlds", &["GET", "PUT"], Class::Global),
+        ("/api/yamls", &["GET", "PUT"], Class::Global),
+        ("/api/manifests", &["GET", "PUT"], Class::Global),
+        ("/api/rooms", &["GET"], Class::Own),
+        ("/api/worlds", &["POST"], Class::Own),
+        ("/api/worlds/{id}", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/room", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/bundle", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/room/events", &["GET"], Class::Scoped),
+        ("/api/rooms/{key}/admins", &["GET", "POST"], Class::Scoped),
+        ("/api/rooms/{key}/admins/{name}", &["PUT", "DELETE"], Class::Scoped),
+        ("/api", &["GET"], Class::CatchAll),
+        ("/api/", &["GET"], Class::CatchAll),
+        ("/api/{*rest}", &["GET"], Class::CatchAll),
+    ];
+
+    /// The paths the router code registers, read from the source of the three modules that
+    /// register them (test code cut off), so a new `.route(` cannot be forgotten.
+    fn registered_paths() -> Vec<String> {
+        let mut found = Vec::new();
+        for src in
+            [include_str!("worlds.rs"), include_str!("room_admins.rs"), include_str!("accounts.rs")]
+        {
+            let code = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            for part in code.split(".route(").skip(1) {
+                let lit = part.trim_start().strip_prefix('"').expect("a literal path");
+                found.push(lit.split('"').next().unwrap().to_owned());
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn no_route_escapes_the_cross_account_walk() {
+        let mut table: Vec<String> = ROUTES.iter().map(|(p, ..)| (*p).to_owned()).collect();
+        table.sort();
+        assert_eq!(
+            registered_paths(),
+            table,
+            "classify every route in ROUTES (and drop gone ones)"
+        );
+    }
+
+    /// User B, with every route of the router and A's ids and keys, never gets A's data and
+    /// changes nothing of A's: scoped routes are 404, lists show only B's own, and A still has
+    /// everything afterwards. Fails if any scoped route skips the role check.
+    #[tokio::test]
+    async fn another_account_walking_every_route_never_reaches_the_first_ones_data() {
+        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann("walk", Limits::DESIGN).await;
+        let a_rooms = call(&app, "GET", "/api/rooms", &ann, "").await;
+        let a_rooms = json_of(a_rooms).await;
+        let a_admins = admins_of(&app, &key, &ann).await;
+        let a_world = json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await;
+        for (template, methods, class) in ROUTES.iter().filter(|r| r.2 != Class::Public) {
+            let path =
+                template.replace("{id}", &id).replace("{key}", &key).replace("{name}", "ann");
+            for method in *methods {
+                let r = call(&app, method, &path, &bob, "{\"username\":\"bob\"}").await;
+                let status = r.status();
+                let body = String::from_utf8_lossy(
+                    &axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap(),
+                )
+                .into_owned();
+                let what = format!("{method} {path} ({class:?}): {status} {body}");
+                match class {
+                    Class::Scoped => assert_eq!(status, StatusCode::NOT_FOUND, "{what}"),
+                    Class::Own => {
+                        assert!(status != StatusCode::OK || !body.contains(&key), "{what}");
+                        assert!(!body.contains(&id), "{what}");
+                    }
+                    Class::CatchAll => assert_eq!(status, StatusCode::NOT_FOUND, "{what}"),
+                    // Uploads are global until #127. Open routes are skipped above (B's own
+                    // logout would end B's session).
+                    Class::Global | Class::Public => {}
+                }
+                assert!(!body.contains("pw:ann"), "A's account id leaked: {what}");
+            }
+        }
+        // B's own list has none of A's rooms, and nothing B did changed A's.
+        let b_rooms = json_of_call(&app, "/api/rooms", &bob).await;
+        assert_eq!(b_rooms, json!([]));
+        assert_eq!(json_of_call(&app, "/api/rooms", &ann).await, a_rooms);
+        assert_eq!(admins_of(&app, &key, &ann).await, a_admins);
+        assert_eq!(json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await, a_world);
     }
 
     async fn admins_of(app: &Router, key: &str, cookie: &str) -> Value {
