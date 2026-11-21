@@ -984,7 +984,7 @@ mod tests {
         ];
         let g = generation_from(env(with_private)).unwrap().unwrap();
         let want: Vec<std::path::PathBuf> =
-            ["/home/u", "/etc/c/db", "/etc/c/token"].iter().map(Into::into).collect();
+            ["/home/u", "/etc/c/token", "/etc/c/db"].iter().map(Into::into).collect();
         assert_eq!(g.private, want);
         let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
         assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");

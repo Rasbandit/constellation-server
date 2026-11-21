@@ -165,9 +165,7 @@ async fn grant(w: &Worlds, who: &Identity, key: &str, name: &str) -> Reply {
     let no_user = || (StatusCode::NOT_FOUND, "no such user".to_owned());
     let name = clean_name(name).ok_or_else(no_user)?;
     let is_owner = room.owner.as_deref().map(name_of) == Some(name.as_str());
-    if !is_owner
-        && !w.db().room_admin_add(key, &name, Some(&who.name)).await.map_err(|e| failed(&e))?
-    {
+    if !is_owner && !w.db().room_admin_add(key, &name, &who.name).await.map_err(|e| failed(&e))? {
         return Err(no_user());
     }
     listing(w.db(), &room, role).await

@@ -43,7 +43,7 @@ pub struct MemLogStore {
     /// Hosted rooms: the record and when it was made.
     owned: Mutex<BTreeMap<RoomId, (crate::OwnedRoom, std::time::Instant)>>,
     /// Room admins: (room key, account) to who granted it.
-    admins: Mutex<BTreeMap<(String, String), Option<String>>>,
+    admins: Mutex<BTreeMap<(String, String), String>>,
     /// How many of the next `job_put`s fail, as a store that is down for a while does.
     job_put_failures: Mutex<usize>,
 }
@@ -593,7 +593,7 @@ impl crate::AccountStore for MemLogStore {
         &self,
         key: &str,
         username: &str,
-        granted_by: Option<&str>,
+        granted_by: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send {
         let known =
             self.users.lock().unwrap_or_else(PoisonError::into_inner).contains_key(username)
@@ -602,7 +602,7 @@ impl crate::AccountStore for MemLogStore {
             let mut admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
             admins
                 .entry((key.to_owned(), username.to_owned()))
-                .or_insert_with(|| granted_by.map(str::to_owned));
+                .or_insert_with(|| granted_by.to_owned());
         }
         ready(Ok(known))
     }

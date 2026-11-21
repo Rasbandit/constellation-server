@@ -136,7 +136,7 @@ impl Sandbox {
         // Its own cgroup first: the memory cap there also counts tmpfs, memfd and shared memory
         // pages, and an out-of-memory kill lands on the sandbox, not the server. `env -i`:
         // bwrap's own process stays in the sandbox as its first process, and its environment
-        // is readable there (`/proc/1/environ`), so it gets none of ours (the admin token).
+        // is readable there (`/proc/1/environ`), so it gets none of ours (the room password and database URL).
         let l = &self.limits;
         let (mem_max, tasks) = (
             format!("MemoryMax={}", l.gen_cgroup_memory_bytes),

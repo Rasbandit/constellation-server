@@ -538,7 +538,7 @@ pub trait AccountStore: Send + Sync + 'static {
         token_hash: &[u8; 32],
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Record `room` (just listed) as made by `owner` (None: the admin token, no account), and
+    /// Record `room` (just listed) as made by `owner` (None: no account), and
     /// the world it came from. Write once: a room already recorded keeps its owner. Only
     /// `room_info.world_id` is read in Postgres, which has the rest in the room's row.
     ///
@@ -587,8 +587,8 @@ pub trait AccountStore: Send + Sync + 'static {
         key: &str,
     ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
 
-    /// Make account `username` an admin of room `key`, granted by account `granted_by` (None:
-    /// the admin token). Already an admin: kept as it was, still true. False when there is no
+    /// Make account `username` an admin of room `key`, granted by account `granted_by`.
+    /// Already an admin: kept as it was, still true. False when there is no
     /// such account or room.
     ///
     /// # Errors
@@ -597,7 +597,7 @@ pub trait AccountStore: Send + Sync + 'static {
         &self,
         key: &str,
         username: &str,
-        granted_by: Option<&str>,
+        granted_by: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// End `username`'s adminship of room `key`; false when it had none.

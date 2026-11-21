@@ -1416,9 +1416,9 @@ impl crate::AccountStore for PgLogStore {
         &self,
         key: &str,
         username: &str,
-        granted_by: Option<&str>,
+        granted_by: &str,
     ) -> Result<bool, StoreError> {
-        let (key, user, by) = (key.to_owned(), username.to_owned(), granted_by.map(str::to_owned));
+        let (key, user, by) = (key.to_owned(), username.to_owned(), granted_by.to_owned());
         self.isolated(move |c| {
             Box::pin(async move {
                 // The insert takes a room only when the account exists too; the result says

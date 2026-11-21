@@ -641,11 +641,11 @@ async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S:
         assert!(s.user_create(name, "h").await.unwrap());
     }
     assert!(s.room_admins(key).await.unwrap().is_empty());
-    assert!(s.room_admin_add(key, "bea", Some("own")).await.unwrap());
-    assert!(s.room_admin_add(key, "bea", Some("cy")).await.unwrap(), "a repeat grant is fine");
+    assert!(s.room_admin_add(key, "bea", "own").await.unwrap());
+    assert!(s.room_admin_add(key, "bea", "cy").await.unwrap(), "a repeat grant is fine");
     assert_eq!(s.room_admins(key).await.unwrap(), ["bea"], "listed once");
-    assert!(!s.room_admin_add(key, "ghost", None).await.unwrap(), "no such account");
-    assert!(!s.room_admin_add(other, "cy", None).await.unwrap(), "no such room");
+    assert!(!s.room_admin_add(key, "ghost", "own").await.unwrap(), "no such account");
+    assert!(!s.room_admin_add(other, "cy", "own").await.unwrap(), "no such room");
     let seen =
         |rooms: Vec<crate::OwnedRoom>| rooms.into_iter().map(|r| r.room_key).collect::<Vec<_>>();
     assert_eq!(seen(s.rooms_administered("bea").await.unwrap()), [key]);
@@ -654,7 +654,7 @@ async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S:
     assert!(!s.room_admin_remove(key, "bea").await.unwrap(), "nothing left to remove");
     assert!(s.rooms_administered("bea").await.unwrap().is_empty());
     for name in ["bea", "cy"] {
-        assert!(s.room_admin_add(key, name, None).await.unwrap());
+        assert!(s.room_admin_add(key, name, "own").await.unwrap());
     }
     s.user_delete("bea").await.unwrap();
     assert_eq!(s.room_admins(key).await.unwrap(), ["cy"], "a deleted account is no admin");

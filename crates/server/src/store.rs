@@ -200,7 +200,7 @@ impl Db {
         &self,
         key: &str,
         username: &str,
-        granted_by: Option<&str>,
+        granted_by: &str,
     ) -> Result<bool, StoreError> {
         on!(self, s => s.room_admin_add(key, username, granted_by).await)
     }

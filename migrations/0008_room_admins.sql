@@ -2,8 +2,7 @@
 --
 -- A room's owner is rooms.owner (never listed here, never removable). A row here makes the
 -- account an admin of that room only: it may add other accounts as admins and remove itself;
--- the owner may remove any admin. granted_by is the account that added it (NULL: the admin
--- token). Deleting an account or a room deletes its rows.
+-- the owner may remove any admin. granted_by is the account that added it. Deleting an account or a room deletes its rows.
 --
 -- Additive only. Rolling back to a binary without this migration:
 -- DROP TABLE room_admins;
@@ -11,7 +10,7 @@
 CREATE TABLE room_admins (
     room_id    bigint NOT NULL REFERENCES rooms (room_id) ON DELETE CASCADE,
     username   text NOT NULL REFERENCES users (name) ON DELETE CASCADE,
-    granted_by text,
+    granted_by text NOT NULL,
     granted_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (room_id, username)
 );
