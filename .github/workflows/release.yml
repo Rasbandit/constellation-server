@@ -70,13 +70,15 @@ jobs:
           test "$n" -gt 0
           docker compose exec -T postgres sh -c 'PGPASSWORD=ci-app-password psql -h 127.0.0.1 -U constellation_app -d constellation -c "CREATE TABLE sneaky (a int)" 2>&1' | grep -q 'permission denied'
       # The one public port serves the UI and the version: `/` is the app, a missing asset is a
-      # 404, /version carries the build, and an unknown /api path is a 404, not the app.
+      # 404, /version carries the build, and an unknown /api path is never the app: 401 without a
+      # session, 404 with one (the cookie jar from the sign-up step).
       - run: |
           P=http://127.0.0.1:38281
           curl -sf $P/ | grep -qi '<div id="root">'
           curl -sf -H 'Accept: text/html' $P/abcdefgh23 | grep -qi '<div id="root">'
           test "$(curl -s -o /dev/null -w '%{http_code}' $P/assets/missing.js)" = 404
-          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/nope)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/nope)" = 401
+          test "$(curl -s -b jar -o /dev/null -w '%{http_code}' $P/api/nope)" = 404
           curl -sf $P/version | grep -q '"version":"'
           js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
           curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'
