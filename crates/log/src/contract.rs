@@ -5,8 +5,9 @@
 //! The race tests (fence race, cancel safety) are gate G-DB items (doc 11 section 4.8).
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, ManifestRecord,
-    ManifestStore, MemLogStore, Snapshot, StoreError, blob_key,
+    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, JobState, JobStore, LogStore,
+    ManifestRecord, ManifestStore, MemLogStore, Snapshot, StoreError, UploadKind, UploadRecord,
+    UploadStore, blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -17,13 +18,28 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore + ManifestStore {
+trait Store: LogStore + BlobStore + ManifestStore + UploadStore + JobStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
+    /// Change a stored upload's file without its id: a torn row.
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 impl Store for MemLogStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send {
         std::future::ready(self.claim(room))
+    }
+
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send {
+        self.tear_upload_for_tests(kind, id);
+        std::future::ready(())
     }
 }
 
@@ -31,6 +47,10 @@ impl Store for MemLogStore {
 impl Store for crate::PgLogStore {
     async fn bump(&self, room: RoomId) -> Epoch {
         self.claim(room).await.unwrap()
+    }
+
+    async fn tear_for_tests(&self, kind: UploadKind, id: &crate::BlobKey) {
+        self.tear_upload_for_tests(kind, id).await;
     }
 }
 
@@ -448,6 +468,120 @@ async fn a_cancelled_append_lands_whole_or_not_at_all_and_the_next_one_works<S: 
     println!("cancel safety: {cancels} of 200 rounds cancelled, head {head}");
 }
 
+fn upload(kind: UploadKind, game: &str, body: &[u8]) -> UploadRecord {
+    let id = blob_key(body);
+    let meta = format!("{game} {}", String::from_utf8_lossy(body));
+    UploadRecord { kind, id, game: game.to_owned(), meta }
+}
+
+/// An upload is stored once by kind and id with its record, read back whole and checked on
+/// write; the two kinds never see each other, and a listing is one kind's, ascending by id.
+async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>) {
+    let bodies: Vec<Vec<u8>> = (0..4).map(|i| format!("upload {i}").into_bytes()).collect();
+    let worlds: Vec<UploadRecord> =
+        bodies.iter().map(|b| upload(UploadKind::Apworld, "g", b)).collect();
+    for (r, b) in worlds.iter().zip(&bodies) {
+        s.upload_put(r, b).await.unwrap();
+    }
+    // The same file again keeps its first record and bytes.
+    s.upload_put(&upload(UploadKind::Apworld, "other", &bodies[0]), &bodies[0]).await.unwrap();
+    let (k, id) = (UploadKind::Apworld, worlds[0].id);
+    assert_eq!(s.upload_meta(k, &id).await.unwrap(), Some(worlds[0].meta.clone()));
+    assert_eq!(s.upload_bytes(k, &id).await.unwrap(), Some(bodies[0].clone()));
+    // The same bytes as a player file are another upload.
+    assert_eq!(s.upload_meta(UploadKind::Yaml, &id).await.unwrap(), None);
+    let player = upload(UploadKind::Yaml, "p", &bodies[0]);
+    s.upload_put(&player, &bodies[0]).await.unwrap();
+    assert_eq!(s.upload_list(UploadKind::Yaml).await.unwrap(), [player.meta]);
+    // Bytes that are not the id's are refused and leave nothing.
+    let lie = upload(UploadKind::Apworld, "g", b"other bytes");
+    assert!(matches!(s.upload_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
+    assert_eq!(s.upload_meta(UploadKind::Apworld, &lie.id).await.unwrap(), None);
+    assert_eq!(s.upload_bytes(UploadKind::Apworld, &blob_key(b"none")).await.unwrap(), None);
+    // Whole when stored; a missing one, or one of the other kind, is not.
+    assert!(s.upload_intact(k, &id).await.unwrap());
+    // A torn row (tampered bytes) is not intact on either store.
+    s.tear_for_tests(k, &id).await;
+    assert!(!s.upload_intact(k, &id).await.unwrap(), "torn");
+    s.upload_put(&worlds[0], &bodies[0]).await.unwrap();
+    assert!(s.upload_intact(k, &id).await.unwrap(), "healed");
+    assert!(!s.upload_intact(UploadKind::Apworld, &blob_key(b"none")).await.unwrap());
+    assert!(!s.upload_intact(UploadKind::Yaml, &worlds[1].id).await.unwrap());
+    let mut want = worlds;
+    want.sort_by_key(|r| r.id);
+    let metas: Vec<String> = want.into_iter().map(|r| r.meta).collect();
+    assert_eq!(s.upload_list(UploadKind::Apworld).await.unwrap(), metas);
+}
+
+/// A job's status is written whole and read back; only queued and running jobs go stale, a
+/// stale one is failed once, and a job marked alive since it was listed is not failed.
+async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc<S>) {
+    let id = |c: char| c.to_string().repeat(64);
+    let (q, r, d) = (id('a'), id('b'), id('c'));
+    s.job_put(&q, JobState::Queued, "q1").await.unwrap();
+    s.job_put(&r, JobState::Running, "r1").await.unwrap();
+    s.job_put(&d, JobState::Done, "d1").await.unwrap();
+    let status = async |id: &str| s.job_status(id).await.unwrap().map(|(status, _)| status);
+    assert_eq!(status(&q).await.as_deref(), Some("q1"));
+    let (_, ago) = s.job_status(&q).await.unwrap().unwrap();
+    assert!(ago < Duration::from_secs(60), "just written: {ago:?}");
+    assert_eq!(status(&id('f')).await, None);
+    let hour = Duration::from_secs(3600);
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
+    assert!(!s.job_fail_stale(&q, "failed", hour).await.unwrap());
+    assert!(s.job_fail_stale(&r, "r failed", Duration::ZERO).await.unwrap());
+    assert!(!s.job_fail_stale(&r, "again", Duration::ZERO).await.unwrap(), "once");
+    assert!(!s.job_fail_stale(&d, "done stays", Duration::ZERO).await.unwrap());
+    assert_eq!(status(&r).await.as_deref(), Some("r failed"));
+    assert_eq!(status(&d).await.as_deref(), Some("d1"));
+    // All the stale ones at once, JSON kept and marked failed; a done one is left alone.
+    let (j1, j2) = (id('d'), id('e'));
+    s.job_put(&j1, JobState::Running, r#"{"id": "d", "slots": 2}"#).await.unwrap();
+    s.job_put(&j2, JobState::Queued, "not json").await.unwrap();
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
+    let failed_now = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(failed_now, [q.clone(), j1.clone(), j2.clone()], "ascending; the done one stays");
+    let json = async |id: &str| -> serde_json::Value {
+        serde_json::from_str(&status(id).await.unwrap()).unwrap()
+    };
+    let failed = serde_json::json!({"id": "d", "slots": 2, "status": "failed", "error": "lost"});
+    assert_eq!(json(&j1).await, failed);
+    assert_eq!(json(&j2).await, serde_json::json!({"status": "failed", "error": "lost"}));
+    assert!(s.job_fail_all_stale(Duration::ZERO, "again").await.unwrap().is_empty(), "once");
+    // Text that is not a JSON object never aborts the sweep: it is replaced, the rest fail.
+    let bad = ["{broken", r#"{"a": "\u0000"}"#, "[1]"];
+    let ids: Vec<String> = ('1'..='4').map(id).collect();
+    for (i, text) in bad.iter().chain(&[r#"{"ok": 1}"#]).enumerate() {
+        s.job_put(&ids[i], JobState::Running, text).await.unwrap();
+    }
+    let all = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(all, ids, "every one failed, none aborted the sweep");
+    let bare = serde_json::json!({"status": "failed", "error": "lost"});
+    for i in 0..3 {
+        assert_eq!(json(&ids[i]).await, bare, "{}", bad[i]);
+    }
+    assert_eq!(json(&ids[3]).await["ok"], 1);
+    // A put replaces the status; a touch of a finished job changes nothing.
+    s.job_put(&q, JobState::Done, "q2").await.unwrap();
+    s.job_touch(&q).await.unwrap();
+    assert!(s.job_fail_all_stale(Duration::ZERO, "x").await.unwrap().is_empty());
+    assert_eq!(status(&q).await.as_deref(), Some("q2"));
+    // A server that comes back finishes over a sweep's failed.
+    s.job_put(&r, JobState::Done, "r done").await.unwrap();
+    assert_eq!(status(&r).await.as_deref(), Some("r done"));
+}
+
+/// A status put only when there is none never replaces one that is stored, of any state.
+async fn a_job_put_if_absent_never_replaces_a_stored_status<S: Store>(s: Arc<S>) {
+    let id = "a".repeat(64);
+    assert!(s.job_put_if_absent(&id, JobState::Running, "old file").await.unwrap());
+    assert!(!s.job_put_if_absent(&id, JobState::Failed, "newer?").await.unwrap());
+    s.job_put(&id, JobState::Done, "newer row").await.unwrap();
+    assert!(!s.job_put_if_absent(&id, JobState::Running, "stale file").await.unwrap());
+    let (status, _) = s.job_status(&id).await.unwrap().unwrap();
+    assert_eq!(status, "newer row");
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -483,6 +617,9 @@ macro_rules! contract {
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
                 manifests_are_deduplicated_checked_and_listed_in_pages,
+                uploads_are_deduplicated_by_kind_checked_and_listed,
+                jobs_are_read_back_and_only_stale_unfinished_ones_fail,
+                a_job_put_if_absent_never_replaces_a_stored_status,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

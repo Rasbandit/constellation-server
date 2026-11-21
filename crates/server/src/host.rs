@@ -359,7 +359,7 @@ impl Host {
         } else {
             tracing::warn!(
                 "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the rooms \
-                 and draws new room keys"
+                 (and draws new room keys) and the admin API's uploads and world statuses"
             );
             Store::Mem { log: Arc::new(MemLogStore::new()), finished: BTreeSet::new() }
         };
@@ -386,11 +386,11 @@ impl Host {
         Ok(host)
     }
 
-    /// Where the admin API keeps uploaded manifests: this host's store.
-    pub(crate) fn manifest_db(&self) -> crate::manifests::Db {
+    /// Where the admin API keeps manifests, uploads and generation statuses: this host's store.
+    pub(crate) fn db(&self) -> crate::store::Db {
         match &self.store {
-            Store::Pg(pg) => crate::manifests::Db::Pg(Arc::clone(pg)),
-            Store::Mem { log, .. } => crate::manifests::Db::Mem(Arc::clone(log)),
+            Store::Pg(pg) => crate::store::Db::Pg(Arc::clone(pg)),
+            Store::Mem { log, .. } => crate::store::Db::Mem(Arc::clone(log)),
         }
     }
 

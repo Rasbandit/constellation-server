@@ -72,7 +72,8 @@ export const liveRooms = adminApi;
 /** `GET /api/worlds/:id` (crates/server/src/worlds.rs). */
 interface WorldStatus {
   id: string;
-  status: 'queued' | 'running' | 'done' | 'failed';
+  /** `stalled`: its server stopped checking in for a while; it may come back, so keep waiting. */
+  status: 'queued' | 'running' | 'stalled' | 'done' | 'failed';
   error?: string;
   seed_name?: string;
   room_key?: string;

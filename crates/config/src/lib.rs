@@ -202,6 +202,24 @@ pub struct Limits {
     /// Wall-clock limit of one sandboxed generation, after which it is killed
     /// (`CONSTELLATION_GEN_TIMEOUT_MS`; design value: one real world took about 22 s here).
     pub gen_timeout_ms: u64,
+    /// A queued or running generation marks itself alive in the store this often, so another
+    /// server instance can tell it from one whose process stopped (#119; a cost trade, not a
+    /// design value).
+    pub gen_heartbeat_secs: u64,
+    /// A queued or running generation not marked alive for this long reads as `stalled`: its
+    /// server stopped, or lost the store for a while and may come back. Several heartbeats, so
+    /// one slow write never shows a live job as stalled.
+    pub gen_stale_secs: u64,
+    /// A generation not marked alive for this long is failed by any instance's sweep: its
+    /// server is gone. Longer than `gen_timeout_ms` ([`Limits::check`]), so a server that
+    /// lost the store mid-job, and could not write its heartbeats, can still end the job by
+    /// its own timeout before the sweep fails it (the heartbeat covers a job of any length;
+    /// this covers only failed writes). A cost trade, not a design value. A server that does
+    /// come back still writes how its job really ended.
+    pub gen_lost_secs: u64,
+    /// Most files a job folder's log line names (a removed folder, or one a stopped server
+    /// left); past it the line says how many more (a cost trade: log line length).
+    pub job_log_files_max: usize,
     /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
     /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
     pub gen_memory_bytes: u64,
@@ -347,6 +365,10 @@ impl Limits {
         admin_write_refill_milli_per_sec: 1000,
         inspect_timeout_ms: 30_000,
         gen_timeout_ms: 15 * 60 * 1000,
+        gen_heartbeat_secs: 15,
+        gen_stale_secs: 60,
+        gen_lost_secs: 20 * 60,
+        job_log_files_max: 32,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
         gen_error_max_bytes: 16 * 1024,
         gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
@@ -359,6 +381,26 @@ impl Limits {
     };
 }
 
+impl Limits {
+    /// Whether the limits fit together; the one place the rules between them are written.
+    ///
+    /// # Errors
+    /// The first rule broken, as a message naming the limits.
+    pub const fn check(&self) -> Result<(), &'static str> {
+        if self.gen_stale_secs < 3 * self.gen_heartbeat_secs {
+            return Err("gen_stale_secs must be at least 3 times gen_heartbeat_secs");
+        }
+        if self.gen_lost_secs < self.gen_stale_secs {
+            return Err("gen_lost_secs must not be less than gen_stale_secs");
+        }
+        if self.gen_lost_secs.saturating_mul(1000) <= self.gen_timeout_ms {
+            return Err("gen_lost_secs (in ms) must exceed gen_timeout_ms \
+                 (CONSTELLATION_GEN_TIMEOUT_MS)");
+        }
+        Ok(())
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self::DESIGN
@@ -366,9 +408,11 @@ impl Default for Limits {
 }
 
 /// The only place the process environment is read.
+///
+/// # Errors
+/// Overrides that break a rule between the limits ([`Limits::check`]).
 #[cfg(feature = "std")]
-#[must_use]
-pub fn load() -> Limits {
+pub fn load() -> Result<Limits, String> {
     fn num(key: &str) -> Option<u64> {
         std::env::var(key).ok().and_then(|s| s.parse().ok())
     }
@@ -412,7 +456,8 @@ pub fn load() -> Limits {
             *field = v;
         }
     }
-    l
+    l.check().map_err(|e| format!("limits: {e}"))?;
+    Ok(l)
 }
 
 /// Values that must not appear on a command line (visible to every local user in `ps`).
@@ -787,7 +832,7 @@ mod tests {
         if std::env::var("CONFIG_ENV_PROBE").is_err() {
             return;
         }
-        let l = load();
+        let l = load().unwrap();
         println!(
             "probe limits {} {} {:?} {} {} {} {} {} {} {}",
             l.dedupe_window_secs,
@@ -872,6 +917,21 @@ mod tests {
             (256, 4 << 30, 80)
         );
         assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
+        assert_eq!((l.gen_heartbeat_secs, l.gen_stale_secs), (15, 60));
+        assert_eq!((l.gen_lost_secs, l.job_log_files_max), (1200, 32));
+        assert_eq!(l.check(), Ok(()));
+    }
+
+    /// An operator's override must keep the rules between the limits, not only the defaults.
+    #[test]
+    fn limits_that_break_a_rule_are_refused() {
+        let d = Limits::DESIGN;
+        let timeout = Limits { gen_timeout_ms: d.gen_lost_secs * 1000, ..d };
+        assert!(timeout.check().unwrap_err().contains("gen_timeout_ms"));
+        let beats = Limits { gen_stale_secs: 2 * d.gen_heartbeat_secs, ..d };
+        assert!(beats.check().unwrap_err().contains("gen_heartbeat_secs"));
+        let order = Limits { gen_lost_secs: d.gen_stale_secs - 1, ..d };
+        assert!(order.check().unwrap_err().contains("gen_stale_secs"));
     }
 
     #[test]

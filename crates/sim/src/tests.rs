@@ -12,7 +12,7 @@ fn add(total: &mut Stats, s: Stats) {
 
 #[test]
 fn bounded_seeds_hold_every_invariant() {
-    let limits = config::load();
+    let limits = config::load().unwrap();
     let seeds: Vec<u64> =
         limits.sim_replay_seed.map_or_else(|| (0..limits.sim_seeds).collect(), |s| vec![s]);
     let mut total = Stats::default();

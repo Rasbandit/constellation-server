@@ -35,6 +35,22 @@ pub struct MemLogStore {
     packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
+    uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
+    jobs: Mutex<BTreeMap<String, Job>>,
+    /// How many of the next `job_put`s fail, as a store that is down for a while does.
+    job_put_failures: Mutex<usize>,
+}
+
+/// An upload's record and file.
+type Upload = (crate::UploadRecord, Vec<u8>);
+
+/// A job's state, status and when it was last marked alive.
+type Job = (crate::JobState, String, std::time::Instant);
+
+/// Queued or running, and not marked alive for `older_than`.
+fn stale(job: &Job, older_than: core::time::Duration) -> bool {
+    use crate::JobState::{Queued, Running};
+    matches!(job.0, Queued | Running) && job.2.elapsed() >= older_than
 }
 
 /// Insert unless present, under the lock; what is stored after.
@@ -248,7 +264,7 @@ impl crate::ManifestStore for MemLogStore {
             let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
             let row = m.entry(record.id).or_insert_with(|| (record.clone(), bytes.to_vec()));
             // A torn row is healed, as on Postgres.
-            if crate::blob_key(&row.1) != record.id {
+            if crate::is_torn(&row.1, &record.id) {
                 bytes.clone_into(&mut row.1);
             }
         }
@@ -297,6 +313,176 @@ impl crate::ManifestStore for MemLogStore {
             .cloned()
             .collect();
         ready(Ok(page))
+    }
+}
+
+impl MemLogStore {
+    /// Damage a stored upload's bytes, as a torn write would, so a test can see the read
+    /// check and the heal.
+    pub fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
+        let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(&(kind, *id)) {
+            bytes.push(0);
+        }
+    }
+}
+
+impl crate::UploadStore for MemLogStore {
+    fn upload_put(
+        &self,
+        record: &crate::UploadRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let ok = crate::blob_key(bytes) == record.id;
+        if ok {
+            let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+            let row = m
+                .entry((record.kind, record.id))
+                .or_insert_with(|| (record.clone(), bytes.to_vec()));
+            // A torn row is healed, as on Postgres.
+            if crate::is_torn(&row.1, &record.id) {
+                bytes.clone_into(&mut row.1);
+            }
+        }
+        ready(if ok {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("an upload put under an id it does not hash to".into()))
+        })
+    }
+
+    fn upload_meta(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).map(|(r, _)| r.meta.clone())))
+    }
+
+    fn upload_bytes(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(crate::checked_upload(m.get(&(kind, *id)).map(|(_, b)| b.clone()), id))
+    }
+
+    fn upload_intact(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).is_some_and(|(_, b)| !crate::is_torn(b, id))))
+    }
+
+    fn upload_list(
+        &self,
+        kind: crate::UploadKind,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        let all = m.iter().filter(|((k, _), _)| *k == kind).map(|(_, (r, _))| r.meta.clone());
+        ready(Ok(all.collect()))
+    }
+}
+
+impl MemLogStore {
+    /// Fail the next `n` `job_put`s with [`StoreError::Unavailable`].
+    pub fn fail_job_puts_for_tests(&self, n: usize) {
+        *self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner) = n;
+    }
+
+    /// Mark job `id` as last alive `by` ago, as if its process stopped then.
+    pub fn age_job_for_tests(&self, id: &str, by: core::time::Duration) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id) {
+            job.2 = job.2.checked_sub(by).unwrap_or(job.2);
+        }
+    }
+}
+
+impl crate::JobStore for MemLogStore {
+    fn job_put(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut failures = self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let down = failures.checked_sub(1).inspect(|n| *failures = *n).is_some();
+        drop(failures);
+        if down {
+            return ready(Err(StoreError::Unavailable));
+        }
+        let job = (state, status.to_owned(), std::time::Instant::now());
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner).insert(id.to_owned(), job);
+        ready(Ok(()))
+    }
+
+    fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let vacant = !jobs.contains_key(id);
+        if vacant {
+            jobs.insert(id.to_owned(), (state, status.to_owned(), std::time::Instant::now()));
+        }
+        ready(Ok(vacant))
+    }
+
+    fn job_status(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<(String, core::time::Duration)>, StoreError>> + Send
+    {
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(jobs.get(id).map(|j| (j.1.clone(), j.2.elapsed()))))
+    }
+
+    fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+        use crate::JobState::{Queued, Running};
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id).filter(|j| matches!(j.0, Queued | Running)) {
+            job.2 = std::time::Instant::now();
+        }
+        ready(Ok(()))
+    }
+
+    fn job_fail_all_stale(
+        &self,
+        older_than: core::time::Duration,
+        error: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut failed = Vec::new();
+        for (id, job) in jobs.iter_mut().filter(|(_, j)| stale(j, older_than)) {
+            let status = crate::failed_status(&job.1, error);
+            *job = (crate::JobState::Failed, status, std::time::Instant::now());
+            failed.push(id.clone());
+        }
+        ready(Ok(failed))
+    }
+
+    fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: core::time::Duration,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let failed = match jobs.get_mut(id).filter(|j| stale(j, older_than)) {
+            Some(job) => {
+                *job = (crate::JobState::Failed, status.to_owned(), std::time::Instant::now());
+                true
+            }
+            None => false,
+        };
+        ready(Ok(failed))
     }
 }
 

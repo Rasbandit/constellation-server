@@ -3,52 +3,11 @@
 //! never reads a manifest, and a size-bounded in-memory cache in front of the bytes a generation
 //! reads.
 
-use log::{BlobKey, ManifestRecord, ManifestStore, MemLogStore, PgLogStore, StoreError};
+use crate::store::Db;
+use log::{BlobKey, ManifestRecord, StoreError};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
-
-/// Where the manifests live: the host's store.
-#[derive(Debug, Clone)]
-pub(crate) enum Db {
-    Pg(Arc<PgLogStore>),
-    Mem(Arc<MemLogStore>),
-}
-
-impl Db {
-    async fn put(&self, r: &ManifestRecord, bytes: &[u8]) -> Result<(), StoreError> {
-        match self {
-            Self::Pg(s) => s.manifest_put(r, bytes).await,
-            Self::Mem(s) => s.manifest_put(r, bytes).await,
-        }
-    }
-
-    async fn record(&self, id: &BlobKey) -> Result<Option<ManifestRecord>, StoreError> {
-        match self {
-            Self::Pg(s) => s.manifest_record(id).await,
-            Self::Mem(s) => s.manifest_record(id).await,
-        }
-    }
-
-    async fn bytes(&self, id: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
-        match self {
-            Self::Pg(s) => s.manifest_bytes(id).await,
-            Self::Mem(s) => s.manifest_bytes(id).await,
-        }
-    }
-
-    async fn list(
-        &self,
-        game: Option<&str>,
-        after: Option<&BlobKey>,
-        limit: usize,
-    ) -> Result<Vec<ManifestRecord>, StoreError> {
-        match self {
-            Self::Pg(s) => s.manifest_list(game, after, limit).await,
-            Self::Mem(s) => s.manifest_list(game, after, limit).await,
-        }
-    }
-}
 
 /// Manifest bytes held in memory, at most `cap` in all: the least recently used go first. An
 /// entry larger than the cap is never kept.
@@ -103,7 +62,7 @@ pub(crate) struct Manifests {
 }
 
 /// The id as the 32 bytes it is the hex of. `id` must be 64 lowercase hex digits.
-fn key_of(id: &str) -> Option<BlobKey> {
+pub(crate) fn key_of(id: &str) -> Option<BlobKey> {
     let mut key = [0_u8; 32];
     if id.len() != 64 {
         return None;
@@ -136,7 +95,7 @@ impl Manifests {
     /// The record of manifest `id`, if stored.
     pub(crate) async fn record(&self, id: &str) -> Result<Option<Value>, StoreError> {
         let Some(key) = key_of(id) else { return Ok(None) };
-        Ok(self.db.record(&key).await?.as_ref().map(shown))
+        Ok(self.db.manifest_record(&key).await?.as_ref().map(shown))
     }
 
     /// The manifest's bytes: from the cache, else from the database (and then cached).
@@ -146,7 +105,7 @@ impl Manifests {
         if hit.is_some() {
             return Ok(hit);
         }
-        let Some(bytes) = self.db.bytes(&key).await? else { return Ok(None) };
+        let Some(bytes) = self.db.manifest_bytes(&key).await? else { return Ok(None) };
         let bytes = Arc::new(bytes);
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).put(key, Arc::clone(&bytes));
         Ok(Some(bytes))
@@ -171,9 +130,9 @@ impl Manifests {
             items: count("items"),
             locations: count("locations"),
         };
-        self.db.put(&record, bytes).await?;
+        self.db.manifest_put(&record, bytes).await?;
         // The stored record: a manifest uploaded before keeps its first name.
-        let stored = self.db.record(&record.id).await?.unwrap_or(record);
+        let stored = self.db.manifest_record(&record.id).await?.unwrap_or(record);
         Ok(shown(&stored))
     }
 
@@ -193,7 +152,7 @@ impl Manifests {
             Some(a) => Some(key_of(a).ok_or_else(|| StoreError::Corrupt("bad cursor".into()))?),
             None => None,
         };
-        let page = self.db.list(game, after.as_ref(), limit).await?;
+        let page = self.db.manifest_list(game, after.as_ref(), limit).await?;
         let next = (page.len() == limit).then(|| page.last().map(|r| crate::hex(&r.id))).flatten();
         Ok((page.iter().map(shown).collect(), next))
     }
@@ -202,6 +161,7 @@ impl Manifests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::MemLogStore;
 
     fn id(n: u8) -> BlobKey {
         [n; 32]

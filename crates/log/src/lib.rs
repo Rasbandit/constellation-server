@@ -11,6 +11,7 @@ mod mem;
 #[cfg(feature = "postgres")]
 mod pg;
 
+use core::time::Duration;
 use proto::{Epoch, Event, ItemSeq, RoomId, Seq, SlotNo};
 
 pub use mem::MemLogStore;
@@ -275,6 +276,241 @@ pub trait ManifestStore: Send + Sync + 'static {
         after: Option<&BlobKey>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<ManifestRecord>, StoreError>> + Send;
+}
+
+/// The kinds of upload a legacy generation reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UploadKind {
+    /// A world file (`.apworld`).
+    Apworld,
+    /// A player file (`.yaml`).
+    Yaml,
+}
+
+impl UploadKind {
+    /// The kind's name in the store (`world_uploads.kind`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apworld => "apworld",
+            Self::Yaml => "yaml",
+        }
+    }
+}
+
+/// An upload's record: what the upload API answers with, kept beside the file so a listing
+/// never reads a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// Which kind of upload.
+    pub kind: UploadKind,
+    /// The content address: the SHA-256 of the file.
+    pub id: BlobKey,
+    /// The game it is for, as one folder-style name (shown and grouped only).
+    pub game: String,
+    /// The record as JSON text, opaque to the store.
+    pub meta: String,
+}
+
+/// Uploaded world and player files, deduplicated by kind and content address, with their
+/// records beside them. Memory and Postgres implement it.
+pub trait UploadStore: Send + Sync + 'static {
+    /// Store a file under `record.id` (its SHA-256). Idempotent: a file already stored keeps
+    /// its record.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when `record.id` is not the hash of `bytes`; the store failing.
+    fn upload_put(
+        &self,
+        record: &UploadRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// An upload's record (JSON text), without its file.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_meta(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
+    /// An upload's file, checked against its id.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the stored bytes do not hash to `id`; the store failing.
+    fn upload_bytes(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
+
+    /// Every record of `kind` (JSON text), ascending by id.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_list(
+        &self,
+        kind: UploadKind,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+
+    /// Whether the upload is stored whole: present, and its file hashes to `id`. A missing or
+    /// torn upload is `false`, not an error. Decided where the file is, so its bytes need not
+    /// travel.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_intact(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+}
+
+/// Where a generation is (`world_jobs.state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Waiting for a generation permit.
+    Queued,
+    /// Generating.
+    Running,
+    /// Finished with a world.
+    Done,
+    /// Finished without one.
+    Failed,
+}
+
+impl JobState {
+    /// The state's name in the store, as the status API shows it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The state named `s`, if it is one.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Queued, Self::Running, Self::Done, Self::Failed]
+            .into_iter()
+            .find(|j| j.as_str() == s)
+    }
+}
+
+/// World generations' statuses, shared by every server instance. Queued and running jobs are
+/// marked alive by the process running them; one that stops being marked is stale.
+pub trait JobStore: Send + Sync + 'static {
+    /// Write job `id`'s status (JSON text, opaque to the store) and state, marking it alive.
+    /// It replaces whatever is stored, a sweep's `failed` too: a server that lost the store
+    /// for a while and then finished its job writes how the job really ended.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_put(
+        &self,
+        id: &str,
+        state: JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Write job `id`'s status only when the store has none for it; whether it was written.
+    /// For a status an older server kept as a file, which must never overwrite a newer row.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Job `id`'s status, and how long ago it was last marked alive (or written).
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_status(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<(String, Duration)>, StoreError>> + Send;
+
+    /// Mark job `id` alive, while it is queued or running.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Fail, in one step, every queued or running job not marked alive for `older_than`: the
+    /// job's status (a JSON object) gets `"status": "failed"` and `"error": error`, the rest of
+    /// it is kept. The failed ids, ascending.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_fail_all_stale(
+        &self,
+        older_than: Duration,
+        error: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+
+    /// Fail job `id` with `status`, only while it is still queued or running and not marked
+    /// alive for `older_than` (its process may have marked it since it was listed); whether
+    /// it was failed.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+}
+
+/// Whether an upload's `bytes` no longer hash to its `id` (a torn row).
+#[must_use]
+pub(crate) fn is_torn(bytes: &[u8], id: &BlobKey) -> bool {
+    blob_key(bytes) != *id
+}
+
+/// What a read of upload `id` gives: its bytes, or [`StoreError::Corrupt`] when they are torn.
+pub(crate) fn checked_upload(
+    found: Option<Vec<u8>>,
+    id: &BlobKey,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    match found {
+        Some(b) if is_torn(&b, id) => {
+            Err(StoreError::Corrupt("a stored upload does not match its id".into()))
+        }
+        found => Ok(found),
+    }
+}
+
+fn has_nul(v: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Object, String};
+    match v {
+        String(s) => s.contains('\0'),
+        Array(a) => a.iter().any(has_nul),
+        Object(m) => m.iter().any(|(k, v)| k.contains('\0') || has_nul(v)),
+        _ => false,
+    }
+}
+
+/// `status` (a job's JSON text) as failed with `error`; text that is not a JSON object is
+/// replaced by one holding only those two fields.
+pub(crate) fn failed_status(status: &str, error: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(status).unwrap_or_default();
+    // Postgres's jsonb refuses a NUL, so such text is replaced there; the same here.
+    if !v.is_object() || has_nul(&v) {
+        v = serde_json::json!({});
+    }
+    v["status"] = serde_json::json!(JobState::Failed.as_str());
+    v["error"] = serde_json::json!(error);
+    v.to_string()
 }
 
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
