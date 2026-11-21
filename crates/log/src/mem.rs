@@ -44,6 +44,11 @@ pub struct MemLogStore {
     owned: Mutex<BTreeMap<RoomId, (crate::OwnedRoom, std::time::Instant)>>,
     /// Room admins: (room key, account) to who granted it.
     admins: Mutex<BTreeMap<(String, String), String>>,
+    /// Catalogue games by key, their owners ((game key, account) to who granted it), and
+    /// every game's versions in upload order with their game's key.
+    games: Mutex<BTreeMap<String, crate::Game>>,
+    game_owners: Mutex<BTreeMap<(String, String), String>>,
+    versions: Mutex<Vec<(String, crate::GameVersion)>>,
     /// How many of the next `job_put`s fail, as a store that is down for a while does.
     job_put_failures: Mutex<usize>,
 }
@@ -620,7 +625,158 @@ impl crate::AccountStore for MemLogStore {
         self.users.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner).retain(|_, (u, _)| u != name);
         self.admins.lock().unwrap_or_else(PoisonError::into_inner).retain(|(_, u), _| u != name);
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        owners.retain(|(_, u), _| u != name);
         ready(Ok(()))
+    }
+}
+
+impl crate::CatalogueStore for MemLogStore {
+    fn game_create(
+        &self,
+        game: &crate::Game,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = crate::game_key(&game.name);
+        let vacant = !games.contains_key(&key);
+        if vacant {
+            games.insert(key, game.clone());
+        }
+        ready(Ok(vacant))
+    }
+
+    fn game_get(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<crate::Game>, StoreError>> + Send {
+        let games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(games.get(&crate::game_key(name)).cloned()))
+    }
+
+    fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<crate::Game>, StoreError>> + Send {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = after.map_or(Unbounded, |a| Excluded(crate::game_key(a)));
+        let page = games.range((from, Unbounded)).take(limit).map(|(_, g)| g.clone()).collect();
+        ready(Ok(page))
+    }
+
+    fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let known =
+            self.users.lock().unwrap_or_else(PoisonError::into_inner).contains_key(username)
+                && self.games.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&key);
+        if known {
+            let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+            owners.entry((key, username.to_owned())).or_insert_with(|| granted_by.to_owned());
+        }
+        ready(Ok(known))
+    }
+
+    fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(owners.remove(&(crate::game_key(game), username.to_owned())).is_some()))
+    }
+
+    fn game_owners(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let names = owners.keys().filter(|(g, _)| *g == key).map(|(_, u)| u.clone()).collect();
+        ready(Ok(names))
+    }
+
+    fn version_add(
+        &self,
+        version: &crate::NewVersion,
+    ) -> impl Future<Output = Result<crate::VersionAdded, StoreError>> + Send {
+        use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+        let key = crate::game_key(&version.game);
+        let game = self.games.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+        let upload = (crate::UploadKind::Apworld, version.apworld);
+        let uploaded =
+            self.uploads.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&upload);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let added = match game {
+            None => NoGame,
+            Some(_) if !uploaded => NoUpload,
+            Some(_) if versions.iter().any(|(g, v)| *g == key && v.version == version.version) => {
+                Taken
+            }
+            Some(game) => {
+                let new = crate::GameVersion {
+                    game: game.name,
+                    version: version.version.clone(),
+                    note: version.note.clone(),
+                    apworld: version.apworld,
+                    generator: version.generator.clone(),
+                    state: crate::VersionState::Checking,
+                    error: None,
+                };
+                versions.push((key, new));
+                Added
+            }
+        };
+        ready(Ok(added))
+    }
+
+    fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: crate::VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter_mut().find(|(g, v)| {
+            *g == key && v.version == version && v.state != crate::VersionState::Withdrawn
+        });
+        let set = found.map(|(_, v)| {
+            v.state = state;
+            generator.clone_into(&mut v.generator);
+            v.error = error.map(str::to_owned);
+        });
+        ready(Ok(set.is_some()))
+    }
+
+    fn versions(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<crate::GameVersion>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter().rev().filter(|(g, _)| *g == key).map(|(_, v)| v.clone());
+        ready(Ok(found.collect()))
+    }
+
+    fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> impl Future<Output = Result<Option<crate::GameVersion>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let latest = versions.iter().rev().find(|(g, v)| {
+            *g == key && v.state == crate::VersionState::Live && v.generator == generator
+        });
+        ready(Ok(latest.map(|(_, v)| v.clone())))
     }
 }
 
