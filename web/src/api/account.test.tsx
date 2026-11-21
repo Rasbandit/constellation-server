@@ -1,7 +1,7 @@
 import { renderToString } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
-import { RequireSession } from '../components/Account';
+import { RequireSession, signOutAndLeave, UserMenu } from '../components/Account';
 import { AuthPage } from '../pages/AuthPage';
 import { api, HttpError, ownedRoomToSummary } from './client';
 import { accountName, loadAccount, loadSignupOpen, logIn, logOut, markSignedOut, sessionGate, signUp } from './account';
@@ -93,6 +93,41 @@ describe('the login and sign-up pages', () => {
     expect(page(<AuthPage mode="login" />)).not.toContain('href="/signup"');
     server({ status: 200, body: { signup_open: true } });
     await loadSignupOpen();
+  });
+});
+
+describe('the header account menu', () => {
+  it('signed out shows exactly one Log in link to /login and no Sign up or Log out', () => {
+    const html = page(<UserMenu live />);
+    expect(html.match(/<a /g)).toHaveLength(1);
+    expect(html).toContain('href="/login"');
+    expect(html).toContain('Log in');
+    expect(html).not.toContain('Sign up');
+    expect(html).not.toContain('Log out');
+  });
+
+  it('signed in shows one profile button with the initial and name, and Log out inside its popover menu', async () => {
+    server({ status: 200, body: { name: 'ann' } });
+    await loadAccount();
+    const html = page(<UserMenu live />);
+    expect(html).toContain('aria-haspopup="menu"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain('popovertarget="user-menu"');
+    expect(html).toMatch(/class="avatar"[^>]*>A</);
+    expect(html).toMatch(/id="user-menu"[^>]*popover=""/);
+    expect(html).toContain('Signed in as <strong>ann</strong>');
+    expect(html.match(/Log out/g)).toHaveLength(1);
+    expect(html).not.toContain('Log in');
+  });
+
+  it('Log out calls the logout api, forgets the name and returns to /login', async () => {
+    const calls = server({ status: 200, body: { name: 'ann' } }, { status: 204 });
+    await loadAccount();
+    const went: string[] = [];
+    await signOutAndLeave((to) => went.push(to));
+    expect(calls[1]).toMatchObject({ method: 'POST', path: '/api/logout' });
+    expect(accountName()).toBeNull();
+    expect(went).toEqual(['/login']);
   });
 });
 

@@ -1,5 +1,5 @@
-import { useEffect, type ReactNode } from 'react';
-import { Navigate, NavLink, useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { loadAccount, logOut, sessionGate, useAccount } from '../api/account';
 import { liveRooms } from '../api/client';
 
@@ -14,25 +14,49 @@ export function RequireSession({ children, live = liveRooms }: { children: React
   return gate === 'show' ? <>{children}</> : null;
 }
 
-/** The header's account part: who is signed in and a way out, or the ways in. */
-export function UserMenu() {
+/** Ends the session, then goes to the login page. */
+export const signOutAndLeave = (to: (path: string) => void) => logOut().then(() => to('/login'));
+
+/**
+ * The header's account part: one Log in button when signed out; when signed in one profile
+ * button that opens a menu (the native popover: outside click and Escape close it, and focus
+ * returns to the button) with who you are and Log out.
+ */
+export function UserMenu({ live = liveRooms }: { live?: boolean }) {
   const { name } = useAccount();
   const nav = useNavigate();
-  if (!liveRooms) return null;
-  if (name) {
+  const [open, setOpen] = useState(false);
+  const menu = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = menu.current;
+    const on = (e: Event) => setOpen((e as Event & { newState?: string }).newState === 'open');
+    el?.addEventListener('toggle', on);
+    return () => el?.removeEventListener('toggle', on);
+  }, [name]);
+  if (!live) return null;
+  if (!name) {
     return (
-      <p className="user-menu">
-        Signed in as <strong>{name}</strong>{' '}
-        <button type="button" className="btn btn-ghost" onClick={() => void logOut().then(() => nav('/login'))}>
-          Log out
-        </button>
-      </p>
+      <Link className="btn user-menu" to="/login">
+        Log in
+      </Link>
     );
   }
   return (
-    <nav className="user-menu" aria-label="Account">
-      <NavLink to="/login">Log in</NavLink>
-      <NavLink to="/signup">Sign up</NavLink>
-    </nav>
+    <>
+      <button type="button" className="btn btn-ghost user-menu" aria-haspopup="menu" aria-expanded={open} {...{ popovertarget: 'user-menu' }}>
+        <span className="avatar" aria-hidden>
+          {name.charAt(0).toUpperCase()}
+        </span>
+        {name}
+      </button>
+      <div id="user-menu" className="menu" role="menu" ref={menu} {...{ popover: '' }}>
+        <p>
+          Signed in as <strong>{name}</strong>
+        </p>
+        <button type="button" className="btn btn-ghost" role="menuitem" onClick={() => void signOutAndLeave(nav)}>
+          Log out
+        </button>
+      </div>
+    </>
   );
 }
