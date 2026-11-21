@@ -1761,6 +1761,31 @@ mod tests {
         assert_eq!(left, 0, "every status moved and every job folder cleared");
     }
 
+    /// A job waiting in a long queue is kept alive by its heartbeat, so the sweep never fails
+    /// it; once the heartbeat stops, the job goes stale and is failed (#119).
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_jobs_heartbeat_keeps_the_sweep_off_it() {
+        let root = temp("heartbeat");
+        let w = Arc::new(worlds(&root, Limits::DESIGN));
+        let id = "f".repeat(64);
+        w.save_status(&json!({"id": id, "status": "queued"})).await.unwrap();
+        let (store, stale) = (mem_store(&w), Duration::from_secs(Limits::DESIGN.gen_stale_secs));
+        // Unmarked for the stale time, as if it had waited that long in the queue.
+        store.age_job_for_tests(&id, stale);
+        let beat = tokio::spawn(heartbeat(Arc::clone(&w), id.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(Limits::DESIGN.gen_heartbeat_secs)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        w.fail_stale().await;
+        assert_eq!(read_status(&w, &id).await.unwrap()["status"], "queued", "marked alive");
+        beat.abort();
+        store.age_job_for_tests(&id, stale);
+        w.fail_stale().await;
+        assert_eq!(read_status(&w, &id).await.unwrap()["status"], "failed", "no heartbeat now");
+    }
+
     /// A queued or running job whose process stopped marking it alive is failed by the sweep;
     /// one still marked alive, and a finished one, are left alone (#119).
     #[tokio::test]
