@@ -512,6 +512,11 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
+    /// Postgres URL for the migrations, as the role that owns the tables:
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL`, or the first line of the file named by
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL_FILE`. `None`: the migrations run as the runtime
+    /// role (what a deployment from before the split does; the server logs it).
+    pub migrate_database_url: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -519,7 +524,12 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Secrets").field("room_password", &pw).field("database_url", &db).finish()
+        let migrate = self.migrate_database_url.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Secrets")
+            .field("room_password", &pw)
+            .field("database_url", &db)
+            .field("migrate_database_url", &migrate)
+            .finish()
     }
 }
 
@@ -563,9 +573,14 @@ fn secrets_from(
     if let Some(url) = &database_url {
         check_database_url(url)?;
     }
+    let migrate_database_url = var_or_file("CONSTELLATION_MIGRATE_DATABASE_URL", &var, &read)?;
+    if let Some(url) = &migrate_database_url {
+        check_database_url(url)?;
+    }
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
+        migrate_database_url,
     })
 }
 
@@ -589,10 +604,22 @@ pub struct Generation {
     pub container_mode: bool,
 }
 
+/// The Postgres role the server runs as: SELECT, INSERT, UPDATE and DELETE on our tables and
+/// USAGE on their sequences, nothing else (no CREATE, no DDL, no superuser). The migrations run
+/// as [`DB_MIGRATE_ROLE`] (`CONSTELLATION_MIGRATE_DATABASE_URL`), which owns the tables and
+/// grants this role its rights after each migration. `docker/postgres-init.sh` creates both.
+pub const DB_APP_ROLE: &str = "constellation_app";
+
+/// The Postgres role that owns the tables and runs the migrations (see [`DB_APP_ROLE`]).
+pub const DB_MIGRATE_ROLE: &str = "constellation_migrate";
+
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
 #[cfg(feature = "std")]
-const SECRET_FILE_VARS: [&str; 2] =
-    ["CONSTELLATION_ROOM_PASSWORD_FILE", "CONSTELLATION_DATABASE_URL_FILE"];
+const SECRET_FILE_VARS: [&str; 3] = [
+    "CONSTELLATION_ROOM_PASSWORD_FILE",
+    "CONSTELLATION_DATABASE_URL_FILE",
+    "CONSTELLATION_MIGRATE_DATABASE_URL_FILE",
+];
 
 /// Read [`Generation`] from the environment: `None` when none of its variables is set.
 ///
@@ -739,6 +766,49 @@ mod tests {
         assert!(missing.unwrap_err().contains("/nope"));
         let empty = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD", "")]), file);
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    /// The role names live here; the init script and the compose files (which cannot import a
+    /// constant) must spell them the same.
+    #[test]
+    fn the_init_script_and_compose_use_the_role_names_from_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
+        let init = read("docker/postgres-init.sh");
+        for role in [DB_APP_ROLE, DB_MIGRATE_ROLE] {
+            assert!(
+                init.contains(&format!("CREATE ROLE {role} LOGIN")),
+                "{role} in the init script"
+            );
+        }
+        let env_example = read(".env.example");
+        assert!(env_example.contains("CONSTELLATION_MIGRATE_DATABASE_URL_FILE"));
+        let smoke = read(".github/workflows/release.yml");
+        assert!(smoke.contains(&format!("postgres://{DB_APP_ROLE}:")));
+        assert!(smoke.contains(&format!("postgres://{DB_MIGRATE_ROLE}:")));
+    }
+
+    #[test]
+    fn the_migration_url_comes_from_its_own_variable_or_file_and_prints_redacted() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        let file = |_: &std::path::Path| Ok("postgres://m:p@h/db\n".to_owned());
+        let direct =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://m@h/db")]), file)
+                .unwrap();
+        assert_eq!(direct.migrate_database_url.as_deref(), Some("postgres://m@h/db"));
+        assert_eq!(direct.database_url, None, "the runtime URL is its own");
+        let from_file =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL_FILE", "/m")]), file).unwrap();
+        assert_eq!(from_file.migrate_database_url.as_deref(), Some("postgres://m:p@h/db"));
+        assert!(!format!("{from_file:?}").contains("postgres://"), "{from_file:?}");
+        assert_eq!(secrets_from(env(&[]), file).unwrap().migrate_database_url, None);
+        let bad = secrets_from(
+            env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://h/db?bogus=1")]),
+            file,
+        );
+        assert!(bad.is_err());
     }
 
     #[test]

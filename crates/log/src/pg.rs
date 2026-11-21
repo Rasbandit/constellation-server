@@ -152,6 +152,40 @@ fn decode(seq: i64, body: &[u8]) -> Result<Event, StoreError> {
     }
 }
 
+/// After the migrations, as the table owner: give [`config::DB_APP_ROLE`] SELECT, INSERT, UPDATE
+/// and DELETE on every table of the schema and USAGE on its sequences, and the same on tables
+/// the owner makes later (default privileges). It never gets CREATE, DDL or the migration
+/// history. Idempotent; skipped with a warning when the role does not exist. The role name is
+/// a constant of ours, never input.
+async fn grant_runtime_role(pool: &PgPool) -> Result<(), StoreError> {
+    let role = config::DB_APP_ROLE;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+    if !exists {
+        tracing::warn!(role, "the runtime database role does not exist; nothing granted");
+        return Ok(());
+    }
+    let sql = format!(
+        "DO $grants$ BEGIN \
+         EXECUTE format('GRANT USAGE ON SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT USAGE, SELECT ON SEQUENCES TO {role}', current_schema()); \
+         EXECUTE format('REVOKE ALL ON %I._sqlx_migrations FROM {role}', current_schema()); \
+         END $grants$"
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .map(drop)
+        .map_err(|e| db::<StoreError>(&e))
+}
+
 impl PgLogStore {
     /// Connect with the pool size and session timeouts from `limits`, and apply any pending
     /// migrations. The timeouts bound every wait: a writer that hangs mid-transaction is ended
@@ -162,21 +196,70 @@ impl PgLogStore {
     /// `Unavailable` when the URL is invalid, the database cannot be reached or a migration
     /// fails.
     pub async fn connect(url: &str, limits: &Limits) -> Result<Self, StoreError> {
+        Self::connect_split(url, None, limits).await
+    }
+
+    /// [`Self::connect`] with the migrations run as another role: with `migrate_url` (the role
+    /// that owns the tables), they run on a short-lived pool of its own and then grant
+    /// [`config::DB_APP_ROLE`] its rights (see [`grant_runtime_role`]), and the runtime pool
+    /// never migrates. Without it the runtime role migrates, as a deployment from before the
+    /// split does.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_split(
+        url: &str,
+        migrate_url: Option<&str>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
+        let parse = |u: &str| PgConnectOptions::from_str(u).map_err(|e| db::<StoreError>(&e));
+        Self::connect_with(parse(url)?, migrate_url.map(parse).transpose()?, limits).await
+    }
+
+    /// [`Self::connect_split`] on parsed options.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_with(
+        runtime: PgConnectOptions,
+        migrate: Option<PgConnectOptions>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
         // These session settings apply to the migrations below too (a stuck migration lock errors).
-        let options = PgConnectOptions::from_str(url).map_err(|e| db::<StoreError>(&e))?.options([
-            ("statement_timeout", limits.db_statement_timeout_ms),
-            ("lock_timeout", limits.db_lock_timeout_ms),
-            ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
-        ]);
-        let pool = PgPoolOptions::new()
-            .max_connections(limits.db_pool_connections.max(1))
-            .connect_with(options)
-            .await
-            .map_err(|e| db::<StoreError>(&e))?;
-        MIGRATOR.run(&pool).await.map_err(|e| {
-            tracing::error!(error = %e, "migration failed");
-            StoreError::Unavailable
-        })?;
+        let timed = |o: PgConnectOptions| {
+            o.options([
+                ("statement_timeout", limits.db_statement_timeout_ms),
+                ("lock_timeout", limits.db_lock_timeout_ms),
+                ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
+            ])
+        };
+        let pool = |o: PgConnectOptions, n: u32| {
+            PgPoolOptions::new().max_connections(n.max(1)).connect_with(timed(o))
+        };
+        let migrate_on = |p: PgPool| async move {
+            MIGRATOR.run(&p).await.map_err(|e| {
+                tracing::error!(error = %e, "migration failed");
+                StoreError::Unavailable
+            })?;
+            Ok::<_, StoreError>(p)
+        };
+        let Some(owner) = migrate else {
+            tracing::warn!(
+                "migrating with the runtime database role: set CONSTELLATION_MIGRATE_DATABASE_URL \
+                 so the server can run without the right to change the schema"
+            );
+            let p = pool(runtime, limits.db_pool_connections)
+                .await
+                .map_err(|e| db::<StoreError>(&e))?;
+            return Ok(Self { pool: migrate_on(p).await? });
+        };
+        let owner_pool = pool(owner, 1).await.map_err(|e| db::<StoreError>(&e))?;
+        let owner_pool = migrate_on(owner_pool).await?;
+        grant_runtime_role(&owner_pool).await?;
+        owner_pool.close().await;
+        tracing::info!("migrated as the migration role; running as the runtime role");
+        let pool =
+            pool(runtime, limits.db_pool_connections).await.map_err(|e| db::<StoreError>(&e))?;
         Ok(Self { pool })
     }
 

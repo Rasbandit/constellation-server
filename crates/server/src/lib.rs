@@ -377,6 +377,14 @@ pub async fn app(
     app_with_web(source, password, database_url, limits, None).await
 }
 
+/// Where the log lives: the URL the server runs as, and the one the migrations run as (the
+/// table owner; `None`: they run as the runtime role).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DatabaseUrls<'a> {
+    pub runtime: Option<&'a str>,
+    pub migrate: Option<&'a str>,
+}
+
 /// [`app`], also serving the web UI built in `web_dir` on every path that is not a room's
 /// WebSocket upgrade.
 ///
@@ -389,18 +397,35 @@ pub async fn app_with_web(
     limits: Limits,
     web_dir: Option<&std::path::Path>,
 ) -> Result<(Router, Host), String> {
+    let urls = DatabaseUrls { runtime: database_url, migrate: None };
+    app_with_urls(source, password, urls, limits, web_dir).await
+}
+
+/// [`app_with_web`] with a separate migration URL.
+///
+/// # Errors
+/// As [`app_with_web`].
+pub async fn app_with_urls(
+    source: &Source,
+    password: Option<String>,
+    urls: DatabaseUrls<'_>,
+    limits: Limits,
+    web_dir: Option<&std::path::Path>,
+) -> Result<(Router, Host), String> {
+    let (database_url, migrate_url) = (urls.runtime, urls.migrate);
     let web = web_dir.map(web::WebDir::open).transpose()?.map(Arc::new);
     let mut host = match source {
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
-            let mut host = Host::new(database_url, password, limits, None).await?;
+            let mut host = Host::new(database_url, migrate_url, password, limits, None).await?;
             let key = host.import(loaded).await?;
             host.wake(&key).await?;
             host
         }
         Source::Rooms(dir) => {
             host::check_folder(dir)?;
-            let mut host = Host::new(database_url, password, limits, Some(dir.clone())).await?;
+            let mut host =
+                Host::new(database_url, migrate_url, password, limits, Some(dir.clone())).await?;
             host.list_stored().await?;
             host
         }
@@ -744,10 +769,14 @@ pub async fn run(
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;
-        let (router, host) = app_with_web(
+        let urls = DatabaseUrls {
+            runtime: secrets.database_url.as_deref(),
+            migrate: secrets.migrate_database_url.as_deref(),
+        };
+        let (router, host) = app_with_urls(
             &args.source,
             secrets.room_password,
-            secrets.database_url.as_deref(),
+            urls,
             limits,
             args.web_dir.as_deref(),
         )

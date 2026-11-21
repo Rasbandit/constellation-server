@@ -730,6 +730,7 @@ async fn mem_room_admins_are_granted_once_found_by_key_and_end_with_their_accoun
 mod pg_only {
     use super::*;
     use crate::{OpenError, PgLogStore, World};
+    use sqlx::Connection as _;
 
     fn pool(connections: u32) -> config::Limits {
         config::Limits { db_pool_connections: connections, ..config::Limits::DESIGN }
@@ -800,6 +801,67 @@ mod pg_only {
         let s = pg_store().await;
         open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
         room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+    }
+
+    /// A store that migrated as the schema's owner (the test's own login) and runs as the
+    /// runtime role `config::DB_APP_ROLE`, made here with a login and no other right.
+    async fn restricted_store() -> PgLogStore {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+        const PASSWORD: &str = "restricted-test-only";
+        let url = schema().await;
+        let role = config::DB_APP_ROLE;
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        // Another test may make the role at the same time: the duplicate is fine.
+        let make = format!(
+            "DO $r$ BEGIN CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(make)).execute(&mut c).await.unwrap();
+        let owner = PgConnectOptions::from_str(&url).unwrap();
+        let runtime = owner.clone().username(role).password(PASSWORD);
+        PgLogStore::connect_with(runtime, Some(owner), &pool(4)).await.unwrap()
+    }
+
+    /// The runtime role does the server's normal work (rooms, accounts, admins) and cannot
+    /// change the schema or the migration history, and is no superuser. Fails if the runtime
+    /// pool logs in as the owner, or the grants cover more than data.
+    #[tokio::test]
+    async fn the_runtime_role_does_normal_work_but_cannot_change_the_schema() {
+        let s = restricted_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+        accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted(Arc::new(s)).await;
+    }
+
+    #[tokio::test]
+    async fn the_runtime_role_is_refused_every_schema_change() {
+        let s = restricted_store().await;
+        let pool = s.pool_for_tests();
+        let who: String = sqlx::query_scalar("SELECT current_user").fetch_one(pool).await.unwrap();
+        assert_eq!(who, config::DB_APP_ROLE, "the pool runs as the runtime role");
+        let superuser: bool =
+            sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(!superuser);
+        for ddl in [
+            "CREATE TABLE sneaky (a int)",
+            "DROP TABLE rooms",
+            "DROP TABLE users",
+            "ALTER TABLE users ADD COLUMN x int",
+            "TRUNCATE users",
+            "DELETE FROM _sqlx_migrations",
+            "CREATE SCHEMA sneaky",
+        ] {
+            let e = sqlx::raw_sql(ddl).execute(pool).await.expect_err(ddl);
+            let text = e.to_string();
+            assert!(
+                text.contains("permission denied") || text.contains("must be owner"),
+                "{ddl}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
