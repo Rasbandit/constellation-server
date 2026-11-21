@@ -37,6 +37,11 @@ pub struct MemLogStore {
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
     uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
     jobs: Mutex<BTreeMap<String, Job>>,
+    users: Mutex<BTreeMap<String, String>>,
+    /// Login (by token hash) to its account and its end.
+    sessions: Mutex<BTreeMap<[u8; 32], (String, std::time::Instant)>>,
+    /// Hosted rooms: the record and when it was made.
+    owned: Mutex<BTreeMap<RoomId, (crate::OwnedRoom, std::time::Instant)>>,
     /// How many of the next `job_put`s fail, as a store that is down for a while does.
     job_put_failures: Mutex<usize>,
 }
@@ -527,5 +532,85 @@ mod tests {
         assert_eq!(s.seed_get(b).await.unwrap().as_deref(), Some(&b"seed b"[..]));
         s.seed_put(a, b"new seed").await.unwrap();
         assert_eq!(s.seed_get(a).await.unwrap().as_deref(), Some(&b"new seed"[..]));
+    }
+}
+
+impl crate::AccountStore for MemLogStore {
+    fn user_create(
+        &self,
+        name: &str,
+        hash: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
+        let vacant = !users.contains_key(name);
+        if vacant {
+            users.insert(name.to_owned(), hash.to_owned());
+        }
+        ready(Ok(vacant))
+    }
+
+    fn user_hash(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        ready(Ok(self.users.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()))
+    }
+
+    fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: core::time::Duration,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let end = std::time::Instant::now() + ttl;
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        sessions.retain(|_, (_, end)| *end > now);
+        sessions.insert(*token_hash, (name.to_owned(), end));
+        ready(Ok(()))
+    }
+
+    fn session_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let live = sessions.get(token_hash).filter(|(_, end)| *end > std::time::Instant::now());
+        ready(Ok(live.map(|(name, _)| name.clone())))
+    }
+
+    fn session_delete(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner).remove(token_hash);
+        ready(Ok(()))
+    }
+
+    fn room_claim(
+        &self,
+        room: RoomId,
+        owner: &str,
+        room_info: &crate::OwnedRoom,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut record = room_info.clone();
+        record.owner = Some(owner.to_owned());
+        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        owned.entry(room).or_insert((record, std::time::Instant::now()));
+        ready(Ok(()))
+    }
+
+    fn rooms_owned(
+        &self,
+        owner: Option<&str>,
+    ) -> impl Future<Output = Result<Vec<crate::OwnedRoom>, StoreError>> + Send {
+        let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut rooms: Vec<_> = owned
+            .values()
+            .filter(|(r, _)| owner.is_none_or(|o| r.owner.as_deref() == Some(o)))
+            .map(|(r, made)| crate::OwnedRoom { age_secs: made.elapsed().as_secs(), ..r.clone() })
+            .collect();
+        rooms.sort_by_key(|r| r.age_secs);
+        ready(Ok(rooms))
     }
 }

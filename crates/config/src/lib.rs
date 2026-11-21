@@ -159,6 +159,27 @@ pub struct Limits {
     pub admin_auth_fail_burst: u32,
     /// Refill of that bucket, thousandths per second (100 = one every 10 s).
     pub admin_auth_fail_refill_milli_per_sec: u32,
+    /// Shortest account password, in characters (design value; NIST SP 800-63B says at least 8).
+    pub password_min_chars: usize,
+    /// Longest account password, in bytes: argon2 hashes all of it, so it is capped (design value).
+    pub password_max_bytes: usize,
+    /// Longest account name, in bytes (design value).
+    pub account_name_max_bytes: usize,
+    /// How long a login lasts without another one, seconds (design value: 14 days).
+    pub session_ttl_secs: u64,
+    /// Failed logins one client address may make in a burst; more get HTTP 429 until the bucket
+    /// refills (design value). A good login is never counted.
+    pub login_fail_burst: u32,
+    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
+    pub login_fail_refill_milli_per_sec: u32,
+    /// Whether anyone may make an account (`CONSTELLATION_SIGNUP=open|closed`, default open).
+    /// Closed: the sign-up page and `POST /api/signup` refuse; existing accounts still log in.
+    pub signup_open: bool,
+    /// Accounts one client address may make in a burst; more get HTTP 429 until the bucket
+    /// refills (design value).
+    pub signup_burst: u32,
+    /// Refill of that bucket, thousandths per second (10 = one every 100 s).
+    pub signup_refill_milli_per_sec: u32,
     /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
     /// ones are tens of MB).
     pub apworld_max_bytes: usize,
@@ -347,6 +368,15 @@ impl Limits {
         hint_refill_milli_per_sec: 1000,
         admin_auth_fail_burst: 5,
         admin_auth_fail_refill_milli_per_sec: 100,
+        password_min_chars: 10,
+        password_max_bytes: 256,
+        account_name_max_bytes: 64,
+        session_ttl_secs: 14 * 24 * 60 * 60,
+        login_fail_burst: 5,
+        login_fail_refill_milli_per_sec: 100,
+        signup_open: true,
+        signup_burst: 3,
+        signup_refill_milli_per_sec: 10,
         apworld_max_bytes: 64 * 1024 * 1024,
         apworld_max_unpacked_bytes: 256 * 1024 * 1024,
         apworld_max_entries: 20_000,
@@ -397,6 +427,9 @@ impl Limits {
             return Err("gen_lost_secs (in ms) must exceed gen_timeout_ms \
                  (CONSTELLATION_GEN_TIMEOUT_MS)");
         }
+        if self.password_min_chars == 0 || self.password_min_chars > self.password_max_bytes {
+            return Err("password_min_chars must be 1 to password_max_bytes");
+        }
         Ok(())
     }
 }
@@ -424,6 +457,11 @@ pub fn load() -> Result<Limits, String> {
         l.sim_seeds = v;
     }
     l.sim_replay_seed = num("SIM_SEED");
+    l.signup_open = match std::env::var("CONSTELLATION_SIGNUP").ok().as_deref() {
+        None | Some("" | "open") => true,
+        Some("closed") => false,
+        Some(_) => return Err("CONSTELLATION_SIGNUP must be `open` or `closed`".into()),
+    };
     for (key, field) in [
         ("CONSTELLATION_MAX_CONNECTIONS", &mut l.max_connections),
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
@@ -798,6 +836,7 @@ mod tests {
             .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
             .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
             .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
+            .env("CONSTELLATION_SIGNUP", "closed")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
             .env("CONSTELLATION_AP_DIR", "/probe/ap")
             .env("CONSTELLATION_AP_PYTHON", "/probe/python")
@@ -816,6 +855,7 @@ mod tests {
             d.idle_timeout_ms, d.ping_interval_ms
         );
         assert!(text.contains(&want), "want {want:?} in {text}");
+        assert!(text.contains("probe signup false"), "closed by CONSTELLATION_SIGNUP: {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
             "{text}"
@@ -833,6 +873,7 @@ mod tests {
             return;
         }
         let l = load().unwrap();
+        println!("probe signup {}", l.signup_open);
         println!(
             "probe limits {} {} {:?} {} {} {} {} {} {} {}",
             l.dedupe_window_secs,
@@ -903,6 +944,12 @@ mod tests {
         );
         assert_eq!(l.fill_max_processes, 8192);
         assert_eq!((l.admin_write_burst, l.admin_write_refill_milli_per_sec), (30, 1000));
+        assert_eq!(
+            (l.password_min_chars, l.password_max_bytes, l.account_name_max_bytes),
+            (10, 256, 64)
+        );
+        assert_eq!((l.session_ttl_secs, l.login_fail_burst), (1_209_600, 5));
+        assert!(l.signup_open, "sign-up is open unless the operator closes it");
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
         assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
