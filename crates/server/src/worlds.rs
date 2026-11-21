@@ -1558,24 +1558,35 @@ async fn room_events(
         .map_err(|e| unavailable(format!("{e:?}")))
 }
 
-/// Completes when the request's account can no longer read world `id`: its session ended or its
-/// account is gone, or it lost its role on the room (checked through the same
-/// [`read_status_for`] as the open, every `view_access_recheck_ms`). A store error keeps the
-/// stream: only a clear "no access" ends it.
-async fn access_lost(w: Arc<Worlds>, headers: HeaderMap, id: String) {
-    let every = Duration::from_millis(w.limits.view_access_recheck_ms.max(1));
+/// Whether the request's account can still read world `id`, through the same
+/// [`read_status_for`] as the open. Fails closed: no session, no account, a store error or a
+/// bad row all read as "no".
+async fn still_allowed(w: &Worlds, headers: &HeaderMap, id: &str) -> bool {
+    let Some(a) = &w.accounts else { return false };
+    let Some(who) = a.identify(headers).await else { return false };
+    read_status_for(w, &who, id).await.is_ok()
+}
+
+/// Completes the first time `check` says no, answers later than `every`, or does not answer in
+/// `every`: a hung store ends the stream as a refusal does.
+async fn until_lost<F, Fut>(every: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
     loop {
         tokio::time::sleep(every).await;
-        let Some(who) = (match &w.accounts {
-            Some(a) => a.identify(&headers).await,
-            None => None,
-        }) else {
-            return;
-        };
-        if matches!(read_status_for(&w, &who, &id).await, Err((StatusCode::NOT_FOUND, _))) {
+        if !matches!(tokio::time::timeout(every, check()).await, Ok(true)) {
             return;
         }
     }
+}
+
+/// Completes when the request's account can no longer read world `id` (see [`still_allowed`]),
+/// checked every `view_access_recheck_ms`. Any failure to check ends the stream.
+async fn access_lost(w: Arc<Worlds>, headers: HeaderMap, id: String) {
+    let every = Duration::from_millis(w.limits.view_access_recheck_ms.max(1));
+    until_lost(every, || still_allowed(&w, &headers, &id)).await;
 }
 
 #[cfg(test)]
@@ -2808,6 +2819,32 @@ mod tests {
         assert_eq!(json_of_call(&app, "/api/rooms", &ann).await, a_rooms);
         assert_eq!(admins_of(&app, &key, &ann).await, a_admins);
         assert_eq!(json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await, a_world);
+    }
+
+    /// A lookup that errors, a session that is gone and one that hangs all end a room stream;
+    /// only a clean yes keeps it. Fails open without `still_allowed` and `until_lost`.
+    #[tokio::test]
+    async fn a_room_stream_fails_closed_on_an_error_a_gone_session_or_a_hang() {
+        let w =
+            Arc::new(worlds(&temp("fail-closed"), Limits { signup_burst: 10, ..Limits::DESIGN }));
+        let app = routes(Arc::clone(&w));
+        let ann = signed_up(&app, "ann").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(&ann).unwrap());
+        let (good, bad) = (content_id(b"good"), content_id(b"bad"));
+        w.save_status(&json!({"id": good, "status": "queued", "owner": "pw:ann"})).await.unwrap();
+        w.store.job_put(&bad, JobState::Queued, "{not json").await.unwrap();
+        assert!(still_allowed(&w, &headers, &good).await);
+        assert!(!still_allowed(&w, &headers, &bad).await, "a store or row error is a no");
+        assert!(!still_allowed(&w, &HeaderMap::new(), &good).await, "no session is a no");
+        let every = Duration::from_millis(20);
+        let five = Duration::from_secs(5);
+        tokio::time::timeout(five, until_lost(every, || std::future::pending::<bool>()))
+            .await
+            .expect("a check that hangs ends the stream");
+        let keeps =
+            tokio::time::timeout(Duration::from_millis(200), until_lost(every, || async { true }));
+        assert!(keeps.await.is_err(), "a clean yes keeps it open");
     }
 
     async fn admins_of(app: &Router, key: &str, cookie: &str) -> Value {
