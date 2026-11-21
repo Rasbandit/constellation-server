@@ -174,6 +174,9 @@ pub struct Limits {
     pub login_fail_burst: u32,
     /// Refill of that bucket, thousandths per second (100 = one every 10 s).
     pub login_fail_refill_milli_per_sec: u32,
+    /// Passwords hashed or checked at once (design value); more get HTTP 503. Each is a core and
+    /// ~19 MiB, and the per-address counts only apply once the work is done.
+    pub password_hash_parallel: usize,
     /// Whether anyone may make an account (`CONSTELLATION_SIGNUP=open|closed`, default open).
     /// Closed: the sign-up page and `POST /api/signup` refuse; existing accounts still log in.
     pub signup_open: bool,
@@ -377,6 +380,7 @@ impl Limits {
         session_ttl_secs: 14 * 24 * 60 * 60,
         login_fail_burst: 5,
         login_fail_refill_milli_per_sec: 100,
+        password_hash_parallel: 4,
         signup_open: true,
         signup_burst: 3,
         signup_refill_milli_per_sec: 10,
@@ -432,6 +436,9 @@ impl Limits {
         }
         if self.password_min_chars == 0 || self.password_min_chars > self.password_max_bytes {
             return Err("password_min_chars must be 1 to password_max_bytes");
+        }
+        if self.password_hash_parallel == 0 {
+            return Err("password_hash_parallel must be at least 1");
         }
         Ok(())
     }

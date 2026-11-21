@@ -85,6 +85,13 @@ fn normalize(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// Whether `name` (already normalized) holds only what an account name may. Login uses it too,
+/// so a name no account can have never reaches the store (Postgres refuses a NUL byte in text,
+/// which would answer 500 and skip the failure count).
+fn name_chars_ok(name: &str) -> bool {
+    name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
 /// Check a new account's name and password against the limits; the name as stored (lowercase).
 /// The one validator sign-up uses. Messages describe the caller's own input only.
 pub(crate) fn check_account(
@@ -97,7 +104,7 @@ pub(crate) fn check_account(
     if chars < l.account_name_min_chars || name.len() > l.account_name_max_bytes {
         return Err("the name is too short or too long");
     }
-    if !name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')) {
+    if !name_chars_ok(&name) {
         return Err("the name may hold only letters, digits, _ and -");
     }
     if password.chars().count() < l.password_min_chars {
@@ -180,6 +187,9 @@ pub(crate) struct PasswordAuth {
     login_fails: edge_compat::RateTable<std::net::IpAddr>,
     /// Sign-ups per client address (`signup_burst`).
     signups: edge_compat::RateTable<std::net::IpAddr>,
+    /// Passwords being hashed or checked right now (`password_hash_parallel`): each takes
+    /// ~19 MiB and a core, and the per-address counts only bite after the work is done.
+    hashing: tokio::sync::Semaphore,
 }
 
 impl PasswordAuth {
@@ -189,6 +199,7 @@ impl PasswordAuth {
             db,
             limits,
             proxy_header,
+            hashing: tokio::sync::Semaphore::new(limits.password_hash_parallel),
             login_fails: edge_compat::RateTable::new(
                 limits.login_fail_burst,
                 limits.login_fail_refill_milli_per_sec,
@@ -244,9 +255,18 @@ fn failed(why: impl core::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "the server could not do that").into_response()
 }
 
-/// Run argon2 off the async runtime's I/O threads.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    tokio::task::spawn_blocking(f).await.ok()
+/// Run argon2 off the async runtime's I/O threads, at most `password_hash_parallel` at a time;
+/// past that the caller gets 503 at once instead of queueing more memory-hard work.
+async fn blocking<T: Send + 'static>(
+    a: &PasswordAuth,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    let Ok(_permit) = a.hashing.try_acquire() else {
+        let mut res = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(1));
+        return Err(res);
+    };
+    tokio::task::spawn_blocking(f).await.map_err(|e| failed(e))
 }
 
 /// The account's name as the page shows it (never the subject's provider prefix, never a hash).
@@ -288,8 +308,10 @@ async fn signup(State(a): State<Arc<PasswordAuth>>, req: Request) -> Response {
         Ok(n) => n,
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
-    let Some(Ok(hash)) = blocking(move || hash_password(&c.password)).await else {
-        return failed("hashing a password");
+    let hash = match blocking(&a, move || hash_password(&c.password)).await {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(e)) => return failed(e),
+        Err(res) => return res,
     };
     match a.db.user_create(&name, &hash).await {
         Ok(true) => {}
@@ -316,13 +338,20 @@ async fn login(State(a): State<Arc<PasswordAuth>>, req: Request) -> Response {
         Err(status) => return status.into_response(),
     };
     let name = normalize(&c.username);
-    let stored = match a.db.user_hash(&name).await {
-        Ok(h) => h,
-        Err(e) => return failed(format!("{e:?}")),
+    let stored = if name_chars_ok(&name) {
+        match a.db.user_hash(&name).await {
+            Ok(h) => h,
+            Err(e) => return failed(format!("{e:?}")),
+        }
+    } else {
+        None
     };
     let known = stored.is_some();
     let hash = stored.unwrap_or_else(|| dummy_hash().to_owned());
-    let right = blocking(move || verify_password(&hash, &c.password)).await == Some(true);
+    let right = match blocking(&a, move || verify_password(&hash, &c.password)).await {
+        Ok(right) => right,
+        Err(res) => return res,
+    };
     if !(known && right) {
         a.login_fails.charge(ip, 1, Instant::now());
         return StatusCode::UNAUTHORIZED.into_response();
@@ -553,6 +582,28 @@ mod tests {
     fn an_unknown_name_is_checked_against_a_real_hash_so_it_costs_the_same() {
         assert!(dummy_hash().starts_with("$argon2id$"), "{}", dummy_hash());
         assert!(!verify_password(dummy_hash(), PW));
+    }
+
+    /// Fails without the semaphore: every attempt would start its own argon2 (a flood from one
+    /// address runs unbounded work before the failure count ever bites).
+    #[tokio::test]
+    async fn hashing_is_capped_so_a_flood_gets_503_not_unbounded_work() {
+        let a = auth(Limits { password_hash_parallel: 1, ..Limits::DESIGN });
+        let app = routes(Arc::clone(&a));
+        let _busy = a.hashing.try_acquire().unwrap();
+        for path in ["/api/login", "/api/signup"] {
+            let r = post_json(&app, path, &pair("ann", PW)).await;
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert!(r.headers().contains_key(header::RETRY_AFTER));
+        }
+    }
+
+    #[test]
+    fn a_name_with_a_nul_or_any_other_stray_byte_never_reaches_the_store() {
+        assert!(name_chars_ok("ann_b-2"));
+        for bad in ["a\0b", "a b", "ann\u{e9}", "A"] {
+            assert!(!name_chars_ok(bad), "{bad:?}");
+        }
     }
 
     #[tokio::test]

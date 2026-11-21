@@ -1,7 +1,7 @@
 -- Accounts (issue 126): who may host rooms, their logins, and which room each made.
 --
 -- users: name is the lowercase login name and the account's identity; hash is the argon2id
--- PHC string (salt and cost inside), never the password. Accounts are made by the admin only.
+-- PHC string (salt and cost inside), never the password. Anyone may sign up (CONSTELLATION_SIGNUP=closed stops it).
 --
 -- sessions: a login. token_hash is the SHA-256 of the random id in the browser's cookie, so a
 -- copy of this table cannot be used to sign in. Past expires_at a session is dead (and swept).
