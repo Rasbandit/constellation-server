@@ -169,21 +169,18 @@ fn privilege_warning(user: &str, superuser: bool) -> Option<String> {
     ))
 }
 
-/// Warn when the runtime pool is more privileged than it needs to be (not an error: a
-/// deployment from before the role split must still start).
-async fn warn_if_privileged(pool: &PgPool) {
+/// The warning to log when the runtime pool is more privileged than it needs to be (not an
+/// error: a deployment from before the role split must still start), or when its role cannot
+/// be checked.
+pub(crate) async fn pool_privilege_warning(pool: &PgPool) -> Option<String> {
     let row: Result<(String, bool), _> = sqlx::query_as(
         "SELECT current_user::text, COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)",
     )
     .fetch_one(pool)
     .await;
     match row {
-        Ok((user, superuser)) => {
-            if let Some(w) = privilege_warning(&user, superuser) {
-                tracing::warn!("{w}");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "could not check the runtime database role"),
+        Ok((user, superuser)) => privilege_warning(&user, superuser),
+        Err(e) => Some(format!("could not check the runtime database role: {e}")),
     }
 }
 
@@ -297,7 +294,9 @@ impl PgLogStore {
             .connect_with(session(runtime, true))
             .await
             .map_err(|e| db::<StoreError>(&e))?;
-        warn_if_privileged(&pool).await;
+        if let Some(w) = pool_privilege_warning(&pool).await {
+            tracing::warn!("{w}");
+        }
         Ok(Self { pool })
     }
 
@@ -844,25 +843,46 @@ impl crate::ManifestStore for PgLogStore {
 impl PgLogStore {
     /// Change an upload's file without its id, as a torn row is.
     pub(crate) async fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
-        let (kind, id) = (kind, id.to_vec());
+        let sql = "UPDATE world_uploads SET bytes = bytes || '\\x00'::bytea \
+                   WHERE kind = $1 AND id = decode($2, 'hex')";
+        self.exec_for_tests(sql, vec![kind.as_str().to_owned(), hex(id)]).await;
+    }
+
+    /// Change a manifest's bytes without its id, as a torn row is.
+    pub(crate) async fn tear_manifest_for_tests(&self, id: &BlobKey) {
+        let sql = "UPDATE world_manifests SET bytes = bytes || '\\x00'::bytea \
+                   WHERE id = decode($1, 'hex')";
+        self.exec_for_tests(sql, vec![hex(id)]).await;
+    }
+
+    /// Mark job `id` as last alive `by` ago, as if its process stopped then.
+    pub(crate) async fn age_job_for_tests(&self, id: &str, by: core::time::Duration) {
+        let sql = "UPDATE world_jobs SET updated_at = updated_at - make_interval(secs => $2::float8) \
+                   WHERE id = $1";
+        self.exec_for_tests(sql, vec![id.to_owned(), by.as_secs_f64().to_string()]).await;
+    }
+
+    /// Run `sql` with text `args` bound in order; panics on an error (tests only).
+    async fn exec_for_tests(&self, sql: &'static str, args: Vec<String>) {
         let done = self
             .isolated(move |c| {
                 Box::pin(async move {
-                    sqlx::query(
-                        "UPDATE world_uploads SET bytes = bytes || '\\x00'::bytea \
-                         WHERE kind = $1 AND id = $2",
-                    )
-                    .bind(kind.as_str())
-                    .bind(&id)
-                    .execute(&mut *c)
-                    .await
-                    .map(drop)
-                    .map_err(|e| db::<StoreError>(&e))
+                    args.iter()
+                        .fold(sqlx::query(sql), |q, a| q.bind(a))
+                        .execute(&mut *c)
+                        .await
+                        .map(drop)
+                        .map_err(|e| db::<StoreError>(&e))
                 })
             })
             .await;
         done.unwrap();
     }
+}
+
+#[cfg(all(test, feature = "pg-tests"))]
+fn hex(id: &BlobKey) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Uploads in the `world_uploads` table (migration 0005).

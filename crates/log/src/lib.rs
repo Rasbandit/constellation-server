@@ -402,6 +402,15 @@ impl JobState {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn every_job_state_parses_from_its_name_and_nothing_else_does() {
+    for j in [JobState::Queued, JobState::Running, JobState::Done, JobState::Failed] {
+        assert_eq!(JobState::parse(j.as_str()), Some(j));
+    }
+    assert_eq!(JobState::parse("lost"), None);
+}
+
 /// World generations' statuses, shared by every server instance. Queued and running jobs are
 /// marked alive by the process running them; one that stops being marked is stale.
 pub trait JobStore: Send + Sync + 'static {

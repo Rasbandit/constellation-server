@@ -28,6 +28,10 @@ trait Store:
         kind: UploadKind,
         id: &crate::BlobKey,
     ) -> impl Future<Output = ()> + Send;
+    /// Change a stored manifest's bytes without its id: a torn row.
+    fn tear_manifest_for_tests(&self, id: &crate::BlobKey) -> impl Future<Output = ()> + Send;
+    /// Mark job `id` as last alive `by` ago.
+    fn age_job_for_tests(&self, id: &str, by: Duration) -> impl Future<Output = ()> + Send;
 }
 
 impl Store for MemLogStore {
@@ -43,6 +47,16 @@ impl Store for MemLogStore {
         self.tear_upload_for_tests(kind, id);
         std::future::ready(())
     }
+
+    fn tear_manifest_for_tests(&self, id: &crate::BlobKey) -> impl Future<Output = ()> + Send {
+        Self::tear_manifest_for_tests(self, id);
+        std::future::ready(())
+    }
+
+    fn age_job_for_tests(&self, id: &str, by: Duration) -> impl Future<Output = ()> + Send {
+        Self::age_job_for_tests(self, id, by);
+        std::future::ready(())
+    }
 }
 
 #[cfg(feature = "pg-tests")]
@@ -53,6 +67,14 @@ impl Store for crate::PgLogStore {
 
     async fn tear_for_tests(&self, kind: UploadKind, id: &crate::BlobKey) {
         self.tear_upload_for_tests(kind, id).await;
+    }
+
+    async fn tear_manifest_for_tests(&self, id: &crate::BlobKey) {
+        Self::tear_manifest_for_tests(self, id).await;
+    }
+
+    async fn age_job_for_tests(&self, id: &str, by: Duration) {
+        Self::age_job_for_tests(self, id, by).await;
     }
 }
 
@@ -303,6 +325,11 @@ async fn manifests_are_deduplicated_checked_and_listed_in_pages<S: Store>(s: Arc
     let lie = manifest("lie", "Even", b"other bytes");
     assert!(matches!(s.manifest_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
     assert_eq!(s.manifest_record(&lie.id).await.unwrap(), None);
+    // A torn row is refused on read and healed by the next put of the right bytes.
+    s.tear_manifest_for_tests(&want[0].id).await;
+    assert!(matches!(s.manifest_bytes(&want[0].id).await, Err(StoreError::Corrupt(_))), "torn");
+    s.manifest_put(&want[0], &bodies[0]).await.unwrap();
+    assert_eq!(s.manifest_bytes(&want[0].id).await.unwrap(), Some(bodies[0].clone()), "healed");
 
     want.sort_by_key(|r| r.id);
     let first = s.manifest_list(None, None, 2).await.unwrap();
@@ -505,6 +532,7 @@ async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>
     // A torn row (tampered bytes) is not intact on either store.
     s.tear_for_tests(k, &id).await;
     assert!(!s.upload_intact(k, &id).await.unwrap(), "torn");
+    assert!(matches!(s.upload_bytes(k, &id).await, Err(StoreError::Corrupt(_))), "torn read");
     s.upload_put(&worlds[0], &bodies[0]).await.unwrap();
     assert!(s.upload_intact(k, &id).await.unwrap(), "healed");
     assert!(!s.upload_intact(UploadKind::Apworld, &blob_key(b"none")).await.unwrap());
@@ -551,18 +579,18 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     assert_eq!(json(&j2).await, serde_json::json!({"status": "failed", "error": "lost"}));
     assert!(s.job_fail_all_stale(Duration::ZERO, "again").await.unwrap().is_empty(), "once");
     // Text that is not a JSON object never aborts the sweep: it is replaced, the rest fail.
-    let bad = ["{broken", r#"{"a": "\u0000"}"#, "[1]"];
-    let ids: Vec<String> = ('1'..='4').map(id).collect();
+    let bad = ["{broken", r#"{"a": "\u0000"}"#, r#"{"a": ["\u0000"]}"#, "[1]"];
+    let ids: Vec<String> = ('1'..='5').map(id).collect();
     for (i, text) in bad.iter().chain(&[r#"{"ok": 1}"#]).enumerate() {
         s.job_put(&ids[i], JobState::Running, text).await.unwrap();
     }
     let all = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
     assert_eq!(all, ids, "every one failed, none aborted the sweep");
     let bare = serde_json::json!({"status": "failed", "error": "lost"});
-    for i in 0..3 {
-        assert_eq!(json(&ids[i]).await, bare, "{}", bad[i]);
+    for (i, text) in bad.iter().enumerate() {
+        assert_eq!(json(&ids[i]).await, bare, "{text}");
     }
-    assert_eq!(json(&ids[3]).await["ok"], 1);
+    assert_eq!(json(&ids[bad.len()]).await["ok"], 1);
     // A put replaces the status; a touch of a finished job changes nothing.
     s.job_put(&q, JobState::Done, "q2").await.unwrap();
     s.job_touch(&q).await.unwrap();
@@ -571,6 +599,15 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     // A server that comes back finishes over a sweep's failed.
     s.job_put(&r, JobState::Done, "r done").await.unwrap();
     assert_eq!(status(&r).await.as_deref(), Some("r done"));
+    // A touch marks an unfinished job alive again: of two lost an hour ago, only the untouched
+    // one goes stale.
+    let (kept, lost) = (id('6'), id('7'));
+    for j in [&kept, &lost] {
+        s.job_put(j, JobState::Running, "{}").await.unwrap();
+        s.age_job_for_tests(j, hour).await;
+    }
+    s.job_touch(&kept).await.unwrap();
+    assert_eq!(s.job_fail_all_stale(hour / 2, "lost").await.unwrap(), [lost]);
 }
 
 /// A status put only when there is none never replaces one that is stored, of any state.
@@ -609,7 +646,8 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
         seed_name: format!("seed{}", 10 + n),
         room_key: format!("key{n}"),
         owner: None,
-        age_secs: 0,
+        // Ignored: a listed room's age is the store's, from when the room was claimed.
+        age_secs: 1 << 40,
     };
     s.room_claim(RoomId(11), Some("pw:a"), &room(1)).await.unwrap();
     s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
@@ -622,6 +660,7 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
     let all = s.rooms_owned(None).await.unwrap();
     assert!(all.iter().any(|r| r.owner.is_none()), "the admin view lists rooms with no owner");
     assert!(all.len() >= 3);
+    assert!(all.iter().all(|r| r.age_secs < 3600), "ages are the store's: {all:?}");
 }
 
 /// Room 21 must be listed already with key `aaaaaaaaaa` (Postgres reads it from the directory).
@@ -653,10 +692,14 @@ async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S:
     assert!(s.room_admin_remove(key, "bea").await.unwrap());
     assert!(!s.room_admin_remove(key, "bea").await.unwrap(), "nothing left to remove");
     assert!(s.rooms_administered("bea").await.unwrap().is_empty());
-    for name in ["bea", "cy"] {
+    let hour = Duration::from_secs(3600);
+    for (name, token) in [("bea", [7; 32]), ("cy", [8; 32])] {
         assert!(s.room_admin_add(key, name, "own").await.unwrap());
+        s.session_put(&token, name, hour).await.unwrap();
     }
     s.user_delete("bea").await.unwrap();
+    assert_eq!(s.session_user(&[7; 32]).await.unwrap(), None, "a deleted account's login ends");
+    assert_eq!(s.session_user(&[8; 32]).await.unwrap().as_deref(), Some("cy"), "others' stay");
     assert_eq!(s.room_admins(key).await.unwrap(), ["cy"], "a deleted account is no admin");
     assert_eq!(s.user_hash("bea").await.unwrap(), None);
     assert!(s.rooms_administered("bea").await.unwrap().is_empty());
@@ -851,6 +894,16 @@ mod pg_only {
         open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
         room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
         accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted(Arc::new(s)).await;
+    }
+
+    /// A store opened as the test's login (a superuser) is warned about; one running as the
+    /// runtime role is not.
+    #[tokio::test]
+    async fn only_a_pool_with_more_than_data_rights_gets_a_privilege_warning() {
+        let (root, app) = (pg_store().await, restricted_store().await);
+        let warned = crate::pg::pool_privilege_warning(root.pool_for_tests()).await;
+        assert!(warned.is_some_and(|w| w.contains("superuser")), "the test login is a superuser");
+        assert_eq!(crate::pg::pool_privilege_warning(app.pool_for_tests()).await, None);
     }
 
     #[tokio::test]

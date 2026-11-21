@@ -523,7 +523,7 @@ impl crate::AccountStore for MemLogStore {
         let end = std::time::Instant::now() + ttl;
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         let now = std::time::Instant::now();
-        sessions.retain(|_, (_, end)| *end > now);
+        sessions.retain(|_, (_, end)| live(*end, now));
         sessions.insert(*token_hash, (name.to_owned(), end));
         ready(Ok(()))
     }
@@ -533,8 +533,9 @@ impl crate::AccountStore for MemLogStore {
         token_hash: &[u8; 32],
     ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
         let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        let live = sessions.get(token_hash).filter(|(_, end)| *end > std::time::Instant::now());
-        ready(Ok(live.map(|(name, _)| name.clone())))
+        let found =
+            sessions.get(token_hash).filter(|(_, end)| live(*end, std::time::Instant::now()));
+        ready(Ok(found.map(|(name, _)| name.clone())))
     }
 
     fn session_delete(
@@ -624,6 +625,12 @@ impl crate::AccountStore for MemLogStore {
     }
 }
 
+/// Whether a login that ends at `end` is still live at `now`: dead from `end` on, as Postgres's
+/// `expires_at > now()`.
+fn live(end: std::time::Instant, now: std::time::Instant) -> bool {
+    end > now
+}
+
 impl MemLogStore {
     /// The hosted rooms `keep` accepts, newest first.
     fn listed(&self, keep: impl Fn(&crate::OwnedRoom) -> bool) -> Vec<crate::OwnedRoom> {
@@ -665,6 +672,28 @@ mod tests {
             s.put(&blob_key(b), b).await.unwrap();
         }
         assert_eq!(s.blobs(), 2);
+    }
+
+    /// A login is dead from the instant it ends on, not one tick later.
+    #[test]
+    fn a_login_is_dead_at_exactly_its_end() {
+        let now = std::time::Instant::now();
+        let tick = core::time::Duration::from_nanos(1);
+        assert!(!live(now, now), "expires_at == now is expired");
+        assert!(live(now + tick, now));
+        assert!(!live(now, now + tick));
+    }
+
+    /// `fail_job_puts_for_tests(n)` fails exactly the next `n` puts, with `Unavailable`.
+    #[tokio::test]
+    async fn failed_job_puts_fail_only_the_next_n() {
+        use crate::{JobState::Running, JobStore};
+        let s = MemLogStore::new();
+        s.fail_job_puts_for_tests(1);
+        assert_eq!(s.job_put("j", Running, "a").await, Err(StoreError::Unavailable));
+        assert_eq!(s.job_status("j").await.unwrap(), None, "a failed put writes nothing");
+        s.job_put("j", Running, "b").await.unwrap();
+        assert_eq!(s.job_status("j").await.unwrap().unwrap().0, "b");
     }
 
     /// `forget_seed` drops only that room's seed, and the room can then take another one.
