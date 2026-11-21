@@ -744,6 +744,23 @@ mod pg_only {
         .unwrap()
     }
 
+    /// Another migrator holding sqlx's advisory lock (a second server starting, a parallel
+    /// test) makes this connect wait longer than the runtime `lock_timeout`; it must still
+    /// connect once the lock is free. Fails when the migrations run under `lock_timeout`.
+    #[tokio::test]
+    async fn a_connect_waits_for_another_migrator_past_the_runtime_lock_timeout() {
+        use sqlx::migrate::Migrate as _;
+        let url = schema().await;
+        let mut holder = sqlx::PgConnection::connect(&url).await.unwrap();
+        holder.lock().await.unwrap();
+        let limits = config::Limits { db_lock_timeout_ms: 100, ..pool(2) };
+        let mut connecting = tokio::spawn(async move { PgLogStore::connect(&url, &limits).await });
+        let waited = tokio::time::timeout(Duration::from_millis(500), &mut connecting).await;
+        assert!(waited.is_err(), "still waiting for the lock, not failed: {waited:?}");
+        holder.unlock().await.unwrap();
+        connecting.await.unwrap().expect("connected once the lock was free");
+    }
+
     /// Gate G-DB: a writer stuck inside a transaction while holding the owner row lock must
     /// not block a claim forever; with `lock_timeout` the claim errors, and once the stuck
     /// session ends the claim works.

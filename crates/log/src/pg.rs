@@ -260,43 +260,43 @@ impl PgLogStore {
         migrate: Option<PgConnectOptions>,
         limits: &Limits,
     ) -> Result<Self, StoreError> {
-        // These session settings apply to the migrations below too (a stuck migration lock errors).
-        let timed = |o: PgConnectOptions| {
-            o.options([
+        let session = |o: PgConnectOptions, lock_timeout: bool| {
+            let o = o.options([
                 ("statement_timeout", limits.db_statement_timeout_ms),
-                ("lock_timeout", limits.db_lock_timeout_ms),
                 ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
-            ])
+            ]);
+            if lock_timeout { o.options([("lock_timeout", limits.db_lock_timeout_ms)]) } else { o }
         };
-        let pool = |o: PgConnectOptions, n: u32| {
-            PgPoolOptions::new().max_connections(n.max(1)).connect_with(timed(o))
-        };
-        let migrate_on = |p: PgPool| async move {
-            MIGRATOR.run(&p).await.map_err(|e| {
-                tracing::error!(error = %e, "migration failed");
-                StoreError::Unavailable
-            })?;
-            Ok::<_, StoreError>(p)
-        };
-        let Some(owner) = migrate else {
+        let owner = migrate.clone();
+        if owner.is_none() {
             tracing::warn!(
                 "migrating with the runtime database role: set CONSTELLATION_MIGRATE_DATABASE_URL \
                  so the server can run without the right to change the schema"
             );
-            let p = pool(runtime, limits.db_pool_connections)
-                .await
-                .map_err(|e| db::<StoreError>(&e))?;
-            let p = migrate_on(p).await?;
-            warn_if_privileged(&p).await;
-            return Ok(Self { pool: p });
-        };
-        let owner_pool = pool(owner, 1).await.map_err(|e| db::<StoreError>(&e))?;
-        let owner_pool = migrate_on(owner_pool).await?;
-        grant_runtime_role(&owner_pool).await?;
-        owner_pool.close().await;
-        tracing::info!("migrated as the migration role; running as the runtime role");
-        let pool =
-            pool(runtime, limits.db_pool_connections).await.map_err(|e| db::<StoreError>(&e))?;
+        }
+        // The migrations run on a pool of their own, without `lock_timeout`: sqlx serialises
+        // concurrent migrators (another server starting, another test) with an advisory lock,
+        // and the short runtime `lock_timeout` would fail the one that has to wait for it.
+        // `statement_timeout` still bounds that wait, and a stuck migration.
+        let migrating = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(session(owner.unwrap_or_else(|| runtime.clone()), false))
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+        MIGRATOR.run(&migrating).await.map_err(|e| {
+            tracing::error!(error = %e, "migration failed");
+            StoreError::Unavailable
+        })?;
+        if migrate.is_some() {
+            grant_runtime_role(&migrating).await?;
+            tracing::info!("migrated as the migration role; running as the runtime role");
+        }
+        migrating.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(limits.db_pool_connections.max(1))
+            .connect_with(session(runtime, true))
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
         warn_if_privileged(&pool).await;
         Ok(Self { pool })
     }
