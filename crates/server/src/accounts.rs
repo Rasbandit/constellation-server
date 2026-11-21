@@ -68,7 +68,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
 }
 
 /// The one thing a signed-in account (not the admin) may call. Everything else is admin-only
-/// until uploads and generation have per-user trust (see #139). Add a route here, nowhere else.
+/// until uploads and generation have per-user trust (see #127). Add a route here, nowhere else.
 pub(crate) fn user_may(method: &Method, path: &str) -> bool {
     method == Method::GET && path == "/api/rooms"
 }

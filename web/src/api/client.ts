@@ -111,6 +111,30 @@ export async function generateWorld(
   throw new Error('The world was generated but the server never hosted it; start the server with --rooms');
 }
 
+/** A row of `GET /api/rooms` (crates/server/src/worlds.rs `list_rooms`). `id` is the world, null for a room made before accounts. */
+export interface OwnedRoom {
+  id: string | null;
+  name: string;
+  room_key: string;
+  owner: string | null;
+  age_secs: number;
+}
+
+/** The list row as the room list shows it: a live room has no player counts or state to show yet. */
+export function ownedRoomToSummary(r: OwnedRoom, now = Date.now()): RoomSummary {
+  return {
+    id: r.id ?? r.room_key,
+    name: r.name,
+    state: 'running',
+    createdAt: new Date(now - r.age_secs * 1000).toISOString(),
+    slots: 0,
+    slotsOnline: 0,
+    slotsDone: 0,
+    games: [],
+    code: null,
+  };
+}
+
 export const api = {
   games: () => call<{ builtin: string[]; known: string[] }>('GET', '/api/games'),
   catalog: (game: string) => call<GameCatalog>('GET', `/api/games/${enc(game)}`),
@@ -121,7 +145,9 @@ export const api = {
   /** One player per document in the file. */
   uploadPlayerFile: (f: File) => call<YamlRecord>('PUT', `/api/yamls?name=${enc(f.name)}`, { raw: f }).then(toPlayers),
 
-  rooms: () => call<RoomSummary[]>('GET', '/api/rooms'),
+  /** Live: the rooms the signed-in account made (all of them for the admin token). */
+  rooms: (): Promise<RoomSummary[]> =>
+    adminApi ? call<OwnedRoom[]>('GET', '/api/rooms').then((rs) => rs.map((r) => ownedRoomToSummary(r))) : call<RoomSummary[]>('GET', '/api/rooms'),
   resolveCode: (code: string) => call<{ roomId: string }>('GET', `/api/codes/${enc(code)}`),
   /** With the admin API, the server generates and hosts the world, and the room is that world. */
   createRoom: (req: CreateRoomRequest): Promise<Room> =>

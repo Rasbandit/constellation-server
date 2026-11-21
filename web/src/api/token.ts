@@ -13,6 +13,8 @@ interface TokenState {
   notice: string | null;
   /** From `GET /api/auth`: null until known. False: the server is open (no token), no prompt. */
   required: boolean | null;
+  /** From `GET /api/auth`: whether the server lets anyone make an account. */
+  signupOpen: boolean;
 }
 
 const read = (): string | null => {
@@ -23,7 +25,7 @@ const read = (): string | null => {
   }
 };
 
-let state: TokenState = { token: read(), notice: null, required: null };
+let state: TokenState = { token: read(), notice: null, required: null, signupOpen: false };
 const listeners = new Set<() => void>();
 
 function set(next: TokenState) {
@@ -64,13 +66,14 @@ export function useAdminToken(): TokenState {
  */
 export async function loadAuthMode(): Promise<void> {
   let required = true;
+  let signupOpen = false;
   try {
     const res = await fetch('/api/auth');
-    const body: unknown = res.ok ? await res.json() : null;
-    const v = (body as { token_required?: unknown } | null)?.token_required;
-    if (typeof v === 'boolean') required = v;
+    const body = (res.ok ? await res.json() : null) as { token_required?: unknown; signup_open?: unknown } | null;
+    if (typeof body?.token_required === 'boolean') required = body.token_required;
+    signupOpen = body?.signup_open === true;
   } catch {
-    // unreadable: keep the safe default
+    // unreadable: keep the safe defaults
   }
-  set({ ...state, required });
+  set({ ...state, required, signupOpen });
 }
