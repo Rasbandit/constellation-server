@@ -189,7 +189,7 @@ pub(crate) struct PasswordAuth {
     signups: edge_compat::RateTable<std::net::IpAddr>,
     /// Passwords being hashed or checked right now (`password_hash_parallel`): each takes
     /// ~19 MiB and a core, and the per-address counts only bite after the work is done.
-    hashing: tokio::sync::Semaphore,
+    hashing: Arc<tokio::sync::Semaphore>,
 }
 
 impl PasswordAuth {
@@ -199,7 +199,7 @@ impl PasswordAuth {
             db,
             limits,
             proxy_header,
-            hashing: tokio::sync::Semaphore::new(limits.password_hash_parallel),
+            hashing: Arc::new(tokio::sync::Semaphore::new(limits.password_hash_parallel)),
             login_fails: edge_compat::RateTable::new(
                 limits.login_fail_burst,
                 limits.login_fail_refill_milli_per_sec,
@@ -261,12 +261,20 @@ async fn blocking<T: Send + 'static>(
     a: &PasswordAuth,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Response> {
-    let Ok(_permit) = a.hashing.try_acquire() else {
+    let Ok(permit) = Arc::clone(&a.hashing).try_acquire_owned() else {
         let mut res = StatusCode::SERVICE_UNAVAILABLE.into_response();
         res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(1));
         return Err(res);
     };
-    tokio::task::spawn_blocking(f).await.map_err(|e| failed(e))
+    // The permit moves into the job: it frees when the hash ends, not when the request does (a
+    // client that disconnects mid-hash must not free its slot while argon2 still runs).
+    tokio::task::spawn_blocking(move || {
+        let done = f();
+        drop(permit);
+        done
+    })
+    .await
+    .map_err(failed)
 }
 
 /// The account's name as the page shows it (never the subject's provider prefix, never a hash).
@@ -596,6 +604,31 @@ mod tests {
             assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             assert!(r.headers().contains_key(header::RETRY_AFTER));
         }
+    }
+
+    /// Fails while the permit belongs to the request future: a client that disconnects mid-hash
+    /// frees its slot while argon2 still runs, so send-and-disconnect exceeds the cap.
+    #[tokio::test]
+    async fn a_client_that_disconnects_mid_hash_keeps_its_slot_until_the_hash_ends() {
+        let a = auth(Limits { password_hash_parallel: 1, ..Limits::DESIGN });
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let a2 = Arc::clone(&a);
+        let request = tokio::spawn(async move {
+            blocking(&a2, move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap()).await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(a.hashing.available_permits(), 0, "the hash still runs, so its slot is taken");
+        let r = post_json(&routes(Arc::clone(&a)), "/api/login", &pair("ann", PW)).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        finish_tx.send(()).unwrap();
+        drop(a.hashing.acquire().await.unwrap());
     }
 
     #[test]
