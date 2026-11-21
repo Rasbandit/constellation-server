@@ -2765,8 +2765,10 @@ mod tests {
     }
 
     /// The HTTP methods named in `seg` (the text of one `.route(..)` call after its path):
-    /// each `get(`, `post(`, ... is one; `any(` is every method.
-    fn methods_in(seg: &str) -> Vec<String> {
+    /// each `get(`, `post(`, ... is one; `any(` is every method (`ANY` in the table). Any other
+    /// way to pick methods (`on(`, `trace(`, `connect(`, `*_service(`) cannot be read here and
+    /// fails, as does a route that names none.
+    fn methods_in(seg: &str, path: &str) -> Vec<String> {
         let mut found = Vec::new();
         for (at, _) in seg.match_indices('(') {
             let word: String = seg[..at]
@@ -2777,12 +2779,19 @@ mod tests {
                 .into_iter()
                 .rev()
                 .collect();
-            if ["get", "post", "put", "delete", "patch", "head", "options", "any"]
-                .contains(&word.as_str())
-            {
+            let known = ["get", "post", "put", "delete", "patch", "head", "options", "any"];
+            if known.contains(&word.as_str()) {
                 found.push(word.to_ascii_uppercase());
             }
+            let unreadable = ["on", "trace", "connect"].contains(&word.as_str())
+                || word.ends_with("_service")
+                || word.starts_with("on_");
+            assert!(
+                !unreadable,
+                "{path}: `{word}(` picks methods in a way this test cannot read; classify it by hand"
+            );
         }
+        assert!(!found.is_empty(), "{path}: no recognised method; classify it by hand");
         found
     }
 
@@ -2796,7 +2805,13 @@ mod tests {
         for (file, code) in &files {
             for call in [".nest(", ".route_service(", ".nest_service("] {
                 for part in code.split(call).skip(1) {
-                    let path = part.trim_start().trim_start_matches('"');
+                    let lit = part.trim_start().strip_prefix('"');
+                    let path = lit.unwrap_or_else(|| {
+                        panic!(
+                            "{}: {call} takes a path that is not a plain literal",
+                            file.display()
+                        )
+                    });
                     assert!(
                         !path.starts_with("/api"),
                         "{} registers an /api path with {call}: classify it by hand",
@@ -2805,7 +2820,10 @@ mod tests {
                 }
             }
             for part in code.split(".route(").skip(1) {
-                let Some(lit) = part.trim_start().strip_prefix('"') else { continue };
+                let lit = part.trim_start().strip_prefix('"').unwrap_or_else(|| {
+                    let at = part.lines().next().unwrap_or("");
+                    panic!("{}: a .route( path is not a plain string literal: {at}", file.display())
+                });
                 let (path, rest) = lit.split_once('"').unwrap();
                 if !path.starts_with("/api") {
                     continue;
@@ -2822,7 +2840,7 @@ mod tests {
                         depth == 0
                     })
                     .map_or(rest.len(), |(i, _)| i);
-                for m in methods_in(&rest[..end]) {
+                for m in methods_in(&rest[..end], path) {
                     found.push((m, path.to_owned()));
                 }
             }

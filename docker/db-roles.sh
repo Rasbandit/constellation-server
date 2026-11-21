@@ -27,7 +27,7 @@ export PGPASSWORD APP_PW MIGRATE_PW
 PGHOST=${PGHOST:-postgres} PGUSER=${PGUSER:-constellation} PGDATABASE=${PGDATABASE:-constellation}
 export PGHOST PGUSER PGDATABASE
 # The passwords go to psql through the environment, never an argument, so `ps` does not show them.
-psql -v ON_ERROR_STOP=1 -v db="$PGDATABASE" <<'SQL'
+psql -1 -v ON_ERROR_STOP=1 -v db="$PGDATABASE" <<'SQL'
 \set migrate_pw `printenv MIGRATE_PW`
 \set app_pw `printenv APP_PW`
 SELECT 'CREATE ROLE constellation_migrate LOGIN'
