@@ -624,6 +624,44 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
     assert!(all.len() >= 3);
 }
 
+/// Room 21 must be listed already with key `aaaaaaaaaa` (Postgres reads it from the directory).
+async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S: Store>(s: &S) {
+    let (key, other) = ("aaaaaaaaaa", "bbbbbbbbbb");
+    let room = crate::OwnedRoom {
+        world_id: Some("w21".into()),
+        seed_name: "seed21".into(),
+        room_key: key.into(),
+        owner: None,
+        age_secs: 0,
+    };
+    s.room_claim(RoomId(21), Some("pw:own"), &room).await.unwrap();
+    assert_eq!(s.room_by_key(key).await.unwrap().unwrap().seed_name, "seed21");
+    assert_eq!(s.room_by_key(other).await.unwrap(), None);
+    for name in ["bea", "cy"] {
+        assert!(s.user_create(name, "h").await.unwrap());
+    }
+    assert!(s.room_admins(key).await.unwrap().is_empty());
+    assert!(s.room_admin_add(key, "bea", Some("own")).await.unwrap());
+    assert!(s.room_admin_add(key, "bea", Some("cy")).await.unwrap(), "a repeat grant is fine");
+    assert_eq!(s.room_admins(key).await.unwrap(), ["bea"], "listed once");
+    assert!(!s.room_admin_add(key, "ghost", None).await.unwrap(), "no such account");
+    assert!(!s.room_admin_add(other, "cy", None).await.unwrap(), "no such room");
+    let seen =
+        |rooms: Vec<crate::OwnedRoom>| rooms.into_iter().map(|r| r.room_key).collect::<Vec<_>>();
+    assert_eq!(seen(s.rooms_administered("bea").await.unwrap()), [key]);
+    assert!(s.rooms_administered("cy").await.unwrap().is_empty(), "only its own adminships");
+    assert!(s.room_admin_remove(key, "bea").await.unwrap());
+    assert!(!s.room_admin_remove(key, "bea").await.unwrap(), "nothing left to remove");
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
+    for name in ["bea", "cy"] {
+        assert!(s.room_admin_add(key, name, None).await.unwrap());
+    }
+    s.user_delete("bea").await.unwrap();
+    assert_eq!(s.room_admins(key).await.unwrap(), ["cy"], "a deleted account is no admin");
+    assert_eq!(s.user_hash("bea").await.unwrap(), None);
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -681,6 +719,11 @@ contract!(mem, mem_store);
 #[tokio::test]
 async fn mem_hosts_list_only_their_own_rooms() {
     a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&MemLogStore::new()).await;
+}
+
+#[tokio::test]
+async fn mem_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+    room_admins_are_granted_once_found_by_key_and_end_with_their_account(&MemLogStore::new()).await;
 }
 
 #[cfg(feature = "pg-tests")]
@@ -750,6 +793,13 @@ mod pg_only {
         open(&s, RoomId(12), &[2], "bbbbbbbbbb").await.unwrap();
         open(&s, RoomId(13), &[3], "cccccccccc").await.unwrap();
         a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&s).await;
+    }
+
+    #[tokio::test]
+    async fn pg_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+        let s = pg_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
     }
 
     #[tokio::test]

@@ -1377,17 +1377,124 @@ impl crate::AccountStore for PgLogStore {
     }
 
     async fn rooms_owned(&self, owner: Option<&str>) -> Result<Vec<crate::OwnedRoom>, StoreError> {
-        let owner = owner.map(str::to_owned);
+        self.listed("AND ($1::text IS NULL OR owner = $1)", owner).await
+    }
+
+    async fn room_by_key(&self, key: &str) -> Result<Option<crate::OwnedRoom>, StoreError> {
+        Ok(self.listed("AND room_key = $1", Some(key)).await?.pop())
+    }
+
+    async fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        self.listed(
+            "AND room_id IN (SELECT room_id FROM room_admins WHERE username = $1)",
+            Some(username),
+        )
+        .await
+    }
+
+    async fn room_admins(&self, key: &str) -> Result<Vec<String>, StoreError> {
+        let key = key.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT a.username FROM room_admins a JOIN rooms r USING (room_id) \
+                     WHERE r.room_key = $1 ORDER BY a.username",
+                )
+                .bind(&key)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let (key, user, by) = (key.to_owned(), username.to_owned(), granted_by.map(str::to_owned));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // The insert takes a room only when the account exists too; the result says
+                // whether both do (a repeat grant inserts nothing and keeps the first).
+                sqlx::query_scalar(
+                    "WITH ins AS (INSERT INTO room_admins (room_id, username, granted_by) \
+                       SELECT r.room_id, u.name, $3 FROM rooms r, users u \
+                       WHERE r.room_key = $1 AND u.name = $2 ON CONFLICT DO NOTHING) \
+                     SELECT EXISTS (SELECT 1 FROM rooms WHERE room_key = $1) \
+                        AND EXISTS (SELECT 1 FROM users WHERE name = $2)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .bind(&by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_remove(&self, key: &str, username: &str) -> Result<bool, StoreError> {
+        let (key, user) = (key.to_owned(), username.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "DELETE FROM room_admins WHERE username = $2 \
+                     AND room_id = (SELECT room_id FROM rooms WHERE room_key = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn user_delete(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM users WHERE name = $1")
+                    .bind(&name)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
+impl PgLogStore {
+    /// The listed rooms matching `filter` (an `AND` clause on `$1`), newest first.
+    async fn listed(
+        &self,
+        filter: &'static str,
+        arg: Option<&str>,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        let arg = arg.map(str::to_owned);
         let rows: Vec<OwnedRow> = self
             .isolated(move |c| {
                 Box::pin(async move {
-                    sqlx::query_as(
+                    // `filter` is one of this file's own literals, never input.
+                    sqlx::query_as(sqlx::AssertSqlSafe(format!(
                         "SELECT world_id, seed_name, room_key, owner, \
                          GREATEST(0, EXTRACT(EPOCH FROM now() - created_at))::bigint \
                          FROM rooms WHERE room_key IS NOT NULL AND finished_at IS NULL \
-                         AND ($1::text IS NULL OR owner = $1) ORDER BY created_at DESC, room_id",
-                    )
-                    .bind(&owner)
+                         {filter} ORDER BY created_at DESC, room_id"
+                    )))
+                    .bind(&arg)
                     .fetch_all(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))

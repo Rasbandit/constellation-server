@@ -559,6 +559,63 @@ pub trait AccountStore: Send + Sync + 'static {
         &self,
         owner: Option<&str>,
     ) -> impl Future<Output = Result<Vec<OwnedRoom>, StoreError>> + Send;
+
+    /// The listed room with public key `key`.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn room_by_key(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<OwnedRoom>, StoreError>> + Send;
+
+    /// The rooms account `username` is an admin of (not the ones it owns), newest first.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> impl Future<Output = Result<Vec<OwnedRoom>, StoreError>> + Send;
+
+    /// The accounts that are admins of room `key`, by name.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn room_admins(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+
+    /// Make account `username` an admin of room `key`, granted by account `granted_by` (None:
+    /// the admin token). Already an admin: kept as it was, still true. False when there is no
+    /// such account or room.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: Option<&str>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// End `username`'s adminship of room `key`; false when it had none.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn room_admin_remove(
+        &self,
+        key: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Delete account `name`, with its logins and room adminships (its rooms stay, owned by a
+    /// name no one can sign in as). No route does this yet; it is the store's rule.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn user_delete(&self, name: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// Whether an upload's `bytes` no longer hash to its `id` (a torn row).
