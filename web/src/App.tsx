@@ -6,7 +6,8 @@ import { CreateRoom } from './pages/CreateRoom';
 import { Home } from './pages/Home';
 import { NotFound } from './pages/NotFound';
 import { PlayRoom } from './pages/PlayRoom';
-import { NeedsToken } from './components/TokenPrompt';
+import { RequireSession, UserMenu } from './components/Account';
+import { AuthPage } from './pages/AuthPage';
 import { VersionTag } from './components/ui';
 
 export function App() {
@@ -31,6 +32,7 @@ export function App() {
             </NavLink>
           )}
         </nav>
+        <UserMenu />
       </header>
       <main className="page">
         {!liveRooms && (
@@ -40,11 +42,13 @@ export function App() {
           </p>
         )}
         <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/create" element={<NeedsToken><CreateRoom /></NeedsToken>} />
+          <Route path="/" element={<RequireSession><Home /></RequireSession>} />
+          <Route path="/login" element={<AuthPage mode="login" />} />
+          <Route path="/signup" element={<AuthPage mode="signup" />} />
+          <Route path="/create" element={<RequireSession><CreateRoom /></RequireSession>} />
           <Route path="/c/:code" element={<CodeRedirect />} />
-          <Route path="/rooms/:id" element={<NeedsToken><PlayRoom /></NeedsToken>} />
-          <Route path="/rooms/:id/admin" element={<NeedsToken><AdminRoom /></NeedsToken>} />
+          <Route path="/rooms/:id" element={<RequireSession><PlayRoom /></RequireSession>} />
+          <Route path="/rooms/:id/admin" element={<RequireSession><AdminRoom /></RequireSession>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>

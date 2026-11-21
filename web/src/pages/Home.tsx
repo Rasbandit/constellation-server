@@ -1,10 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { loadAccount, useAccount } from '../api/account';
+import { useAccount } from '../api/account';
 import { api, liveRooms } from '../api/client';
-import { loadAuthMode, useAdminToken } from '../api/token';
 import type { RoomState, RoomSummary } from '../api/types';
-import { AccountPanel } from '../components/Account';
 import { Card, Empty, RoomStatePill } from '../components/ui';
 import { ago } from '../lib/format';
 import { joinPath } from '../lib/join';
@@ -18,15 +16,8 @@ function openable(text: string): string | null {
 
 export function Home() {
   const account = useAccount();
-  const { token, required, signupOpen } = useAdminToken();
-  // A live server lists the rooms of whoever is signed in (or holds the admin token); the stub's list is demo data.
-  const who = !liveRooms || account.name !== null || token !== null || required === false;
-  useEffect(() => {
-    if (!liveRooms) return;
-    void loadAccount();
-    if (required === null) void loadAuthMode();
-  }, [required]);
-  const rooms = useLoad(() => (who ? api.rooms() : Promise.resolve([])), [who, account.name, token]);
+  // A live server lists the rooms of whoever is signed in (the page is behind the session gate); the stub's list is demo data.
+  const rooms = useLoad(() => api.rooms(), [account.name]);
   const [join, setJoin] = useState('');
   const [tab, setTab] = useState<'active' | 'closed'>('active');
   const nav = useNavigate();
@@ -88,8 +79,7 @@ export function Home() {
       >
         {rooms.error && <p className="error-text">Could not load rooms: {rooms.error.message}</p>}
         {!rooms.data && !rooms.error && <p className="muted">Loading rooms...</p>}
-        {liveRooms && !token && required !== false && <AccountPanel name={account.name} signupOpen={signupOpen} />}
-        {who && rooms.data && list.length === 0 && (
+        {rooms.data && list.length === 0 && (
           <Empty>{tab === 'active' ? 'No active rooms. Create one to get started.' : 'No closed rooms.'}</Empty>
         )}
         <ul className="room-list">

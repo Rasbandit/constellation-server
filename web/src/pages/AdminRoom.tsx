@@ -29,7 +29,7 @@ function useAdminKey(id: string): [string, (k: string) => void] {
 export function AdminRoom() {
   const { id = '' } = useParams();
   const [key, setKey] = useAdminKey(id);
-  // A live room is reached through the dev server, which holds the server's admin token.
+  // A live room is reached by the signed-in account's session; it needs no admin key.
   if (liveRooms) return <AdminView id={id} adminKey="" onBadKey={() => undefined} />;
   if (!key) return <KeyPrompt onKey={setKey} />;
   return <AdminView id={id} adminKey={key} onBadKey={() => setKey('')} />;

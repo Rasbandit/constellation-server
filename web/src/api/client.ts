@@ -1,4 +1,4 @@
-import { getAdminToken, rejectAdminToken } from './token';
+import { markSignedOut } from './account';
 import { toRoom, type RoomView } from './roomView';
 import { toApWorld, toManifest, toPlayers, type ApWorldRecord, type ManifestRecord, type YamlRecord } from './uploads';
 import type {
@@ -35,12 +35,10 @@ async function call<T>(method: string, path: string, opts: { body?: unknown; raw
     headers['Content-Type'] = 'application/json';
     body = JSON.stringify(opts.body);
   }
-  const token = getAdminToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(path, { method, headers, body });
   if (res.status === 401) {
-    rejectAdminToken();
-    throw new HttpError(401, { error: 'The admin token is missing or wrong.' });
+    markSignedOut();
+    throw new HttpError(401, { error: 'Sign in to continue.' });
   }
   const text = await res.text();
   let data: unknown;
@@ -118,6 +116,15 @@ export interface OwnedRoom {
   room_key: string;
   owner: string | null;
   age_secs: number;
+  /** The caller's role on this room. */
+  role: 'owner' | 'admin';
+}
+
+/** `GET /api/rooms/:key/admins`: who may manage a room, and the caller's own role on it. */
+export interface RoomAdmins {
+  owner: string | null;
+  admins: string[];
+  role: 'owner' | 'admin';
 }
 
 /** The list row as the room list shows it: a live room has no player counts or state to show yet. */
@@ -145,9 +152,15 @@ export const api = {
   /** One player per document in the file. */
   uploadPlayerFile: (f: File) => call<YamlRecord>('PUT', `/api/yamls?name=${enc(f.name)}`, { raw: f }).then(toPlayers),
 
-  /** Live: the rooms the signed-in account made (all of them for the admin token). */
+  /** Live: the rooms the signed-in account owns or administers. */
   rooms: (): Promise<RoomSummary[]> =>
     adminApi ? call<OwnedRoom[]>('GET', '/api/rooms').then((rs) => rs.map((r) => ownedRoomToSummary(r))) : call<RoomSummary[]>('GET', '/api/rooms'),
+  /** The admins of a room by its key; 404 for anyone with no role on it. Removing yourself answers nothing (204). */
+  roomAdmins: (key: string) => ({
+    list: () => call<RoomAdmins>('GET', `/api/rooms/${enc(key)}/admins`),
+    add: (name: string) => call<RoomAdmins>('PUT', `/api/rooms/${enc(key)}/admins/${enc(name)}`),
+    remove: (name: string) => call<RoomAdmins | undefined>('DELETE', `/api/rooms/${enc(key)}/admins/${enc(name)}`),
+  }),
   resolveCode: (code: string) => call<{ roomId: string }>('GET', `/api/codes/${enc(code)}`),
   /** With the admin API, the server generates and hosts the world, and the room is that world. */
   createRoom: (req: CreateRoomRequest): Promise<Room> =>

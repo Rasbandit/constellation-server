@@ -1,58 +1,38 @@
-import { useState } from 'react';
-import { logIn, logOut, signUp } from '../api/account';
+import { useEffect, type ReactNode } from 'react';
+import { Navigate, NavLink, useNavigate } from 'react-router-dom';
+import { loadAccount, logOut, sessionGate, useAccount } from '../api/account';
+import { liveRooms } from '../api/client';
 
-/** Log in or create an account, or (signed in) who you are and a way out. */
-export function AccountPanel({ name, signupOpen }: { name: string | null; signupOpen: boolean }) {
-  const [user, setUser] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+/** Shows its page once a session is known; goes to `/login` when signed out. The demo stub needs none. */
+export function RequireSession({ children, live = liveRooms }: { children: ReactNode; live?: boolean }) {
+  const account = useAccount();
+  useEffect(() => {
+    if (live && !account.known) void loadAccount();
+  }, [live, account.known]);
+  const gate = sessionGate(account, live);
+  if (gate === 'login') return <Navigate to="/login" replace />;
+  return gate === 'show' ? <>{children}</> : null;
+}
 
+/** The header's account part: who is signed in and a way out, or the ways in. */
+export function UserMenu() {
+  const { name } = useAccount();
+  const nav = useNavigate();
+  if (!liveRooms) return null;
   if (name) {
     return (
-      <p>
+      <p className="user-menu">
         Signed in as <strong>{name}</strong>{' '}
-        <button type="button" className="btn btn-ghost" onClick={() => void logOut()}>
+        <button type="button" className="btn btn-ghost" onClick={() => void logOut().then(() => nav('/login'))}>
           Log out
         </button>
       </p>
     );
   }
-
-  const submit = (enter: typeof logIn) => () => {
-    setError(null);
-    enter(user, password).then(
-      () => setPassword(''),
-      (e: Error) => setError(e.message),
-    );
-  };
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        submit(logIn)();
-      }}
-    >
-      <p className="muted">Log in to see the rooms you made.</p>
-      {error && (
-        <p className="callout warn" role="alert">
-          {error}
-        </p>
-      )}
-      <label className="field">
-        Username <input value={user} onChange={(e) => setUser(e.target.value)} autoComplete="username" required />
-      </label>
-      <label className="field">
-        Password{' '}
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
-      </label>
-      <button type="submit" className="btn btn-primary">
-        Log in
-      </button>{' '}
-      {signupOpen && (
-        <button type="button" className="btn" onClick={submit(signUp)} disabled={!user || !password}>
-          Create account
-        </button>
-      )}
-    </form>
+    <nav className="user-menu" aria-label="Account">
+      <NavLink to="/login">Log in</NavLink>
+      <NavLink to="/signup">Sign up</NavLink>
+    </nav>
   );
 }
