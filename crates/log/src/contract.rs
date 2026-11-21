@@ -479,6 +479,10 @@ async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>
     assert!(matches!(s.upload_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
     assert_eq!(s.upload_meta(UploadKind::Apworld, &lie.id).await.unwrap(), None);
     assert_eq!(s.upload_bytes(UploadKind::Apworld, &blob_key(b"none")).await.unwrap(), None);
+    // Whole when stored; a missing one, or one of the other kind, is not.
+    assert!(s.upload_intact(k, &id).await.unwrap());
+    assert!(!s.upload_intact(UploadKind::Apworld, &blob_key(b"none")).await.unwrap());
+    assert!(!s.upload_intact(UploadKind::Yaml, &worlds[1].id).await.unwrap());
     let mut want = worlds;
     want.sort_by_key(|r| r.id);
     let metas: Vec<String> = want.into_iter().map(|r| r.meta).collect();
@@ -499,24 +503,46 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     assert!(ago < Duration::from_secs(60), "just written: {ago:?}");
     assert_eq!(status(&id('f')).await, None);
     let hour = Duration::from_secs(3600);
-    assert_eq!(s.job_stale(hour).await.unwrap(), [], "all just marked alive");
-    let now = s.job_stale(Duration::ZERO).await.unwrap();
-    assert_eq!(now, [(q.clone(), "q1".to_owned()), (r.clone(), "r1".to_owned())], "never done");
-    // Marked alive since: not failed.
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
     assert!(!s.job_fail_stale(&q, "failed", hour).await.unwrap());
     assert!(s.job_fail_stale(&r, "r failed", Duration::ZERO).await.unwrap());
     assert!(!s.job_fail_stale(&r, "again", Duration::ZERO).await.unwrap(), "once");
     assert!(!s.job_fail_stale(&d, "done stays", Duration::ZERO).await.unwrap());
     assert_eq!(status(&r).await.as_deref(), Some("r failed"));
     assert_eq!(status(&d).await.as_deref(), Some("d1"));
+    // All the stale ones at once, JSON kept and marked failed; a done one is left alone.
+    let (j1, j2) = (id('d'), id('e'));
+    s.job_put(&j1, JobState::Running, r#"{"id": "d", "slots": 2}"#).await.unwrap();
+    s.job_put(&j2, JobState::Queued, "not json").await.unwrap();
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
+    let failed_now = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(failed_now, [q.clone(), j1.clone(), j2.clone()], "ascending; the done one stays");
+    let json = async |id: &str| -> serde_json::Value {
+        serde_json::from_str(&status(id).await.unwrap()).unwrap()
+    };
+    let failed = serde_json::json!({"id": "d", "slots": 2, "status": "failed", "error": "lost"});
+    assert_eq!(json(&j1).await, failed);
+    assert_eq!(json(&j2).await, serde_json::json!({"status": "failed", "error": "lost"}));
+    assert!(s.job_fail_all_stale(Duration::ZERO, "again").await.unwrap().is_empty(), "once");
     // A put replaces the status; a touch of a finished job changes nothing.
     s.job_put(&q, JobState::Done, "q2").await.unwrap();
     s.job_touch(&q).await.unwrap();
-    assert_eq!(s.job_stale(Duration::ZERO).await.unwrap(), []);
+    assert!(s.job_fail_all_stale(Duration::ZERO, "x").await.unwrap().is_empty());
     assert_eq!(status(&q).await.as_deref(), Some("q2"));
     // A server that comes back finishes over a sweep's failed.
     s.job_put(&r, JobState::Done, "r done").await.unwrap();
     assert_eq!(status(&r).await.as_deref(), Some("r done"));
+}
+
+/// A status put only when there is none never replaces one that is stored, of any state.
+async fn a_job_put_if_absent_never_replaces_a_stored_status<S: Store>(s: Arc<S>) {
+    let id = "a".repeat(64);
+    assert!(s.job_put_if_absent(&id, JobState::Running, "old file").await.unwrap());
+    assert!(!s.job_put_if_absent(&id, JobState::Failed, "newer?").await.unwrap());
+    s.job_put(&id, JobState::Done, "newer row").await.unwrap();
+    assert!(!s.job_put_if_absent(&id, JobState::Running, "stale file").await.unwrap());
+    let (status, _) = s.job_status(&id).await.unwrap().unwrap();
+    assert_eq!(status, "newer row");
 }
 
 macro_rules! suite {
@@ -556,6 +582,7 @@ macro_rules! contract {
                 manifests_are_deduplicated_checked_and_listed_in_pages,
                 uploads_are_deduplicated_by_kind_checked_and_listed,
                 jobs_are_read_back_and_only_stale_unfinished_ones_fail,
+                a_job_put_if_absent_never_replaces_a_stored_status,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

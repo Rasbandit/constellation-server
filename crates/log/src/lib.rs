@@ -354,6 +354,18 @@ pub trait UploadStore: Send + Sync + 'static {
         &self,
         kind: UploadKind,
     ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+
+    /// Whether the upload is stored whole: present, and its file hashes to `id`. A missing or
+    /// torn upload is `false`, not an error. Decided where the file is, so its bytes need not
+    /// travel.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn upload_intact(
+        &self,
+        kind: UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
 /// Where a generation is (`world_jobs.state`).
@@ -406,6 +418,18 @@ pub trait JobStore: Send + Sync + 'static {
         status: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
+    /// Write job `id`'s status only when the store has none for it; whether it was written.
+    /// For a status an older server kept as a file, which must never overwrite a newer row.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
     /// Job `id`'s status, and how long ago it was last marked alive (or written).
     ///
     /// # Errors
@@ -421,14 +445,17 @@ pub trait JobStore: Send + Sync + 'static {
     /// The store failing.
     fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// The queued and running jobs not marked alive for `older_than`, with their statuses.
+    /// Fail, in one step, every queued or running job not marked alive for `older_than`: the
+    /// job's status (a JSON object) gets `"status": "failed"` and `"error": error`, the rest of
+    /// it is kept. The failed ids, ascending.
     ///
     /// # Errors
     /// The store failing.
-    fn job_stale(
+    fn job_fail_all_stale(
         &self,
         older_than: Duration,
-    ) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> + Send;
+        error: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
 
     /// Fail job `id` with `status`, only while it is still queued or running and not marked
     /// alive for `older_than` (its process may have marked it since it was listed); whether
@@ -442,6 +469,37 @@ pub trait JobStore: Send + Sync + 'static {
         status: &str,
         older_than: Duration,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+}
+
+/// Whether an upload's `bytes` no longer hash to its `id` (a torn row).
+#[must_use]
+pub(crate) fn is_torn(bytes: &[u8], id: &BlobKey) -> bool {
+    blob_key(bytes) != *id
+}
+
+/// What a read of upload `id` gives: its bytes, or [`StoreError::Corrupt`] when they are torn.
+pub(crate) fn checked_upload(
+    found: Option<Vec<u8>>,
+    id: &BlobKey,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    match found {
+        Some(b) if is_torn(&b, id) => {
+            Err(StoreError::Corrupt("a stored upload does not match its id".into()))
+        }
+        found => Ok(found),
+    }
+}
+
+/// `status` (a job's JSON text) as failed with `error`; text that is not a JSON object is
+/// replaced by one holding only those two fields.
+pub(crate) fn failed_status(status: &str, error: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(status).unwrap_or_default();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    v["status"] = serde_json::json!(JobState::Failed.as_str());
+    v["error"] = serde_json::json!(error);
+    v.to_string()
 }
 
 /// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.

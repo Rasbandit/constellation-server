@@ -777,7 +777,7 @@ impl crate::UploadStore for PgLogStore {
         kind: crate::UploadKind,
         id: &BlobKey,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = id.to_vec();
+        let (key, want) = (id.to_vec(), *id);
         let found: Option<Vec<u8>> = self
             .isolated(move |c| {
                 Box::pin(async move {
@@ -792,12 +792,33 @@ impl crate::UploadStore for PgLogStore {
                 })
             })
             .await?;
-        match found {
-            Some(b) if crate::blob_key(&b) != *id => {
-                Err(StoreError::Corrupt("a stored upload does not match its id".into()))
-            }
-            found => Ok(found),
-        }
+        // An upload may be up to its cap: hashed off the runtime's threads.
+        tokio::task::spawn_blocking(move || crate::checked_upload(found, &want))
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+    }
+
+    async fn upload_intact(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<bool, StoreError> {
+        let id = id.to_vec();
+        let whole: Option<bool> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT sha256(bytes) = id FROM world_uploads WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(whole.unwrap_or(false))
     }
 
     async fn upload_list(&self, kind: crate::UploadKind) -> Result<Vec<String>, StoreError> {
@@ -847,6 +868,31 @@ impl crate::JobStore for PgLogStore {
         .await
     }
 
+    async fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> Result<bool, StoreError> {
+        let (id, status) = (id.to_owned(), status.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO world_jobs (id, state, status) VALUES ($1, $2, $3) \
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(state.as_str())
+                .bind(&status)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
     async fn job_status(
         &self,
         id: &str,
@@ -888,24 +934,34 @@ impl crate::JobStore for PgLogStore {
         .await
     }
 
-    async fn job_stale(
+    async fn job_fail_all_stale(
         &self,
         older_than: core::time::Duration,
-    ) -> Result<Vec<(String, String)>, StoreError> {
-        let older = secs(older_than);
-        self.isolated(move |c| {
-            Box::pin(async move {
-                sqlx::query_as(
-                    "SELECT id, status FROM world_jobs WHERE state IN ('queued', 'running') \
-                     AND updated_at <= now() - make_interval(secs => $1) ORDER BY id",
-                )
-                .bind(older)
-                .fetch_all(&mut *c)
-                .await
-                .map_err(|e| db::<StoreError>(&e))
+        error: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let (older, error) = (secs(older_than), error.to_owned());
+        let mut failed: Vec<String> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        // A status that is not a JSON object is replaced, as the memory store does.
+                        "UPDATE world_jobs SET state = 'failed', updated_at = now(), \
+                         status = ((CASE WHEN status ~ '^\\s*\\{' THEN status::jsonb \
+                                    ELSE '{}'::jsonb END) \
+                                   || jsonb_build_object('status', 'failed', 'error', $2::text))::text \
+                         WHERE state IN ('queued', 'running') \
+                         AND updated_at <= now() - make_interval(secs => $1) RETURNING id",
+                    )
+                    .bind(older)
+                    .bind(&error)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
             })
-        })
-        .await
+            .await?;
+        failed.sort();
+        Ok(failed)
     }
 
     async fn job_fail_stale(

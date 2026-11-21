@@ -262,7 +262,7 @@ impl crate::ManifestStore for MemLogStore {
             let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
             let row = m.entry(record.id).or_insert_with(|| (record.clone(), bytes.to_vec()));
             // A torn row is healed, as on Postgres.
-            if crate::blob_key(&row.1) != record.id {
+            if crate::is_torn(&row.1, &record.id) {
                 bytes.clone_into(&mut row.1);
             }
         }
@@ -338,7 +338,7 @@ impl crate::UploadStore for MemLogStore {
                 .entry((record.kind, record.id))
                 .or_insert_with(|| (record.clone(), bytes.to_vec()));
             // A torn row is healed, as on Postgres.
-            if crate::blob_key(&row.1) != record.id {
+            if crate::is_torn(&row.1, &record.id) {
                 bytes.clone_into(&mut row.1);
             }
         }
@@ -364,12 +364,16 @@ impl crate::UploadStore for MemLogStore {
         id: &BlobKey,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
         let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
-        ready(match m.get(&(kind, *id)) {
-            Some((_, b)) if crate::blob_key(b) != *id => {
-                Err(StoreError::Corrupt("a stored upload does not match its id".into()))
-            }
-            found => Ok(found.map(|(_, b)| b.clone())),
-        })
+        ready(crate::checked_upload(m.get(&(kind, *id)).map(|(_, b)| b.clone()), id))
+    }
+
+    fn upload_intact(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).is_some_and(|(_, b)| !crate::is_torn(b, id))))
     }
 
     fn upload_list(
@@ -404,6 +408,20 @@ impl crate::JobStore for MemLogStore {
         ready(Ok(()))
     }
 
+    fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let vacant = !jobs.contains_key(id);
+        if vacant {
+            jobs.insert(id.to_owned(), (state, status.to_owned(), std::time::Instant::now()));
+        }
+        ready(Ok(vacant))
+    }
+
     fn job_status(
         &self,
         id: &str,
@@ -422,13 +440,19 @@ impl crate::JobStore for MemLogStore {
         ready(Ok(()))
     }
 
-    fn job_stale(
+    fn job_fail_all_stale(
         &self,
         older_than: core::time::Duration,
-    ) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> + Send {
-        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-        let old = jobs.iter().filter(|(_, j)| stale(j, older_than));
-        ready(Ok(old.map(|(id, j)| (id.clone(), j.1.clone())).collect()))
+        error: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut failed = Vec::new();
+        for (id, job) in jobs.iter_mut().filter(|(_, j)| stale(j, older_than)) {
+            let status = crate::failed_status(&job.1, error);
+            *job = (crate::JobState::Failed, status, std::time::Instant::now());
+            failed.push(id.clone());
+        }
+        ready(Ok(failed))
     }
 
     fn job_fail_stale(
