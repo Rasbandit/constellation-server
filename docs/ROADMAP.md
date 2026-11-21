@@ -41,6 +41,24 @@ Five lanes, one owner each. A lane owns its crates, so two people rarely edit th
 - **Lane D: reliability and hosting (M1 playtests, M4).** Owns `crates/sim`, `.github/workflows`, deploy files, `docs/TESTING.md`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:reliability)
 - **Lane E: web UI (M1, M2 stretch).** Owns a new `crates/web` (or `crates/server/src/web`), `templates/`, `static/`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:web)
 
+## Projects
+
+Projects are goals that cut across the five lanes. Each has a label `project:<name>`; the issues are the source of truth, and this file holds the goals and the order. A GitHub Projects board will mirror these labels.
+
+**Connection standard** (`project:connection-standard`: #133 to #146, plus #13, #14, #15, #16, #17, #18, #49, #50, #114). Goal: one simple way for any game mod to connect, with SDKs for the languages games need.
+1. Research: #133 (how mods connect today), #135 (room to connected game), #136 (how other mod ecosystems ship SDKs).
+2. The game contract (#134) and the shared core (#16).
+3. Connect flow, reconnect, SDKs, then the mod kit.
+4. Ports of the first games (#144 picks them, #145 ports them), then lessons (#146).
+
+Issues marked `decision-needed` are decided by the claiming dev and recorded in the issue.
+
+**Developer portal and games site** (`project:developer-portal`: #148 to #161). Goal: an easy path for developers to get a game listed, and a place for players to find it. Decided: game code and releases live in the dev's own repo; the only gate is automated checks.
+1. Research: #148 (game entry), #149 (how a dev submits), #150 (how other registries work), and #152 (registry) as appropriate.
+2. The site order and split decision (#151).
+3. Registry and automated checks (#152, #153).
+4. Then the portal (#156), sandbox (#157), games site (#160), maintainer dashboard (#159) and game health signal (#161).
+
 ## Tech choices
 
 The web UI is server-rendered HTML from the existing server binary: axum (already used) with Askama templates, htmx (one vendored JS file) for interactivity, server-sent events (SSE) from axum for live updates, and plain CSS. Why: it is the fastest path, it ships as one binary, and contributors install nothing beyond Rust (no Node, no build step). This is a POC choice; design decision D-70 (Leptos SSR) stays open for later.
