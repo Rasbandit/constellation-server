@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, liveRooms } from '../api/client';
 import type { Hint, HintStatus, Room, Slot } from '../api/types';
+import { RoomAdmins } from '../components/RoomAdmins';
 import { Feed, HintBoard, LinkBadge, SlotTable } from '../components/room';
 import { shortLink } from '../components/phases';
 import { Card, CopyButton, RoomStatePill, StatusPill, useToast } from '../components/ui';
@@ -83,6 +84,8 @@ export function PlayRoom() {
       <Card title="Players">
         <SlotTable slots={r.slotList} me={me} />
       </Card>
+
+      {liveRooms && <RoomAdmins roomKey={r.address.split('/').pop() ?? ''} />}
 
       <div className="room-cols">
         <Card title="Activity">

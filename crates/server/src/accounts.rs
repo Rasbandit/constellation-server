@@ -1,15 +1,14 @@
 //! Who is calling: accounts, logins and the seam handlers use to ask.
 //!
-//! Handlers never see credentials. They take a [`Caller`]: the admin token, or an [`Identity`]
-//! some [`Authenticator`] made from the request. The one authenticator today is
+//! Handlers never see credentials. They take an [`Identity`] some [`Authenticator`] made from
+//! the request; the gate in `worlds` answers 401 before a handler runs without one. The one authenticator today is
 //! [`PasswordAuth`] (username and password, argon2id hashes and server-side sessions in the
 //! host's store, a random id in an `HttpOnly` cookie). A hosted provider (Clerk, Auth0) is
 //! another `Authenticator` that verifies the provider's signed token instead; nothing that asks
 //! "who is this?" changes. Ownership of rooms is separate: it is keyed by `Identity::subject`.
 //!
-//! Sign-up is open (`Limits::signup_open` closes it) and rate-limited per client address, so
-//! a new account may do nothing but what [`user_may`] lists: it never reaches an endpoint that
-//! runs uploaded code.
+//! Sign-up is open (`Limits::signup_open` closes it) and rate-limited per client address. There
+//! is no site-wide admin: what a person may do to a room is its role on it (`room_admins`).
 
 use crate::store::Db;
 use crate::{hex, worlds::client_ip};
@@ -17,7 +16,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use config::Limits;
@@ -38,39 +37,31 @@ pub(crate) struct Identity {
     pub name: String,
 }
 
-/// Who a request is from, once the gate has let it in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Caller {
-    /// The admin token (or open mode): everything.
-    Admin,
-    /// A signed-in account: only what [`user_may`] allows.
-    User(Identity),
-}
-
-impl Caller {
-    /// The owner to record on a room this caller makes (None: the admin).
-    pub(crate) fn owner(&self) -> Option<&str> {
-        match self {
-            Self::Admin => None,
-            Self::User(i) => Some(&i.subject),
-        }
-    }
-}
-
-impl<S: Send + Sync> FromRequestParts<S> for Caller {
+impl<S: Send + Sync> FromRequestParts<S> for Identity {
     type Rejection = StatusCode;
 
-    /// The gate puts the caller in the request; a handler reached without one is a wiring bug,
-    /// answered as unauthorized, never as admin.
+    /// The gate puts the identity in the request; a handler reached without one is a wiring
+    /// bug, answered as unauthorized.
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> {
         parts.extensions.get::<Self>().cloned().ok_or(StatusCode::UNAUTHORIZED)
     }
 }
 
-/// The one thing a signed-in account (not the admin) may call. Everything else is admin-only
-/// until uploads and generation have per-user trust (see #127). Add a route here, nowhere else.
-pub(crate) fn user_may(method: &Method, path: &str) -> bool {
-    method == Method::GET && path == "/api/rooms"
+/// The subject of the account called `name`: what a room records as its owner.
+pub(crate) fn subject_of(name: &str) -> String {
+    format!("pw:{name}")
+}
+
+/// The account name inside an owner subject (the subject itself when it is not one of ours).
+pub(crate) fn name_of(subject: &str) -> &str {
+    subject.strip_prefix("pw:").unwrap_or(subject)
+}
+
+/// `name` as an account is stored (lowercase), or None when no account can have that name, so
+/// it never reaches the store.
+pub(crate) fn clean_name(name: &str) -> Option<String> {
+    let name = normalize(name);
+    (!name.is_empty() && name_chars_ok(&name)).then_some(name)
 }
 
 /// Turns a request into an [`Identity`]; the seam a hosted provider implements.
@@ -216,7 +207,7 @@ impl PasswordAuth {
     async fn identity(&self, headers: &HeaderMap) -> Option<Identity> {
         let key = session_key(cookie_value(headers)?);
         let name = self.db.session_user(&key).await.ok()??;
-        Some(Identity { subject: format!("pw:{name}"), name })
+        Some(Identity { subject: subject_of(&name), name })
     }
 
     /// Start a login for `name`: the cookie to set.

@@ -346,12 +346,13 @@ impl Host {
     /// A host with no rooms yet, on Postgres when `database_url` is set.
     pub(crate) async fn new(
         database_url: Option<&str>,
+        migrate_url: Option<&str>,
         password: Option<String>,
         limits: Limits,
         folder: Option<PathBuf>,
     ) -> Result<Self, String> {
         let store = if let Some(url) = database_url {
-            let pg = PgLogStore::connect(url, &limits)
+            let pg = PgLogStore::connect_split(url, migrate_url, &limits)
                 .await
                 .map_err(|e| format!("postgres: {e:?} (see the log above)"))?;
             tracing::info!("log store: postgres");

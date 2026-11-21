@@ -9,7 +9,7 @@ WORKDIR /web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web/ ./
-# The server answers /api through an operator proxy (docs/container.md), so the build calls it.
+# The server answers /api on its own port (docs/container.md), so the build calls it.
 ENV CONSTELLATION_WEB_ADMIN_API=1
 RUN bun --bun run build && bun scripts/precompress.mjs
 

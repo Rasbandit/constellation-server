@@ -100,6 +100,9 @@ pub struct Limits {
     /// Room view streams (admin API, server-sent events) open at once per process; more get
     /// HTTP 503.
     pub view_streams: usize,
+    /// How often an open room view stream checks that its account still has a role on the room
+    /// (a removed admin or deleted account loses the stream within this long; design value).
+    pub view_access_recheck_ms: u64,
     /// A socket that has not connected to a slot within this long is closed
     /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
     pub connect_timeout_ms: u64,
@@ -154,11 +157,6 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
-    /// Wrong admin tokens one client address may send in a burst; more get HTTP 429 until the
-    /// bucket refills (design value). A right token is never counted.
-    pub admin_auth_fail_burst: u32,
-    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
-    pub admin_auth_fail_refill_milli_per_sec: u32,
     /// Shortest account password, in characters (design value; NIST SP 800-63B says at least 8).
     pub password_min_chars: usize,
     /// Longest account password, in bytes: argon2 hashes all of it, so it is capped (design value).
@@ -274,10 +272,6 @@ pub struct Limits {
     pub gen_cgroup_tasks: u64,
 }
 
-/// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
-/// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
-pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
-
 /// Deepest rule nesting a world's rules section may hold, counting every node and every def a
 /// rule reaches through `ref`: the loader rejects deeper rules, so the recursive evaluators
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
@@ -350,6 +344,7 @@ impl Limits {
         max_connections: 10_000,
         view_history_events: 400,
         view_streams: 64,
+        view_access_recheck_ms: 5000,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
@@ -371,8 +366,6 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
-        admin_auth_fail_burst: 5,
-        admin_auth_fail_refill_milli_per_sec: 100,
         password_min_chars: 10,
         password_max_bytes: 256,
         account_name_min_chars: 3,
@@ -519,9 +512,11 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
-    /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
-    pub admin_token: Option<String>,
+    /// Postgres URL for the migrations, as the role that owns the tables:
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL`, or the first line of the file named by
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL_FILE`. `None`: the migrations run as the runtime
+    /// role (what a deployment from before the split does; the server logs it).
+    pub migrate_database_url: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -529,11 +524,11 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        let admin = self.admin_token.as_ref().map(|_| "<redacted>");
+        let migrate = self.migrate_database_url.as_ref().map(|_| "<redacted>");
         f.debug_struct("Secrets")
             .field("room_password", &pw)
             .field("database_url", &db)
-            .field("admin_token", &admin)
+            .field("migrate_database_url", &migrate)
             .finish()
     }
 }
@@ -578,21 +573,15 @@ fn secrets_from(
     if let Some(url) = &database_url {
         check_database_url(url)?;
     }
+    let migrate_database_url = var_or_file("CONSTELLATION_MIGRATE_DATABASE_URL", &var, &read)?;
+    if let Some(url) = &migrate_database_url {
+        check_database_url(url)?;
+    }
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
-        admin_token: admin_token(var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?)?,
+        migrate_database_url,
     })
-}
-
-#[cfg(feature = "std")]
-fn admin_token(token: Option<String>) -> Result<Option<String>, String> {
-    match token {
-        Some(t) if t.len() < ADMIN_TOKEN_MIN_BYTES => Err(format!(
-            "CONSTELLATION_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_BYTES} bytes (not shown)"
-        )),
-        t => Ok(t),
-    }
 }
 
 /// Where seed generation finds Archipelago and our sidecar. All three are needed for the
@@ -615,12 +604,21 @@ pub struct Generation {
     pub container_mode: bool,
 }
 
+/// The Postgres role the server runs as: SELECT, INSERT, UPDATE and DELETE on our tables and
+/// USAGE on their sequences, nothing else (no CREATE, no DDL, no superuser). The migrations run
+/// as [`DB_MIGRATE_ROLE`] (`CONSTELLATION_MIGRATE_DATABASE_URL`), which owns the tables and
+/// grants this role its rights after each migration. `docker/db-roles.sh` creates both.
+pub const DB_APP_ROLE: &str = "constellation_app";
+
+/// The Postgres role that owns the tables and runs the migrations (see [`DB_APP_ROLE`]).
+pub const DB_MIGRATE_ROLE: &str = "constellation_migrate";
+
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
 #[cfg(feature = "std")]
 const SECRET_FILE_VARS: [&str; 3] = [
     "CONSTELLATION_ROOM_PASSWORD_FILE",
     "CONSTELLATION_DATABASE_URL_FILE",
-    "CONSTELLATION_ADMIN_TOKEN_FILE",
+    "CONSTELLATION_MIGRATE_DATABASE_URL_FILE",
 ];
 
 /// Read [`Generation`] from the environment: `None` when none of its variables is set.
@@ -768,6 +766,49 @@ mod tests {
         assert!(missing.unwrap_err().contains("/nope"));
         let empty = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD", "")]), file);
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    /// The role names live here; the roles script and the compose files (which cannot import a
+    /// constant) must spell them the same.
+    #[test]
+    fn the_roles_script_and_compose_use_the_role_names_from_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
+        let init = read("docker/db-roles.sh");
+        for role in [DB_APP_ROLE, DB_MIGRATE_ROLE] {
+            assert!(
+                init.contains(&format!("CREATE ROLE {role} LOGIN")),
+                "{role} in the roles script"
+            );
+        }
+        let env_example = read(".env.example");
+        assert!(env_example.contains("CONSTELLATION_MIGRATE_DATABASE_URL_FILE"));
+        let smoke = read(".github/workflows/release.yml");
+        assert!(smoke.contains(&format!("postgres://{DB_APP_ROLE}:")));
+        assert!(smoke.contains(&format!("postgres://{DB_MIGRATE_ROLE}:")));
+    }
+
+    #[test]
+    fn the_migration_url_comes_from_its_own_variable_or_file_and_prints_redacted() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        let file = |_: &std::path::Path| Ok("postgres://m:p@h/db\n".to_owned());
+        let direct =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://m@h/db")]), file)
+                .unwrap();
+        assert_eq!(direct.migrate_database_url.as_deref(), Some("postgres://m@h/db"));
+        assert_eq!(direct.database_url, None, "the runtime URL is its own");
+        let from_file =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL_FILE", "/m")]), file).unwrap();
+        assert_eq!(from_file.migrate_database_url.as_deref(), Some("postgres://m:p@h/db"));
+        assert!(!format!("{from_file:?}").contains("postgres://"), "{from_file:?}");
+        assert_eq!(secrets_from(env(&[]), file).unwrap().migrate_database_url, None);
+        let bad = secrets_from(
+            env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://h/db?bogus=1")]),
+            file,
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
@@ -992,31 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_token_comes_from_the_variable_or_a_file_and_prints_redacted() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
-        };
-        const T32: &str = "t0ken-t0ken-t0ken-t0ken-t0ken-32";
-        let file = |_: &std::path::Path| Ok("t0ken-from-file-t0ken-from-file-\n".to_owned());
-        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", T32)]), file).unwrap();
-        assert_eq!(direct.admin_token.as_deref(), Some(T32));
-        assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
-        let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
-        assert_eq!(
-            from_file.unwrap().admin_token.as_deref(),
-            Some("t0ken-from-file-t0ken-from-file-")
-        );
-        const T31: &[(&str, &str)] = &[("CONSTELLATION_ADMIN_TOKEN", T32.split_at(1).1)];
-        let short = secrets_from(env(T31), file);
-        let e = short.unwrap_err();
-        assert!(e.contains("shorter than 32") && !e.contains("t0ken"), "{e}");
-        let both: &'static [(&str, &str)] =
-            &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
-        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
-        assert_eq!(secrets_from(env(&[]), file).unwrap().admin_token, None);
-    }
-
-    #[test]
     fn generation_paths_come_from_the_environment_and_are_all_or_nothing() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
@@ -1037,12 +1053,12 @@ mod tests {
             ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
             ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
             ("HOME", "/home/u"),
-            ("CONSTELLATION_ADMIN_TOKEN_FILE", "/etc/c/token"),
+            ("CONSTELLATION_ROOM_PASSWORD_FILE", "/etc/c/token"),
             ("CONSTELLATION_DATABASE_URL_FILE", "/etc/c/db"),
         ];
         let g = generation_from(env(with_private)).unwrap().unwrap();
         let want: Vec<std::path::PathBuf> =
-            ["/home/u", "/etc/c/db", "/etc/c/token"].iter().map(Into::into).collect();
+            ["/home/u", "/etc/c/token", "/etc/c/db"].iter().map(Into::into).collect();
         assert_eq!(g.private, want);
         let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
         assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");

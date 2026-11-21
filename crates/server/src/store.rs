@@ -180,4 +180,41 @@ impl Db {
     ) -> Result<Vec<OwnedRoom>, StoreError> {
         on!(self, s => s.rooms_owned(owner).await)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn user_delete(&self, name: &str) -> Result<(), StoreError> {
+        on!(self, s => s.user_delete(name).await)
+    }
+
+    pub(crate) async fn room_by_key(&self, key: &str) -> Result<Option<OwnedRoom>, StoreError> {
+        on!(self, s => s.room_by_key(key).await)
+    }
+
+    pub(crate) async fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> Result<Vec<OwnedRoom>, StoreError> {
+        on!(self, s => s.rooms_administered(username).await)
+    }
+
+    pub(crate) async fn room_admins(&self, key: &str) -> Result<Vec<String>, StoreError> {
+        on!(self, s => s.room_admins(key).await)
+    }
+
+    pub(crate) async fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.room_admin_add(key, username, granted_by).await)
+    }
+
+    pub(crate) async fn room_admin_remove(
+        &self,
+        key: &str,
+        username: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.room_admin_remove(key, username).await)
+    }
 }

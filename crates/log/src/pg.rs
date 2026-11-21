@@ -152,6 +152,75 @@ fn decode(seq: i64, body: &[u8]) -> Result<Event, StoreError> {
     }
 }
 
+/// The warning for a runtime connection that holds more than data rights: logged in as the
+/// table owner (`config::DB_MIGRATE_ROLE`) or as a superuser. None when it is fine.
+fn privilege_warning(user: &str, superuser: bool) -> Option<String> {
+    let why = if superuser {
+        format!("a superuser ({user})")
+    } else if user == config::DB_MIGRATE_ROLE {
+        format!("the table owner ({user})")
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the server runs as {why}, so a bug or injection could change the schema; point \
+         CONSTELLATION_DATABASE_URL at the {} role (see docs/container.md)",
+        config::DB_APP_ROLE
+    ))
+}
+
+/// Warn when the runtime pool is more privileged than it needs to be (not an error: a
+/// deployment from before the role split must still start).
+async fn warn_if_privileged(pool: &PgPool) {
+    let row: Result<(String, bool), _> = sqlx::query_as(
+        "SELECT current_user::text, COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)",
+    )
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok((user, superuser)) => {
+            if let Some(w) = privilege_warning(&user, superuser) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not check the runtime database role"),
+    }
+}
+
+/// After the migrations, as the table owner: give [`config::DB_APP_ROLE`] SELECT, INSERT, UPDATE
+/// and DELETE on every table of the schema and USAGE on its sequences, and the same on tables
+/// the owner makes later (default privileges). It never gets CREATE, DDL or the migration
+/// history. Idempotent; skipped with a warning when the role does not exist. The role name is
+/// a constant of ours, never input.
+async fn grant_runtime_role(pool: &PgPool) -> Result<(), StoreError> {
+    let role = config::DB_APP_ROLE;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+    if !exists {
+        tracing::warn!(role, "the runtime database role does not exist; nothing granted");
+        return Ok(());
+    }
+    let sql = format!(
+        "DO $grants$ BEGIN \
+         EXECUTE format('GRANT USAGE ON SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT USAGE, SELECT ON SEQUENCES TO {role}', current_schema()); \
+         EXECUTE format('REVOKE ALL ON %I._sqlx_migrations FROM {role}', current_schema()); \
+         END $grants$"
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .map(drop)
+        .map_err(|e| db::<StoreError>(&e))
+}
+
 impl PgLogStore {
     /// Connect with the pool size and session timeouts from `limits`, and apply any pending
     /// migrations. The timeouts bound every wait: a writer that hangs mid-transaction is ended
@@ -162,21 +231,73 @@ impl PgLogStore {
     /// `Unavailable` when the URL is invalid, the database cannot be reached or a migration
     /// fails.
     pub async fn connect(url: &str, limits: &Limits) -> Result<Self, StoreError> {
-        // These session settings apply to the migrations below too (a stuck migration lock errors).
-        let options = PgConnectOptions::from_str(url).map_err(|e| db::<StoreError>(&e))?.options([
-            ("statement_timeout", limits.db_statement_timeout_ms),
-            ("lock_timeout", limits.db_lock_timeout_ms),
-            ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
-        ]);
-        let pool = PgPoolOptions::new()
-            .max_connections(limits.db_pool_connections.max(1))
-            .connect_with(options)
+        Self::connect_split(url, None, limits).await
+    }
+
+    /// [`Self::connect`] with the migrations run as another role: with `migrate_url` (the role
+    /// that owns the tables), they run on a short-lived pool of its own and then grant
+    /// [`config::DB_APP_ROLE`] its rights (see [`grant_runtime_role`]), and the runtime pool
+    /// never migrates. Without it the runtime role migrates, as a deployment from before the
+    /// split does.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_split(
+        url: &str,
+        migrate_url: Option<&str>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
+        let parse = |u: &str| PgConnectOptions::from_str(u).map_err(|e| db::<StoreError>(&e));
+        Self::connect_with(parse(url)?, migrate_url.map(parse).transpose()?, limits).await
+    }
+
+    /// [`Self::connect_split`] on parsed options.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_with(
+        runtime: PgConnectOptions,
+        migrate: Option<PgConnectOptions>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
+        let session = |o: PgConnectOptions, lock_timeout: bool| {
+            let o = o.options([
+                ("statement_timeout", limits.db_statement_timeout_ms),
+                ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
+            ]);
+            if lock_timeout { o.options([("lock_timeout", limits.db_lock_timeout_ms)]) } else { o }
+        };
+        let owner = migrate.clone();
+        if owner.is_none() {
+            tracing::warn!(
+                "migrating with the runtime database role: set CONSTELLATION_MIGRATE_DATABASE_URL \
+                 so the server can run without the right to change the schema"
+            );
+        }
+        // The migrations run on a pool of their own, without `lock_timeout`: sqlx serialises
+        // concurrent migrators (another server starting, another test) with an advisory lock,
+        // and the short runtime `lock_timeout` would fail the one that has to wait for it.
+        // `statement_timeout` still bounds that wait, and a stuck migration.
+        let migrating = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(session(owner.unwrap_or_else(|| runtime.clone()), false))
             .await
             .map_err(|e| db::<StoreError>(&e))?;
-        MIGRATOR.run(&pool).await.map_err(|e| {
+        MIGRATOR.run(&migrating).await.map_err(|e| {
             tracing::error!(error = %e, "migration failed");
             StoreError::Unavailable
         })?;
+        if migrate.is_some() {
+            grant_runtime_role(&migrating).await?;
+            tracing::info!("migrated as the migration role; running as the runtime role");
+        }
+        migrating.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(limits.db_pool_connections.max(1))
+            .connect_with(session(runtime, true))
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+        warn_if_privileged(&pool).await;
         Ok(Self { pool })
     }
 
@@ -1245,6 +1366,19 @@ pub mod testing {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn a_runtime_connection_with_more_than_data_rights_is_warned_about() {
+    let owner = privilege_warning(config::DB_MIGRATE_ROLE, false).unwrap();
+    assert!(
+        owner.contains("table owner") && owner.contains("CONSTELLATION_DATABASE_URL"),
+        "{owner}"
+    );
+    let root = privilege_warning("postgres", true).unwrap();
+    assert!(root.contains("superuser") && root.contains(config::DB_APP_ROLE), "{root}");
+    assert_eq!(privilege_warning(config::DB_APP_ROLE, false), None);
+}
+
 /// The nightly workflow excludes `fence`'s `&&` to `||` mutant by name (equivalent, see the
 /// comment in `fence`). A second `&&` in `fence` would be excluded silently with it, so this
 /// fails first: whoever adds one must narrow the exclusion in nightly.yml.
@@ -1377,17 +1511,124 @@ impl crate::AccountStore for PgLogStore {
     }
 
     async fn rooms_owned(&self, owner: Option<&str>) -> Result<Vec<crate::OwnedRoom>, StoreError> {
-        let owner = owner.map(str::to_owned);
+        self.listed("AND ($1::text IS NULL OR owner = $1)", owner).await
+    }
+
+    async fn room_by_key(&self, key: &str) -> Result<Option<crate::OwnedRoom>, StoreError> {
+        Ok(self.listed("AND room_key = $1", Some(key)).await?.pop())
+    }
+
+    async fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        self.listed(
+            "AND room_id IN (SELECT room_id FROM room_admins WHERE username = $1)",
+            Some(username),
+        )
+        .await
+    }
+
+    async fn room_admins(&self, key: &str) -> Result<Vec<String>, StoreError> {
+        let key = key.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT a.username FROM room_admins a JOIN rooms r USING (room_id) \
+                     WHERE r.room_key = $1 ORDER BY a.username",
+                )
+                .bind(&key)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, user, by) = (key.to_owned(), username.to_owned(), granted_by.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // The insert takes a room only when the account exists too; the result says
+                // whether both do (a repeat grant inserts nothing and keeps the first).
+                sqlx::query_scalar(
+                    "WITH ins AS (INSERT INTO room_admins (room_id, username, granted_by) \
+                       SELECT r.room_id, u.name, $3 FROM rooms r, users u \
+                       WHERE r.room_key = $1 AND u.name = $2 ON CONFLICT DO NOTHING) \
+                     SELECT EXISTS (SELECT 1 FROM rooms WHERE room_key = $1) \
+                        AND EXISTS (SELECT 1 FROM users WHERE name = $2)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .bind(&by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_remove(&self, key: &str, username: &str) -> Result<bool, StoreError> {
+        let (key, user) = (key.to_owned(), username.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "DELETE FROM room_admins WHERE username = $2 \
+                     AND room_id = (SELECT room_id FROM rooms WHERE room_key = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn user_delete(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM users WHERE name = $1")
+                    .bind(&name)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
+impl PgLogStore {
+    /// The listed rooms matching `filter` (an `AND` clause on `$1`), newest first.
+    async fn listed(
+        &self,
+        filter: &'static str,
+        arg: Option<&str>,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        let arg = arg.map(str::to_owned);
         let rows: Vec<OwnedRow> = self
             .isolated(move |c| {
                 Box::pin(async move {
-                    sqlx::query_as(
+                    // `filter` is one of this file's own literals, never input.
+                    sqlx::query_as(sqlx::AssertSqlSafe(format!(
                         "SELECT world_id, seed_name, room_key, owner, \
                          GREATEST(0, EXTRACT(EPOCH FROM now() - created_at))::bigint \
                          FROM rooms WHERE room_key IS NOT NULL AND finished_at IS NULL \
-                         AND ($1::text IS NULL OR owner = $1) ORDER BY created_at DESC, room_id",
-                    )
-                    .bind(&owner)
+                         {filter} ORDER BY created_at DESC, room_id"
+                    )))
+                    .bind(&arg)
                     .fetch_all(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))

@@ -42,6 +42,8 @@ pub struct MemLogStore {
     sessions: Mutex<BTreeMap<[u8; 32], (String, std::time::Instant)>>,
     /// Hosted rooms: the record and when it was made.
     owned: Mutex<BTreeMap<RoomId, (crate::OwnedRoom, std::time::Instant)>>,
+    /// Room admins: (room key, account) to who granted it.
+    admins: Mutex<BTreeMap<(String, String), String>>,
     /// How many of the next `job_put`s fail, as a store that is down for a while does.
     job_put_failures: Mutex<usize>,
 }
@@ -560,14 +562,79 @@ impl crate::AccountStore for MemLogStore {
         &self,
         owner: Option<&str>,
     ) -> impl Future<Output = Result<Vec<crate::OwnedRoom>, StoreError>> + Send {
+        ready(Ok(self.listed(|r| owner.is_none_or(|o| r.owner.as_deref() == Some(o)))))
+    }
+
+    fn room_by_key(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<crate::OwnedRoom>, StoreError>> + Send {
+        ready(Ok(self.listed(|r| r.room_key == key).pop()))
+    }
+
+    fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> impl Future<Output = Result<Vec<crate::OwnedRoom>, StoreError>> + Send {
+        let admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = |r: &crate::OwnedRoom| (r.room_key.clone(), username.to_owned());
+        ready(Ok(self.listed(|r| admins.contains_key(&key(r)))))
+    }
+
+    fn room_admins(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(admins.keys().filter(|(k, _)| k == key).map(|(_, u)| u.clone()).collect()))
+    }
+
+    fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let known =
+            self.users.lock().unwrap_or_else(PoisonError::into_inner).contains_key(username)
+                && !self.listed(|r| r.room_key == key).is_empty();
+        if known {
+            let mut admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+            admins
+                .entry((key.to_owned(), username.to_owned()))
+                .or_insert_with(|| granted_by.to_owned());
+        }
+        ready(Ok(known))
+    }
+
+    fn room_admin_remove(
+        &self,
+        key: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(admins.remove(&(key.to_owned(), username.to_owned())).is_some()))
+    }
+
+    fn user_delete(&self, name: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.users.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner).retain(|_, (u, _)| u != name);
+        self.admins.lock().unwrap_or_else(PoisonError::into_inner).retain(|(_, u), _| u != name);
+        ready(Ok(()))
+    }
+}
+
+impl MemLogStore {
+    /// The hosted rooms `keep` accepts, newest first.
+    fn listed(&self, keep: impl Fn(&crate::OwnedRoom) -> bool) -> Vec<crate::OwnedRoom> {
         let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
         let mut rooms: Vec<_> = owned
             .values()
-            .filter(|(r, _)| owner.is_none_or(|o| r.owner.as_deref() == Some(o)))
+            .filter(|(r, _)| keep(r))
             .map(|(r, made)| crate::OwnedRoom { age_secs: made.elapsed().as_secs(), ..r.clone() })
             .collect();
         rooms.sort_by_key(|r| r.age_secs);
-        ready(Ok(rooms))
+        rooms
     }
 }
 

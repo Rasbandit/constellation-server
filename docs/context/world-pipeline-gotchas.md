@@ -15,7 +15,7 @@ Fedora Linux, shared box. Claude Code shell. GitHub Actions CI.
 
 ## Connection
 Pipeline on main:
-1. Upload `.apworld` and `.yaml` with `PUT /api/apworlds` and `PUT /api/yamls` (admin listener, bearer token).
+1. Upload `.apworld` and `.yaml` with `PUT /api/apworlds` and `PUT /api/yamls` (signed-in session cookie).
 2. `POST /api/worlds`.
 3. Sandboxed Python sidecar (`tools/ap-gen`) runs Archipelago's `Generate.py` inside bwrap, with a per-job `systemd-run --user --scope` memory cap.
 4. `tools/ap-import` converts the output to v1 JSON.
@@ -25,7 +25,7 @@ Pipeline on main:
 Proof: `just e2e-full`. It uses real files in `~/Downloads`; never commit them.
 
 ## Auth
-Admin listener uses a bearer token.
+Every `/api` route needs a session cookie (sign up at `/api/signup`).
 
 ## Key Commands / Patterns
 - `just e2e-full` runs the whole pipeline end to end.

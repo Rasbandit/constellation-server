@@ -1,58 +1,62 @@
-import { useState } from 'react';
-import { logIn, logOut, signUp } from '../api/account';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Link, Navigate, useNavigate } from 'react-router-dom';
+import { loadAccount, logOut, sessionGate, useAccount } from '../api/account';
+import { liveRooms } from '../api/client';
 
-/** Log in or create an account, or (signed in) who you are and a way out. */
-export function AccountPanel({ name, signupOpen }: { name: string | null; signupOpen: boolean }) {
-  const [user, setUser] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+/** Shows its page once a session is known; goes to `/login` when signed out. The demo stub needs none. */
+export function RequireSession({ children, live = liveRooms }: { children: ReactNode; live?: boolean }) {
+  const account = useAccount();
+  useEffect(() => {
+    if (live && !account.known) void loadAccount();
+  }, [live, account.known]);
+  const gate = sessionGate(account, live);
+  if (gate === 'login') return <Navigate to="/login" replace />;
+  return gate === 'show' ? <>{children}</> : null;
+}
 
-  if (name) {
+/** Ends the session, then goes to the login page. */
+export const signOutAndLeave = (to: (path: string) => void) => logOut().then(() => to('/login'));
+
+/**
+ * The header's account part: one Log in button when signed out; when signed in one profile
+ * button that opens a menu (the native popover: outside click and Escape close it, and focus
+ * returns to the button) with who you are and Log out.
+ */
+export function UserMenu({ live = liveRooms }: { live?: boolean }) {
+  const { name } = useAccount();
+  const nav = useNavigate();
+  const [open, setOpen] = useState(false);
+  const menu = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = menu.current;
+    const on = (e: Event) => setOpen((e as Event & { newState?: string }).newState === 'open');
+    el?.addEventListener('toggle', on);
+    return () => el?.removeEventListener('toggle', on);
+  }, [name]);
+  if (!live) return null;
+  if (!name) {
     return (
-      <p>
-        Signed in as <strong>{name}</strong>{' '}
-        <button type="button" className="btn btn-ghost" onClick={() => void logOut()}>
-          Log out
-        </button>
-      </p>
+      <Link className="btn user-menu" to="/login">
+        Log in
+      </Link>
     );
   }
-
-  const submit = (enter: typeof logIn) => () => {
-    setError(null);
-    enter(user, password).then(
-      () => setPassword(''),
-      (e: Error) => setError(e.message),
-    );
-  };
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        submit(logIn)();
-      }}
-    >
-      <p className="muted">Log in to see the rooms you made.</p>
-      {error && (
-        <p className="callout warn" role="alert">
-          {error}
+    <>
+      <button type="button" className="btn btn-ghost user-menu" aria-haspopup="menu" aria-expanded={open} {...{ popovertarget: 'user-menu' }}>
+        <span className="avatar" aria-hidden>
+          {name.charAt(0).toUpperCase()}
+        </span>
+        {name}
+      </button>
+      <div id="user-menu" className="menu" role="menu" ref={menu} {...{ popover: '' }}>
+        <p>
+          Signed in as <strong>{name}</strong>
         </p>
-      )}
-      <label className="field">
-        Username <input value={user} onChange={(e) => setUser(e.target.value)} autoComplete="username" required />
-      </label>
-      <label className="field">
-        Password{' '}
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
-      </label>
-      <button type="submit" className="btn btn-primary">
-        Log in
-      </button>{' '}
-      {signupOpen && (
-        <button type="button" className="btn" onClick={submit(signUp)} disabled={!user || !password}>
-          Create account
+        <button type="button" className="btn btn-ghost" role="menuitem" onClick={() => void signOutAndLeave(nav)}>
+          Log out
         </button>
-      )}
-    </form>
+      </div>
+    </>
   );
 }

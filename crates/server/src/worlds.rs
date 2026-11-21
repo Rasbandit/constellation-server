@@ -1,5 +1,5 @@
 //! Uploads of `.apworld` and player `.yaml` files, and seed generation from a chosen set of
-//! them, over HTTP. Admin only: every route needs `Authorization: Bearer <token>`.
+//! them, over HTTP. Signed-in accounts only: every route but sign-up and login needs a session.
 //!
 //! Storage:
 //! - uploads live in the host's store (`world_uploads`, migration 0005), content-addressed by
@@ -21,7 +21,7 @@
 //! keeps them; `WebHostLib/generate.py` generates one queued seed at a time from the stored
 //! player files). Every call to the sidecar goes through [`crate::sandbox`].
 
-use crate::accounts::{self, Authenticator, Caller, PasswordAuth, user_may};
+use crate::accounts::{self, Authenticator, Identity, PasswordAuth};
 use crate::host::{RoomsFolder, Waker};
 use crate::manifests::{self, Manifests};
 use crate::rooms::RoomKey;
@@ -50,8 +50,6 @@ use tokio::sync::Semaphore;
 /// The API's shared state.
 pub(crate) struct Worlds {
     dir: PathBuf,
-    /// SHA-256 of the admin token, or None: open mode, no auth (compared in constant time, see [`authorized`]).
-    token: Option<[u8; 32]>,
     sandbox: Sandbox,
     limits: Limits,
     /// Generations running at once (`gen_concurrency`).
@@ -81,8 +79,6 @@ pub(crate) struct Worlds {
     importer: Option<Waker>,
     /// Sign-up, login and sessions, on the host's store (set by [`Worlds::router`]).
     accounts: Option<Arc<PasswordAuth>>,
-    /// Wrong tokens per client address (`admin_auth_fail_burst`).
-    auth_fails: edge_compat::RateTable<IpAddr>,
     /// Behind a reverse proxy: the header carrying the client address (`--trusted-proxy-header`).
     /// Off by default, because any client could send it.
     proxy_header: Option<HeaderName>,
@@ -232,12 +228,7 @@ fn json_text(status: StatusCode, text: String) -> Response {
 ///
 /// # Errors
 /// When the data folder cannot be made or read.
-pub(crate) fn open(
-    dir: &Path,
-    token: Option<&str>,
-    paths: Generation,
-    limits: Limits,
-) -> Result<Worlds, String> {
+pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worlds, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
     // Uploads a previous process was inspecting when it stopped.
     if dir.join("tmp").exists() {
@@ -249,7 +240,6 @@ pub(crate) fn open(
     let mem = Arc::new(log::MemLogStore::new());
     Ok(Worlds {
         dir: dir.to_owned(),
-        token: token.map(|t| Sha256::digest(t.as_bytes()).into()),
         sandbox: Sandbox::new(paths, limits, dir)?,
         limits,
         one_gen: Arc::new(Semaphore::new(limits.gen_concurrency.max(1))),
@@ -270,11 +260,6 @@ pub(crate) fn open(
         rooms: None,
         importer: None,
         accounts: None,
-        auth_fails: edge_compat::RateTable::new(
-            limits.admin_auth_fail_burst,
-            limits.admin_auth_fail_refill_milli_per_sec,
-            limits.rate_table_max_keys,
-        ),
         proxy_header: None,
     })
 }
@@ -286,6 +271,11 @@ impl core::fmt::Debug for Worlds {
 }
 
 impl Worlds {
+    /// The host's store.
+    pub(crate) const fn db(&self) -> &store::Db {
+        &self.store
+    }
+
     /// Count a generation against `gen_queue_max`, or `None` when that many are already queued
     /// or running.
     fn admit(&self) -> Option<JobSlot> {
@@ -334,7 +324,7 @@ impl Worlds {
         Ok(())
     }
 
-    /// The routes, rooted at `/api` (every path under it needs the token), on the host's store
+    /// The routes, rooted at `/api` (every path under it needs a session, but sign-up and login), on the host's store
     /// `db`, after the files an older server kept are moved into it. With `rooms` (the host's
     /// rooms folder and the public `host:port`), finished worlds are hosted as rooms.
     /// `proxy_header` names the header a trusted reverse proxy puts the client address in.
@@ -727,77 +717,47 @@ fn routes(state: Arc<Worlds>) -> Router {
             "/api/manifests",
             get(list_manifests).merge(put(put_manifest).layer(capped(l.manifest_max_bytes))),
         )
-        .route("/api/rooms", get(list_rooms))
+        .merge(crate::room_admins::routes())
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route("/api/worlds/{id}/room", get(room_summary))
         .route("/api/worlds/{id}/bundle", get(world_bundle))
         .route("/api/worlds/{id}/room/events", get(room_events))
-        // Anything else under /api is the token's too: 401 without it, never the web UI's 404.
+        // Anything else under /api needs a session too: 401 without one, never the web UI's 404.
         .route("/api", any(StatusCode::NOT_FOUND))
         .route("/api/", any(StatusCode::NOT_FOUND))
         .route("/api/{*rest}", any(StatusCode::NOT_FOUND))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), limit_writes))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth))
-        // After the gate, so it is open: the web UI asks whether to prompt for a token.
+        // After the gate, so it is open: the web UI asks whether to offer sign-up.
         .route("/api/auth", get(auth_mode))
         // The world requests are small JSON.
         .layer(capped(l.yaml_max_bytes))
         .with_state(state)
-        // Open: sign-up, login, logout and who-am-I carry no token (their own limits apply).
+        // Open: sign-up, login, logout and who-am-I carry no session (their own limits apply).
         .merge(accounts.map_or_else(Router::new, accounts::routes))
 }
 
-/// `GET /api/auth`: `{"token_required": bool, "signup_open": bool}`, so the UI knows whether to
-/// ask for a token and whether to offer sign-up.
+/// `GET /api/auth`: `{"signup_open": bool}`, so the UI knows whether to offer sign-up.
 async fn auth_mode(State(w): State<Arc<Worlds>>) -> impl IntoResponse {
-    let body = format!(
-        "{{\"token_required\":{},\"signup_open\":{}}}",
-        w.token.is_some(),
-        w.limits.signup_open
-    );
+    let body = format!("{{\"signup_open\":{}}}", w.limits.signup_open);
     ([(header::CONTENT_TYPE, "application/json")], body)
 }
 
-/// A wrong token is a bare 401 (no detail for a scanner). A client address that sends more than
-/// `admin_auth_fail_burst` of them gets 429 until its bucket refills. A right token is never
-/// counted or refused, so nobody can lock the admin out by guessing from the same address (all
-/// clients share the proxy's address unless `--trusted-proxy-header` is set).
+/// The one gate for `/api`: a valid session cookie puts the [`Identity`] in the request, anything
+/// else is a bare 401. Sign-up, login, logout, who-am-I and `/api/auth` are routed outside it.
 async fn auth(State(w): State<Arc<Worlds>>, mut req: Request, next: Next) -> Response {
-    // Open mode (no token configured): everyone is admin, nothing is counted.
-    let Some(want) = &w.token else {
-        req.extensions_mut().insert(Caller::Admin);
-        return next.run(req).await;
-    };
-    if authorized(req.headers(), want) {
-        req.extensions_mut().insert(Caller::Admin);
-        return next.run(req).await;
-    }
-    // A signed-in account is no admin: it passes only where `user_may` says (not counted as a
-    // failure, it is who it says it is).
-    if let Some(a) = &w.accounts
-        && let Some(who) = a.identify(req.headers()).await
-    {
-        if !user_may(req.method(), req.uri().path()) {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-        req.extensions_mut().insert(Caller::User(who));
-        return next.run(req).await;
-    }
-    let ip = client_ip(&req, w.proxy_header.as_ref());
-    if w.auth_fails.take(ip, std::time::Instant::now()) {
+    let Some(a) = &w.accounts else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Some(who) = a.identify(req.headers()).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let refill = u64::from(w.limits.admin_auth_fail_refill_milli_per_sec).max(1);
-    let wait = 1000_u64.div_ceil(refill).max(1);
-    let mut res = StatusCode::TOO_MANY_REQUESTS.into_response();
-    res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
-    res
+    };
+    req.extensions_mut().insert(who);
+    next.run(req).await
 }
 
 /// A client address may upload and request generations `admin_write_burst` times in a burst,
 /// then `admin_write_refill_milli_per_sec` per second; past it, 429 until its allowance refills.
-/// Runs behind the token check, so only a token holder is counted.
+/// Runs behind the session check, so only a signed-in account is counted.
 async fn limit_writes(State(w): State<Arc<Worlds>>, req: Request, next: Next) -> Response {
     if !matches!(*req.method(), Method::PUT | Method::POST) {
         return next.run(req).await;
@@ -836,20 +796,6 @@ pub(crate) fn client_ip(req: &Request, proxy_header: Option<&HeaderName>) -> IpA
         IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
         v4 => v4,
     }
-}
-
-/// `Authorization: Bearer <token>` whose SHA-256 equals `want`. Both sides are hashed first, so
-/// the comparison takes the same time for every token, whatever its length or content.
-fn authorized(headers: &HeaderMap, want: &[u8; 32]) -> bool {
-    let Some(token) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    let got: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    got.iter().zip(want).fold(0_u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 /// Ids are the lowercase hex of a SHA-256: checked before any id reaches a path.
@@ -1136,12 +1082,12 @@ async fn prepare(
     Ok(())
 }
 
-async fn create_world(State(w): State<Arc<Worlds>>, caller: Caller, body: Bytes) -> Reply {
+async fn create_world(State(w): State<Arc<Worlds>>, who: Identity, body: Bytes) -> Reply {
     let Some(slot) = w.admit() else { return Ok(busy(&w, "too many generations are queued")) };
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
     let req: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("bad JSON: {e}")))?;
     if req.get("manifest").is_some() {
-        return create_data_only_world(&w, &req, caller.owner(), slot).await;
+        return create_data_only_world(&w, &req, Some(who.subject.as_str()), slot).await;
     }
     let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).await?;
     let yamls = chosen(&w, &req, "yamls", Kind::Yaml).await?;
@@ -1162,12 +1108,12 @@ async fn create_world(State(w): State<Arc<Worlds>>, caller: Caller, body: Bytes)
     }
     let mut status =
         json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
-    with_owner(&mut status, caller.owner());
+    with_owner(&mut status, Some(who.subject.as_str()));
     queue(&w, status, slot).await
 }
 
 /// Note who asked for the world, so its room is recorded as theirs once it is listed
-/// ([`claim_room`]). The admin token has no account: no owner.
+/// ([`claim_room`]).
 fn with_owner(status: &mut Value, owner: Option<&str>) {
     if let Some(o) = owner {
         status["owner"] = json!(o);
@@ -1471,8 +1417,7 @@ fn hosted<'a>(w: &'a Worlds, status: &Value) -> Option<(&'a RoomsFolder, RoomKey
     Some((folder, key, address))
 }
 
-/// Record the finished world's listed room under the account that asked for it (the admin's
-/// rooms are recorded with no owner), so `GET /api/rooms` finds it. A failure is logged: the
+/// Record the finished world's listed room under the account that asked for it, so `GET /api/rooms` finds it. A failure is logged: the
 /// world is made, only its listing under that account is missing.
 async fn claim_room(w: &Worlds, status: &Value) {
     let (Some((_, key, _)), Some(seed)) = (hosted(w, status), status["seed_name"].as_str()) else {
@@ -1489,22 +1434,6 @@ async fn claim_room(w: &Worlds, status: &Value) {
     if let Err(e) = w.store.room_claim(crate::room_id(seed), owner, &info).await {
         tracing::error!(error = ?e, world = ?status["id"], "recording the room's owner failed");
     }
-}
-
-/// `GET /api/rooms`: the rooms the caller made, newest first; the admin token sees every listed
-/// room, and the ones made before accounts have no `id` (no world to open them by).
-async fn list_rooms(State(w): State<Arc<Worlds>>, caller: Caller) -> Reply {
-    let rooms = w.store.rooms_owned(caller.owner()).await.map_err(store_error)?;
-    let rooms: Vec<Value> = rooms
-        .into_iter()
-        .map(|r| {
-            json!({
-                "id": r.world_id, "name": r.seed_name, "room_key": r.room_key,
-                "owner": r.owner, "age_secs": r.age_secs,
-            })
-        })
-        .collect();
-    Ok(json_reply(StatusCode::OK, &Value::Array(rooms)))
 }
 
 fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
@@ -1527,9 +1456,33 @@ async fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCode, String)
     Ok(status)
 }
 
+/// [`read_status`] for a caller: the world's requester, or anyone with a role on its listed room
+/// (`room_admins::role_on`), may see it; everyone else gets the same 404 as for no such world.
+async fn read_status_for(
+    w: &Worlds,
+    who: &Identity,
+    id: &str,
+) -> Result<Value, (StatusCode, String)> {
+    let status = read_status(w, id).await?;
+    let mut allowed = status["owner"].as_str() == Some(who.subject.as_str());
+    if let (false, Some((_, key, _))) = (allowed, hosted(w, &status)) {
+        let role = crate::room_admins::role_on(w.db(), who, key.as_str()).await;
+        allowed = role.map_err(|e| internal(format!("{e:?}")))?.is_some();
+    }
+    if allowed { Ok(status) } else { Err((StatusCode::NOT_FOUND, "no such world".to_owned())) }
+}
+
 /// The status, plus `room_key` and `address` once the host lists the world's room.
-async fn world_status(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let mut status = read_status(&w, &id).await?;
+async fn world_status(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let mut status = read_status_for(&w, &who, &id).await?;
+    // The requester's account id is theirs to see; a room admin does not get the owner's.
+    if status["owner"].as_str() != Some(who.subject.as_str()) {
+        status.as_object_mut().map(|s| s.remove("owner"));
+    }
     if let Some((_, key, address)) = hosted(&w, &status) {
         status["room_key"] = json!(key.as_str());
         status["address"] = json!(address);
@@ -1551,8 +1504,12 @@ fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) {
 /// cold room is loaded to answer, as a connection would load it.
 /// A finished world's seed, decoded from the store to its v1 JSON: the human view of what the
 /// server keeps as binary (`docs/seed-bundle-v2.md`).
-async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let status = read_status(&w, &id).await?;
+async fn world_bundle(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let status = read_status_for(&w, &who, &id).await?;
     let seed =
         status["seed_name"].as_str().ok_or((StatusCode::NOT_FOUND, "not done".to_owned()))?;
     let hash = status["bundle_hash"].as_str().unwrap_or_default().to_owned();
@@ -1561,8 +1518,12 @@ async fn world_bundle(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>
     Ok(json_text(StatusCode::OK, v1))
 }
 
-async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>) -> Reply {
-    let status = read_status(&w, &id).await?;
+async fn room_summary(
+    State(w): State<Arc<Worlds>>,
+    who: Identity,
+    UrlPath(id): UrlPath<String>,
+) -> Reply {
+    let status = read_status_for(&w, &who, &id).await?;
     let (folder, key, address) = hosted(&w, &status).ok_or_else(no_room)?;
     let (room, _visit) = folder.enter(key.clone()).await.map_err(unavailable)?;
     let mut summary = room.summary().await.map_err(|e| unavailable(format!("{e:?}")))?;
@@ -1576,10 +1537,11 @@ async fn room_summary(State(w): State<Arc<Worlds>>, UrlPath(id): UrlPath<String>
 /// while someone watches it; at most `view_streams` are open at once.
 async fn room_events(
     State(w): State<Arc<Worlds>>,
+    who: Identity,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Reply {
-    let status = read_status(&w, &id).await?;
+    let status = read_status_for(&w, &who, &id).await?;
     let (folder, key, _) = hosted(&w, &status).ok_or_else(no_room)?;
     let permit = Arc::clone(&w.view_streams).try_acquire_owned().map_err(|_| {
         (StatusCode::SERVICE_UNAVAILABLE, "too many room views are open; try again".to_owned())
@@ -1590,9 +1552,41 @@ async fn room_events(
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .map_or(proto::Seq(0), proto::Seq);
     let held = crate::room_view::Held { _visit: visit, _permit: permit };
-    crate::room_view::events(room, held, after, w.limits.view_history_events)
+    let lost = access_lost(Arc::clone(&w), headers, id);
+    crate::room_view::events(room, held, after, w.limits.view_history_events, lost)
         .await
         .map_err(|e| unavailable(format!("{e:?}")))
+}
+
+/// Whether the request's account can still read world `id`, through the same
+/// [`read_status_for`] as the open. Fails closed: no session, no account, a store error or a
+/// bad row all read as "no".
+async fn still_allowed(w: &Worlds, headers: &HeaderMap, id: &str) -> bool {
+    let Some(a) = &w.accounts else { return false };
+    let Some(who) = a.identify(headers).await else { return false };
+    read_status_for(w, &who, id).await.is_ok()
+}
+
+/// Completes the first time `check` says no, answers later than `every`, or does not answer in
+/// `every`: a hung store ends the stream as a refusal does.
+async fn until_lost<F, Fut>(every: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    loop {
+        tokio::time::sleep(every).await;
+        if !matches!(tokio::time::timeout(every, check()).await, Ok(true)) {
+            return;
+        }
+    }
+}
+
+/// Completes when the request's account can no longer read world `id` (see [`still_allowed`]),
+/// checked every `view_access_recheck_ms`. Any failure to check ends the stream.
+async fn access_lost(w: Arc<Worlds>, headers: HeaderMap, id: String) {
+    let every = Duration::from_millis(w.limits.view_access_recheck_ms.max(1));
+    until_lost(every, || still_allowed(&w, &headers, &id)).await;
 }
 
 #[cfg(test)]
@@ -1627,12 +1621,6 @@ mod tests {
         assert_ne!(content_id(b"abc"), content_id(b"abx"));
     }
 
-    fn headers(auth: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, HeaderValue::from_str(auth).unwrap());
-        h
-    }
-
     #[test]
     fn an_ipv6_client_is_counted_by_its_64() {
         let req = |ip: &str| {
@@ -1652,33 +1640,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_bearer_token_is_authorized() {
-        let want: [u8; 32] = Sha256::digest(b"s3cret").into();
-        assert!(authorized(&headers("Bearer s3cret"), &want));
-        for bad in [
-            "Bearer s3cre",
-            "Bearer s3cret ",
-            "Bearer S3cret",
-            "bearer s3cret",
-            "s3cret",
-            "Bearer ",
-            "Basic s3cret",
-        ] {
-            assert!(!authorized(&headers(bad), &want), "{bad:?}");
-        }
-        assert!(!authorized(&HeaderMap::new(), &want));
-    }
-
-    /// Two bytes of the hash off by the same bit: an XOR fold would cancel them out.
-    #[test]
-    fn a_token_whose_hash_differs_in_two_bytes_alike_is_refused() {
-        let mut want: [u8; 32] = Sha256::digest(b"s3cret").into();
-        want[0] ^= 1;
-        want[1] ^= 1;
-        assert!(!authorized(&headers("Bearer s3cret"), &want));
-    }
-
-    #[test]
     fn an_internal_error_is_a_500_that_hides_its_detail() {
         let (status, text) = internal("/srv/data/secret.json: permission denied");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1692,20 +1653,19 @@ mod tests {
         assert_eq!(text, "the room is not available right now; try again");
     }
 
-    /// Shows the data folder only: never the token's hash, the sandbox or the limits.
+    /// Shows the data folder only: never the sandbox or the limits.
     #[test]
-    fn the_state_shows_its_folder_and_not_the_token() {
+    fn the_state_shows_its_folder_only() {
         let root = temp("debug");
         let w = worlds(&root, Limits::DESIGN);
         let shown = format!("{w:?}");
         assert_eq!(shown, format!("Worlds {{ dir: {:?}, .. }}", root.join("data")));
-        assert!(!shown.contains("token") && !shown.contains(&hex(&w.token.unwrap())), "{shown}");
     }
 
     /// The API's state on a fake checkout under `root`, data in `root/data`.
     fn worlds(root: &Path, limits: Limits) -> Worlds {
         let paths = crate::sandbox::tests::layout(root);
-        let mut w = open(&root.join("data"), Some("token"), paths, limits).unwrap();
+        let mut w = open(&root.join("data"), paths, limits).unwrap();
         // The unit tests are not the server's executable: the jobs run in this process.
         w.jobs = JobRunner::InProcess;
         w.accounts = Some(Arc::new(PasswordAuth::new(w.store.clone(), limits, None)));
@@ -1827,8 +1787,7 @@ mod tests {
         let two = stored(&w, Kind::Apworld, b"2", json!({"module": "clique"})).await;
         let yaml = stored(&w, Kind::Yaml, b"y", json!({})).await;
         let req = json!({"apworlds": [one["id"], two["id"]], "yamls": [yaml["id"]]});
-        let e =
-            create_world(State(w), Caller::Admin, Bytes::from(req.to_string())).await.unwrap_err();
+        let e = create_world(State(w), me(), Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e, (StatusCode::BAD_REQUEST, "two apworlds have the same module name".into()));
         let worlds_dir = std::fs::read_dir(root.join("data/worlds")).unwrap();
         assert_eq!(worlds_dir.count(), 0, "no world folder was made");
@@ -1867,6 +1826,10 @@ mod tests {
         for bad in ["", "1a", "a-b", "a/b", "..", "a.b", "é"] {
             assert!(!valid_module(bad), "{bad}");
         }
+    }
+
+    fn me() -> Identity {
+        Identity { subject: "pw:me".into(), name: "me".into() }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -2084,8 +2047,7 @@ mod tests {
         let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
         // The one generation permit is taken, so the job waits queued, as one a restart cuts.
         let _held = w.one_gen.acquire().await.unwrap();
-        let queued =
-            create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req)).await.unwrap();
+        let queued = create_world(State(Arc::clone(&w)), me(), Bytes::from(req)).await.unwrap();
         let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
         // The restarted server: the same store and data folder, a new process.
         let mut next = worlds(&root, Limits::DESIGN);
@@ -2412,11 +2374,12 @@ mod tests {
         let limits =
             Limits { admin_write_burst: 2, admin_write_refill_milli_per_sec: 1, ..Limits::DESIGN };
         let app = routes(Arc::new(worlds(&root, limits)));
+        let cookie = signed_up(&app, "ann").await;
         let call = |method: &str, path: &str| {
             let req = axum::http::Request::builder()
                 .method(method)
                 .uri(path)
-                .header(header::AUTHORIZATION, "Bearer token")
+                .header(header::COOKIE, &cookie)
                 .body(axum::body::Body::from("x"))
                 .unwrap();
             app.clone().oneshot(req)
@@ -2449,19 +2412,43 @@ mod tests {
 
     /// The API's state with a host listing rooms under `root/rooms`, as `--rooms` does.
     async fn hosting(root: &Path) -> Arc<Worlds> {
+        hosting_with(root, Limits::DESIGN).await
+    }
+
+    async fn hosting_with(root: &Path, limits: Limits) -> Arc<Worlds> {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
-            crate::app(&crate::Source::Rooms(rooms), None, None, Limits::DESIGN).await.unwrap();
+            crate::app(&crate::Source::Rooms(rooms), None, None, limits).await.unwrap();
         let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.db());
         tokio::spawn(async move { host.supervise().await });
-        let mut w = worlds(root, Limits::DESIGN);
+        let mut w = worlds(root, limits);
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
         w.store = db.clone();
-        w.accounts = Some(Arc::new(PasswordAuth::new(db.clone(), Limits::DESIGN, None)));
-        w.manifests = Manifests::new(db, &Limits::DESIGN);
+        w.accounts = Some(Arc::new(PasswordAuth::new(db.clone(), limits, None)));
+        w.manifests = Manifests::new(db, &limits);
         Arc::new(w)
+    }
+
+    /// A world `who` asked for, generated by the engine and hosted as a listed room; its id.
+    async fn finished_world(w: &Arc<Worlds>, who: &Identity) -> String {
+        let up = upload_manifest(w, Some("name=m.json"), &manifest(|_| {})).await.unwrap();
+        let manifest_id = json_of(up).await["id"].clone();
+        let insts = fixture_instances();
+        let yaml = player_yaml(w, "Ann", "Fixture Game", &insts[0]).await["id"].clone();
+        let req = json!({"manifest": manifest_id, "yamls": [yaml]});
+        let queued = create_world(State(Arc::clone(w)), who.clone(), Bytes::from(req.to_string()));
+        let id = json_of(queued.await.unwrap()).await["id"].as_str().unwrap().to_owned();
+        for _ in 0..600 {
+            let status = read_status(w, &id).await.unwrap();
+            if status["status"] == "done" && hosted(w, &status).is_some() {
+                return id;
+            }
+            assert!(status["status"] != "failed", "{status}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the world never finished and listed");
     }
 
     /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
@@ -2481,9 +2468,7 @@ mod tests {
         }
         let req = json!({"manifest": manifest_id, "yamls": yamls});
         let queued =
-            create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.to_string()))
-                .await
-                .unwrap();
+            create_world(State(Arc::clone(&w)), me(), Bytes::from(req.to_string())).await.unwrap();
         assert_eq!(queued.status(), StatusCode::ACCEPTED);
         let id = json_of(queued).await["id"].as_str().unwrap().to_owned();
         let mut status = read_status(&w, &id).await.unwrap();
@@ -2506,8 +2491,7 @@ mod tests {
         assert_eq!(w.queued.load(Ordering::Acquire), 0, "the job's slot is released");
         // A manifest world takes no legacy world files.
         let both = json!({"manifest": manifest_id, "yamls": yamls, "apworlds": ["x"]});
-        let e =
-            create_world(State(w), Caller::Admin, Bytes::from(both.to_string())).await.unwrap_err();
+        let e = create_world(State(w), me(), Bytes::from(both.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
     }
 
@@ -2522,7 +2506,7 @@ mod tests {
         let insts = fixture_instances();
         let yaml = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await["id"].clone();
         let req = json!({"manifest": manifest_id, "yamls": [yaml]});
-        let ann = Caller::User(accounts::Identity { subject: "pw:ann".into(), name: "ann".into() });
+        let ann = accounts::Identity { subject: "pw:ann".into(), name: "ann".into() };
         let queued = create_world(State(Arc::clone(&w)), ann, Bytes::from(req.to_string())).await;
         let id = json_of(queued.unwrap()).await["id"].as_str().unwrap().to_owned();
         let mut status = read_status(&w, &id).await.unwrap();
@@ -2567,80 +2551,483 @@ mod tests {
         app.clone().oneshot(req.body(axum::body::Body::empty()).unwrap()).await.unwrap()
     }
 
-    /// Each account lists its own rooms; the admin token lists all, an anonymous caller none.
-    /// Fails if the list ignores the caller (every account would see every room).
-    #[tokio::test]
-    async fn an_account_lists_only_its_rooms_and_the_admin_lists_all() {
-        let root = temp("room-list");
-        let w = Arc::new(worlds(&root, Limits { signup_burst: 10, ..Limits::DESIGN }));
-        let app = routes(Arc::clone(&w));
-        let (ann, bo) = (signed_up(&app, "ann").await, signed_up(&app, "bob").await);
-        let room = |n: u8| log::OwnedRoom {
+    fn room(n: u8) -> log::OwnedRoom {
+        log::OwnedRoom {
             world_id: Some(format!("{n:064x}")),
             seed_name: format!("seed{n}"),
             room_key: format!("key{n}"),
             owner: None,
             age_secs: 0,
-        };
+        }
+    }
+
+    async fn call(app: &Router, method: &str, path: &str, cookie: &str, body: &str) -> Response {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// Accounts ann, bob and cy on a router, with ann's room 1 and bob's room 2, and room 3
+    /// made before accounts (no owner).
+    async fn three_accounts() -> (Arc<Worlds>, Router, [String; 3]) {
+        let w =
+            Arc::new(worlds(&temp("room-roles"), Limits { signup_burst: 10, ..Limits::DESIGN }));
+        let app = routes(Arc::clone(&w));
+        let c = [
+            signed_up(&app, "ann").await,
+            signed_up(&app, "bob").await,
+            signed_up(&app, "cyd").await,
+        ];
         let db = &w.store;
         db.room_claim(proto::RoomId(1), Some("pw:ann"), &room(1)).await.unwrap();
         db.room_claim(proto::RoomId(2), Some("pw:bob"), &room(2)).await.unwrap();
         db.room_claim(proto::RoomId(3), None, &room(3)).await.unwrap();
-        let names = async |r: Response| -> Vec<String> {
-            assert_eq!(r.status(), StatusCode::OK);
-            let v = json_of(r).await;
-            v.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_owned()).collect()
-        };
-        let as_ann = get_as(&app, "/api/rooms", Some(("cookie", &ann))).await;
-        assert_eq!(names(as_ann).await, ["seed1"]);
-        let as_bo = get_as(&app, "/api/rooms", Some(("cookie", &bo))).await;
-        assert_eq!(names(as_bo).await, ["seed2"]);
-        let admin = get_as(&app, "/api/rooms", Some(("authorization", "Bearer token"))).await;
-        let mut all = names(admin).await;
-        all.sort();
-        assert_eq!(all, ["seed1", "seed2", "seed3"]);
+        (w, app, c)
+    }
+
+    async fn names_of(r: Response) -> Vec<String> {
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = json_of(r).await;
+        v.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_owned()).collect()
+    }
+
+    /// Each account lists its own rooms with its role; a room with no owner is listed to nobody;
+    /// a signed-out caller gets 401. Fails if the list ignores the caller.
+    #[tokio::test]
+    async fn an_account_lists_only_the_rooms_it_owns_or_administers_with_its_role() {
+        let (_w, app, [ann, bob, cy]) = three_accounts().await;
+        let as_ann = call(&app, "GET", "/api/rooms", &ann, "").await;
+        let v = json_of(as_ann).await;
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!((v[0]["name"].as_str(), v[0]["role"].as_str()), (Some("seed1"), Some("owner")));
+        assert_eq!(v[0]["owner"], "ann", "the name, not the subject");
+        assert_eq!(names_of(call(&app, "GET", "/api/rooms", &bob, "").await).await, ["seed2"]);
+        assert!(names_of(call(&app, "GET", "/api/rooms", &cy, "").await).await.is_empty());
+        let r = call(&app, "PUT", "/api/rooms/key2/admins/ann", &bob, "").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = json_of(call(&app, "GET", "/api/rooms", &ann, "").await).await;
+        let roles: Vec<_> =
+            v.as_array().unwrap().iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles.len(), 2);
+        assert!(roles.contains(&"admin") && roles.contains(&"owner"));
         assert_eq!(get_as(&app, "/api/rooms", None).await.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// A new account (sign-up is open) may not reach anything that runs uploaded code or spends
-    /// the host's CPU: every route but its own room list is the admin token's. Fails if
-    /// the gate treats a session like the token.
-    #[tokio::test]
-    async fn a_new_account_cannot_reach_the_admin_routes() {
-        use tower::ServiceExt;
-        let root = temp("user-gate");
-        let w = Arc::new(worlds(&root, Limits::DESIGN));
+    fn account(name: &str) -> Identity {
+        Identity { subject: format!("pw:{name}"), name: name.to_owned() }
+    }
+
+    /// A hosted world, its room's key, and the router, with accounts ann, bob and cyd signed up.
+    async fn hosted_for_ann(
+        name: &str,
+        limits: Limits,
+    ) -> (Arc<Worlds>, Router, [String; 3], String, String) {
+        let limits = Limits { signup_burst: 10, ..limits };
+        let w = hosting_with(&temp(name), limits).await;
         let app = routes(Arc::clone(&w));
-        let cookie = signed_up(&app, "ann").await;
-        let zeros = "0".repeat(64);
-        for (method, path) in [
-            ("PUT", "/api/apworlds?name=x.apworld".to_owned()),
-            ("PUT", "/api/yamls?name=x.yaml".to_owned()),
-            ("PUT", "/api/manifests?name=m.json".to_owned()),
-            ("POST", "/api/worlds".to_owned()),
-            ("GET", format!("/api/worlds/{zeros}")),
-            ("GET", "/api/apworlds".to_owned()),
-            ("GET", "/api/manifests".to_owned()),
-            ("POST", "/api/rooms".to_owned()),
-            ("GET", "/api/nothing-here".to_owned()),
-        ] {
-            let req = axum::http::Request::builder()
-                .method(method)
-                .uri(&path)
-                .header(header::COOKIE, &cookie)
-                .body(axum::body::Body::from("x"))
-                .unwrap();
-            let r = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let c = [
+            signed_up(&app, "ann").await,
+            signed_up(&app, "bob").await,
+            signed_up(&app, "cyd").await,
+        ];
+        let id = finished_world(&w, &account("ann")).await;
+        let status =
+            json_of(call(&app, "GET", &format!("/api/worlds/{id}"), &c[0], "").await).await;
+        let key = status["room_key"].as_str().unwrap().to_owned();
+        (w, app, c, id, key)
+    }
+
+    /// A finished world's status, bundle, room and event routes answer its requester and the
+    /// admins of its room; another account gets 404, like for an unknown id; a room admin never
+    /// sees the owner's account id. Each route fails without `read_status_for`.
+    #[tokio::test]
+    async fn another_account_cannot_read_a_world_it_did_not_ask_for() {
+        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann("read-routes", Limits::DESIGN).await;
+        let paths: Vec<String> = ["", "/bundle", "/room", "/room/events"]
+            .iter()
+            .map(|t| format!("/api/worlds/{id}{t}"))
+            .collect();
+        for path in &paths {
+            assert_eq!(call(&app, "GET", path, &bob, "").await.status(), 404, "bob on {path}");
+            assert_eq!(call(&app, "GET", path, &ann, "").await.status(), 200, "ann on {path}");
         }
-        let r = get_as(&app, "/api/rooms", Some(("cookie", &cookie))).await;
+        let r = call(&app, "PUT", &format!("/api/rooms/{key}/admins/bob"), &ann, "").await;
         assert_eq!(r.status(), StatusCode::OK);
-        // With no login at all it is a plain 401, and a forged cookie is no login.
-        let forged = format!("constellation_session={zeros}");
-        for auth in [None, Some(("cookie", forged.as_str()))] {
-            let r = get_as(&app, "/api/manifests", auth).await;
-            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        for path in &paths {
+            assert_eq!(
+                call(&app, "GET", path, &bob, "").await.status(),
+                200,
+                "admin bob on {path}"
+            );
         }
+        assert_eq!(json_of_call(&app, &paths[0], &ann).await["owner"], "pw:ann");
+        assert!(
+            json_of_call(&app, &paths[0], &bob).await.get("owner").is_none(),
+            "an admin does not get the owner's id"
+        );
+    }
+
+    async fn json_of_call(app: &Router, path: &str, cookie: &str) -> Value {
+        json_of(call(app, "GET", path, cookie, "").await).await
+    }
+
+    /// Reads `r`'s body until the server ends it; fails after 5 s.
+    async fn ends(r: Response) {
+        use futures_util::StreamExt;
+        let mut body = r.into_body().into_data_stream();
+        let end = tokio::time::timeout(Duration::from_secs(5), async {
+            while body.next().await.is_some() {}
+        });
+        end.await.expect("the stream was ended by the server");
+    }
+
+    /// An open room stream ends soon after its viewer is removed as a room admin, and after its
+    /// account is deleted. Fails without `access_lost` (the stream stays open).
+    #[tokio::test]
+    async fn an_open_room_stream_ends_when_the_viewer_loses_access() {
+        let limits = Limits { view_access_recheck_ms: 20, ..Limits::DESIGN };
+        let (w, app, [ann, bob, cyd], id, key) = hosted_for_ann("stream-access", limits).await;
+        for n in ["bob", "cyd"] {
+            let r = call(&app, "PUT", &format!("/api/rooms/{key}/admins/{n}"), &ann, "").await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let events = format!("/api/worlds/{id}/room/events");
+        let (bobs, cyds) = (
+            call(&app, "GET", &events, &bob, "").await,
+            call(&app, "GET", &events, &cyd, "").await,
+        );
+        assert_eq!((bobs.status(), cyds.status()), (StatusCode::OK, StatusCode::OK));
+        let r = call(&app, "DELETE", &format!("/api/rooms/{key}/admins/bob"), &ann, "").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        ends(bobs).await;
+        w.store.user_delete("cyd").await.unwrap();
+        ends(cyds).await;
+        let owners = call(&app, "GET", &events, &ann, "").await;
+        assert_eq!(owners.status(), StatusCode::OK, "the owner keeps hers");
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Class {
+        /// Open to everyone: no session needed.
+        Public,
+        /// Uploads: shared by every account until per-account trust exists (see #127).
+        Global,
+        /// Makes something owned by the caller; touches nobody else's data.
+        Own,
+        /// Reads or changes one room or world: only those with a role on it.
+        Scoped,
+        /// Answers 404 whatever it is asked.
+        CatchAll,
+    }
+
+    /// Every `/api` route of the router and what it may show another account. A route the
+    /// router has and this table lacks fails `no_route_escapes_the_cross_account_walk`.
+    const ROUTES: &[(&str, &[&str], Class)] = &[
+        ("/api/auth", &["GET"], Class::Public),
+        ("/api/signup", &["POST"], Class::Public),
+        ("/api/login", &["POST"], Class::Public),
+        ("/api/logout", &["POST"], Class::Public),
+        ("/api/me", &["GET"], Class::Public),
+        ("/api/apworlds", &["GET", "PUT"], Class::Global),
+        ("/api/yamls", &["GET", "PUT"], Class::Global),
+        ("/api/manifests", &["GET", "PUT"], Class::Global),
+        ("/api/rooms", &["GET"], Class::Own),
+        ("/api/worlds", &["POST"], Class::Own),
+        ("/api/worlds/{id}", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/room", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/bundle", &["GET"], Class::Scoped),
+        ("/api/worlds/{id}/room/events", &["GET"], Class::Scoped),
+        ("/api/rooms/{key}/admins", &["GET", "POST"], Class::Scoped),
+        ("/api/rooms/{key}/admins/{name}", &["PUT", "DELETE"], Class::Scoped),
+        ("/api", &["ANY"], Class::CatchAll),
+        ("/api/", &["ANY"], Class::CatchAll),
+        ("/api/{*rest}", &["ANY"], Class::CatchAll),
+    ];
+
+    /// Every `.rs` file under `dir`, with its non-test code (the tests module cut off).
+    fn source_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                source_files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                let src = std::fs::read_to_string(&path).unwrap();
+                let code = src.split("\n#[cfg(test)]\nmod tests").next().unwrap().to_owned();
+                out.push((path, code));
+            }
+        }
+    }
+
+    /// The HTTP methods named in `seg` (the text of one `.route(..)` call after its path):
+    /// each `get(`, `post(`, ... is one; `any(` is every method (`ANY` in the table). Any other
+    /// way to pick methods (`on(`, `trace(`, `connect(`, `*_service(`) cannot be read here and
+    /// fails, as does a route that names none.
+    fn methods_in(seg: &str, path: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (at, _) in seg.match_indices('(') {
+            let word: String = seg[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let known = ["get", "post", "put", "delete", "patch", "head", "options", "any"];
+            if known.contains(&word.as_str()) {
+                found.push(word.to_ascii_uppercase());
+            }
+            let unreadable = ["on", "trace", "connect"].contains(&word.as_str())
+                || word.ends_with("_service")
+                || word.starts_with("on_");
+            assert!(
+                !unreadable,
+                "{path}: `{word}(` picks methods in a way this test cannot read; classify it by hand"
+            );
+        }
+        assert!(!found.is_empty(), "{path}: no recognised method; classify it by hand");
+        found
+    }
+
+    /// Every `(METHOD, path)` under `/api` that any non-test code of this crate registers, read
+    /// from all of `crates/server/src` so a route in a new module cannot be missed. A `.nest(`,
+    /// `.route_service(` or `.nest_service(` of an `/api` path cannot be read this way and fails.
+    fn registered_routes() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        source_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut found = Vec::new();
+        for (file, code) in &files {
+            for call in [".nest(", ".route_service(", ".nest_service("] {
+                for part in code.split(call).skip(1) {
+                    let lit = part.trim_start().strip_prefix('"');
+                    let path = lit.unwrap_or_else(|| {
+                        panic!(
+                            "{}: {call} takes a path that is not a plain literal",
+                            file.display()
+                        )
+                    });
+                    assert!(
+                        !path.starts_with("/api"),
+                        "{} registers an /api path with {call}: classify it by hand",
+                        file.display()
+                    );
+                }
+            }
+            for part in code.split(".route(").skip(1) {
+                let lit = part.trim_start().strip_prefix('"').unwrap_or_else(|| {
+                    let at = part.lines().next().unwrap_or("");
+                    panic!("{}: a .route( path is not a plain string literal: {at}", file.display())
+                });
+                let (path, rest) = lit.split_once('"').unwrap();
+                if !path.starts_with("/api") {
+                    continue;
+                }
+                let mut depth = 1_usize;
+                let end = rest
+                    .char_indices()
+                    .find(|(_, c)| {
+                        depth = match c {
+                            '(' => depth + 1,
+                            ')' => depth - 1,
+                            _ => depth,
+                        };
+                        depth == 0
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                for m in methods_in(&rest[..end], path) {
+                    found.push((m, path.to_owned()));
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    #[test]
+    fn no_route_escapes_the_cross_account_walk() {
+        let mut table: Vec<(String, String)> = ROUTES
+            .iter()
+            .flat_map(|(p, methods, _)| {
+                methods.iter().map(move |m| ((*m).to_owned(), (*p).to_owned()))
+            })
+            .collect();
+        table.sort();
+        assert_eq!(
+            registered_routes(),
+            table,
+            "classify every (method, path) in ROUTES, and drop gone ones"
+        );
+    }
+
+    /// User B, with every route of the router and A's ids and keys, never gets A's data and
+    /// changes nothing of A's: scoped routes are 404, lists show only B's own, and A still has
+    /// everything afterwards. Fails if any scoped route skips the role check.
+    #[tokio::test]
+    async fn another_account_walking_every_route_never_reaches_the_first_ones_data() {
+        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann("walk", Limits::DESIGN).await;
+        let a_rooms = call(&app, "GET", "/api/rooms", &ann, "").await;
+        let a_rooms = json_of(a_rooms).await;
+        let a_admins = admins_of(&app, &key, &ann).await;
+        let a_world = json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await;
+        for (template, methods, class) in ROUTES.iter().filter(|r| r.2 != Class::Public) {
+            // `{name}` is the owner, and B himself (B tries to make himself an admin).
+            for name in ["ann", "bob"] {
+                let path =
+                    template.replace("{id}", &id).replace("{key}", &key).replace("{name}", name);
+                for method in *methods {
+                    let method = if *method == "ANY" { "GET" } else { method };
+                    let r = call(&app, method, &path, &bob, "{\"username\":\"bob\"}").await;
+                    let status = r.status();
+                    let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    let body = String::from_utf8_lossy(&bytes).into_owned();
+                    let what = format!("{method} {path} ({class:?}): {status} {body}");
+                    match class {
+                        Class::Scoped | Class::CatchAll => {
+                            assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
+                        }
+                        Class::Own => {
+                            assert!(status != StatusCode::OK || !body.contains(&key), "{what}");
+                            assert!(!body.contains(&id), "{what}");
+                        }
+                        // Uploads are global until #127. Open routes are skipped above (B's
+                        // own logout would end B's session).
+                        Class::Global | Class::Public => {}
+                    }
+                    assert!(!body.contains("pw:ann"), "A's account id leaked: {what}");
+                }
+            }
+        }
+        // B's own list has none of A's rooms, and nothing B did changed A's.
+        let b_rooms = json_of_call(&app, "/api/rooms", &bob).await;
+        assert_eq!(b_rooms, json!([]));
+        assert_eq!(json_of_call(&app, "/api/rooms", &ann).await, a_rooms);
+        assert_eq!(admins_of(&app, &key, &ann).await, a_admins);
+        assert_eq!(json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await, a_world);
+    }
+
+    /// A lookup that errors, a session that is gone and one that hangs all end a room stream;
+    /// only a clean yes keeps it. Fails open without `still_allowed` and `until_lost`.
+    #[tokio::test]
+    async fn a_room_stream_fails_closed_on_an_error_a_gone_session_or_a_hang() {
+        let w =
+            Arc::new(worlds(&temp("fail-closed"), Limits { signup_burst: 10, ..Limits::DESIGN }));
+        let app = routes(Arc::clone(&w));
+        let ann = signed_up(&app, "ann").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(&ann).unwrap());
+        let (good, bad) = (content_id(b"good"), content_id(b"bad"));
+        w.save_status(&json!({"id": good, "status": "queued", "owner": "pw:ann"})).await.unwrap();
+        w.store.job_put(&bad, JobState::Queued, "{not json").await.unwrap();
+        assert!(still_allowed(&w, &headers, &good).await);
+        assert!(!still_allowed(&w, &headers, &bad).await, "a store or row error is a no");
+        assert!(!still_allowed(&w, &HeaderMap::new(), &good).await, "no session is a no");
+        let every = Duration::from_millis(20);
+        let five = Duration::from_secs(5);
+        tokio::time::timeout(five, until_lost(every, || std::future::pending::<bool>()))
+            .await
+            .expect("a check that hangs ends the stream");
+        let keeps =
+            tokio::time::timeout(Duration::from_millis(200), until_lost(every, || async { true }));
+        assert!(keeps.await.is_err(), "a clean yes keeps it open");
+    }
+
+    async fn admins_of(app: &Router, key: &str, cookie: &str) -> Value {
+        json_of(call(app, "GET", &format!("/api/rooms/{key}/admins"), cookie, "").await).await
+    }
+
+    /// The owner and an admin both grant admin; a repeat changes nothing; an unknown name is
+    /// 404; the owner needs no grant. Fails without the grant routes.
+    #[tokio::test]
+    async fn an_owner_and_an_admin_can_grant_admin_and_a_repeat_changes_nothing() {
+        let (_w, app, [ann, bob, _cy]) = three_accounts().await;
+        assert_eq!(call(&app, "PUT", "/api/rooms/key1/admins/bob", &ann, "").await.status(), 200);
+        assert_eq!(call(&app, "PUT", "/api/rooms/key1/admins/bob", &ann, "").await.status(), 200);
+        assert_eq!(admins_of(&app, "key1", &ann).await["admins"], json!(["bob"]));
+        // Bob, now an admin, adds cy by the POST form.
+        let r = call(&app, "POST", "/api/rooms/key1/admins", &bob, "{\"username\":\"CYD\"}").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = admins_of(&app, "key1", &bob).await;
+        assert_eq!(
+            (v["admins"].clone(), v["owner"].as_str(), v["role"].as_str()),
+            (json!(["bob", "cyd"]), Some("ann"), Some("admin"))
+        );
+        assert_eq!(call(&app, "PUT", "/api/rooms/key1/admins/ghost", &ann, "").await.status(), 404);
+        assert_eq!(call(&app, "PUT", "/api/rooms/key1/admins/ann", &bob, "").await.status(), 200);
+        assert_eq!(
+            admins_of(&app, "key1", &ann).await["admins"],
+            json!(["bob", "cyd"]),
+            "no owner row"
+        );
+    }
+
+    /// A caller with no role gets 404 for the room, the same as for a room that does not exist,
+    /// on every admins route. Fails if a non-member can tell the room is there.
+    #[tokio::test]
+    async fn a_non_member_gets_404_for_a_room_and_cannot_tell_it_exists() {
+        let (_w, app, [_ann, _bob, cy]) = three_accounts().await;
+        for (method, tail) in [("GET", ""), ("POST", ""), ("PUT", "/bob"), ("DELETE", "/bob")] {
+            let body = "{\"username\":\"bob\"}";
+            let real =
+                call(&app, method, &format!("/api/rooms/key1/admins{tail}"), &cy, body).await;
+            let none =
+                call(&app, method, &format!("/api/rooms/nokey/admins{tail}"), &cy, body).await;
+            assert_eq!(
+                (real.status(), none.status()),
+                (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)
+            );
+            let bytes = |r: Response| axum::body::to_bytes(r.into_body(), usize::MAX);
+            assert_eq!(bytes(real).await.unwrap(), bytes(none).await.unwrap());
+        }
+        // The owner-less room belongs to nobody.
+        let r = call(&app, "GET", "/api/rooms/key3/admins", &cy, "").await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The owner removes any admin; an admin removes only itself (403 for another), and leaving
+    /// takes its access (404 after); the owner cannot be removed (409); a non-admin is 404.
+    #[tokio::test]
+    async fn only_the_owner_removes_other_admins_and_the_owner_stays() {
+        let (_w, app, [ann, bob, cy]) = three_accounts().await;
+        for n in ["bob", "cyd"] {
+            assert_eq!(
+                call(&app, "PUT", &format!("/api/rooms/key1/admins/{n}"), &ann, "").await.status(),
+                200
+            );
+        }
+        let del = |who: &str| format!("/api/rooms/key1/admins/{who}");
+        assert_eq!(
+            call(&app, "DELETE", &del("cyd"), &bob, "").await.status(),
+            403,
+            "admin removes admin"
+        );
+        assert_eq!(
+            call(&app, "DELETE", &del("ann"), &bob, "").await.status(),
+            409,
+            "owner by admin"
+        );
+        assert_eq!(
+            call(&app, "DELETE", &del("ann"), &ann, "").await.status(),
+            409,
+            "owner by owner"
+        );
+        assert_eq!(
+            call(&app, "DELETE", &del("bob"), &bob, "").await.status(),
+            204,
+            "an admin leaves"
+        );
+        assert_eq!(call(&app, "GET", "/api/rooms/key1/admins", &bob, "").await.status(), 404);
+        assert_eq!(call(&app, "DELETE", &del("bob"), &ann, "").await.status(), 404, "already gone");
+        let r = call(&app, "DELETE", &del("cyd"), &ann, "").await;
+        assert_eq!(r.status(), StatusCode::OK, "the owner removes an admin");
+        assert_eq!(admins_of(&app, "key1", &ann).await["admins"], json!([]));
+        assert_eq!(call(&app, "GET", "/api/rooms/key1/admins", &cy, "").await.status(), 404);
     }
 
     /// The API is the boundary: a player file for another game is refused before anything runs.
@@ -2654,8 +3041,7 @@ mod tests {
         let ok = player_yaml(&w, "Ann", "Fixture Game", &insts[0]).await;
         let other = player_yaml(&w, "Bo", "Other Game", &insts[1]).await;
         let req = json!({"manifest": manifest_id, "yamls": [ok["id"], other["id"]]});
-        let e =
-            create_world(State(w), Caller::Admin, Bytes::from(req.to_string())).await.unwrap_err();
+        let e = create_world(State(w), me(), Bytes::from(req.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
         assert!(e.1.contains("Bo") && e.1.contains("Fixture Game"), "{}", e.1);
         let made = std::fs::read_dir(root.join("data/worlds")).unwrap().count();
@@ -2675,13 +3061,11 @@ mod tests {
         let req = json!({"manifest": manifest_id, "yamls": [yaml["id"]]}).to_string();
         // The one generation permit is taken, so the first job waits queued.
         let held = w.one_gen.acquire().await.unwrap();
-        let first = create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.clone()))
-            .await
-            .unwrap();
+        let first =
+            create_world(State(Arc::clone(&w)), me(), Bytes::from(req.clone())).await.unwrap();
         assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let second = create_world(State(Arc::clone(&w)), Caller::Admin, Bytes::from(req.clone()))
-            .await
-            .unwrap();
+        let second =
+            create_world(State(Arc::clone(&w)), me(), Bytes::from(req.clone())).await.unwrap();
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(second.headers().contains_key(header::RETRY_AFTER));
         drop(held);
@@ -2691,7 +3075,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let third = create_world(State(w), Caller::Admin, Bytes::from(req)).await.unwrap();
+        let third = create_world(State(w), me(), Bytes::from(req)).await.unwrap();
         assert_eq!(third.status(), StatusCode::ACCEPTED, "the finished job gave its slot back");
     }
 

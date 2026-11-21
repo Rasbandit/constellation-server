@@ -606,7 +606,7 @@ async fn accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted<S: S
 async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(s: &S) {
     let room = |n: u8| crate::OwnedRoom {
         world_id: Some(format!("w{n}")),
-        seed_name: format!("seed{n}"),
+        seed_name: format!("seed{}", 10 + n),
         room_key: format!("key{n}"),
         owner: None,
         age_secs: 0,
@@ -615,13 +615,51 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
     s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
     s.room_claim(RoomId(11), Some("pw:b"), &room(1)).await.unwrap();
     let mine = s.rooms_owned(Some("pw:a")).await.unwrap();
-    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed1"]);
+    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed11"]);
     assert_eq!(mine[0].owner.as_deref(), Some("pw:a"), "an owner is kept");
     assert!(s.rooms_owned(Some("pw:nobody")).await.unwrap().is_empty());
     s.room_claim(RoomId(13), None, &room(3)).await.unwrap();
     let all = s.rooms_owned(None).await.unwrap();
     assert!(all.iter().any(|r| r.owner.is_none()), "the admin view lists rooms with no owner");
     assert!(all.len() >= 3);
+}
+
+/// Room 21 must be listed already with key `aaaaaaaaaa` (Postgres reads it from the directory).
+async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S: Store>(s: &S) {
+    let (key, other) = ("aaaaaaaaaa", "bbbbbbbbbb");
+    let room = crate::OwnedRoom {
+        world_id: Some("w21".into()),
+        seed_name: "seed21".into(),
+        room_key: key.into(),
+        owner: None,
+        age_secs: 0,
+    };
+    s.room_claim(RoomId(21), Some("pw:own"), &room).await.unwrap();
+    assert_eq!(s.room_by_key(key).await.unwrap().unwrap().seed_name, "seed21");
+    assert_eq!(s.room_by_key(other).await.unwrap(), None);
+    for name in ["bea", "cy"] {
+        assert!(s.user_create(name, "h").await.unwrap());
+    }
+    assert!(s.room_admins(key).await.unwrap().is_empty());
+    assert!(s.room_admin_add(key, "bea", "own").await.unwrap());
+    assert!(s.room_admin_add(key, "bea", "cy").await.unwrap(), "a repeat grant is fine");
+    assert_eq!(s.room_admins(key).await.unwrap(), ["bea"], "listed once");
+    assert!(!s.room_admin_add(key, "ghost", "own").await.unwrap(), "no such account");
+    assert!(!s.room_admin_add(other, "cy", "own").await.unwrap(), "no such room");
+    let seen =
+        |rooms: Vec<crate::OwnedRoom>| rooms.into_iter().map(|r| r.room_key).collect::<Vec<_>>();
+    assert_eq!(seen(s.rooms_administered("bea").await.unwrap()), [key]);
+    assert!(s.rooms_administered("cy").await.unwrap().is_empty(), "only its own adminships");
+    assert!(s.room_admin_remove(key, "bea").await.unwrap());
+    assert!(!s.room_admin_remove(key, "bea").await.unwrap(), "nothing left to remove");
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
+    for name in ["bea", "cy"] {
+        assert!(s.room_admin_add(key, name, "own").await.unwrap());
+    }
+    s.user_delete("bea").await.unwrap();
+    assert_eq!(s.room_admins(key).await.unwrap(), ["cy"], "a deleted account is no admin");
+    assert_eq!(s.user_hash("bea").await.unwrap(), None);
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
 }
 
 macro_rules! suite {
@@ -683,10 +721,16 @@ async fn mem_hosts_list_only_their_own_rooms() {
     a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&MemLogStore::new()).await;
 }
 
+#[tokio::test]
+async fn mem_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+    room_admins_are_granted_once_found_by_key_and_end_with_their_account(&MemLogStore::new()).await;
+}
+
 #[cfg(feature = "pg-tests")]
 mod pg_only {
     use super::*;
     use crate::{OpenError, PgLogStore, World};
+    use sqlx::Connection as _;
 
     fn pool(connections: u32) -> config::Limits {
         config::Limits { db_pool_connections: connections, ..config::Limits::DESIGN }
@@ -698,6 +742,23 @@ mod pg_only {
         )
         .await
         .unwrap()
+    }
+
+    /// Another migrator holding sqlx's advisory lock (a second server starting, a parallel
+    /// test) makes this connect wait longer than the runtime `lock_timeout`; it must still
+    /// connect once the lock is free. Fails when the migrations run under `lock_timeout`.
+    #[tokio::test]
+    async fn a_connect_waits_for_another_migrator_past_the_runtime_lock_timeout() {
+        use sqlx::migrate::Migrate as _;
+        let url = schema().await;
+        let mut holder = sqlx::PgConnection::connect(&url).await.unwrap();
+        holder.lock().await.unwrap();
+        let limits = config::Limits { db_lock_timeout_ms: 100, ..pool(2) };
+        let mut connecting = tokio::spawn(async move { PgLogStore::connect(&url, &limits).await });
+        let waited = tokio::time::timeout(Duration::from_millis(500), &mut connecting).await;
+        assert!(waited.is_err(), "still waiting for the lock, not failed: {waited:?}");
+        holder.unlock().await.unwrap();
+        connecting.await.unwrap().expect("connected once the lock was free");
     }
 
     /// Gate G-DB: a writer stuck inside a transaction while holding the owner row lock must
@@ -740,7 +801,9 @@ mod pg_only {
         hash: &[u8],
         key: &str,
     ) -> Result<String, OpenError> {
-        s.open_room(room, "seed", 1, hash, key, World::V1(b"{}")).await.map(|o| o.key)
+        s.open_room(room, &format!("seed{}", room.0), 1, hash, key, World::V1(b"{}"))
+            .await
+            .map(|o| o.key)
     }
 
     #[tokio::test]
@@ -750,6 +813,74 @@ mod pg_only {
         open(&s, RoomId(12), &[2], "bbbbbbbbbb").await.unwrap();
         open(&s, RoomId(13), &[3], "cccccccccc").await.unwrap();
         a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&s).await;
+    }
+
+    #[tokio::test]
+    async fn pg_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+        let s = pg_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+    }
+
+    /// A store that migrated as the schema's owner (the test's own login) and runs as the
+    /// runtime role `config::DB_APP_ROLE`, made here with a login and no other right.
+    async fn restricted_store() -> PgLogStore {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+        const PASSWORD: &str = "restricted-test-only";
+        let url = schema().await;
+        let role = config::DB_APP_ROLE;
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        // Another test may make the role at the same time: the duplicate is fine.
+        let make = format!(
+            "DO $r$ BEGIN CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(make)).execute(&mut c).await.unwrap();
+        let owner = PgConnectOptions::from_str(&url).unwrap();
+        let runtime = owner.clone().username(role).password(PASSWORD);
+        PgLogStore::connect_with(runtime, Some(owner), &pool(4)).await.unwrap()
+    }
+
+    /// The runtime role does the server's normal work (rooms, accounts, admins) and cannot
+    /// change the schema or the migration history, and is no superuser. Fails if the runtime
+    /// pool logs in as the owner, or the grants cover more than data.
+    #[tokio::test]
+    async fn the_runtime_role_does_normal_work_but_cannot_change_the_schema() {
+        let s = restricted_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+        accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted(Arc::new(s)).await;
+    }
+
+    #[tokio::test]
+    async fn the_runtime_role_is_refused_every_schema_change() {
+        let s = restricted_store().await;
+        let pool = s.pool_for_tests();
+        let who: String = sqlx::query_scalar("SELECT current_user").fetch_one(pool).await.unwrap();
+        assert_eq!(who, config::DB_APP_ROLE, "the pool runs as the runtime role");
+        let superuser: bool =
+            sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(!superuser);
+        for ddl in [
+            "CREATE TABLE sneaky (a int)",
+            "DROP TABLE rooms",
+            "DROP TABLE users",
+            "ALTER TABLE users ADD COLUMN x int",
+            "TRUNCATE users",
+            "DELETE FROM _sqlx_migrations",
+            "CREATE SCHEMA sneaky",
+        ] {
+            let e = sqlx::raw_sql(ddl).execute(pool).await.expect_err(ddl);
+            let text = e.to_string();
+            assert!(
+                text.contains("permission denied") || text.contains("must be owner"),
+                "{ddl}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
