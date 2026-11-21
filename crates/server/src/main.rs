@@ -46,7 +46,14 @@ async fn serve() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match server::run(args, config::load(), secrets, generation).await {
+    let limits = match config::load() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    match server::run(args, limits, secrets, generation).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
