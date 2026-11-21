@@ -48,7 +48,7 @@ export type RoomEvent =
 /** Feed lines a page keeps. */
 export const FEED_LINES = 400;
 
-/** Archipelago item flags: bit 0 progression, bit 1 useful, bit 2 trap. */
+/** Item flags: bit 0 progression, bit 1 useful, bit 2 trap. */
 function flagOf(flags: number): ItemFlag {
   if (flags & 1) return 'progression';
   if (flags & 2) return 'useful';
