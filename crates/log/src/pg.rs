@@ -847,18 +847,27 @@ impl crate::JobStore for PgLogStore {
         .await
     }
 
-    async fn job_status(&self, id: &str) -> Result<Option<String>, StoreError> {
+    async fn job_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, core::time::Duration)>, StoreError> {
         let id = id.to_owned();
-        self.isolated(move |c| {
-            Box::pin(async move {
-                sqlx::query_scalar("SELECT status FROM world_jobs WHERE id = $1")
+        let row: Option<(String, f64)> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT status, EXTRACT(EPOCH FROM now() - updated_at)::float8 \
+                         FROM world_jobs WHERE id = $1",
+                    )
                     .bind(&id)
                     .fetch_optional(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))
+                })
             })
-        })
-        .await
+            .await?;
+        // Both times from the database's clock: never negative but for rounding.
+        Ok(row.map(|(status, ago)| (status, core::time::Duration::from_secs_f64(ago.max(0.0)))))
     }
 
     async fn job_touch(&self, id: &str) -> Result<(), StoreError> {

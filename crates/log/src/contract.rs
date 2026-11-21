@@ -493,8 +493,11 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     s.job_put(&q, JobState::Queued, "q1").await.unwrap();
     s.job_put(&r, JobState::Running, "r1").await.unwrap();
     s.job_put(&d, JobState::Done, "d1").await.unwrap();
-    assert_eq!(s.job_status(&q).await.unwrap().as_deref(), Some("q1"));
-    assert_eq!(s.job_status(&id('f')).await.unwrap(), None);
+    let status = async |id: &str| s.job_status(id).await.unwrap().map(|(status, _)| status);
+    assert_eq!(status(&q).await.as_deref(), Some("q1"));
+    let (_, ago) = s.job_status(&q).await.unwrap().unwrap();
+    assert!(ago < Duration::from_secs(60), "just written: {ago:?}");
+    assert_eq!(status(&id('f')).await, None);
     let hour = Duration::from_secs(3600);
     assert_eq!(s.job_stale(hour).await.unwrap(), [], "all just marked alive");
     let now = s.job_stale(Duration::ZERO).await.unwrap();
@@ -504,13 +507,16 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     assert!(s.job_fail_stale(&r, "r failed", Duration::ZERO).await.unwrap());
     assert!(!s.job_fail_stale(&r, "again", Duration::ZERO).await.unwrap(), "once");
     assert!(!s.job_fail_stale(&d, "done stays", Duration::ZERO).await.unwrap());
-    assert_eq!(s.job_status(&r).await.unwrap().as_deref(), Some("r failed"));
-    assert_eq!(s.job_status(&d).await.unwrap().as_deref(), Some("d1"));
+    assert_eq!(status(&r).await.as_deref(), Some("r failed"));
+    assert_eq!(status(&d).await.as_deref(), Some("d1"));
     // A put replaces the status; a touch of a finished job changes nothing.
     s.job_put(&q, JobState::Done, "q2").await.unwrap();
     s.job_touch(&q).await.unwrap();
     assert_eq!(s.job_stale(Duration::ZERO).await.unwrap(), []);
-    assert_eq!(s.job_status(&q).await.unwrap().as_deref(), Some("q2"));
+    assert_eq!(status(&q).await.as_deref(), Some("q2"));
+    // A server that comes back finishes over a sweep's failed.
+    s.job_put(&r, JobState::Done, "r done").await.unwrap();
+    assert_eq!(status(&r).await.as_deref(), Some("r done"));
 }
 
 macro_rules! suite {

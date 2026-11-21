@@ -407,9 +407,10 @@ impl crate::JobStore for MemLogStore {
     fn job_status(
         &self,
         id: &str,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+    ) -> impl Future<Output = Result<Option<(String, core::time::Duration)>, StoreError>> + Send
+    {
         let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-        ready(Ok(jobs.get(id).map(|j| j.1.clone())))
+        ready(Ok(jobs.get(id).map(|j| (j.1.clone(), j.2.elapsed()))))
     }
 
     fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send {

@@ -394,6 +394,8 @@ impl JobState {
 /// marked alive by the process running them; one that stops being marked is stale.
 pub trait JobStore: Send + Sync + 'static {
     /// Write job `id`'s status (JSON text, opaque to the store) and state, marking it alive.
+    /// It replaces whatever is stored, a sweep's `failed` too: a server that lost the store
+    /// for a while and then finished its job writes how the job really ended.
     ///
     /// # Errors
     /// The store failing.
@@ -404,14 +406,14 @@ pub trait JobStore: Send + Sync + 'static {
         status: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Job `id`'s status.
+    /// Job `id`'s status, and how long ago it was last marked alive (or written).
     ///
     /// # Errors
     /// The store failing.
     fn job_status(
         &self,
         id: &str,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<(String, Duration)>, StoreError>> + Send;
 
     /// Mark job `id` alive, while it is queued or running.
     ///

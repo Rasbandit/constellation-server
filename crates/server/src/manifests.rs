@@ -78,7 +78,10 @@ impl Db {
         }
     }
 
-    pub(crate) async fn job_status(&self, id: &str) -> Result<Option<String>, StoreError> {
+    pub(crate) async fn job_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Duration)>, StoreError> {
         match self {
             Self::Pg(s) => s.job_status(id).await,
             Self::Mem(s) => s.job_status(id).await,

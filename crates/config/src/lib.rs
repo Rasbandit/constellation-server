@@ -206,9 +206,18 @@ pub struct Limits {
     /// server instance can tell it from one whose process stopped (#119; a cost trade, not a
     /// design value).
     pub gen_heartbeat_secs: u64,
-    /// A queued or running generation not marked alive for this long is failed: its process
-    /// stopped. Several heartbeats, so one slow write never fails a live job.
+    /// A queued or running generation not marked alive for this long reads as `stalled`: its
+    /// server stopped, or lost the store for a while and may come back. Several heartbeats, so
+    /// one slow write never shows a live job as stalled.
     pub gen_stale_secs: u64,
+    /// A generation not marked alive for this long is failed by any instance's sweep: its
+    /// server is gone. Longer than the default `gen_timeout_ms`, past which a live server ends
+    /// its own generation anyway (a cost trade, not a design value). A server that does come
+    /// back still writes how its job really ended.
+    pub gen_lost_secs: u64,
+    /// Most files a job folder's log line names (a removed folder, or one a stopped server
+    /// left); past it the line says how many more (a cost trade: log line length).
+    pub job_log_files_max: usize,
     /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
     /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
     pub gen_memory_bytes: u64,
@@ -356,6 +365,8 @@ impl Limits {
         gen_timeout_ms: 15 * 60 * 1000,
         gen_heartbeat_secs: 15,
         gen_stale_secs: 60,
+        gen_lost_secs: 20 * 60,
+        job_log_files_max: 32,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
         gen_error_max_bytes: 16 * 1024,
         gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
@@ -883,6 +894,8 @@ mod tests {
         assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
         assert_eq!((l.gen_heartbeat_secs, l.gen_stale_secs), (15, 60));
         assert!(l.gen_stale_secs >= 3 * l.gen_heartbeat_secs, "several beats before stale");
+        assert_eq!((l.gen_lost_secs, l.job_log_files_max), (1200, 32));
+        assert!(l.gen_lost_secs * 1000 > l.gen_timeout_ms, "a live server ends its job first");
     }
 
     #[test]

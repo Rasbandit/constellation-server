@@ -359,7 +359,7 @@ impl Host {
         } else {
             tracing::warn!(
                 "log store: IN MEMORY, no CONSTELLATION_DATABASE_URL; a restart loses the rooms \
-                 and draws new room keys"
+                 (and draws new room keys) and the admin API's uploads and world statuses"
             );
             Store::Mem { log: Arc::new(MemLogStore::new()), finished: BTreeSet::new() }
         };
