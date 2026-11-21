@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BIN: &str = env!("CARGO_BIN_EXE_constellation-server");
-/// A secret in the server's environment that the sandbox must never show the sidecar.
+/// A value in the server's environment that the sandbox must never show the sidecar. It is a
+/// variable of no meaning to the server, so it changes nothing about the rooms (a room password
+/// would).
 const SECRET: &str = "test-room-password-test-room-pw";
 
 /// The seed name of every world the fake sidecar generates.
@@ -48,7 +50,7 @@ impl Setup {
             serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
         bundle["seed_name"] = json!(GENERATED);
         std::fs::write(tools.join("bundle.json"), bundle.to_string()).unwrap();
-        // What the fake sidecar must not see: the room password (in the server's environment) and
+        // What the fake sidecar must not see: the probe value (in the server's environment) and
         // host folders.
         let hidden: Vec<String> = ["data", "ap", "tools", ""]
             .iter()
@@ -62,7 +64,7 @@ impl Setup {
     fn env(&self) -> Vec<(String, String)> {
         let p = |s: &str| self.root.join(s).display().to_string();
         vec![
-            ("CONSTELLATION_ROOM_PASSWORD".into(), SECRET.into()),
+            ("CONSTELLATION_HOST_SECRET_PROBE".into(), SECRET.into()),
             ("CONSTELLATION_AP_DIR".into(), p("ap")),
             ("CONSTELLATION_AP_PYTHON".into(), "/usr/bin/python3".into()),
             ("CONSTELLATION_AP_GEN_SCRIPT".into(), p("tools/fake/ap_gen.py")),

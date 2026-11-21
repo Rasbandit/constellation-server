@@ -606,7 +606,7 @@ async fn accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted<S: S
 async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(s: &S) {
     let room = |n: u8| crate::OwnedRoom {
         world_id: Some(format!("w{n}")),
-        seed_name: format!("seed{n}"),
+        seed_name: format!("seed{}", 10 + n),
         room_key: format!("key{n}"),
         owner: None,
         age_secs: 0,
@@ -615,7 +615,7 @@ async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(
     s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
     s.room_claim(RoomId(11), Some("pw:b"), &room(1)).await.unwrap();
     let mine = s.rooms_owned(Some("pw:a")).await.unwrap();
-    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed1"]);
+    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed11"]);
     assert_eq!(mine[0].owner.as_deref(), Some("pw:a"), "an owner is kept");
     assert!(s.rooms_owned(Some("pw:nobody")).await.unwrap().is_empty());
     s.room_claim(RoomId(13), None, &room(3)).await.unwrap();
@@ -784,7 +784,9 @@ mod pg_only {
         hash: &[u8],
         key: &str,
     ) -> Result<String, OpenError> {
-        s.open_room(room, "seed", 1, hash, key, World::V1(b"{}")).await.map(|o| o.key)
+        s.open_room(room, &format!("seed{}", room.0), 1, hash, key, World::V1(b"{}"))
+            .await
+            .map(|o| o.key)
     }
 
     #[tokio::test]
