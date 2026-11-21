@@ -719,6 +719,31 @@ impl crate::ManifestStore for PgLogStore {
     }
 }
 
+#[cfg(all(test, feature = "pg-tests"))]
+impl PgLogStore {
+    /// Change an upload's file without its id, as a torn row is.
+    pub(crate) async fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
+        let (kind, id) = (kind, id.to_vec());
+        let done = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "UPDATE world_uploads SET bytes = bytes || '\\x00'::bytea \
+                         WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await;
+        done.unwrap();
+    }
+}
+
 /// Uploads in the `world_uploads` table (migration 0005).
 impl crate::UploadStore for PgLogStore {
     async fn upload_put(&self, r: &crate::UploadRecord, bytes: &[u8]) -> Result<(), StoreError> {
@@ -946,8 +971,7 @@ impl crate::JobStore for PgLogStore {
                     sqlx::query_scalar(
                         // A status that is not a JSON object is replaced, as the memory store does.
                         "UPDATE world_jobs SET state = 'failed', updated_at = now(), \
-                         status = ((CASE WHEN status ~ '^\\s*\\{' THEN status::jsonb \
-                                    ELSE '{}'::jsonb END) \
+                         status = (world_jobs_status_object(status) \
                                    || jsonb_build_object('status', 'failed', 'error', $2::text))::text \
                          WHERE state IN ('queued', 'running') \
                          AND updated_at <= now() - make_interval(secs => $1) RETURNING id",

@@ -490,11 +490,22 @@ pub(crate) fn checked_upload(
     }
 }
 
+fn has_nul(v: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Object, String};
+    match v {
+        String(s) => s.contains('\0'),
+        Array(a) => a.iter().any(has_nul),
+        Object(m) => m.iter().any(|(k, v)| k.contains('\0') || has_nul(v)),
+        _ => false,
+    }
+}
+
 /// `status` (a job's JSON text) as failed with `error`; text that is not a JSON object is
 /// replaced by one holding only those two fields.
 pub(crate) fn failed_status(status: &str, error: &str) -> String {
     let mut v: serde_json::Value = serde_json::from_str(status).unwrap_or_default();
-    if !v.is_object() {
+    // Postgres's jsonb refuses a NUL, so such text is replaced there; the same here.
+    if !v.is_object() || has_nul(&v) {
         v = serde_json::json!({});
     }
     v["status"] = serde_json::json!(JobState::Failed.as_str());

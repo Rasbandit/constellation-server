@@ -20,11 +20,26 @@ const R: RoomId = RoomId(1);
 /// A store plus the directory's claim, which is not part of the trait.
 trait Store: LogStore + BlobStore + ManifestStore + UploadStore + JobStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
+    /// Change a stored upload's file without its id: a torn row.
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 impl Store for MemLogStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send {
         std::future::ready(self.claim(room))
+    }
+
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send {
+        self.tear_upload_for_tests(kind, id);
+        std::future::ready(())
     }
 }
 
@@ -32,6 +47,10 @@ impl Store for MemLogStore {
 impl Store for crate::PgLogStore {
     async fn bump(&self, room: RoomId) -> Epoch {
         self.claim(room).await.unwrap()
+    }
+
+    async fn tear_for_tests(&self, kind: UploadKind, id: &crate::BlobKey) {
+        self.tear_upload_for_tests(kind, id).await;
     }
 }
 
@@ -481,6 +500,11 @@ async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>
     assert_eq!(s.upload_bytes(UploadKind::Apworld, &blob_key(b"none")).await.unwrap(), None);
     // Whole when stored; a missing one, or one of the other kind, is not.
     assert!(s.upload_intact(k, &id).await.unwrap());
+    // A torn row (tampered bytes) is not intact on either store.
+    s.tear_for_tests(k, &id).await;
+    assert!(!s.upload_intact(k, &id).await.unwrap(), "torn");
+    s.upload_put(&worlds[0], &bodies[0]).await.unwrap();
+    assert!(s.upload_intact(k, &id).await.unwrap(), "healed");
     assert!(!s.upload_intact(UploadKind::Apworld, &blob_key(b"none")).await.unwrap());
     assert!(!s.upload_intact(UploadKind::Yaml, &worlds[1].id).await.unwrap());
     let mut want = worlds;
@@ -524,6 +548,19 @@ async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc
     assert_eq!(json(&j1).await, failed);
     assert_eq!(json(&j2).await, serde_json::json!({"status": "failed", "error": "lost"}));
     assert!(s.job_fail_all_stale(Duration::ZERO, "again").await.unwrap().is_empty(), "once");
+    // Text that is not a JSON object never aborts the sweep: it is replaced, the rest fail.
+    let bad = ["{broken", r#"{"a": "\u0000"}"#, "[1]"];
+    let ids: Vec<String> = ('1'..='4').map(id).collect();
+    for (i, text) in bad.iter().chain(&[r#"{"ok": 1}"#]).enumerate() {
+        s.job_put(&ids[i], JobState::Running, text).await.unwrap();
+    }
+    let all = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(all, ids, "every one failed, none aborted the sweep");
+    let bare = serde_json::json!({"status": "failed", "error": "lost"});
+    for i in 0..3 {
+        assert_eq!(json(&ids[i]).await, bare, "{}", bad[i]);
+    }
+    assert_eq!(json(&ids[3]).await["ok"], 1);
     // A put replaces the status; a touch of a finished job changes nothing.
     s.job_put(&q, JobState::Done, "q2").await.unwrap();
     s.job_touch(&q).await.unwrap();

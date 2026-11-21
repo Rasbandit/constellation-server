@@ -10,7 +10,7 @@
 -- unfinished jobs.
 --
 -- Additive only. Dropping the table loses the statuses:
--- DROP TABLE world_jobs; DELETE FROM _sqlx_migrations WHERE version = 6;
+-- DROP TABLE world_jobs; DROP FUNCTION world_jobs_status_object(text); DELETE FROM _sqlx_migrations WHERE version = 6;
 CREATE TABLE world_jobs (
     id         text PRIMARY KEY CHECK (id ~ '^[0-9a-f]{64}$'),
     state      text NOT NULL CHECK (state IN ('queued', 'running', 'done', 'failed')),
@@ -21,3 +21,17 @@ CREATE TABLE world_jobs (
 
 CREATE INDEX world_jobs_unfinished_idx ON world_jobs (updated_at)
     WHERE state IN ('queued', 'running');
+
+-- A status as a JSON object, or {} for text that is not one (not JSON, or holding a \u0000
+-- escape, which jsonb refuses): the sweep that fails lost jobs must never abort on one bad row.
+CREATE FUNCTION world_jobs_status_object(t text) RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF jsonb_typeof(t::jsonb) = 'object' THEN
+        RETURN t::jsonb;
+    END IF;
+    RETURN '{}'::jsonb;
+EXCEPTION WHEN OTHERS THEN
+    RETURN '{}'::jsonb;
+END
+$$;
