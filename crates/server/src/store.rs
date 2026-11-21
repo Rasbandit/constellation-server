@@ -181,6 +181,11 @@ impl Db {
         on!(self, s => s.rooms_owned(owner).await)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn user_delete(&self, name: &str) -> Result<(), StoreError> {
+        on!(self, s => s.user_delete(name).await)
+    }
+
     pub(crate) async fn room_by_key(&self, key: &str) -> Result<Option<OwnedRoom>, StoreError> {
         on!(self, s => s.room_by_key(key).await)
     }

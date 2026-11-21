@@ -100,6 +100,9 @@ pub struct Limits {
     /// Room view streams (admin API, server-sent events) open at once per process; more get
     /// HTTP 503.
     pub view_streams: usize,
+    /// How often an open room view stream checks that its account still has a role on the room
+    /// (a removed admin or deleted account loses the stream within this long; design value).
+    pub view_access_recheck_ms: u64,
     /// A socket that has not connected to a slot within this long is closed
     /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
     pub connect_timeout_ms: u64,
@@ -341,6 +344,7 @@ impl Limits {
         max_connections: 10_000,
         view_history_events: 400,
         view_streams: 64,
+        view_access_recheck_ms: 5000,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
