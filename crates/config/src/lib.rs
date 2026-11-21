@@ -154,11 +154,6 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
-    /// Wrong admin tokens one client address may send in a burst; more get HTTP 429 until the
-    /// bucket refills (design value). A right token is never counted.
-    pub admin_auth_fail_burst: u32,
-    /// Refill of that bucket, thousandths per second (100 = one every 10 s).
-    pub admin_auth_fail_refill_milli_per_sec: u32,
     /// Shortest account password, in characters (design value; NIST SP 800-63B says at least 8).
     pub password_min_chars: usize,
     /// Longest account password, in bytes: argon2 hashes all of it, so it is capped (design value).
@@ -274,10 +269,6 @@ pub struct Limits {
     pub gen_cgroup_tasks: u64,
 }
 
-/// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
-/// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
-pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
-
 /// Deepest rule nesting a world's rules section may hold, counting every node and every def a
 /// rule reaches through `ref`: the loader rejects deeper rules, so the recursive evaluators
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
@@ -371,8 +362,6 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
-        admin_auth_fail_burst: 5,
-        admin_auth_fail_refill_milli_per_sec: 100,
         password_min_chars: 10,
         password_max_bytes: 256,
         account_name_min_chars: 3,
@@ -519,9 +508,6 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
-    /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
-    pub admin_token: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -529,12 +515,7 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        let admin = self.admin_token.as_ref().map(|_| "<redacted>");
-        f.debug_struct("Secrets")
-            .field("room_password", &pw)
-            .field("database_url", &db)
-            .field("admin_token", &admin)
-            .finish()
+        f.debug_struct("Secrets").field("room_password", &pw).field("database_url", &db).finish()
     }
 }
 
@@ -581,18 +562,7 @@ fn secrets_from(
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
-        admin_token: admin_token(var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?)?,
     })
-}
-
-#[cfg(feature = "std")]
-fn admin_token(token: Option<String>) -> Result<Option<String>, String> {
-    match token {
-        Some(t) if t.len() < ADMIN_TOKEN_MIN_BYTES => Err(format!(
-            "CONSTELLATION_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_BYTES} bytes (not shown)"
-        )),
-        t => Ok(t),
-    }
 }
 
 /// Where seed generation finds Archipelago and our sidecar. All three are needed for the
@@ -617,11 +587,8 @@ pub struct Generation {
 
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
 #[cfg(feature = "std")]
-const SECRET_FILE_VARS: [&str; 3] = [
-    "CONSTELLATION_ROOM_PASSWORD_FILE",
-    "CONSTELLATION_DATABASE_URL_FILE",
-    "CONSTELLATION_ADMIN_TOKEN_FILE",
-];
+const SECRET_FILE_VARS: [&str; 2] =
+    ["CONSTELLATION_ROOM_PASSWORD_FILE", "CONSTELLATION_DATABASE_URL_FILE"];
 
 /// Read [`Generation`] from the environment: `None` when none of its variables is set.
 ///
@@ -992,31 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_token_comes_from_the_variable_or_a_file_and_prints_redacted() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
-        };
-        const T32: &str = "t0ken-t0ken-t0ken-t0ken-t0ken-32";
-        let file = |_: &std::path::Path| Ok("t0ken-from-file-t0ken-from-file-\n".to_owned());
-        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", T32)]), file).unwrap();
-        assert_eq!(direct.admin_token.as_deref(), Some(T32));
-        assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
-        let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
-        assert_eq!(
-            from_file.unwrap().admin_token.as_deref(),
-            Some("t0ken-from-file-t0ken-from-file-")
-        );
-        const T31: &[(&str, &str)] = &[("CONSTELLATION_ADMIN_TOKEN", T32.split_at(1).1)];
-        let short = secrets_from(env(T31), file);
-        let e = short.unwrap_err();
-        assert!(e.contains("shorter than 32") && !e.contains("t0ken"), "{e}");
-        let both: &'static [(&str, &str)] =
-            &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
-        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
-        assert_eq!(secrets_from(env(&[]), file).unwrap().admin_token, None);
-    }
-
-    #[test]
     fn generation_paths_come_from_the_environment_and_are_all_or_nothing() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
@@ -1037,7 +979,7 @@ mod tests {
             ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
             ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
             ("HOME", "/home/u"),
-            ("CONSTELLATION_ADMIN_TOKEN_FILE", "/etc/c/token"),
+            ("CONSTELLATION_ROOM_PASSWORD_FILE", "/etc/c/token"),
             ("CONSTELLATION_DATABASE_URL_FILE", "/etc/c/db"),
         ];
         let g = generation_from(env(with_private)).unwrap().unwrap();
