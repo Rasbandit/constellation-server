@@ -152,6 +152,41 @@ fn decode(seq: i64, body: &[u8]) -> Result<Event, StoreError> {
     }
 }
 
+/// The warning for a runtime connection that holds more than data rights: logged in as the
+/// table owner (`config::DB_MIGRATE_ROLE`) or as a superuser. None when it is fine.
+fn privilege_warning(user: &str, superuser: bool) -> Option<String> {
+    let why = if superuser {
+        format!("a superuser ({user})")
+    } else if user == config::DB_MIGRATE_ROLE {
+        format!("the table owner ({user})")
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the server runs as {why}, so a bug or injection could change the schema; point \
+         CONSTELLATION_DATABASE_URL at the {} role (see docs/container.md)",
+        config::DB_APP_ROLE
+    ))
+}
+
+/// Warn when the runtime pool is more privileged than it needs to be (not an error: a
+/// deployment from before the role split must still start).
+async fn warn_if_privileged(pool: &PgPool) {
+    let row: Result<(String, bool), _> = sqlx::query_as(
+        "SELECT current_user::text, COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)",
+    )
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok((user, superuser)) => {
+            if let Some(w) = privilege_warning(&user, superuser) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not check the runtime database role"),
+    }
+}
+
 /// After the migrations, as the table owner: give [`config::DB_APP_ROLE`] SELECT, INSERT, UPDATE
 /// and DELETE on every table of the schema and USAGE on its sequences, and the same on tables
 /// the owner makes later (default privileges). It never gets CREATE, DDL or the migration
@@ -251,7 +286,9 @@ impl PgLogStore {
             let p = pool(runtime, limits.db_pool_connections)
                 .await
                 .map_err(|e| db::<StoreError>(&e))?;
-            return Ok(Self { pool: migrate_on(p).await? });
+            let p = migrate_on(p).await?;
+            warn_if_privileged(&p).await;
+            return Ok(Self { pool: p });
         };
         let owner_pool = pool(owner, 1).await.map_err(|e| db::<StoreError>(&e))?;
         let owner_pool = migrate_on(owner_pool).await?;
@@ -260,6 +297,7 @@ impl PgLogStore {
         tracing::info!("migrated as the migration role; running as the runtime role");
         let pool =
             pool(runtime, limits.db_pool_connections).await.map_err(|e| db::<StoreError>(&e))?;
+        warn_if_privileged(&pool).await;
         Ok(Self { pool })
     }
 
@@ -1326,6 +1364,19 @@ pub mod testing {
         let sep = if url.contains('?') { '&' } else { '?' };
         Ok(format!("{url}{sep}options[search_path]={schema}"))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_runtime_connection_with_more_than_data_rights_is_warned_about() {
+    let owner = privilege_warning(config::DB_MIGRATE_ROLE, false).unwrap();
+    assert!(
+        owner.contains("table owner") && owner.contains("CONSTELLATION_DATABASE_URL"),
+        "{owner}"
+    );
+    let root = privilege_warning("postgres", true).unwrap();
+    assert!(root.contains("superuser") && root.contains(config::DB_APP_ROLE), "{root}");
+    assert_eq!(privilege_warning(config::DB_APP_ROLE, false), None);
 }
 
 /// The nightly workflow excludes `fence`'s `&&` to `||` mutant by name (equivalent, see the

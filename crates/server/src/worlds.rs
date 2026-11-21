@@ -2745,36 +2745,106 @@ mod tests {
         ("/api/worlds/{id}/room/events", &["GET"], Class::Scoped),
         ("/api/rooms/{key}/admins", &["GET", "POST"], Class::Scoped),
         ("/api/rooms/{key}/admins/{name}", &["PUT", "DELETE"], Class::Scoped),
-        ("/api", &["GET"], Class::CatchAll),
-        ("/api/", &["GET"], Class::CatchAll),
-        ("/api/{*rest}", &["GET"], Class::CatchAll),
+        ("/api", &["ANY"], Class::CatchAll),
+        ("/api/", &["ANY"], Class::CatchAll),
+        ("/api/{*rest}", &["ANY"], Class::CatchAll),
     ];
 
-    /// The paths the router code registers, read from the source of the three modules that
-    /// register them (test code cut off), so a new `.route(` cannot be forgotten.
-    fn registered_paths() -> Vec<String> {
+    /// Every `.rs` file under `dir`, with its non-test code (the tests module cut off).
+    fn source_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                source_files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                let src = std::fs::read_to_string(&path).unwrap();
+                let code = src.split("\n#[cfg(test)]\nmod tests").next().unwrap().to_owned();
+                out.push((path, code));
+            }
+        }
+    }
+
+    /// The HTTP methods named in `seg` (the text of one `.route(..)` call after its path):
+    /// each `get(`, `post(`, ... is one; `any(` is every method.
+    fn methods_in(seg: &str) -> Vec<String> {
         let mut found = Vec::new();
-        for src in
-            [include_str!("worlds.rs"), include_str!("room_admins.rs"), include_str!("accounts.rs")]
-        {
-            let code = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        for (at, _) in seg.match_indices('(') {
+            let word: String = seg[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if ["get", "post", "put", "delete", "patch", "head", "options", "any"]
+                .contains(&word.as_str())
+            {
+                found.push(word.to_ascii_uppercase());
+            }
+        }
+        found
+    }
+
+    /// Every `(METHOD, path)` under `/api` that any non-test code of this crate registers, read
+    /// from all of `crates/server/src` so a route in a new module cannot be missed. A `.nest(`,
+    /// `.route_service(` or `.nest_service(` of an `/api` path cannot be read this way and fails.
+    fn registered_routes() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        source_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut found = Vec::new();
+        for (file, code) in &files {
+            for call in [".nest(", ".route_service(", ".nest_service("] {
+                for part in code.split(call).skip(1) {
+                    let path = part.trim_start().trim_start_matches('"');
+                    assert!(
+                        !path.starts_with("/api"),
+                        "{} registers an /api path with {call}: classify it by hand",
+                        file.display()
+                    );
+                }
+            }
             for part in code.split(".route(").skip(1) {
-                let lit = part.trim_start().strip_prefix('"').expect("a literal path");
-                found.push(lit.split('"').next().unwrap().to_owned());
+                let Some(lit) = part.trim_start().strip_prefix('"') else { continue };
+                let (path, rest) = lit.split_once('"').unwrap();
+                if !path.starts_with("/api") {
+                    continue;
+                }
+                let mut depth = 1_usize;
+                let end = rest
+                    .char_indices()
+                    .find(|(_, c)| {
+                        depth = match c {
+                            '(' => depth + 1,
+                            ')' => depth - 1,
+                            _ => depth,
+                        };
+                        depth == 0
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                for m in methods_in(&rest[..end]) {
+                    found.push((m, path.to_owned()));
+                }
             }
         }
         found.sort();
+        found.dedup();
         found
     }
 
     #[test]
     fn no_route_escapes_the_cross_account_walk() {
-        let mut table: Vec<String> = ROUTES.iter().map(|(p, ..)| (*p).to_owned()).collect();
+        let mut table: Vec<(String, String)> = ROUTES
+            .iter()
+            .flat_map(|(p, methods, _)| {
+                methods.iter().map(move |m| ((*m).to_owned(), (*p).to_owned()))
+            })
+            .collect();
         table.sort();
         assert_eq!(
-            registered_paths(),
+            registered_routes(),
             table,
-            "classify every route in ROUTES (and drop gone ones)"
+            "classify every (method, path) in ROUTES, and drop gone ones"
         );
     }
 
@@ -2789,28 +2859,31 @@ mod tests {
         let a_admins = admins_of(&app, &key, &ann).await;
         let a_world = json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await;
         for (template, methods, class) in ROUTES.iter().filter(|r| r.2 != Class::Public) {
-            let path =
-                template.replace("{id}", &id).replace("{key}", &key).replace("{name}", "ann");
-            for method in *methods {
-                let r = call(&app, method, &path, &bob, "{\"username\":\"bob\"}").await;
-                let status = r.status();
-                let body = String::from_utf8_lossy(
-                    &axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap(),
-                )
-                .into_owned();
-                let what = format!("{method} {path} ({class:?}): {status} {body}");
-                match class {
-                    Class::Scoped => assert_eq!(status, StatusCode::NOT_FOUND, "{what}"),
-                    Class::Own => {
-                        assert!(status != StatusCode::OK || !body.contains(&key), "{what}");
-                        assert!(!body.contains(&id), "{what}");
+            // `{name}` is the owner, and B himself (B tries to make himself an admin).
+            for name in ["ann", "bob"] {
+                let path =
+                    template.replace("{id}", &id).replace("{key}", &key).replace("{name}", name);
+                for method in *methods {
+                    let method = if *method == "ANY" { "GET" } else { method };
+                    let r = call(&app, method, &path, &bob, "{\"username\":\"bob\"}").await;
+                    let status = r.status();
+                    let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    let body = String::from_utf8_lossy(&bytes).into_owned();
+                    let what = format!("{method} {path} ({class:?}): {status} {body}");
+                    match class {
+                        Class::Scoped | Class::CatchAll => {
+                            assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
+                        }
+                        Class::Own => {
+                            assert!(status != StatusCode::OK || !body.contains(&key), "{what}");
+                            assert!(!body.contains(&id), "{what}");
+                        }
+                        // Uploads are global until #127. Open routes are skipped above (B's
+                        // own logout would end B's session).
+                        Class::Global | Class::Public => {}
                     }
-                    Class::CatchAll => assert_eq!(status, StatusCode::NOT_FOUND, "{what}"),
-                    // Uploads are global until #127. Open routes are skipped above (B's own
-                    // logout would end B's session).
-                    Class::Global | Class::Public => {}
+                    assert!(!body.contains("pw:ann"), "A's account id leaked: {what}");
                 }
-                assert!(!body.contains("pw:ann"), "A's account id leaked: {what}");
             }
         }
         // B's own list has none of A's rooms, and nothing B did changed A's.

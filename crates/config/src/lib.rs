@@ -607,7 +607,7 @@ pub struct Generation {
 /// The Postgres role the server runs as: SELECT, INSERT, UPDATE and DELETE on our tables and
 /// USAGE on their sequences, nothing else (no CREATE, no DDL, no superuser). The migrations run
 /// as [`DB_MIGRATE_ROLE`] (`CONSTELLATION_MIGRATE_DATABASE_URL`), which owns the tables and
-/// grants this role its rights after each migration. `docker/postgres-init.sh` creates both.
+/// grants this role its rights after each migration. `docker/db-roles.sh` creates both.
 pub const DB_APP_ROLE: &str = "constellation_app";
 
 /// The Postgres role that owns the tables and runs the migrations (see [`DB_APP_ROLE`]).
@@ -768,17 +768,17 @@ mod tests {
         assert!(empty.unwrap_err().contains("empty"));
     }
 
-    /// The role names live here; the init script and the compose files (which cannot import a
+    /// The role names live here; the roles script and the compose files (which cannot import a
     /// constant) must spell them the same.
     #[test]
-    fn the_init_script_and_compose_use_the_role_names_from_here() {
+    fn the_roles_script_and_compose_use_the_role_names_from_here() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
-        let init = read("docker/postgres-init.sh");
+        let init = read("docker/db-roles.sh");
         for role in [DB_APP_ROLE, DB_MIGRATE_ROLE] {
             assert!(
                 init.contains(&format!("CREATE ROLE {role} LOGIN")),
-                "{role} in the init script"
+                "{role} in the roles script"
             );
         }
         let env_example = read(".env.example");

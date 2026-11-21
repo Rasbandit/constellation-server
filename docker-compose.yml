@@ -12,6 +12,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
     command:
       - --host
       - 0.0.0.0
@@ -53,16 +55,26 @@ services:
       POSTGRES_DB: constellation
       PGDATA: /var/lib/postgresql/18/docker
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-    secrets: [postgres_password, app_password, migrate_password]
+    secrets: [postgres_password]
     volumes:
       - pgdata:/var/lib/postgresql
-      # Makes the migration and runtime roles on first start (docs/container.md).
-      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U constellation -d constellation"]
       interval: 5s
       timeout: 3s
       retries: 10
+  # One-shot: makes the migration and runtime roles (docs/container.md). Runs as root, so
+  # secret files of mode 600 are readable; safe to run on every start.
+  db-roles:
+    image: postgres:18
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "/db-roles.sh"]
+    secrets: [postgres_password, app_password, migrate_password]
+    volumes:
+      - ./docker/db-roles.sh:/db-roles.sh:ro
 volumes:
   data:
   pgdata:
