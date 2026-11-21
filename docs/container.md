@@ -6,11 +6,15 @@ The image holds the room server, the web UI and the upload and generation API. R
 cp .env.example .env   # set GEN_REPO_URL and GEN_REPO_REF too (see Building)
 mkdir -p secrets
 openssl rand -hex 24 > secrets/postgres_password
-printf 'postgres://constellation:%s@postgres/constellation' "$(cat secrets/postgres_password)" > secrets/database_url
-chmod 400 secrets/database_url && sudo chown 10001 secrets/database_url
-docker compose up -d   # admin API open, see "The admin API on the same port"
+openssl rand -hex 24 > secrets/app_password
+openssl rand -hex 24 > secrets/migrate_password
+printf 'postgres://constellation_app:%s@postgres/constellation' "$(cat secrets/app_password)" > secrets/database_url
+printf 'postgres://constellation_migrate:%s@postgres/constellation' "$(cat secrets/migrate_password)" > secrets/migrate_database_url
+chmod 400 secrets/database_url secrets/migrate_database_url && sudo chown 10001 secrets/database_url secrets/migrate_database_url
+docker compose up -d   # sign-up is open, see "The world API on the same port"
 ```
 
+- **Database roles (least privilege).** The server never logs in as a Postgres superuser. `docker/postgres-init.sh` runs once, when Postgres first makes its data folder, and creates `constellation_migrate` (owns the database and its tables; runs the migrations) and `constellation_app` (the runtime role). After each migration the server grants `constellation_app` SELECT, INSERT, UPDATE and DELETE on the tables and USAGE on the sequences, plus the same on tables later migrations make (default privileges); it never gets CREATE, DDL, the right to touch `_sqlx_migrations`, or superuser. `postgres_password` is the bootstrap superuser, used only by that script and the health check. The names are `DB_MIGRATE_ROLE` and `DB_APP_ROLE` in `crates/config`. The migration URL is `CONSTELLATION_MIGRATE_DATABASE_URL` (or `_FILE`); if it is unset the server migrates as the runtime role and logs a warning, so a deployment from before the split keeps working but has not gained the protection. The init script does not run on an existing data folder: to move one over, create the roles and `ALTER ... OWNER` the tables yourself (see the PR that introduced this) or start from an empty volume.
 - Secrets are files mounted as Docker secrets; the server reads the database URL from `CONSTELLATION_DATABASE_URL_FILE`. The server runs as uid 10001 and the mount keeps the host file's owner and mode, so `database_url` must be readable by that uid: the `chmod 400` and `chown 10001` above keep it private to it, (the Postgres entrypoint reads its password file as root, so `postgres_password` can stay `600`).
 - Seed bundles (`*.json`) go in `/data/rooms` on the `data` volume, for example `docker compose cp seed.json server:/data/rooms/` (the server lists the folder, no restart needed for a new room) or a bind mount over `/data/rooms`. Each room logs `room ready key=<key>`.
 - Postgres 18: the volume is mounted at `/var/lib/postgresql` with `PGDATA=/var/lib/postgresql/18/docker`, the layout the official image has used since 18.

@@ -26,10 +26,12 @@ services:
       - --public-host
       - ${CONSTELLATION_PUBLIC_HOST:-localhost}
     environment:
+      # The server runs as the runtime role; the migrations run as the table owner.
       CONSTELLATION_DATABASE_URL_FILE: /run/secrets/database_url
+      CONSTELLATION_MIGRATE_DATABASE_URL_FILE: /run/secrets/migrate_database_url
       # No per-job cgroup in a container: the limits below bound uploaded code instead (README).
       CONSTELLATION_SANDBOX_MODE: container
-    secrets: [database_url]
+    secrets: [database_url, migrate_database_url]
     mem_limit: 6g
     memswap_limit: 6g # no swap beyond mem_limit
     pids_limit: 512
@@ -51,9 +53,11 @@ services:
       POSTGRES_DB: constellation
       PGDATA: /var/lib/postgresql/18/docker
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-    secrets: [postgres_password]
+    secrets: [postgres_password, app_password, migrate_password]
     volumes:
       - pgdata:/var/lib/postgresql
+      # Makes the migration and runtime roles on first start (docs/container.md).
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U constellation -d constellation"]
       interval: 5s
@@ -65,5 +69,11 @@ volumes:
 secrets:
   database_url:
     file: ${CONSTELLATION_DATABASE_URL_FILE:-./secrets/database_url}
+  migrate_database_url:
+    file: ${CONSTELLATION_MIGRATE_DATABASE_URL_FILE:-./secrets/migrate_database_url}
   postgres_password:
     file: ${POSTGRES_PASSWORD_FILE:-./secrets/postgres_password}
+  app_password:
+    file: ${POSTGRES_APP_PASSWORD_FILE:-./secrets/app_password}
+  migrate_password:
+    file: ${POSTGRES_MIGRATE_PASSWORD_FILE:-./secrets/migrate_password}

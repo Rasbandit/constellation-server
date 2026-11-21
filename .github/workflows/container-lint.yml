@@ -20,5 +20,5 @@ jobs:
       - run: sh docker/test-entrypoint.sh
       # The secret files only need to exist for the config check.
       - run: |
-          mkdir secrets && touch secrets/database_url secrets/postgres_password
+          mkdir secrets && touch secrets/database_url secrets/migrate_database_url secrets/postgres_password secrets/app_password secrets/migrate_password
           GEN_REPO_URL=x GEN_REPO_REF=x docker compose config -q

@@ -44,9 +44,12 @@ jobs:
       - run: |
           mkdir secrets
           echo ci-password > secrets/postgres_password
-          echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
-          chmod 400 secrets/database_url
-          sudo chown 10001 secrets/database_url
+          echo ci-app-password > secrets/app_password
+          echo ci-migrate-password > secrets/migrate_password
+          echo 'postgres://constellation_app:ci-app-password@postgres/constellation' > secrets/database_url
+          echo 'postgres://constellation_migrate:ci-migrate-password@postgres/constellation' > secrets/migrate_database_url
+          chmod 400 secrets/database_url secrets/migrate_database_url
+          sudo chown 10001 secrets/database_url secrets/migrate_database_url
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
       # /api needs a session: 401 without one. Sign up, then a yaml upload runs the sandbox
       # (bubblewrap under the seccomp profile) and must land in the store (a 201 with its id).
@@ -61,6 +64,11 @@ jobs:
           code=$(curl -s -b jar -X PUT -o up.out -w '%{http_code}' --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
           cat up.out; echo " (HTTP $code)"
           test "$code" = 201
+      # The server runs as the runtime role: connected as it, and that role cannot change the schema.
+      - run: |
+          n=$(docker compose exec -T postgres psql -U constellation -d constellation -tAc "select count(*) from pg_stat_activity where usename = 'constellation_app'")
+          test "$n" -gt 0
+          docker compose exec -T postgres sh -c 'PGPASSWORD=ci-app-password psql -h 127.0.0.1 -U constellation_app -d constellation -c "CREATE TABLE sneaky (a int)" 2>&1' | grep -q 'permission denied'
       # The one public port serves the UI and the version: `/` is the app, a missing asset is a
       # 404, /version carries the build, and an unknown /api path is a 404, not the app.
       - run: |
