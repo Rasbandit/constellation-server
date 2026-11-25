@@ -598,6 +598,38 @@ async fn catalogue_versions_follow_their_states_and_the_newest_live_one_is_used<
     assert_eq!(s.versions("No Game").await.unwrap(), []);
 }
 
+/// A restart finds every version still checking, oldest upload first; a scan is recorded on
+/// a version whatever its state, and reads back with it.
+async fn catalogue_checking_versions_are_found_and_scans_recorded<S: Store>(s: Arc<S>) {
+    use crate::VersionState::{Checking, Live};
+    assert!(s.game_create(&game("Scanned")).await.unwrap());
+    let world = upload(UploadKind::Apworld, "Scanned", b"scanned zip");
+    s.upload_put(&world, b"scanned zip").await.unwrap();
+    for v in ["1", "2", "3"] {
+        let new = crate::NewVersion {
+            game: "Scanned".to_owned(),
+            version: v.to_owned(),
+            note: String::new(),
+            apworld: world.id,
+            generator: String::new(),
+        };
+        assert_eq!(s.version_add(&new).await.unwrap(), crate::VersionAdded::Added);
+    }
+    assert!(s.version_set("Scanned", "2", Live, "gen-1", None).await.unwrap());
+    // Other tests' versions may share the store: only this game's count here.
+    let checking = s.versions_checking().await.unwrap();
+    let mine: Vec<_> = checking.iter().filter(|v| v.game == "Scanned").collect();
+    let mine: Vec<_> = mine.iter().map(|v| (v.version.as_str(), v.state)).collect();
+    assert_eq!(mine, [("1", Checking), ("3", Checking)], "oldest first, live ones not");
+    assert!(s.versions("Scanned").await.unwrap().iter().all(|v| v.scan.is_none()));
+    let flags = r#"[{"file":"w/__init__.py","line":3,"reason":"opens a network connection"}]"#;
+    assert!(s.version_scan_set("scanned", "2", flags).await.unwrap(), "any state");
+    assert!(s.version_scan_set("Scanned", "3", "[]").await.unwrap());
+    assert!(!s.version_scan_set("Scanned", "9", "[]").await.unwrap(), "no such version");
+    let scans: Vec<_> = s.versions("Scanned").await.unwrap().into_iter().map(|v| v.scan).collect();
+    assert_eq!(scans, [Some("[]".to_owned()), Some(flags.to_owned()), None]);
+}
+
 /// An upload is stored once by kind and id with its record, read back whole and checked on
 /// write; the two kinds never see each other, and a listing is one kind's, ascending by id.
 async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>) {
@@ -826,6 +858,7 @@ macro_rules! contract {
                 catalogue_games_are_unique_ignoring_case_and_listed_bytewise,
                 catalogue_owners_are_granted_once_and_end_with_their_account,
                 catalogue_versions_follow_their_states_and_the_newest_live_one_is_used,
+                catalogue_checking_versions_are_found_and_scans_recorded,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

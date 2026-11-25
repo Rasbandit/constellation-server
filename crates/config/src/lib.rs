@@ -207,6 +207,14 @@ pub struct Limits {
     pub catalogue_version_max_bytes: usize,
     /// Longest catalogue version note ("what changed"), in bytes (design value).
     pub catalogue_note_max_bytes: usize,
+    /// Test seeds a catalogue version must generate without an error before it goes live, each
+    /// with a random seed and a default player (design value, agreed in #189: a real world took
+    /// about 22 s, so 20 take about 7 minutes one at a time).
+    pub catalogue_check_seeds: usize,
+    /// Test seeds generating or waiting to, server-wide. Each also waits its turn for a
+    /// generation slot (`gen_concurrency`) in the same line as players, so a player is behind
+    /// at most this many; at most `gen_concurrency` (design value).
+    pub catalogue_check_concurrency: usize,
     /// Manifest checks (a child process each) running at once; more are refused as busy.
     pub manifest_check_concurrency: usize,
     /// Address-space cap of a fill or manifest check child process, bytes (design value).
@@ -396,6 +404,8 @@ impl Limits {
         catalogue_description_max_bytes: 2000,
         catalogue_version_max_bytes: 32,
         catalogue_note_max_bytes: 4000,
+        catalogue_check_seeds: 20,
+        catalogue_check_concurrency: 1,
         manifest_check_concurrency: 2,
         fill_memory_bytes: 1024 * 1024 * 1024,
         fill_cpu_secs: 120,
@@ -442,6 +452,16 @@ impl Limits {
         if self.password_min_chars == 0 || self.password_min_chars > self.password_max_bytes {
             return Err("password_min_chars must be 1 to password_max_bytes");
         }
+        if self.catalogue_check_concurrency == 0
+            // Generation treats 0 as 1.
+            || (self.catalogue_check_concurrency > self.gen_concurrency
+                && self.catalogue_check_concurrency > 1)
+        {
+            return Err("catalogue_check_concurrency must be 1 to gen_concurrency");
+        }
+        if self.catalogue_check_seeds == 0 {
+            return Err("catalogue_check_seeds must be at least 1");
+        }
         if self.password_hash_parallel == 0 {
             return Err("password_hash_parallel must be at least 1");
         }
@@ -483,6 +503,8 @@ pub fn load() -> Result<Limits, String> {
         ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
         ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
         ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
+        ("CONSTELLATION_CATALOGUE_CHECK_SEEDS", &mut l.catalogue_check_seeds),
+        ("CONSTELLATION_CATALOGUE_CHECK_CONCURRENCY", &mut l.catalogue_check_concurrency),
     ] {
         if let Some(v) = num(key).and_then(|v| usize::try_from(v).ok()) {
             *field = v;
