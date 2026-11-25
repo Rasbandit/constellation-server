@@ -2,8 +2,9 @@
 //! generation statuses, over Postgres or memory. The one place that chooses between the two.
 
 use log::{
-    AccountStore, BlobKey, JobState, JobStore, ManifestRecord, ManifestStore, MemLogStore,
-    OwnedRoom, PgLogStore, StoreError, UploadKind, UploadRecord, UploadStore,
+    AccountStore, BlobKey, CatalogueStore, Game, GameVersion, JobState, JobStore, ManifestRecord,
+    ManifestStore, MemLogStore, NewVersion, OwnedRoom, PgLogStore, StoreError, UploadKind,
+    UploadRecord, UploadStore, VersionAdded, VersionState,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -216,5 +217,61 @@ impl Db {
         username: &str,
     ) -> Result<bool, StoreError> {
         on!(self, s => s.room_admin_remove(key, username).await)
+    }
+
+    pub(crate) async fn game_create(&self, game: &Game) -> Result<bool, StoreError> {
+        on!(self, s => s.game_create(game).await)
+    }
+
+    pub(crate) async fn game_get(&self, name: &str) -> Result<Option<Game>, StoreError> {
+        on!(self, s => s.game_get(name).await)
+    }
+
+    pub(crate) async fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Game>, StoreError> {
+        on!(self, s => s.game_list(after, limit).await)
+    }
+
+    pub(crate) async fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.game_owner_add(game, username, granted_by).await)
+    }
+
+    pub(crate) async fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.game_owner_remove(game, username).await)
+    }
+
+    pub(crate) async fn game_owners(&self, game: &str) -> Result<Vec<String>, StoreError> {
+        on!(self, s => s.game_owners(game).await)
+    }
+
+    pub(crate) async fn version_add(&self, v: &NewVersion) -> Result<VersionAdded, StoreError> {
+        on!(self, s => s.version_add(v).await)
+    }
+
+    pub(crate) async fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.version_set(game, version, state, generator, error).await)
+    }
+
+    pub(crate) async fn versions(&self, game: &str) -> Result<Vec<GameVersion>, StoreError> {
+        on!(self, s => s.versions(game).await)
     }
 }

@@ -214,7 +214,7 @@ fn store_failed(e: &log::StoreError) -> String {
     format!("the store: {e:?}")
 }
 
-fn json_reply(status: StatusCode, v: &Value) -> Response {
+pub(crate) fn json_reply(status: StatusCode, v: &Value) -> Response {
     json_text(status, v.to_string())
 }
 
@@ -274,6 +274,11 @@ impl Worlds {
     /// The host's store.
     pub(crate) const fn db(&self) -> &store::Db {
         &self.store
+    }
+
+    /// The server's limits.
+    pub(crate) const fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Count a generation against `gen_queue_max`, or `None` when that many are already queued
@@ -718,6 +723,7 @@ fn routes(state: Arc<Worlds>) -> Router {
             get(list_manifests).merge(put(put_manifest).layer(capped(l.manifest_max_bytes))),
         )
         .merge(crate::room_admins::routes())
+        .merge(crate::catalogue::routes())
         .route("/api/worlds", post(create_world))
         .route("/api/worlds/{id}", get(world_status))
         .route("/api/worlds/{id}/room", get(room_summary))
@@ -824,11 +830,11 @@ fn upload_name(query: Option<&str>) -> Result<String, String> {
 }
 
 /// The raw (still percent-encoded) value of query parameter `key`.
-fn raw_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn raw_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='))
 }
 
-fn percent_decode(s: &str) -> Option<String> {
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let mut out = Vec::with_capacity(s.len());
     let mut it = s.bytes();
     while let Some(b) = it.next() {
@@ -2724,6 +2730,8 @@ mod tests {
         Scoped,
         /// Answers 404 whatever it is asked.
         CatchAll,
+        /// The game catalogue: every account reads it, only a game's owners change it.
+        Catalogue,
     }
 
     /// Every `/api` route of the router and what it may show another account. A route the
@@ -2745,6 +2753,11 @@ mod tests {
         ("/api/worlds/{id}/room/events", &["GET"], Class::Scoped),
         ("/api/rooms/{key}/admins", &["GET", "POST"], Class::Scoped),
         ("/api/rooms/{key}/admins/{name}", &["PUT", "DELETE"], Class::Scoped),
+        ("/api/games", &["GET", "POST"], Class::Catalogue),
+        ("/api/games/{game}", &["GET"], Class::Catalogue),
+        ("/api/games/{game}/owners/{name}", &["PUT", "DELETE"], Class::Catalogue),
+        ("/api/games/{game}/versions", &["POST"], Class::Catalogue),
+        ("/api/games/{game}/versions/{version}/withdraw", &["POST"], Class::Catalogue),
         ("/api", &["ANY"], Class::CatchAll),
         ("/api/", &["ANY"], Class::CatchAll),
         ("/api/{*rest}", &["ANY"], Class::CatchAll),
@@ -2871,16 +2884,21 @@ mod tests {
     /// everything afterwards. Fails if any scoped route skips the role check.
     #[tokio::test]
     async fn another_account_walking_every_route_never_reaches_the_first_ones_data() {
-        let (_w, app, [ann, bob, _], id, key) = hosted_for_ann("walk", Limits::DESIGN).await;
+        let (w, app, [ann, bob, _], id, key) = hosted_for_ann("walk", Limits::DESIGN).await;
         let a_rooms = call(&app, "GET", "/api/rooms", &ann, "").await;
         let a_rooms = json_of(a_rooms).await;
         let a_admins = admins_of(&app, &key, &ann).await;
         let a_world = json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await;
+        let a_game = ann_game(&w, &app, &ann).await;
         for (template, methods, class) in ROUTES.iter().filter(|r| r.2 != Class::Public) {
             // `{name}` is the owner, and B himself (B tries to make himself an admin).
             for name in ["ann", "bob"] {
-                let path =
-                    template.replace("{id}", &id).replace("{key}", &key).replace("{name}", name);
+                let path = template
+                    .replace("{id}", &id)
+                    .replace("{key}", &key)
+                    .replace("{name}", name)
+                    .replace("{game}", "annsgame")
+                    .replace("{version}", "1");
                 for method in *methods {
                     let method = if *method == "ANY" { "GET" } else { method };
                     let r = call(&app, method, &path, &bob, "{\"username\":\"bob\"}").await;
@@ -2898,7 +2916,11 @@ mod tests {
                         }
                         // Uploads are global until #127. Open routes are skipped above (B's
                         // own logout would end B's session).
-                        Class::Global | Class::Public => {}
+                        // B reads ann's game, and changes nothing of it.
+                        Class::Catalogue if method != "GET" => {
+                            assert!(!status.is_success(), "{what}");
+                        }
+                        Class::Catalogue | Class::Global | Class::Public => {}
                     }
                     assert!(!body.contains("pw:ann"), "A's account id leaked: {what}");
                 }
@@ -2910,6 +2932,107 @@ mod tests {
         assert_eq!(json_of_call(&app, "/api/rooms", &ann).await, a_rooms);
         assert_eq!(admins_of(&app, &key, &ann).await, a_admins);
         assert_eq!(json_of_call(&app, &format!("/api/worlds/{id}"), &ann).await, a_world);
+        assert_eq!(json_of_call(&app, "/api/games/annsgame", &ann).await, a_game);
+    }
+
+    /// Ann's game `annsgame` with version 1 (checking), from a stored `.apworld`; its page.
+    async fn ann_game(w: &Worlds, app: &Router, ann: &str) -> Value {
+        let up = stored(w, Kind::Apworld, b"ann's world", json!({"name": "a.apworld"})).await;
+        let r = call(app, "POST", "/api/games", ann, r#"{"name":"annsgame"}"#).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let v = json!({"version": "1", "apworld": up["id"]}).to_string();
+        let r = call(app, "POST", "/api/games/annsgame/versions", ann, &v).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        json_of(r).await
+    }
+
+    /// The catalogue routes: make a game (its maker is its owner, a name taken ignoring case
+    /// is 409), list it, add and remove owners (never the last), post versions (one the game
+    /// has is 409, an unknown upload 400, a non-owner 403) and withdraw one, for good.
+    #[tokio::test]
+    async fn a_game_is_made_listed_owned_versioned_and_withdrawn() {
+        let (w, app, [ann, bob, _]) = three_accounts().await;
+        let up = stored(&w, Kind::Apworld, b"wind waker", json!({"name": "ww.apworld"})).await;
+        let make = |name: &str| json!({"name": name, "description": " Sail. "}).to_string();
+        let r = call(&app, "POST", "/api/games", &ann, &make(" Wind Waker ")).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let page = json_of(r).await;
+        assert_eq!(
+            (&page["name"], &page["description"], &page["owners"], &page["owner"]),
+            (&json!("Wind Waker"), &json!("Sail."), &json!(["ann"]), &json!(true))
+        );
+        let taken = call(&app, "POST", "/api/games", &bob, &make("wind waker")).await;
+        assert_eq!(taken.status(), StatusCode::CONFLICT);
+        for bad in [r#"{"name":"  "}"#, r#"{"name":"a/b"}"#, r#"{"name":"a b"}"#, "{}"] {
+            let r = call(&app, "POST", "/api/games", &bob, bad).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let long = "x".repeat(Limits::DESIGN.catalogue_name_max_bytes + 1);
+        let r = call(&app, "POST", "/api/games", &bob, &make(&long)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let r = call(&app, "POST", "/api/games", &bob, &make("Alpha")).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        // A page at a time, by name ignoring case.
+        let first = json_of_call(&app, "/api/games?limit=1", &bob).await;
+        assert_eq!(
+            (&first["items"][0]["name"], &first["next"]),
+            (&json!("Alpha"), &json!("Alpha"))
+        );
+        let second = json_of_call(&app, "/api/games?limit=1&after=Alpha", &bob).await;
+        assert_eq!(
+            (&second["items"][0]["name"], &second["next"]),
+            (&json!("Wind Waker"), &Value::Null)
+        );
+
+        // Versions: only an owner posts one; bob reads the page but is no owner.
+        let v = |n: &str, id: &Value| json!({"version": n, "note": "first", "apworld": id});
+        let path = "/api/games/wind%20waker/versions";
+        let r = call(&app, "POST", path, &bob, &v("1", &up["id"]).to_string()).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = call(&app, "POST", path, &ann, &v("1", &up["id"]).to_string()).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let page = json_of(r).await;
+        assert_eq!(page["versions"][0]["state"], json!("checking"));
+        assert_eq!(page["versions"][0]["apworld"], up["id"]);
+        let again = call(&app, "POST", path, &ann, &v("1", &up["id"]).to_string()).await;
+        assert_eq!(again.status(), StatusCode::CONFLICT, "a version number the game has");
+        let unknown = json!(content_id(b"never uploaded"));
+        let r = call(&app, "POST", path, &ann, &v("2", &unknown).to_string()).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "no such upload");
+        let r = call(&app, "POST", path, &ann, &v("2", &json!("zz")).to_string()).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "not an id");
+        let r =
+            call(&app, "POST", "/api/games/nope/versions", &ann, &v("1", &up["id"]).to_string())
+                .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let seen = json_of_call(&app, "/api/games/Wind%20Waker", &bob).await;
+        assert_eq!((&seen["owner"], &seen["versions"][0]["version"]), (&json!(false), &json!("1")));
+
+        // Owners: ann adds bob; neither may remove the last one.
+        let owners = "/api/games/wind%20waker/owners";
+        let r = call(&app, "PUT", &format!("{owners}/nobody"), &ann, "").await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = call(&app, "PUT", &format!("{owners}/bob"), &ann, "").await;
+        assert_eq!(json_of(r).await["owners"], json!(["ann", "bob"]));
+        let r = call(&app, "DELETE", &format!("{owners}/ann"), &bob, "").await;
+        assert_eq!(json_of(r).await["owners"], json!(["bob"]));
+        let r = call(&app, "DELETE", &format!("{owners}/bob"), &bob, "").await;
+        assert_eq!(r.status(), StatusCode::CONFLICT, "the last owner stays");
+        let r = call(&app, "PUT", &format!("{owners}/ann"), &ann, "").await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "ann is no owner any more");
+
+        // Withdraw: for good, and again changes nothing.
+        let withdraw = "/api/games/wind%20waker/versions/1/withdraw";
+        assert_eq!(call(&app, "POST", withdraw, &ann, "").await.status(), StatusCode::FORBIDDEN);
+        let r = call(&app, "POST", withdraw, &bob, "").await;
+        assert_eq!(json_of(r).await["versions"][0]["state"], json!("withdrawn"));
+        let r = call(&app, "POST", withdraw, &bob, "").await;
+        assert_eq!(json_of(r).await["versions"][0]["state"], json!("withdrawn"));
+        let gone = "/api/games/wind%20waker/versions/9/withdraw";
+        assert_eq!(call(&app, "POST", gone, &bob, "").await.status(), StatusCode::NOT_FOUND);
+        let ok = w.store.version_set("wind waker", "1", log::VersionState::Live, "g", None);
+        assert!(!ok.await.unwrap(), "a withdrawal is final");
     }
 
     /// A lookup that errors, a session that is gone and one that hangs all end a room stream;
