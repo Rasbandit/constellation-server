@@ -510,10 +510,18 @@ async fn catalogue_games_are_unique_ignoring_case_and_listed_bytewise<S: Store>(
 /// An owner is an existing account of an existing game, granted once (the first grant is
 /// kept); removing it says whether there was one, and deleting the account ends it.
 async fn catalogue_owners_are_granted_once_and_end_with_their_account<S: Store>(s: Arc<S>) {
-    assert!(s.game_create(&game("Owned Game")).await.unwrap());
-    for name in ["bob", "ann"] {
+    use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+    for name in ["bob", "ann", "cyd"] {
         assert!(s.user_create(name, "hash").await.unwrap());
     }
+    // A game's maker is its first owner when it is an account.
+    let made = crate::Game { created_by: "cyd".to_owned(), ..game("Cyd's Game") };
+    assert!(s.game_create(&made).await.unwrap());
+    assert_eq!(s.game_owners("cyd's game").await.unwrap(), ["cyd"]);
+    assert_eq!(s.game_owner_remove("Cyd's Game", "cyd").await.unwrap(), LastOwner);
+    assert_eq!(s.game_owners("Cyd's Game").await.unwrap(), ["cyd"], "the last owner stays");
+    assert!(s.game_create(&game("Owned Game")).await.unwrap());
+    assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new(), "admin: none");
     assert!(s.game_owner_add("owned game", "bob", "admin").await.unwrap());
     assert!(s.game_owner_add("Owned Game", "bob", "ann").await.unwrap(), "already: still true");
     assert!(s.game_owner_add("OWNED GAME", "ann", "bob").await.unwrap());
@@ -521,8 +529,10 @@ async fn catalogue_owners_are_granted_once_and_end_with_their_account<S: Store>(
     assert!(!s.game_owner_add("No Game", "ann", "admin").await.unwrap(), "no game");
     assert_eq!(s.game_owners("owned game").await.unwrap(), ["ann", "bob"]);
     assert_eq!(s.game_owners("No Game").await.unwrap(), Vec::<String>::new());
-    assert!(s.game_owner_remove("Owned Game", "bob").await.unwrap());
-    assert!(!s.game_owner_remove("Owned Game", "bob").await.unwrap(), "once");
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), Removed);
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), NotOwner, "once");
+    assert_eq!(s.game_owner_remove("No Game", "ann").await.unwrap(), NotOwner);
+    assert_eq!(s.game_owner_remove("Owned Game", "ann").await.unwrap(), LastOwner);
     s.user_delete("ann").await.unwrap();
     assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new());
 }

@@ -3,8 +3,8 @@
 
 use log::{
     AccountStore, BlobKey, CatalogueStore, Game, GameVersion, JobState, JobStore, ManifestRecord,
-    ManifestStore, MemLogStore, NewVersion, OwnedRoom, PgLogStore, StoreError, UploadKind,
-    UploadRecord, UploadStore, VersionAdded, VersionState,
+    ManifestStore, MemLogStore, NewVersion, OwnedRoom, OwnerRemoved, PgLogStore, StoreError,
+    UploadKind, UploadRecord, UploadStore, VersionAdded, VersionState,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -248,7 +248,7 @@ impl Db {
         &self,
         game: &str,
         username: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<OwnerRemoved, StoreError> {
         on!(self, s => s.game_owner_remove(game, username).await)
     }
 

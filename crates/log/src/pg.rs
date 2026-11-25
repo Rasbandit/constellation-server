@@ -1695,17 +1695,21 @@ impl crate::CatalogueStore for PgLogStore {
         let (key, game) = (crate::game_key(&game.name), game.clone());
         self.isolated(move |c| {
             Box::pin(async move {
-                sqlx::query(
-                    "INSERT INTO catalogue_games (key, name, description, created_by) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                // One statement: the owner row goes in only with the new game, and only when
+                // its maker is an account.
+                sqlx::query_scalar(
+                    "WITH g AS (INSERT INTO catalogue_games (key, name, description, created_by) \
+                       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING key), \
+                     o AS (INSERT INTO catalogue_owners (game, username, granted_by) \
+                       SELECT g.key, u.name, u.name FROM g, users u WHERE u.name = $4) \
+                     SELECT EXISTS (SELECT 1 FROM g)",
                 )
                 .bind(&key)
                 .bind(&game.name)
                 .bind(&game.description)
                 .bind(&game.created_by)
-                .execute(&mut *c)
+                .fetch_one(&mut *c)
                 .await
-                .map(|done| done.rows_affected() == 1)
                 .map_err(|e| db::<StoreError>(&e))
             })
         })
@@ -1784,17 +1788,51 @@ impl crate::CatalogueStore for PgLogStore {
         .await
     }
 
-    async fn game_owner_remove(&self, game: &str, username: &str) -> Result<bool, StoreError> {
+    async fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> Result<crate::OwnerRemoved, StoreError> {
+        use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
         let (key, user) = (crate::game_key(game), username.to_owned());
         self.isolated(move |c| {
             Box::pin(async move {
-                sqlx::query("DELETE FROM catalogue_owners WHERE game = $1 AND username = $2")
+                let err = |e: sqlx::Error| db::<StoreError>(&e);
+                let mut tx = c.begin().await.map_err(err)?;
+                // Removals of one game's owners take turns on its row. Each statement after the
+                // lock reads afresh (READ COMMITTED), so it counts what the one before left.
+                sqlx::query("SELECT 1 FROM catalogue_games WHERE key = $1 FOR UPDATE")
                     .bind(&key)
-                    .bind(&user)
-                    .execute(&mut *c)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map(|done| done.rows_affected() == 1)
-                    .map_err(|e| db::<StoreError>(&e))
+                    .map_err(err)?;
+                let (owner, owners): (bool, i64) = sqlx::query_as(
+                    "SELECT EXISTS (SELECT 1 FROM catalogue_owners \
+                       WHERE game = $1 AND username = $2), \
+                     (SELECT count(*) FROM catalogue_owners WHERE game = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(err)?;
+                let done = match (owner, owners) {
+                    (false, _) => NotOwner,
+                    (true, ..=1) => LastOwner,
+                    (true, _) => {
+                        sqlx::query(
+                            "DELETE FROM catalogue_owners WHERE game = $1 AND username = $2",
+                        )
+                        .bind(&key)
+                        .bind(&user)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(err)?;
+                        Removed
+                    }
+                };
+                tx.commit().await.map_err(err)?;
+                Ok(done)
             })
         })
         .await

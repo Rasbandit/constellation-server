@@ -2963,7 +2963,13 @@ mod tests {
         );
         let taken = call(&app, "POST", "/api/games", &bob, &make("wind waker")).await;
         assert_eq!(taken.status(), StatusCode::CONFLICT);
-        for bad in [r#"{"name":"  "}"#, r#"{"name":"a/b"}"#, r#"{"name":"a b"}"#, "{}"] {
+        for bad in [
+            r#"{"name":"  "}"#,
+            r#"{"name":"a/b"}"#,
+            r#"{"name":"a\u0000b"}"#,
+            r#"{"name":".."}"#,
+            "{}",
+        ] {
             let r = call(&app, "POST", "/api/games", &bob, bad).await;
             assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
         }

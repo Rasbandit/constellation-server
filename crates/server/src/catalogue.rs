@@ -14,7 +14,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post, put};
-use log::{Game, GameVersion, NewVersion, StoreError, VersionAdded, VersionState};
+use log::{Game, GameVersion, NewVersion, OwnerRemoved, StoreError, VersionAdded, VersionState};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -48,7 +48,8 @@ fn not_owner() -> (StatusCode, String) {
 }
 
 /// `raw` trimmed, 1 to `max` bytes, with no control characters (`multiline` allows line
-/// breaks and tabs). A name or version is in a URL path, so it has no `/` either.
+/// breaks and tabs). A name or version is in a URL path, so it has no `/` and is not `.` or
+/// `..` either.
 fn text(raw: &str, field: &str, max: usize, multiline: bool) -> Result<String, String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > max {
@@ -58,8 +59,8 @@ fn text(raw: &str, field: &str, max: usize, multiline: bool) -> Result<String, S
     if t.chars().any(|c| c.is_control() && !allowed(c)) {
         return Err(format!("{field} has a control character"));
     }
-    if !multiline && t.contains('/') {
-        return Err(format!("{field} may not contain /"));
+    if !multiline && (t.contains('/') || t == "." || t == "..") {
+        return Err(format!("{field} may not contain / or be . or .."));
     }
     Ok(t.to_owned())
 }
@@ -141,13 +142,10 @@ async fn create_game(State(w): State<Arc<Worlds>>, who: Identity, body: Bytes) -
             .map_err(bad)?
     };
     let game = Game { name, description, created_by: who.name.clone() };
-    let db = w.db();
-    if !db.game_create(&game).await.map_err(|e| failed(&e))? {
+    // The game and its first owner (the caller) go in together.
+    if !w.db().game_create(&game).await.map_err(|e| failed(&e))? {
         return Err((StatusCode::CONFLICT, "a game of that name exists".to_owned()));
     }
-    // The account exists (it is signed in); an account deleted in between leaves the game
-    // ownerless, which only that account could have changed anyway.
-    db.game_owner_add(&game.name, &who.name, &who.name).await.map_err(|e| failed(&e))?;
     tracing::info!(game = game.name, by = who.name, "catalogue game made");
     page(&w, &who, &game, StatusCode::CREATED).await
 }
@@ -190,18 +188,13 @@ async fn remove_owner(
     }
     let gone = || (StatusCode::NOT_FOUND, "that account is not an owner".to_owned());
     let name = clean_name(&name).ok_or_else(gone)?;
-    let db = w.db();
-    let owners = db.game_owners(&game.name).await.map_err(|e| failed(&e))?;
-    if !owners.contains(&name) {
-        return Err(gone());
+    match w.db().game_owner_remove(&game.name, &name).await.map_err(|e| failed(&e))? {
+        OwnerRemoved::Removed => page(&w, &who, &game, StatusCode::OK).await,
+        OwnerRemoved::NotOwner => Err(gone()),
+        OwnerRemoved::LastOwner => {
+            Err((StatusCode::CONFLICT, "a game keeps at least one owner".to_owned()))
+        }
     }
-    if owners.len() == 1 {
-        return Err((StatusCode::CONFLICT, "a game keeps at least one owner".to_owned()));
-    }
-    if !db.game_owner_remove(&game.name, &name).await.map_err(|e| failed(&e))? {
-        return Err(gone());
-    }
-    page(&w, &who, &game, StatusCode::OK).await
 }
 
 #[derive(Deserialize)]
