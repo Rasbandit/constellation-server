@@ -199,6 +199,14 @@ pub struct Limits {
     pub manifest_cache_bytes: usize,
     /// Most records one listing page returns, whatever the caller asks (design value).
     pub list_page_max: usize,
+    /// Longest catalogue game name, in bytes (design value: real game names are under 60).
+    pub catalogue_name_max_bytes: usize,
+    /// Longest catalogue game description, in bytes (design value).
+    pub catalogue_description_max_bytes: usize,
+    /// Longest catalogue version number, in bytes (design value).
+    pub catalogue_version_max_bytes: usize,
+    /// Longest catalogue version note ("what changed"), in bytes (design value).
+    pub catalogue_note_max_bytes: usize,
     /// Manifest checks (a child process each) running at once; more are refused as busy.
     pub manifest_check_concurrency: usize,
     /// Address-space cap of a fill or manifest check child process, bytes (design value).
@@ -384,6 +392,10 @@ impl Limits {
         manifest_max_bytes: 8 * 1024 * 1024,
         manifest_cache_bytes: 64 * 1024 * 1024,
         list_page_max: 200,
+        catalogue_name_max_bytes: 100,
+        catalogue_description_max_bytes: 2000,
+        catalogue_version_max_bytes: 32,
+        catalogue_note_max_bytes: 4000,
         manifest_check_concurrency: 2,
         fill_memory_bytes: 1024 * 1024 * 1024,
         fill_cpu_secs: 120,

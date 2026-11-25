@@ -13,6 +13,7 @@
 //! ([`worlds`], run in [`sandbox`]).
 
 mod accounts;
+mod catalogue;
 mod manifests;
 mod room_admins;
 mod room_view;

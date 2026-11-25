@@ -636,10 +636,17 @@ impl crate::CatalogueStore for MemLogStore {
         &self,
         game: &crate::Game,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        // Locked in game_owner_add's order: users, games, owners.
+        let users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
         let mut games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
         let key = crate::game_key(&game.name);
         let vacant = !games.contains_key(&key);
         if vacant {
+            if users.contains_key(&game.created_by) {
+                let by = game.created_by.clone();
+                owners.insert((key.clone(), by.clone()), by);
+            }
             games.insert(key, game.clone());
         }
         ready(Ok(vacant))
@@ -686,9 +693,20 @@ impl crate::CatalogueStore for MemLogStore {
         &self,
         game: &str,
         username: &str,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+    ) -> impl Future<Output = Result<crate::OwnerRemoved, StoreError>> + Send {
+        use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+        let key = crate::game_key(game);
         let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
-        ready(Ok(owners.remove(&(crate::game_key(game), username.to_owned())).is_some()))
+        let one = (key.clone(), username.to_owned());
+        let done = if !owners.contains_key(&one) {
+            NotOwner
+        } else if owners.keys().filter(|(g, _)| *g == key).count() == 1 {
+            LastOwner
+        } else {
+            owners.remove(&one);
+            Removed
+        };
+        ready(Ok(done))
     }
 
     fn game_owners(

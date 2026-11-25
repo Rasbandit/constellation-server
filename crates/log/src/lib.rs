@@ -716,6 +716,17 @@ pub enum VersionAdded {
     Taken,
 }
 
+/// What removing a game owner did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerRemoved {
+    /// It is no owner any more.
+    Removed,
+    /// It was no owner (or there is no such game).
+    NotOwner,
+    /// It is the game's last owner, and stays one.
+    LastOwner,
+}
+
 /// A game's key: its name in lowercase. Names match ignoring case by this key on every store,
 /// so Postgres never lowers a name itself.
 #[must_use]
@@ -726,7 +737,9 @@ pub fn game_key(name: &str) -> String {
 /// The game catalogue (#173): games, the accounts that own them, and their versions. A game
 /// is named in any case and found by [`game_key`].
 pub trait CatalogueStore: Send + Sync + 'static {
-    /// Add `game`; false when a game of that name (ignoring case) exists.
+    /// Add `game` and, when `created_by` is an account, make it the first owner, in one step
+    /// (so a failure never leaves a new game without its owner); false when a game of that
+    /// name (ignoring case) exists.
     ///
     /// # Errors
     /// The store failing.
@@ -761,7 +774,8 @@ pub trait CatalogueStore: Send + Sync + 'static {
         granted_by: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
-    /// End `username`'s ownership of `game`; false when it had none.
+    /// End `username`'s ownership of `game`, unless it is the game's last owner: two owners
+    /// removing each other at once leave one. (Deleting an account still ends its ownerships.)
     ///
     /// # Errors
     /// The store failing.
@@ -769,7 +783,7 @@ pub trait CatalogueStore: Send + Sync + 'static {
         &self,
         game: &str,
         username: &str,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    ) -> impl Future<Output = Result<OwnerRemoved, StoreError>> + Send;
 
     /// The owners of `game`, by name.
     ///
