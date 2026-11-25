@@ -82,7 +82,7 @@ pub(crate) struct Worlds {
     /// Behind a reverse proxy: the header carrying the client address (`--trusted-proxy-header`).
     /// Off by default, because any client could send it.
     proxy_header: Option<HeaderName>,
-    /// The Archipelago version of the checkout (`__version__` in its `Utils.py`): what a
+    /// The generator checkout's version (`__version__` in its `Utils.py`): what a
     /// catalogue version is checked with. None when it cannot be read.
     generator: Option<String>,
     /// The catalogue's version checks running in this process.
@@ -278,7 +278,7 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
     })
 }
 
-/// The checkout's version: `__version__ = "<v>"` in its `Utils.py` (Archipelago keeps it there).
+/// The checkout's version: `__version__ = "<v>"` in its `Utils.py`.
 fn generator_version(ap: &Path) -> Option<String> {
     let utils = std::fs::read_to_string(ap.join("Utils.py")).ok()?;
     utils.lines().find_map(|line| {
