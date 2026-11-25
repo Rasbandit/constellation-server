@@ -618,6 +618,212 @@ pub trait AccountStore: Send + Sync + 'static {
     fn user_delete(&self, name: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
+/// Where a catalogue version is (#173). It starts [`Checking`](Self::Checking), then is
+/// [`Live`](Self::Live) or [`Failed`](Self::Failed). An owner may withdraw it, which is final.
+/// A generator upgrade marks a live version that fails its re-check as
+/// [`NeedsUpdate`](Self::NeedsUpdate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VersionState {
+    /// Its checks are running.
+    Checking,
+    /// It passed its checks: a new room may use it.
+    Live,
+    /// A check failed; its error says which and why.
+    Failed,
+    /// Withdrawn by an owner or an admin: no new room uses it, rooms made with it keep it.
+    Withdrawn,
+    /// It failed its re-check on a new generator version.
+    NeedsUpdate,
+}
+
+impl VersionState {
+    /// The stored name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Checking => "checking",
+            Self::Live => "live",
+            Self::Failed => "failed",
+            Self::Withdrawn => "withdrawn",
+            Self::NeedsUpdate => "needs_update",
+        }
+    }
+
+    /// The state a stored name names.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Checking, Self::Live, Self::Failed, Self::Withdrawn, Self::NeedsUpdate]
+            .into_iter()
+            .find(|v| v.as_str() == s)
+    }
+}
+
+/// A catalogue game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Game {
+    /// Its name, in the case it was made with. Names are unique ignoring case ([`game_key`]).
+    pub name: String,
+    /// A short description.
+    pub description: String,
+    /// Who made it: an account name, or `admin` for the admin token.
+    pub created_by: String,
+}
+
+/// A new version of a catalogue game, before its checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewVersion {
+    /// The game's name, in any case.
+    pub game: String,
+    /// Its version number, unique within the game.
+    pub version: String,
+    /// What changed.
+    pub note: String,
+    /// The world file it is: an `apworld` upload's id.
+    pub apworld: BlobKey,
+    /// The generator version it is checked with.
+    pub generator: String,
+}
+
+/// One version of a catalogue game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameVersion {
+    /// Its game's name, as the game keeps it.
+    pub game: String,
+    /// Its version number.
+    pub version: String,
+    /// What changed.
+    pub note: String,
+    /// The world file it is.
+    pub apworld: BlobKey,
+    /// The generator version it was last checked with (or is being checked with).
+    pub generator: String,
+    /// Where it is.
+    pub state: VersionState,
+    /// Why its check failed, when it did.
+    pub error: Option<String>,
+}
+
+/// What adding a version did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionAdded {
+    /// Stored, as [`VersionState::Checking`].
+    Added,
+    /// There is no such game.
+    NoGame,
+    /// There is no `apworld` upload with that id.
+    NoUpload,
+    /// The game already has that version number.
+    Taken,
+}
+
+/// A game's key: its name in lowercase. Names match ignoring case by this key on every store,
+/// so Postgres never lowers a name itself.
+#[must_use]
+pub fn game_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// The game catalogue (#173): games, the accounts that own them, and their versions. A game
+/// is named in any case and found by [`game_key`].
+pub trait CatalogueStore: Send + Sync + 'static {
+    /// Add `game`; false when a game of that name (ignoring case) exists.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_create(&self, game: &Game) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// The game named `name` (ignoring case).
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_get(&self, name: &str)
+    -> impl Future<Output = Result<Option<Game>, StoreError>> + Send;
+
+    /// Up to `limit` games ascending by key, after the game named `after` (ignoring case).
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Game>, StoreError>> + Send;
+
+    /// Make account `username` an owner of `game`, granted by `granted_by`. Already one: kept
+    /// as it was, still true. False when there is no such game or account.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// End `username`'s ownership of `game`; false when it had none.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// The owners of `game`, by name.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn game_owners(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send;
+
+    /// Add `version` to its game as [`VersionState::Checking`].
+    ///
+    /// # Errors
+    /// The store failing.
+    fn version_add(
+        &self,
+        version: &NewVersion,
+    ) -> impl Future<Output = Result<VersionAdded, StoreError>> + Send;
+
+    /// Set `game`'s `version` to `state`, checked with `generator`, with `error` (None clears
+    /// it). False when there is no such version, or it is withdrawn: a withdrawal is final.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// `game`'s versions, newest upload first.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn versions(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<GameVersion>, StoreError>> + Send;
+
+    /// What a new room of `game` uses: its newest uploaded version that is live and was
+    /// checked with `generator` (the server's). None when it has none.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> impl Future<Output = Result<Option<GameVersion>, StoreError>> + Send;
+}
+
 /// Whether an upload's `bytes` no longer hash to its `id` (a torn row).
 #[must_use]
 pub(crate) fn is_torn(bytes: &[u8], id: &BlobKey) -> bool {
