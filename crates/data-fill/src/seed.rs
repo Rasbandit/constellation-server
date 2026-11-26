@@ -1,7 +1,8 @@
 //! The fill's output as a seed: [`generate`] compiles a manifest, fills every player's world
 //! together and assembles the [`SeedBundle`] a room runs on, with each item's class, the
-//! spheres (when a location is first reachable) and slot details. `seed_bundle::v2::encode`
-//! (or `seed_bundle::import_v1`) writes it as a v2 seed (`docs/seed-bundle-v2.md`).
+//! spheres (when a location is first reachable) and slot details. [`generate_on`] does the same
+//! on a world prepared earlier ([`crate::prepared`]), and [`encode_on`] writes its bundle as a
+//! v2 seed (`docs/seed-bundle-v2.md`); `seed_bundle::import_v1` does that for a bundle's JSON.
 
 use std::collections::BTreeMap;
 
@@ -141,6 +142,24 @@ fn named(players: &[Player]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The seed file (v2, `docs/seed-bundle-v2.md`) of a `bundle` assembled on a prepared world,
+/// at most `max_bytes`: checked as an imported bundle is, hashed as its JSON text would be
+/// ([`seed_bundle::bundle_hash`]) and encoded on the world's package, so nothing is written as
+/// JSON and parsed back and the package is not made again.
+///
+/// # Errors
+/// A bundle that breaks a rule a room trusts, or is too large for a seed file.
+pub fn encode_on(
+    prepared: &Prepared,
+    bundle: &SeedBundle,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    bundle.validate().map_err(|e| e.to_string())?;
+    let tables = std::slice::from_ref(prepared.table());
+    seed_bundle::v2::encode_on(bundle, &bundle.hash()?, max_bytes, tables)
+        .map_err(|e| e.to_string())
 }
 
 /// A loaded world, its game's name and the game's tables ([`game_data`], which depend only on

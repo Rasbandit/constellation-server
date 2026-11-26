@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::prepared::{self, Prepared};
-use crate::seed::{Player, checked_name, generate_by, generate_on, manifest_game};
+use crate::seed::{Player, checked_name, encode_on, generate_by, generate_on, manifest_game};
 use crate::world::World;
 
 /// A fill request less its world: who plays, and the seed's name and random stream.
@@ -19,6 +19,14 @@ struct Fill {
     /// How progression is placed; a request without it gets the exact fill.
     #[serde(default)]
     algorithm: crate::room::Algorithm,
+    /// Most bytes the seed file may take ([`fill`] only); a request without it gets the design
+    /// cap.
+    #[serde(default = "seed_max_bytes")]
+    seed_max_bytes: u64,
+}
+
+const fn seed_max_bytes() -> u64 {
+    config::Limits::DESIGN.bundle_max_bytes
 }
 
 /// A fill request that carries the manifest to compile.
@@ -77,18 +85,20 @@ pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Fill a room on a prepared world: the input is a [`frame`] of the request (JSON:
-/// `seed_name`, `players`, `rng_seed`, `workers`, and `algorithm` if not the exact fill) and
-/// the prepared world's file ([`prepare`]). Nothing is compiled. The seed bundle as JSON text.
+/// `seed_name`, `players`, `rng_seed`, `workers`, and if not the defaults `algorithm` and
+/// `seed_max_bytes`) and the prepared world's file ([`prepare`]). Nothing is compiled. The
+/// output is the seed file itself (v2), which names the game's package in the prepared world
+/// (`crate::prepared::seed_game`) by key.
 ///
 /// # Errors
 /// A message for a frame or request that does not parse, a file that is not a prepared world
-/// of this layout, or what [`crate::seed::generate`] refuses.
+/// of this layout, what [`crate::seed::generate`] refuses, or a seed over its cap.
 pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     let (head, file) = unframe(input)?;
     let f: Fill = serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
     let world = Prepared::open(file)?;
     let bundle = generate_on(&world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    serde_json::to_vec(&bundle).map_err(|e| e.to_string())
+    encode_on(&world, &bundle, f.seed_max_bytes)
 }
 
 /// A manifest's game and version, checked.

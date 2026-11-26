@@ -1341,6 +1341,7 @@ struct FillReq<'a> {
     players: Vec<PlayerReq>,
     rng_seed: u64,
     workers: usize,
+    seed_max_bytes: u64,
 }
 
 /// The players' files as fill request players. Real YAML player files are not read for manifest
@@ -1359,18 +1360,19 @@ fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String
 }
 
 /// The fill request of a generation on the prepared world `prepared`, as the child reads it: on
-/// `config::GENERATION_WORKERS` threads.
+/// `config::GENERATION_WORKERS` threads, for a seed of at most `seed_max_bytes`.
 fn fill_request(
     prepared: &[u8],
     seed_name: &str,
     files: &[(String, Vec<u8>)],
-    rng_seed: u64,
+    (rng_seed, seed_max_bytes): (u64, u64),
 ) -> Result<Vec<u8>, String> {
     let req = FillReq {
         seed_name,
         players: player_requests(files)?,
         rng_seed,
         workers: config::GENERATION_WORKERS,
+        seed_max_bytes,
     };
     let head = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     Ok(data_fill::job::frame(&head, prepared))
@@ -1406,16 +1408,22 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     let files = player_files(w, &yamls).await?;
     let players = yamls.len();
     // Building the request is blocking work.
-    let input =
-        tokio::task::spawn_blocking(move || fill_request(&prepared, &seed_name, &files, rng_seed))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))?;
-    let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
-    let bundle = w.run_job("fill", &input, timeout).await.map_err(|e| e.to_string())?;
     let limits = w.limits;
-    let loaded = tokio::task::spawn_blocking(move || parse_bundle(&bundle, &limits))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))?;
+    let world = Arc::clone(&prepared);
+    let input = tokio::task::spawn_blocking(move || {
+        fill_request(&world, &seed_name, &files, (rng_seed, limits.bundle_max_bytes))
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))?;
+    let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
+    // The child prints the seed file itself; it names the game's package of the prepared world.
+    let seed = w.run_job("fill", &input, timeout).await.map_err(|e| e.to_string())?;
+    let loaded = tokio::task::spawn_blocking(move || {
+        let game = data_fill::prepared::seed_game(&prepared)?.to_vec();
+        crate::parse_seed(seed, vec![game], &limits)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))?;
     publish_loaded(w, loaded.clone()).await?;
     let report = json!({"engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players});
     Ok((loaded, report))
@@ -2494,7 +2502,7 @@ mod tests {
     /// still ask for more). Fails with the old four.
     #[test]
     fn a_generation_asks_the_fill_for_one_worker() {
-        let req = fill_request(b"world", "s", &[], 1).unwrap();
+        let req = fill_request(b"world", "s", &[], (1, 64)).unwrap();
         let (head, world) = data_fill::job::unframe(&req).unwrap();
         assert_eq!(world, b"world");
         let req: Value = serde_json::from_slice(head).unwrap();
@@ -2559,6 +2567,37 @@ mod tests {
         let file = w.manifests.prepared(&content_id(&manifest(|_| {}))).await.unwrap().unwrap();
         let world = data_fill::prepared::Prepared::open(&file).unwrap();
         assert_eq!(world.game(), "Fixture Game");
+    }
+
+    /// The seed a generation stores is, byte for byte, the seed the path before stored for the
+    /// same inputs: the manifest compiled and filled, the bundle written as JSON and imported.
+    /// So are its hash and its package. Fails if the fill's own seed file differs anywhere.
+    #[tokio::test]
+    async fn the_stored_seed_is_the_one_the_json_import_path_stored() {
+        let root = temp("prepared-bytes");
+        let w = hosting(&root).await;
+        let id = finished_world(&w, &me()).await;
+        let status = read_status(&w, &id).await.unwrap();
+        let (name, rng) =
+            (status["seed_name"].as_str().unwrap(), &status["generation"]["rng_seed"]);
+        let store::Db::Mem(mem) = &w.store else { panic!("the test host is in memory") };
+        let stored = log::LogStore::seed_get(&**mem, crate::room_id(name)).await.unwrap().unwrap();
+
+        let world: Value = serde_json::from_slice(&manifest(|_| {})).unwrap();
+        let ann = json!({"name": "Ann", "instance": fixture_instances()[0]});
+        let players = [serde_json::from_value(ann).unwrap()];
+        let bundle =
+            data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap(), 1).unwrap();
+        let old = parse_bundle(&serde_json::to_vec(&bundle).unwrap(), &Limits::DESIGN).unwrap();
+        assert_eq!(stored, old.bundle.bytes());
+        assert_eq!(status["bundle_hash"], crate::hex(&old.hash), "{status}");
+        for package in &old.packages {
+            let key = log::blob_key(package);
+            assert_eq!(w.store.blob_get(&key).await.unwrap().as_ref(), Some(package));
+        }
+        // A seed cut short is refused (its body hash no longer matches).
+        let cut = stored[..stored.len() - 1].to_vec();
+        assert!(crate::parse_seed(cut, old.packages.clone(), &Limits::DESIGN).is_err());
     }
 
     /// A world prepared by an engine of another layout is stale: the generation sees no

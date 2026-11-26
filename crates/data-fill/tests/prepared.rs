@@ -1,7 +1,8 @@
 //! The seed a generation stores, byte for byte: seeds 1 to 20 of one world at 1 and at 10
 //! players, through `seed::generate` on the manifest and the v1 import, pinned by one digest.
 //! Every faster way to the same seed must give these bytes: here the prepared path, which
-//! compiles the world once (`job::prepare`) and fills from the stored form (`job::fill`).
+//! compiles the world once (`job::prepare`) and fills from the stored form (`job::fill`), whose
+//! output is the seed file itself: no JSON bundle is written, parsed and encoded again.
 
 use data_fill::job;
 use data_fill::prepared::{self, Prepared};
@@ -59,11 +60,11 @@ fn request(file: &[u8], players: &[Player], rng: u64, workers: usize) -> Vec<u8>
     job::frame(head.to_string().as_bytes(), file)
 }
 
-/// The seed file and package files the prepared path stores.
+/// The seed file and package files the prepared path stores: the fill's output as it is (a
+/// v2 seed file), and the game's package the world was prepared with.
 fn by_prepared(file: &[u8], players: &[Player], rng: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let out = job::fill(&request(file, players, rng, 1)).unwrap();
-    let (seed, packages) = seed_bundle::import_v1(&out, MAX).unwrap();
-    (seed.bytes().to_vec(), packages)
+    let seed = job::fill(&request(file, players, rng, 1)).unwrap();
+    (seed, vec![prepared::seed_game(file).unwrap().to_vec()])
 }
 
 /// Seeds 1 to 20 at 1 and at 10 players.
@@ -148,4 +149,28 @@ fn the_prepared_world_holds_the_tables_every_seed_of_it_shares() {
     assert_eq!(packages, [prepared::seed_game(&file).unwrap().to_vec()]);
     assert_eq!(world.table().key(), &key_of(&packages[0]));
     assert_eq!(world.table().name(), "Synth");
+}
+
+/// Fails while the fill prints a JSON bundle: its output is a v2 seed file that opens on the
+/// prepared world's package, with the hash of the bundle's canonical JSON, and a seed over the
+/// request's cap is refused.
+#[test]
+fn the_fill_prints_a_seed_file_with_the_hash_of_its_bundle() {
+    let (m, p) = room(2);
+    let (_, file) = prepared(&m);
+    let seed = job::fill(&request(&file, &p, 5, 1)).unwrap();
+    assert!(seed_bundle::v2::is_v2(&seed));
+    let bundle = generate(&m, "s5", &p, 5, 1).unwrap();
+    let text = serde_json::to_string(&bundle).unwrap();
+    let hash = seed_bundle::bundle_hash(&text).unwrap();
+    assert_eq!(seed_bundle::v2::bundle_hash_of(&seed).unwrap().to_vec(), hash);
+    let game = prepared::seed_game(&file).unwrap().to_vec();
+    let back = seed_bundle::v2::decode(seed, |_| Ok(game.clone()), MAX).unwrap();
+    assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&bundle).unwrap());
+    let framed = request(&file, &p, 5, 1);
+    let (head, world) = job::unframe(&framed).unwrap();
+    let mut head: Value = serde_json::from_slice(head).unwrap();
+    head["seed_max_bytes"] = json!(64);
+    let small = job::frame(head.to_string().as_bytes(), world);
+    assert!(job::fill(&small).unwrap_err().contains("cap"));
 }
