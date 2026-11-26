@@ -79,6 +79,30 @@ jobs:
                 --players "$PLAYERS" --checks "$CHECKS"
             done
           done
+          # Worlds built to be hard for a fill (`data_fill::synth::Hostile`), forward against
+          # split: every item a key of a chain, one key in front of nine tenths of the world,
+          # half the items keys, a gate that needs all copies but one (every round's state is
+          # the whole world, any two rounds' shared state only its front: split's worst case),
+          # and as much progression as locations that take it.
+          for profile in chain gated keys brink tight; do for path in forward split; do
+            bench --profile "$profile" --path "$path" --workers 1 --players 1,10 --reps 3
+          done; done
+          # The same at 100 players, where the fill ends within two minutes. A row that does
+          # not is left out and named here.
+          for profile in chain gated keys brink; do for path in forward split; do
+            if timeout 120 target/release/examples/synth_room --profile "$profile" --path "$path" \
+                --workers 1 --players 100 --reps 1 > hostile.jsonl; then
+              tee -a bench-room.jsonl < hostile.jsonl
+            else
+              echo "$profile $path 100: no row" | tee -a hostile-missing.txt
+            fi
+          done; done
+          # Other seeds: the two paths at 100 players on seeds 2 and 3 (the rows above are seed
+          # 1), in a file of their own so that no table above matches them twice.
+          for seed in 2 3; do for profile in light heavy; do for path in forward split; do
+            target/release/examples/synth_room --profile "$profile" --path "$path" --workers 1 \
+              --players 100 --checks "$CHECKS" --seed "$seed" --reps 1 | tee -a bench-seeds.jsonl
+          done; done; done
           if [ "$FULL" = on ]; then
             for profile in light heavy; do for run in "forward 4"; do
               read -r path workers <<< "$run"
@@ -153,6 +177,16 @@ jobs:
             | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
                | "\(.s.profile) \(.s.world) \(.s.players)"]
             | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The same on the other seeds.
+          jq -s -e '
+            [.[] | select(.players != null)] as $rows
+            | [$rows[] | select(.path == "split") | . as $s
+               | {s: $s, f: [$rows[] | select(.path == "forward" and .profile == $s.profile and .seed == $s.seed
+                                               and .players == $s.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no split row") else . end
+            | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
+               | "\(.s.profile) seed \(.s.seed) \(.s.players)"]
+            | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-seeds.jsonl
       # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
       # on the two small fixture worlds against uniform beatable placements. Full size only on a
       # dispatch with `full` on; every other run draws few seeds of three modes, enough to fail
@@ -229,6 +263,20 @@ jobs:
               | $rows[] | select(.path == "split") as $s
               | ($rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world and .players == $s.players)) as $f
               | "| \($s.profile) | \($s.world) | \($s.players) | \($f.fill_ms) | \($s.fill_ms) | \(if $s.fill_ms > 0 then ($f.fill_ms / $s.fill_ms * 100 | round) / 100 else "n/a" end) | \($f.rule_evals) | \($s.rule_evals) | \($f.rounds_profile.settle_ms) | \($s.rounds_profile.settle_ms) | \($s.rounds_profile.undone) | \($s.rounds_profile.undone / $s.rounds_profile.world_solves | round) | \($s.rounds_profile.journal_peak / $s.players | round) | \(if $f.peak_heap_bytes then ($f.peak_heap_bytes / $f.players | round) else "n/a" end) | \(if $s.peak_heap_bytes then ($s.peak_heap_bytes / $s.players | round) else "n/a" end) |"' bench-room.jsonl
+            if [ -s hostile-missing.txt ]; then
+              echo
+              echo "No row within two minutes (or stuck on every attempt): $(paste -sd, hostile-missing.txt)."
+            fi
+            echo
+            echo "#### Other seeds, 100 players, a world per player (one timed fill per row)"
+            echo
+            echo "| profile | seed | fill ms forward | split | forward / split | rule evals forward | split |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players != null)] as $rows
+              | $rows[] | select(.path == "split") as $s
+              | ($rows[] | select(.path == "forward" and .profile == $s.profile and .seed == $s.seed and .players == $s.players)) as $f
+              | "| \($s.profile) | \($s.seed) | \($f.fill_ms) | \($s.fill_ms) | \(($f.fill_ms / $s.fill_ms * 100 | round) / 100) | \($f.rule_evals) | \($s.rule_evals) |"' bench-seeds.jsonl
             echo
             echo "#### Loading a world with and without its bit rules (measured; the engine as it is, forward path)"
             echo
@@ -309,4 +357,5 @@ jobs:
           name: bench-room
           path: |
             bench-room.jsonl
+            bench-seeds.jsonl
             quality-*.json
