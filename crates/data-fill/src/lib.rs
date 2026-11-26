@@ -14,6 +14,7 @@ pub mod room;
 pub mod section;
 pub mod seed;
 pub mod spheres;
+pub mod synth;
 pub mod world;
 
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};

@@ -93,6 +93,52 @@ pub fn instances(raw: &[serde_json::Value]) -> Result<Vec<Instance>, String> {
         .collect()
 }
 
+/// Every player's compiled world, resolved plan and progression flags, in player order: what
+/// [`Seat`]s borrow.
+#[derive(Debug)]
+pub struct Compiled {
+    /// Per player: the world.
+    pub worlds: Vec<World>,
+    /// Per player: the resolved instance.
+    pub plans: Vec<Plan>,
+    /// Per player, per world item: whether it counts as held.
+    pub progression: Vec<Vec<bool>>,
+}
+
+impl Compiled {
+    /// Compile each manifest ([`worlds`]) and resolve each player's instance against it
+    /// ([`plans`]), on up to `workers` threads.
+    ///
+    /// # Errors
+    /// As [`worlds`] and [`plans`], or when the two lists differ in length.
+    pub fn new(
+        manifests: &[&serde_json::Value],
+        insts: &[&Instance],
+        workers: usize,
+    ) -> Result<Self, String> {
+        if manifests.len() != insts.len() {
+            return Err(format!("{} manifests, {} instances", manifests.len(), insts.len()));
+        }
+        let worlds = worlds(manifests, workers)?;
+        let pairs: Vec<(&World, &Instance)> = worlds.iter().zip(insts.iter().copied()).collect();
+        let plans = plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
+        let progression = worlds.iter().zip(insts).map(|(w, i)| i.progression(w)).collect();
+        Ok(Compiled { worlds, plans, progression })
+    }
+
+    /// One seat per player.
+    #[must_use]
+    pub fn seats(&self) -> Vec<Seat<'_>> {
+        (0..self.plans.len())
+            .map(|p| Seat {
+                w: &self.worlds[p],
+                plan: &self.plans[p],
+                progression: &self.progression[p],
+            })
+            .collect()
+    }
+}
+
 /// A room takes 1 to `config::ROOM_MAX_PLAYERS` players.
 ///
 /// # Errors
@@ -125,6 +171,8 @@ pub struct RoomFilled {
     pub solves: u32,
     /// Steps whose removal retracted something.
     pub rederived: u32,
+    /// Groups of items placed together against one state (rounds), in the last attempt.
+    pub rounds: u32,
     /// Work counters across all players' states.
     pub stats: Stats,
     /// Per player: the goal holds with everything placed collected.
@@ -374,6 +422,7 @@ fn fill_with(
         held: vec![Vec::new(); seats.len()],
         solves: 0,
         rederived: 0,
+        rounds: 0,
         stats: Stats::default(),
         extend,
     };
@@ -386,6 +435,7 @@ fn fill_with(
                     attempts: attempt,
                     solves: s.solves,
                     rederived: s.rederived,
+                    rounds: s.rounds,
                     stats: s.stats,
                     beatable,
                     reached,
@@ -635,6 +685,7 @@ struct Steps<'a, 'w> {
     held: Vec<Vec<u16>>,
     solves: u32,
     rederived: u32,
+    rounds: u32,
     stats: Stats,
     extend: bool,
 }
@@ -642,6 +693,7 @@ struct Steps<'a, 'w> {
 impl Steps<'_, '_> {
     fn try_fill(&mut self, rng: &mut SpecRng) -> Result<Vec<Vec<Option<Given>>>, FillError> {
         let seats = self.room.seats;
+        self.rounds = 0;
         let mut placed = locked_placed(seats);
         // Every player's free locations and items, in player order.
         let mut free: Vec<(u16, u32)> = Vec::new();
@@ -722,6 +774,7 @@ impl Steps<'_, '_> {
     ) -> Result<(), FillError> {
         let seats = self.room.seats;
         for (k, group) in groups.iter().enumerate() {
+            self.rounds += 1;
             let carried = if !prev.is_empty() && self.extend {
                 // The last group goes where it was put, then this group is taken back.
                 self.room.reset_stats();

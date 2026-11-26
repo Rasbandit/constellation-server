@@ -1,0 +1,57 @@
+name: bench
+# Room fill scaling on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build.
+# Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints a table to
+# the job summary and uploads the JSON lines as an artifact; nothing here gates a merge yet.
+# A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
+# through its concurrency group, cancel the run already in progress.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      players: { description: "Player counts, comma separated", default: "1,10,20,50,100" }
+      checks: { description: "Checks per world", default: "1000" }
+      clocks: { description: "on or off", default: "off" }
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+jobs:
+  bench-room:
+    # On a PR: it carries `perf`, and a label event is the `perf` label itself.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      # Inputs go through the environment, never into the script text.
+      - name: synth_room
+        env:
+          PLAYERS: ${{ inputs.players || '1,10,20,50,100' }}
+          CHECKS: ${{ inputs.checks || '1000' }}
+          CLOCKS: ${{ inputs.clocks || 'off' }}
+        run: |
+          set -o pipefail
+          cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
+            --players "$PLAYERS" --checks "$CHECKS" --clocks "$CLOCKS" | tee bench-room.jsonl
+      - name: summary
+        run: |
+          {
+            echo "### Room fill scaling (measured on a GitHub-hosted ubuntu-latest runner, release build)"
+            echo
+            echo "| players | checks | setup ms | fill ms (median) | rule evals | ns/eval | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | peak heap bytes | beatable |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(has("players")) | "| \(.players) | \(.checks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
+            echo
+            jq -r 'select(has("fitted_exponent")) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: { name: bench-room, path: bench-room.jsonl }
