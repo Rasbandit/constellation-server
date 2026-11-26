@@ -323,21 +323,21 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
-/// generation costs one core and many run side by side. The price is wall time for rooms on the
-/// forward path (8 players and up): measured on the `bench-room` CI job, 100 players filled in
-/// about half the time on 4 threads. The parallel path stays for a caller of the fill that asks
-/// for more, up to [`ROOM_FORWARD_WORKERS`] (results never depend on the number).
+/// generation costs one core and many run side by side. A room's fill runs on one thread on
+/// the path a room takes by itself (`data_fill::room::Path::of`). The forward path, which can
+/// use threads, stays for a caller that names it, up to [`ROOM_FORWARD_WORKERS`] (results
+/// never depend on the number).
 pub const GENERATION_WORKERS: usize = 1;
 
 /// Worker threads that compile worlds and resolve instances of a room's players in parallel
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
-/// Players from which a room's fill places its rounds against a fresh forward solve of the
-/// room instead of taking the round's items back by truth maintenance (`data_fill::room::Path`;
-/// both give the same placements). The forward solve is slower for one player and faster at
-/// ten on the synthetic rooms of the `bench-room` CI job; where the two cross in between is not
-/// measured (see `docs/port-check.md`, "Scaling with players").
+/// Players from which a room's fill stops taking a round's items back by truth maintenance
+/// (the carried path) and takes the split path instead: one solve, then every round's state by
+/// adding to it and undoing (`data_fill::room::Path`; every path gives the same placements).
+/// On the synthetic rooms of the `bench-room` CI job the split path is faster than the carried
+/// one at 1 and at 10 players too; smaller rooms stay carried until a real world is timed.
 pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
 
 /// Most threads the players' states of a room run on while a round is solved forward: a fill

@@ -16,6 +16,10 @@
 //! A third, [`Shape::wide`], is another kind of world: one region that holds every check, each
 //! behind a deep OR-of-AND tree over counts of items and sums of counts, so every rule reads
 //! many items and every item is read by many rules.
+//!
+//! And worlds built to be hard for a fill ([`Hostile`]): a chain of regions each opened by one
+//! item, one item in front of nine tenths of the world, half the progression as such keys, and
+//! a world with as much progression as locations that take it.
 
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -52,6 +56,31 @@ pub struct Shape {
     pub rich: bool,
     /// One region only ([`Shape::wide`]); the fields about regions, time and defs are not read.
     pub wide: bool,
+    /// A world built to be hard for a fill; `None`: the layered world or the wide one.
+    pub hostile: Option<Hostile>,
+}
+
+/// Worlds where taking one item out of what is held changes much of what is reached, or where
+/// a round has few locations to choose from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hostile {
+    /// Every progression item is a key: region `k + 1` is entered from region `k` with item
+    /// `k` (one copy), and the checks are spread evenly over the regions.
+    Chain,
+    /// One key: a tenth of the checks are in the start region and the rest behind one item.
+    /// The other progression items (four copies a kind) gate single checks.
+    Gated,
+    /// Half the progression copies are keys of a chain, the other half gate single checks.
+    Keys,
+    /// All but one: the progression is `n` copies of one item and seven tenths of the checks
+    /// are behind a gate that needs `n - 1` of them. Those checks take no progression, so the
+    /// copies stay in front of the gate: a state that lacks one copy reaches the whole world,
+    /// a state that lacks two reaches only the front.
+    Brink,
+    /// The layered world with half its pool progression and every other location excluded:
+    /// as much progression as locations that take it, so a round has few to choose from and
+    /// an attempt is often stuck.
+    Tight,
 }
 
 impl Default for Shape {
@@ -69,6 +98,7 @@ impl Default for Shape {
             absent: 0.0,
             rich: false,
             wide: false,
+            hostile: None,
         }
     }
 }
@@ -97,6 +127,101 @@ impl Shape {
     pub fn wide() -> Self {
         Shape { checks: 131, progression: 0.6, wide: true, ..Shape::default() }
     }
+}
+
+impl Shape {
+    /// A light world of 1,000 checks made [`Hostile`] in the way `how` says.
+    #[must_use]
+    pub fn hostile(how: Hostile) -> Self {
+        let progression = match how {
+            Hostile::Tight => 0.5,
+            // 100 keys: a longer chain leaves a round too few locations in a room of ten.
+            Hostile::Chain => 0.1,
+            _ => Shape::default().progression,
+        };
+        Shape { hostile: Some(how), progression, ..Shape::default() }
+    }
+}
+
+/// The key worlds of [`Hostile`]: `links` keys, one copy each, key `k` on the only exit from
+/// region `k` to region `k + 1`; the goal is the last region.
+fn keyed(shape: &Shape, how: Hostile, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance) {
+    let checks = shape.checks.max(8);
+    // At most 200 copies: a `has` counts to 255.
+    let copies_total =
+        ((checks as f64 * shape.progression).round() as usize).clamp(2, (checks / 4).min(200));
+    let brink = how == Hostile::Brink;
+    let links = match how {
+        Hostile::Gated | Hostile::Brink => 1,
+        Hostile::Keys => copies_total / 2,
+        _ => copies_total,
+    };
+    // What is not a key: kinds of four copies, each read by single checks.
+    let loose = if brink { 0 } else { (copies_total - links) / 4 };
+    // The checks in front of the one gate: a tenth, or (brink) three tenths.
+    let front = if brink { checks * 3 / 10 } else { checks / 10 };
+    let (key, p) = (|k: usize| format!("k{k}"), |k: usize| format!("p{k}"));
+    let regions = links + 1;
+    // The region of a check: a tenth in front of the one key, or spread evenly.
+    let region = |l: usize| match how {
+        Hostile::Gated | Hostile::Brink => usize::from(l >= front),
+        _ => l * regions / checks,
+    };
+    let mut region_checks: Vec<Vec<Value>> = vec![Vec::new(); regions];
+    for l in 0..checks {
+        let rule = if loose > 0 && pick(4) == 0 {
+            json!({"has": p(pick(loose))})
+        } else {
+            json!({"true": {}})
+        };
+        region_checks[region(l)].push(json!({"loc": format!("l{l}"), "rule": rule}));
+    }
+    let regions_json: Vec<Value> = (0..regions)
+        .map(|r| {
+            let exits = if r + 1 < regions {
+                let n = if brink { copies_total - 1 } else { 1 };
+                json!([{"to": format!("r{}", r + 1), "rule": {"has": key(r), "n": n}}])
+            } else {
+                json!([])
+            };
+            json!({"key": format!("r{r}"), "can_stay": false, "checks": region_checks[r],
+                   "exits": exits, "events": [], "stays": []})
+        })
+        .collect();
+    let kinds = (0..links).map(key).chain((0..loose).map(p));
+    let mut items: Vec<Value> =
+        kinds.clone().enumerate().map(|(i, k)| json!({"key": k, "id": i + 1})).collect();
+    items.push(json!({"key": "filler", "id": links + loose + 1}));
+    let manifest = json!({
+        "options": [],
+        "items": items,
+        "locations": (0..checks).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
+            .collect::<Vec<_>>(),
+        "start": "r0",
+        "x.time": {"slices": 1, "start_mask": 1},
+        "defs": {},
+        "regions": regions_json,
+        "goal": {"reach": format!("region:r{links}")},
+    });
+    let keys = if brink { copies_total } else { 1 };
+    let mut pool: Vec<String> = (0..links)
+        .flat_map(|k| vec![key(k); keys])
+        .chain((0..loose).flat_map(|k| vec![p(k); 4]))
+        .collect();
+    pool.resize(checks, "filler".to_owned());
+    let mut pool_class: std::collections::HashMap<String, String> =
+        kinds.map(|k| (k, "progression".to_owned())).collect();
+    pool_class.insert("filler".to_owned(), "filler".to_owned());
+    let mut inst = Instance {
+        locations: (0..checks).map(|l| format!("l{l}")).collect(),
+        pool,
+        pool_class,
+        ..Instance::default()
+    };
+    if brink {
+        inst.excluded = (front..checks).map(|l| format!("l{l}")).collect();
+    }
+    (manifest, inst)
 }
 
 /// The one-region world of [`Shape::wide`].
@@ -173,6 +298,9 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut pick = |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
     if shape.wide {
         return wide(shape, &mut pick);
+    }
+    if let Some(how) = shape.hostile.filter(|h| *h != Hostile::Tight) {
+        return keyed(shape, how, &mut pick);
     }
     let checks = shape.checks.max(1);
     let regions = ((checks as f64 * shape.regions) as usize).max(2);
@@ -315,12 +443,15 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
         (0..kinds).map(|k| (p(k), "progression".to_owned())).collect();
     pool_class.insert("useful".to_owned(), "useful".to_owned());
     pool_class.insert("filler".to_owned(), "filler".to_owned());
-    let inst = Instance {
+    let mut inst = Instance {
         locations: (0..checks).map(|l| format!("l{l}")).collect(),
         pool,
         pool_class,
         ..Instance::default()
     };
+    if shape.hostile == Some(Hostile::Tight) {
+        inst.excluded = (0..checks).step_by(2).map(|l| format!("l{l}")).collect();
+    }
     (manifest, inst)
 }
 
@@ -436,6 +567,191 @@ mod tests {
             let hash = format!("{:016x}", crate::check::fnv1a(out.as_bytes()));
             assert_eq!(hash, "036064f5ec95175d", "{workers} workers");
         }
+    }
+
+    /// A confined progression item never lands on an excluded location of its group (#203):
+    /// `p0` is confined to a group of 24 locations, every other one of them excluded. Over
+    /// many seeds, alone and in a room, on every path. And a group that could hold its item's
+    /// copies only by using excluded locations is refused when the instance is resolved, by
+    /// name, instead of being filled onto them or tried twenty times.
+    #[test]
+    fn a_confined_progression_item_never_takes_an_excluded_location() {
+        let shape = small(false);
+        let grouped = |inst: &mut Instance, most: usize| {
+            confine(inst, 5, 2);
+            inst.excluded = (0..inst.locations.len())
+                .filter(|l| l % 5 < 2)
+                .enumerate()
+                .filter(|(k, _)| k % 2 == 0 || *k >= most)
+                .map(|(_, l)| format!("l{l}"))
+                .collect();
+        };
+        let (mut fills, mut copies) = (0, 0);
+        let mut on_excluded = |c: &Compiled, placed: &[Vec<Option<Given>>], what: &str| {
+            for (p, row) in placed.iter().enumerate() {
+                let (w, plan) = (&c.worlds[p], &c.plans[p]);
+                let p0 = w.item("p0").unwrap();
+                for (l, g) in row.iter().enumerate() {
+                    if g.is_some_and(|g| g.item == p0 && usize::from(g.to) == p) {
+                        copies += 1;
+                        assert!(!plan.excluded[l], "{what}: p0 on excluded l{l} of player {p}");
+                    }
+                }
+            }
+            fills += 1;
+        };
+        for seed in 1..=30 {
+            let one = room_with(&shape, 23, 1, |_, inst| grouped(inst, 24)).unwrap();
+            let mut rng = SpecRng::from_u64(seed);
+            if let Ok(f) = crate::fill(&one.worlds[0], &one.plans[0], &mut rng, 20) {
+                let placed: Vec<Option<Given>> =
+                    f.placed.iter().map(|i| i.map(|item| Given { to: 0, item })).collect();
+                on_excluded(&one, &[placed], &format!("alone, seed {seed}"));
+            }
+            let room = room_with(&shape, 23, 3, |_, inst| grouped(inst, 24)).unwrap();
+            for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Split] {
+                let mut rng = SpecRng::from_u64(seed);
+                if let Ok((f, _)) = fill_room_on(&room.seats(), &mut rng, 20, path) {
+                    on_excluded(&room, &f.placed, &format!("{path:?}, seed {seed}"));
+                }
+            }
+        }
+        assert!(fills >= 100 && copies > 500, "{fills} fills, {copies} copies of p0 seen");
+        // Only two of the group's 24 locations take progression: fewer than p0's copies.
+        let e = room_with(&shape, 23, 1, |_, inst| grouped(inst, 4)).unwrap_err();
+        assert!(e.contains("p0") && e.contains("excluded"), "{e}");
+    }
+
+    /// An opt-in mode in a room of several players: whether it places the seed itself or
+    /// gives up and the exact fill places it, the split path decides what the carried and the
+    /// forward path decide. Tight rooms, where the modes do fall back.
+    #[test]
+    fn a_mode_in_a_room_places_the_same_on_the_split_path_fallen_back_or_not() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let tight = Shape { checks: 60, ..Shape::hostile(Hostile::Tight) };
+        let (mut fell, mut fast, mut filled) = (0, 0, 0);
+        for (shape, players) in [(tight, 3), (tight, 9), (small(true), 4)] {
+            let c = room_with(&shape, 23, players, |_, _| {}).unwrap();
+            let seats = c.seats();
+            for seed in 1..=8 {
+                for mode in
+                    [Algorithm::Shuffle(Dials::default()), Algorithm::Level(Dials::default())]
+                {
+                    let on = |path| {
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|(f, sp)| (f.placed, f.fast, f.fallbacks, f.attempts, sp))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    let split = on(Path::Split);
+                    let at = format!("{players} players, seed {seed}, {mode:?}");
+                    assert_eq!(split, on(Path::Carry), "{at}");
+                    assert_eq!(split, on(Path::Forward { workers: 1 }), "{at}");
+                    if let Ok(f) = split {
+                        fell += f.2;
+                        fast += u32::from(f.1);
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            fell > 0 && fast > 0 && filled > 20,
+            "{fell} fallbacks, {fast} fast, {filled} filled"
+        );
+    }
+
+    /// The same pin with the rooms forced onto the split path.
+    #[test]
+    fn the_pinned_placements_are_the_same_on_the_split_path() {
+        let out = pinned(Some(Path::Split));
+        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// The split path reaches every round's state by adding to one solve and taking the
+    /// additions back; that state is the least fixed point a fresh solve of the round gives,
+    /// so it must decide everything exactly as the forward path and truth maintenance do:
+    /// placements, spheres, attempts, rounds, what is reached, or the error. Rooms of 1 to 12
+    /// players; both profiles, clocks on and off, a high progression share; the hostile
+    /// worlds and the wide one; excluded and locked locations, start items, confined items;
+    /// fills that are stuck on every attempt and fills that need a retry (an attempt that
+    /// ends in the middle of the rounds); every rule as bytecode; every player on one world;
+    /// a world of enough rounds for seven levels of halves.
+    #[test]
+    fn the_split_path_places_what_a_solve_per_round_places() {
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let dense = Shape { progression: 0.7, ..small(true) };
+        let hostile = |how| Shape { checks: 60, ..Shape::hostile(how) };
+        let cases = [
+            (small(false), ""),
+            (small(true), "confined"),
+            (small(false), "excluded+locked+start"),
+            (heavy, ""),
+            (heavy, "confined+excluded+locked+start"),
+            (dense, "excluded"),
+            (dense, "confined+locked"),
+            (small(true), "cramped"),
+            // Worlds where one item out changes much of what is reached, and deep rules.
+            (hostile(Hostile::Chain), ""),
+            (hostile(Hostile::Gated), ""),
+            (hostile(Hostile::Keys), ""),
+            (hostile(Hostile::Brink), ""),
+            (hostile(Hostile::Tight), ""),
+            (Shape::wide(), ""),
+        ];
+        let (mut rooms, mut stuck, mut retried, mut undone) = (0, 0, 0, 0);
+        for (shape, what) in cases {
+            for players in [1u64, 2, 3, 8, 12] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                for seed in 1..=4 {
+                    let at = format!("{what:?}, {players} players, seed {seed}");
+                    let (split, _, _) = outcome(&c, seed, Path::Split);
+                    assert_eq!(split, outcome(&c, seed, Path::Forward { workers: 1 }).0, "{at}");
+                    assert_eq!(split, outcome(&c, seed, Path::Carry).0, "{at}");
+                    rooms += 1;
+                    stuck += u32::from(split.is_err());
+                    retried += u32::from(split.is_ok_and(|x| x.2 > 1));
+                    let mut rng = SpecRng::from_u64(seed);
+                    let filled =
+                        fill_room_on(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, Path::Split);
+                    undone += filled.map_or(0, |f| f.0.profile.undone);
+                }
+            }
+        }
+        // As much progression as locations that take it: stuck at first, filled on a later
+        // attempt, with the same draws on every path.
+        let tight = Shape { progression: 0.5, ..small(true) };
+        for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
+            let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
+            let (split, _, _) = outcome(&c, seed, Path::Split);
+            assert_eq!(split, outcome(&c, seed, Path::Carry).0, "{players} players, seed {seed}");
+            retried += u32::from(split.is_ok_and(|x| x.2 > 1));
+        }
+        assert_eq!(rooms, 280);
+        assert!(stuck > 0 && retried >= 4, "{stuck} stuck, {retried} retried");
+        // Every rule as bytecode, and every player on one world (`Compiled::shared`).
+        for (shape, players) in [(heavy, 3), (hostile(Hostile::Brink), 2), (Shape::wide(), 2)] {
+            let mut c = room_with(&shape, 23, players, |_, _| {}).unwrap();
+            c.plans = c.plans.into_iter().map(crate::Plan::interpreted).collect();
+            let (m, inst) = world(&shape, 23, 0);
+            let one = vec![&inst; 9];
+            let shared = Compiled::shared(World::load(&m).unwrap(), &one, 1).unwrap();
+            for seed in 1..=4 {
+                for (room, what) in [(&c, "bytecode"), (&shared, "one world")] {
+                    let (split, stats, _) = outcome(room, seed, Path::Split);
+                    let at = format!("{shape:?}, {what}, seed {seed}");
+                    assert_eq!(split, outcome(room, seed, Path::Forward { workers: 1 }).0, "{at}");
+                    assert!(what != "bytecode" || stats.bits == 0, "{at}");
+                }
+            }
+        }
+        // Rounds enough for seven levels of halves (the rooms above have four to six).
+        let deep = Shape { checks: 400, ..Shape::heavy() };
+        let c = room_with(&deep, 23, 2, |_, _| {}).unwrap();
+        let (split, _, _) = outcome(&c, 1, Path::Split);
+        assert!(split.as_ref().is_ok_and(|f| f.3 > 64), "rounds: {:?}", split.map(|f| f.3));
+        assert_eq!(split, outcome(&c, 1, Path::Forward { workers: 1 }).0, "400 checks");
+        assert!(undone > 100_000, "{undone} journal steps undone");
     }
 
     /// Rule nodes of a rule in the manifest's JSON: one per object, plus its list operands.
@@ -933,24 +1249,24 @@ mod tests {
         assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
     }
 
-    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it goes forward, on
-    /// the workers asked for, capped by `config::ROOM_FORWARD_WORKERS` and never below one.
+    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it takes the split
+    /// path, whatever the workers asked for.
     #[test]
     fn the_path_changes_at_the_configured_room_size() {
-        let (at, cap) = (config::ROOM_FORWARD_MIN_PLAYERS, config::ROOM_FORWARD_WORKERS);
+        let at = config::ROOM_FORWARD_MIN_PLAYERS;
         assert_eq!(Path::of(1, 4), Path::Carry);
         assert_eq!(Path::of(at - 1, 4), Path::Carry);
-        assert_eq!(Path::of(at, 1), Path::Forward { workers: 1 });
-        assert_eq!(Path::of(at + 1, 0), Path::Forward { workers: 1 });
-        let Path::Forward { workers } = Path::of(at, usize::MAX) else { panic!("forward") };
-        let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        assert_eq!(workers, cap.min(cores), "the cap, or the machine's cores when fewer");
-        // The room fill takes that path: a room at the threshold solves afresh per round.
+        assert_eq!(Path::of(at, 1), Path::Split);
+        assert_eq!(Path::of(at + 1, 0), Path::Split);
+        assert_eq!(Path::of(at, usize::MAX), Path::Split);
+        // The room fill takes that path: a room at the threshold solves once, takes nothing
+        // back by truth maintenance, and undoes what it added for its rounds.
         let c = room(&small(false), 5, at, 1).unwrap();
         let (f, _) =
             fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
                 .unwrap();
-        assert!(f.solves > 1 && f.stats.removals == 0, "solves {}", f.solves);
+        assert!(f.solves == 1 && f.stats.removals == 0, "solves {}", f.solves);
+        assert!(f.profile.undone > 0, "nothing was undone");
     }
 
     #[test]
