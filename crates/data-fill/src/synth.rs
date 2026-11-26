@@ -7,6 +7,11 @@
 //! without counts), `any`, `all` with a def, and counters lit by events in the first layer.
 //! Every gate can be met with every item held, so the goal (reach every region of the last
 //! layer) holds with the whole pool.
+//!
+//! Two profiles: [`Shape::default`] (light: few sites, two time slices, short rules) and
+//! [`Shape::heavy`], whose counts per check follow the experiment's test world as counted in
+//! `docs/data-only-world-experiment.md` (1516 checks, 318 regions, 3685 rule sites, 107 defs,
+//! 45 time slices, clocks as items).
 
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -25,13 +30,57 @@ pub struct Shape {
     pub branching: usize,
     /// Share of the pool that is progression.
     pub progression: f64,
-    /// Clocks restrict time: the later slice is owned only with the first progression item.
+    /// Clocks restrict time: only the first half-day is owned from the start, each later one
+    /// with a progression item of its own.
     pub clocks: bool,
+    /// Regions per check.
+    pub regions: f64,
+    /// Time slices of the day (2 to 64), split into `slices / 8` half-days (at least two).
+    pub slices: usize,
+    /// Events that light each counter.
+    pub events: usize,
+    /// Named defs per kind of progression item.
+    pub defs: f64,
+    /// Locations that do not exist this seed, per check: their rules are still evaluated.
+    pub absent: f64,
+    /// Longer rules: three checks in eight are gated like exits, half the gates carry a second
+    /// condition, defs read other defs and time, and time leaves test a window of slices.
+    pub rich: bool,
 }
 
 impl Default for Shape {
     fn default() -> Self {
-        Shape { checks: 1000, layers: 6, branching: 2, progression: 0.19, clocks: false }
+        Shape {
+            checks: 1000,
+            layers: 6,
+            branching: 2,
+            progression: 0.19,
+            clocks: false,
+            regions: 0.125,
+            slices: 2,
+            events: 2,
+            defs: 0.125,
+            absent: 0.0,
+            rich: false,
+        }
+    }
+}
+
+impl Shape {
+    /// The heavy profile: per check, the test world's counted regions (0.21), rule sites (2.4),
+    /// defs and events; its 45 time slices; clocks on.
+    #[must_use]
+    pub fn heavy() -> Self {
+        Shape {
+            clocks: true,
+            regions: 0.21,
+            slices: 45,
+            events: 6,
+            defs: 1.5,
+            absent: 0.85,
+            rich: true,
+            ..Shape::default()
+        }
     }
 }
 
@@ -41,7 +90,12 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut rng = SpecRng::from_u64_tagged(seed, b"synthrm\0", player);
     let mut pick = |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
     let checks = shape.checks.max(1);
-    let regions = (checks / 8).max(2);
+    let regions = ((checks as f64 * shape.regions) as usize).max(2);
+    let slices = shape.slices.clamp(2, 64);
+    let halves = (slices / 8).max(2);
+    // Half-day `h` is slices `half(h).0..=half(h).1`; the later half of the day as a mask.
+    let half = |h: usize| (h * slices / halves, (h + 1) * slices / halves - 1);
+    let late: u64 = (slices / 2..slices).fold(0, |m, b| m | 1 << b);
     let layers = shape.layers.clamp(1, regions - 1);
     // Region 0 is the start; the others are spread evenly over the layers.
     let layer = |r: usize| if r == 0 { 0 } else { (r - 1) * layers / (regions - 1) + 1 };
@@ -59,10 +113,27 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
             _ => json!({"has": p(k)}),
         }
     };
-    let defs = (kinds / 8).max(1);
+    // A time leaf: the later half of the day, or (rich) a window of up to eight slices.
+    let time_leaf = |pick: &mut dyn FnMut(usize) -> usize| {
+        if !shape.rich || slices <= 2 {
+            return json!({"x.time_any": late});
+        }
+        let from = 1 + pick(slices - 1);
+        let window = (from..slices.min(from + 1 + pick(8))).fold(0u64, |m, b| m | 1 << b);
+        json!({"x.time_any": window})
+    };
+    let defs = ((kinds as f64 * shape.defs) as usize).max(1);
     let def_rules: serde_json::Map<String, Value> = (0..defs)
         .map(|d| {
-            let rule = json!({"any": [has(&mut pick), {"all": [has(&mut pick), has(&mut pick)]}]});
+            // Rich: chains of up to four defs, and one def in seven reads time.
+            let (first, second) = (has(&mut pick), has(&mut pick));
+            let last = match d {
+                _ if !shape.rich => has(&mut pick),
+                _ if d % 7 == 3 => time_leaf(&mut pick),
+                _ if d % 4 != 0 => json!({"ref": format!("d{}", d - 1)}),
+                _ => has(&mut pick),
+            };
+            let rule = json!({"any": [first, {"all": [second, last]}]});
             (format!("d{d}"), rule)
         })
         .collect();
@@ -70,17 +141,24 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let counters = (regions / 16).max(1);
     let mut events: Vec<Vec<Value>> = vec![Vec::new(); regions];
     for c in 0..counters {
-        for _ in 0..2 {
+        for _ in 0..shape.events {
             let r = in_layer[1][pick(in_layer[1].len())];
             events[r].push(json!({"event": format!("c{c}"), "rule": has(&mut pick)}));
         }
     }
-    let gate = |d: usize, pick: &mut dyn FnMut(usize) -> usize| match pick(20) {
-        0..=7 => has(pick),
-        8..=11 => json!({"any": [has(pick), has(pick)]}),
-        12..=15 => json!({"all": [has(pick), {"ref": format!("d{}", pick(defs))}]}),
-        16..=17 if d >= 3 => json!({"ge": [{"counter": format!("c{}", pick(counters))}, 2]}),
-        _ => has(pick),
+    let gate = |d: usize, pick: &mut dyn FnMut(usize) -> usize| {
+        let first = match pick(20) {
+            0..=7 => has(pick),
+            8..=11 => json!({"any": [has(pick), has(pick)]}),
+            12..=15 => json!({"all": [has(pick), {"ref": format!("d{}", pick(defs))}]}),
+            16..=17 if d >= 3 => json!({"ge": [{"counter": format!("c{}", pick(counters))}, 2]}),
+            _ => has(pick),
+        };
+        if shape.rich && pick(2) == 0 {
+            let second = json!({"any": [has(pick), {"ref": format!("d{}", pick(defs))}]});
+            return json!({"all": [first, second]});
+        }
+        first
     };
     let mut exits: Vec<Vec<Value>> = vec![Vec::new(); regions];
     for r in 1..regions {
@@ -93,11 +171,14 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     // Every fourth region past the start can wait into the later slice.
     let can_stay = |r: usize| r % 4 == 3;
     let mut region_checks: Vec<Vec<Value>> = vec![Vec::new(); regions];
-    for l in 0..checks {
+    // The checks that exist, then the absent ones (in the manifest, not in the instance).
+    let locations = checks + (checks as f64 * shape.absent) as usize;
+    for l in 0..locations {
         let r = l % regions;
         let rule = match pick(8) {
-            0 if can_stay(r) => json!({"x.time_any": 2}),
+            0 if can_stay(r) => time_leaf(&mut pick),
             1 | 2 => has(&mut pick),
+            3..=5 if shape.rich => gate(layer(r), &mut pick),
             _ => json!({"true": {}}),
         };
         region_checks[r].push(json!({"loc": format!("l{l}"), "rule": rule}));
@@ -105,7 +186,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let regions_json: Vec<Value> = (0..regions)
         .map(|r| {
             let stays = if can_stay(r) && r % 8 == 7 {
-                json!([{"slice": 1, "rule": has(&mut pick)}])
+                json!([{"slice": slices / 2, "rule": has(&mut pick)}])
             } else {
                 json!([])
             };
@@ -114,11 +195,17 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
                    "stays": stays})
         })
         .collect();
-    let mut time = json!({"slices": 2, "start_mask": 1});
+    let mut time = json!({"slices": slices, "start_mask": 1});
     if shape.clocks {
-        time["owned"] = json!({"when": {"true": {}}, "none_owned_mask": 1, "half_days": [
-            {"first": 0, "last": 0, "rule": {"true": {}}},
-            {"first": 1, "last": 1, "rule": {"has": p(0)}}]});
+        // The first half-day is owned from the start, each later one with an item of its own.
+        let half_days: Vec<Value> = (0..halves)
+            .map(|h| {
+                let rule =
+                    if h == 0 { json!({"true": {}}) } else { json!({"has": p((h - 1) % kinds)}) };
+                json!({"first": half(h).0, "last": half(h).1, "rule": rule})
+            })
+            .collect();
+        time["owned"] = json!({"when": {"true": {}}, "none_owned_mask": 1, "half_days": half_days});
     }
     let goal: Vec<Value> =
         in_layer[layers].iter().map(|r| json!({"reach": format!("region:r{r}")})).collect();
@@ -128,7 +215,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let manifest = json!({
         "options": [],
         "items": items,
-        "locations": (0..checks).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
+        "locations": (0..locations).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
             .collect::<Vec<_>>(),
         "start": "r0",
         "x.time": time,
@@ -220,6 +307,60 @@ mod tests {
         let p0 = |row: &str| row.matches("item: 0 }").count();
         assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
         assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// Rule nodes of a rule in the manifest's JSON: one per object, plus its list operands.
+    fn nodes(rule: &Value) -> usize {
+        let inner = |v: &Value| v.as_array().map_or(0, |a| a.iter().map(nodes).sum());
+        1 + rule.as_object().map_or(0, |o| o.values().map(inner).sum())
+    }
+
+    /// The heavy profile against the test world's counts per check
+    /// (`docs/data-only-world-experiment.md`: 1516 checks, 318 regions, 3685 rule sites, 107
+    /// defs, 45 slices), within a fifth; about 2.6 nodes per rule site.
+    #[test]
+    fn the_heavy_profile_has_the_test_worlds_counts_per_check() {
+        let shape = Shape::heavy();
+        let (m, inst) = world(&shape, 1, 0);
+        let checks = inst.locations.len() as f64;
+        let regions = m["regions"].as_array().unwrap();
+        let (mut sites, mut size) = (0usize, 0usize);
+        for r in regions {
+            for group in ["checks", "exits", "events", "stays"] {
+                for s in r[group].as_array().unwrap() {
+                    sites += 1;
+                    size += nodes(&s["rule"]);
+                }
+            }
+        }
+        let near = |got: f64, want: f64, what: &str| {
+            assert!((got / want - 1.0).abs() <= 0.2, "{what}: {got}, the test world has {want}");
+        };
+        near(regions.len() as f64 / checks, 318.0 / 1516.0, "regions per check");
+        near(sites as f64 / checks, 3685.0 / 1516.0, "rule sites per check");
+        near(m["defs"].as_object().unwrap().len() as f64 / checks, 107.0 / 1516.0, "defs");
+        near(size as f64 / sites as f64, 2.6, "nodes per rule site");
+        assert_eq!(m["x.time"]["slices"], 45);
+        assert!(m["x.time"]["owned"]["half_days"].as_array().unwrap().len() > 2, "clocks on");
+        assert!(regions.iter().any(|r| !r["events"].as_array().unwrap().is_empty()), "events");
+        eprintln!(
+            "heavy: {} regions, {sites} sites, {} defs, {:.2} nodes per site",
+            regions.len(),
+            m["defs"].as_object().unwrap().len(),
+            size as f64 / sites as f64
+        );
+        // A small room of it fills beatable, the same bytes for a seed, items crossing worlds.
+        let shape = Shape { checks: 60, layers: 3, ..shape };
+        let (a, b) = (room(&shape, 7, 3, 1).unwrap(), room(&shape, 7, 3, 3).unwrap());
+        for seed in 1..=3 {
+            let x = fill(&a, seed);
+            assert_eq!(x, fill(&b, seed), "seed {seed}");
+            let crossed =
+                x.0.iter()
+                    .enumerate()
+                    .any(|(p, r)| r.iter().flatten().any(|g| usize::from(g.to) != p));
+            assert!(crossed && x.1.removals > 0, "seed {seed}: items cross, removals ran");
+        }
     }
 
     #[test]

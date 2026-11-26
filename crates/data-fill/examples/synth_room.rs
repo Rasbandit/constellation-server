@@ -1,6 +1,6 @@
-//! `synth_room [--players 1,10,20,50,100] [--checks 1000] [--layers 6] [--branching 2]
-//! [--progression 0.19] [--clocks on|off] [--seed 1] [--reps 5]`: room fill scaling on
-//! synthetic worlds ([`data_fill::synth`]). One JSON object per player count, then one with the
+//! `synth_room [--profile light|heavy] [--players 1,10,20,50,100] [--checks 1000] [--layers 6]
+//! [--branching 2] [--progression 0.19] [--clocks on|off] [--seed 1] [--reps 5]`: room fill
+//! scaling on synthetic worlds ([`data_fill::synth`]; the heavy profile has clocks on). One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
 //! `setup_ms` draws, compiles and resolves every player's world. `fill_ms` is the median of
@@ -108,17 +108,24 @@ fn exponent(points: &[(f64, f64)]) -> Option<f64> {
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let d = Shape::default();
+    let profile = arg(&args, "--profile", "light".to_owned())?;
+    let d = match profile.as_str() {
+        "light" => Shape::default(),
+        "heavy" => Shape::heavy(),
+        x => return Err(format!("--profile: light or heavy, got {x}")),
+    };
+    let on = |b: bool| if b { "on" } else { "off" }.to_owned();
     let shape = Shape {
         checks: arg(&args, "--checks", d.checks)?,
         layers: arg(&args, "--layers", d.layers)?,
         branching: arg(&args, "--branching", d.branching)?,
         progression: arg(&args, "--progression", d.progression)?,
-        clocks: match arg(&args, "--clocks", "off".to_owned())?.as_str() {
+        clocks: match arg(&args, "--clocks", on(d.clocks))?.as_str() {
             "on" => true,
             "off" => false,
             x => return Err(format!("--clocks: on or off, got {x}")),
         },
+        ..d
     };
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
@@ -128,10 +135,12 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let row = one(&shape, seed, n, reps)?;
+        let mut row = one(&shape, seed, n, reps)?;
+        row["profile"] = json!(profile);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
     }
-    println!("{}", json!({"fitted_exponent": exponent(&points), "points": points}));
+    let fitted = exponent(&points);
+    println!("{}", json!({"profile": profile, "fitted_exponent": fitted, "points": points}));
     Ok(())
 }
