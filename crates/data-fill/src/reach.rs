@@ -1021,7 +1021,8 @@ impl<'w> Reach<'w> {
                 // An option atom: the seed decided it, no value of the state moves it.
                 _ => return usize::from(a.kind) == STATIC,
             };
-            (self.atoms[bit / 64] >> (bit % 64) & 1 == 1) == (v >= i64::from(a.n))
+            let bit = u16::try_from(bit).unwrap_or(u16::MAX);
+            crate::bitrules::bit(&self.atoms, bit) == (v >= i64::from(a.n))
         })
     }
 
@@ -1108,6 +1109,8 @@ impl<'w> Reach<'w> {
     pub(crate) fn start_removal(&mut self, item: u16) -> bool {
         let i = usize::from(item);
         self.adjust[i] -= 1;
+        // The fold answered every `has` the start items meet for good: they are never taken back.
+        debug_assert!(self.adjust[i] >= self.plan.start_copies(item), "a start item taken back");
         self.count_change(item, -1);
         if self.adjust[i] >= self.plan.saturated_at(item) {
             return false;
@@ -1579,20 +1582,26 @@ impl<'w> Reach<'w> {
         }
     }
 
-    /// Whether fact `f` holds now, in a region of mask `t`: by its bit rule, or its bytecode.
-    fn now(&self, f: usize, t: u64) -> bool {
+    /// Whether fact `f` holds now, in a region of mask `t`, and whether its bit rule said so
+    /// (not its bytecode).
+    fn answer(&self, f: usize, t: u64) -> (bool, bool) {
         match self.rules.holds(&self.atoms, f, t) {
-            Some(v) => v,
-            None => self.env().eval(self.rule(f) as usize, t),
+            Some(v) => (v, true),
+            None => (self.env().eval(self.rule(f) as usize, t), false),
         }
+    }
+
+    /// Whether fact `f` holds now, in a region of mask `t`.
+    fn now(&self, f: usize, t: u64) -> bool {
+        self.answer(f, t).0
     }
 
     /// [`Reach::now`] for site `s`, counted as a rule evaluation.
     fn eval(&mut self, s: usize, t: u64) -> bool {
+        let (v, by_bits) = self.answer(s, t);
         self.stats.evals += 1;
-        let v = self.rules.holds(&self.atoms, s, t);
-        self.stats.bits += u64::from(v.is_some());
-        v.unwrap_or_else(|| self.env().eval(self.rule(s) as usize, t))
+        self.stats.bits += u64::from(by_bits);
+        v
     }
 
     fn push_site(&mut self, s: u32) {

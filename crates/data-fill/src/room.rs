@@ -250,9 +250,6 @@ pub struct Rounds {
     /// Of them: worlds that reached another set of locations than in the round before (the
     /// first round's all count).
     pub changed: u64,
-    /// Of them: worlds something changed for since the round before (an item of the player
-    /// was taken out of the held ones or placed, or an item was placed in the world).
-    pub touched: u64,
     /// Nanoseconds: setting the states up for a solve (reset, start items, what locations
     /// hold), running them to the fixed point, and picking the round's locations.
     pub nanos: [u64; 3],
@@ -1571,13 +1568,6 @@ impl Steps<'_, '_> {
                 self.room.solve(&self.held, placed);
                 self.solves += 1;
                 self.room.absorb(&mut self.stats);
-                let mut touched = vec![false; seats.len()];
-                group.iter().for_each(|g| touched[usize::from(g.to)] = true);
-                for ((p, _), g) in prev.iter() {
-                    touched[usize::from(*p)] = true;
-                    touched[usize::from(g.to)] = true;
-                }
-                self.profile.touched += touched.iter().filter(|t| **t).count() as u64;
                 for (m, last) in self.room.models.iter().zip(&mut self.last) {
                     self.profile.solved += 1;
                     if last.as_slice() != m.reached_words() {

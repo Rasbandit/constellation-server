@@ -572,6 +572,40 @@ mod tests {
         }
     }
 
+    /// Folding the `has` tests the start items meet changes nothing a fill decides: the same
+    /// plans with those tests left in the rules (`Plan::without_start_fold`) give the same
+    /// outcome, by bit rules and by bytecode, carried and forward.
+    #[test]
+    fn folding_the_start_items_changes_nothing_a_fill_decides() {
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let cases = [(small(false), "excluded+locked+start"), (heavy, "confined+locked+start")];
+        let mut removals = 0;
+        for (shape, what) in cases {
+            for players in [1u64, 3, 9] {
+                for bits in [true, false] {
+                    let plain = |p: crate::Plan| if bits { p } else { p.interpreted() };
+                    let room =
+                        || room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                    let (mut folded, mut unfolded) = (room(), room());
+                    folded.plans = folded.plans.into_iter().map(plain).collect();
+                    unfolded.plans = (unfolded.plans.into_iter().zip(&unfolded.worlds))
+                        .map(|(p, w)| plain(p.without_start_fold(w)))
+                        .collect();
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        for seed in 1..=3 {
+                            let (a, stats, _) = outcome(&folded, seed, path);
+                            let (b, _, _) = outcome(&unfolded, seed, path);
+                            let at = format!("{what}, {players} players, bits {bits}, {path:?}");
+                            assert_eq!(a, b, "{at}, seed {seed}");
+                            removals += stats.removals;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(removals > 0, "no item was taken back");
+    }
+
     /// A round's state is the unique least fixed point for what is held and placed, and
     /// placement reads only what that state reaches: so a fresh forward solve per round
     /// (`Path::Forward`, on one thread and on four) must decide everything exactly as truth

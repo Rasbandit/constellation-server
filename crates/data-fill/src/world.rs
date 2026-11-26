@@ -837,6 +837,13 @@ impl World {
             .unwrap_or(0)
     }
 
+    /// For measurements: build this world's bit rules again (what a load does once) and
+    /// return the bytes they take; the world is not changed.
+    #[must_use]
+    pub fn build_bit_rules(&self) -> usize {
+        Bits::of(self).bytes()
+    }
+
     /// The rules as bit rules.
     pub(crate) fn bits(&self) -> &Bits {
         &self.bits

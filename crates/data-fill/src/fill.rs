@@ -142,6 +142,11 @@ pub enum FillError {
     },
 }
 
+/// Folded rule offsets that are a constant (0 true, 1 false).
+fn constant(sites: &[u32]) -> usize {
+    sites.iter().filter(|at| **at <= 1).count()
+}
+
 impl Plan {
     /// Resolve an instance against a world.
     ///
@@ -231,7 +236,7 @@ impl Plan {
         let mut atoms = vec![0u64; rules.words()];
         let decided = eval_statics(w, &opts, &rolls, rules.statics.iter().map(|s| s.1));
         for ((bit, _), _) in rules.statics.iter().zip(decided).filter(|x| x.1) {
-            atoms[usize::from(bit >> 6)] |= 1 << (bit & 63);
+            crate::bitrules::put(&mut atoms, *bit, true);
         }
         let mut holds = is_included;
         locked.iter().chain(&self_grants).for_each(|(l, _)| holds[*l as usize] = true);
@@ -322,15 +327,42 @@ impl Plan {
     }
 
     /// What this seed's fold leaves of the world's rules, all counted: rule sites per class and
-    /// the bit rules' bytes ([`Plan::bit_rules`]), and the atom sets a player holds (the plan's
-    /// and one state's); sites whose rule is constant with the options
-    /// and rolls alone and with the start items too; the absent locations' check sites a fill
-    /// skips; regions no exit that can open leads to, and their sites; exits that are always
-    /// open, and the regions whose only entrance that can open is one of those (what merging
-    /// chains of open exits could remove).
+    /// the bit rules' bytes ([`Plan::bit_rules`]), the atom sets a player holds, the sites whose
+    /// rule is constant with the options, rolls and start items, and the absent locations'
+    /// check sites a fill skips. Reads what the plan already holds: no rule is folded again.
+    #[must_use]
+    pub fn rules_summary(&self, w: &World) -> serde_json::Value {
+        let (classes, bytes) = self.bit_rules(w);
+        serde_json::json!({
+            "rule_sites": self.folded.sites.len(),
+            "classes": CLASSES.iter().zip(classes).collect::<HashMap<_, _>>(),
+            "bit_rule_bytes_per_world": bytes,
+            // Two sets of 8-byte words: the plan's (the option atoms) and one state's.
+            "atom_set_bytes_per_player": self.atoms.len() * 2 * size_of::<u64>(),
+            "constant_sites_with_start_items": constant(&self.folded.sites),
+            "absent_check_sites": self.absent.len(),
+        })
+    }
+
+    /// For measurements only (it folds every rule again and walks the regions):
+    /// [`Plan::rules_summary`], and what the shrinking steps that were not built could remove,
+    /// all counted. Sites constant with the
+    /// options and rolls alone; regions no exit that can open leads to, and their sites; exits
+    /// that are always open, and the regions whose only entrance that can open is one of those
+    /// (what merging chains of open exits could remove).
     #[must_use]
     pub fn rules_report(&self, w: &World) -> serde_json::Value {
-        let constant = |sites: &[u32]| sites.iter().filter(|at| **at <= 1).count();
+        let mut all = self.rules_summary(w);
+        if let (Some(all), serde_json::Value::Object(more)) =
+            (all.as_object_mut(), self.shrink_report(w))
+        {
+            all.extend(more);
+        }
+        all
+    }
+
+    /// The part of [`Plan::rules_report`] that folds and walks.
+    fn shrink_report(&self, w: &World) -> serde_json::Value {
         let sites = &self.folded.sites;
         let options_only = fold(w, &self.opts, &self.rolls, &[]);
         let live = |r: usize| w.group(r, EXITS).filter(|e| sites[*e] != 1);
@@ -351,15 +383,8 @@ impl Plan {
             }
         }
         let dead = (0..w.regions()).filter(|r| !seen[*r]);
-        let (classes, bytes) = self.bit_rules(w);
         serde_json::json!({
-            "rule_sites": sites.len(),
-            "classes": CLASSES.iter().zip(classes).collect::<HashMap<_, _>>(),
-            "bit_rule_bytes_per_world": bytes,
-            "atom_set_bytes_per_player": self.atoms.len() * 16,
             "constant_sites_by_options": constant(&options_only.sites),
-            "constant_sites_with_start_items": constant(sites),
-            "absent_check_sites": self.absent.len(),
             "regions": w.regions(),
             "unreachable_regions": dead.clone().count(),
             "sites_in_unreachable_regions": dead
@@ -371,6 +396,19 @@ impl Plan {
             "regions_entered_only_by_one_open_exit": (0..w.regions())
                 .filter(|r| *r != w.start as usize && ways[*r] == (1, 1)).count(),
         })
+    }
+
+    /// The same plan with the start items' `has` tests left in its rules (folded for the
+    /// options and rolls alone): what folding them is tested against.
+    #[cfg(test)]
+    pub(crate) fn without_start_fold(mut self, w: &World) -> Self {
+        self.folded = fold(w, &self.opts, &self.rolls, &[]);
+        self
+    }
+
+    /// Start copies of `item` (the start inventory's and the logic start's).
+    pub(crate) fn start_copies(&self, item: u16) -> i64 {
+        self.start.iter().filter(|(i, _)| *i == item).map(|(_, n)| *n).sum()
     }
 
     /// Copies of `item` that exist this seed.
