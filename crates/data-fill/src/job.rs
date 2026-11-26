@@ -95,10 +95,18 @@ pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
 /// of this layout, what [`crate::seed::generate`] refuses, or a seed over its cap.
 pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     let (head, file) = unframe(input)?;
+    fill_on(&Prepared::open(file)?, head)
+}
+
+/// [`fill`] on a prepared world already loaded: `head` is the request alone. The work of one
+/// seed and nothing else, for a worker that keeps loaded worlds.
+///
+/// # Errors
+/// As [`fill`], less what loading the world refuses.
+pub fn fill_on(world: &Prepared, head: &[u8]) -> Result<Vec<u8>, String> {
     let f: Fill = serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
-    let world = Prepared::open(file)?;
-    let bundle = generate_on(&world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    encode_on(&world, &bundle, f.seed_max_bytes)
+    let bundle = generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
+    encode_on(world, &bundle, f.seed_max_bytes)
 }
 
 /// A manifest's game and version, checked.

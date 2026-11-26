@@ -294,6 +294,14 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// prepared at another version is prepared again from its manifest.
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
 
+/// Bytes of loaded prepared worlds one fill worker process keeps in memory, least recently used
+/// out first (`server::cache`). A design value, not measured under load: a loaded world of 1000
+/// checks was counted at about 0.2 MB (light synthetic profile) to 0.4 MB (heavy), so this
+/// keeps on the order of a hundred such worlds ready in a worker, and a world not held loads
+/// from its stored form in about a millisecond. Small on purpose: it is paid once per worker
+/// process, beside the fill's own memory.
+pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. The parallel path stays for a caller of
 /// the fill that asks for more, up to [`ROOM_FORWARD_WORKERS`] (results never depend on the

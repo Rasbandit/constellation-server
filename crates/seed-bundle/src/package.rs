@@ -230,7 +230,30 @@ pub struct Names {
 /// A name group: its name and its member indexes.
 type Group = (Box<str>, Box<[u32]>);
 
+/// Heap bytes a map of `m`'s size holds for its nodes, as an upper bound (every node counted at
+/// the fewest entries a node may hold), and for what `more` says each entry owns besides.
+pub(crate) fn map_bytes<K, V>(m: &BTreeMap<K, V>, more: impl Fn(&K, &V) -> usize) -> usize {
+    // The standard B-tree: up to 11 entries a node, at least 5; a parent pointer, two lengths,
+    // and in an inner node 12 child pointers (charged to every node here).
+    let node = 11 * (size_of::<K>() + size_of::<V>()) + 16 + 12 * size_of::<usize>();
+    let nodes = if m.is_empty() { 0 } else { m.len() / 5 + 1 };
+    nodes * node + m.iter().map(|(k, v)| more(k, v)).sum::<usize>()
+}
+
 impl Names {
+    /// Heap bytes held: every name, the index in name order, the groups.
+    fn held_bytes(&self) -> usize {
+        let strs =
+            |s: &[Box<str>]| s.iter().map(|n| n.len() + size_of::<Box<str>>()).sum::<usize>();
+        strs(&self.by_index)
+            + self.by_name.len() * 4
+            + self
+                .groups
+                .iter()
+                .map(|(g, ids)| size_of::<Group>() + g.len() + ids.len() * 4)
+                .sum::<usize>()
+    }
+
     /// The names `by_index` (one per index) and their `groups`; a member that is not a name
     /// of the game is left out of its group.
     fn new(by_index: Box<[Box<str>]>, groups: &BTreeMap<String, Vec<String>>) -> Self {
@@ -370,6 +393,21 @@ impl GamePackage {
             )));
         }
         Ok((f.game, f.data))
+    }
+
+    /// Bytes this package holds, itself and on the heap: what a cache of packages counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.name.len()
+            + self.checksum.len()
+            + (self.locations.len() + self.items.len()) * size_of::<i64>()
+            + self.location_names.held_bytes()
+            + self.item_names.held_bytes()
+            + self.data_package.len()
+            + self.item_groups.len()
+            + self.location_groups.len()
+            + self.hint_blacklist.iter().map(|n| n.len() + size_of::<Box<str>>()).sum::<usize>()
     }
 
     /// The content address.

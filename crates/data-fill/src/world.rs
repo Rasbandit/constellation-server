@@ -947,6 +947,29 @@ impl World {
             .map_err(|_| format!("unknown {what} {key:?}"))
     }
 
+    /// Bytes this world holds, itself and on the heap: the two sections, and every index
+    /// unpacked from them at load. What a cache of loaded worlds counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        fn v<T>(x: &Vec<T>) -> usize {
+            x.capacity() * size_of::<T>()
+        }
+        let h = &self.hot;
+        let pairs = [&h.item_sites, &h.counter_sites, &h.into[0], &h.into[1], &h.into[2]];
+        let sets = [&h.time_dep, &h.def_time, &h.def_items, &h.def_counters];
+        size_of::<Self>()
+            + v(&self.rules)
+            + v(&self.game)
+            + v(&h.target)
+            + v(&h.place)
+            + v(&h.starts)
+            + pairs.iter().map(|(a, b)| v(a) + v(b)).sum::<usize>()
+            + sets.iter().map(|s| size_of_val(s.words())).sum::<usize>()
+            + self.names.iter().map(|n| v(&n.spans) + v(&n.sorted)).sum::<usize>()
+            + v(&self.item_groups.0)
+            + v(&self.item_groups.1)
+    }
+
     /// Size of the rules section in bytes.
     #[must_use]
     pub fn rules_bytes(&self) -> usize {

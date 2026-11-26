@@ -4,61 +4,17 @@
 //! by manifest and engine layout. A size-bounded in-memory cache is in front of the bytes a
 //! generation reads.
 
+use crate::cache::Cache;
 use crate::store::Db;
 use log::{BlobKey, ManifestRecord, StoreError};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
-
-/// Manifest bytes held in memory, at most `cap` in all: the least recently used go first. An
-/// entry larger than the cap is never kept.
-#[derive(Debug)]
-struct Cache {
-    cap: usize,
-    used: usize,
-    tick: u64,
-    /// id to (bytes, last use).
-    held: HashMap<BlobKey, (Arc<Vec<u8>>, u64)>,
-    /// last use to id: the first entry is the least recently used.
-    order: BTreeMap<u64, BlobKey>,
-}
-
-impl Cache {
-    fn new(cap: usize) -> Self {
-        Self { cap, used: 0, tick: 0, held: HashMap::new(), order: BTreeMap::new() }
-    }
-
-    fn get(&mut self, id: &BlobKey) -> Option<Arc<Vec<u8>>> {
-        self.tick += 1;
-        let (bytes, used) = self.held.get_mut(id)?;
-        self.order.remove(used);
-        *used = self.tick;
-        self.order.insert(self.tick, *id);
-        Some(Arc::clone(bytes))
-    }
-
-    fn put(&mut self, id: BlobKey, bytes: Arc<Vec<u8>>) {
-        if bytes.len() > self.cap || self.held.contains_key(&id) {
-            return;
-        }
-        while self.used + bytes.len() > self.cap {
-            let Some((_, oldest)) = self.order.pop_first() else { break };
-            if let Some((b, _)) = self.held.remove(&oldest) {
-                self.used -= b.len();
-            }
-        }
-        self.tick += 1;
-        self.used += bytes.len();
-        self.order.insert(self.tick, id);
-        self.held.insert(id, (bytes, self.tick));
-    }
-}
 
 /// The manifest store the admin API uses.
 #[derive(Debug)]
 pub(crate) struct Manifests {
     db: Db,
-    cache: Mutex<Cache>,
+    cache: Mutex<Cache<Vec<u8>>>,
     page_max: usize,
     /// The engine layout prepared worlds are stored and found under.
     pub(crate) layout: u32,
@@ -209,22 +165,6 @@ mod tests {
 
     fn id(n: u8) -> BlobKey {
         [n; 32]
-    }
-
-    #[test]
-    fn the_cache_stays_within_its_bytes_and_drops_the_least_recently_used() {
-        let mut c = Cache::new(10);
-        c.put(id(1), Arc::new(vec![0; 4]));
-        c.put(id(2), Arc::new(vec![0; 4]));
-        assert!(c.get(&id(1)).is_some(), "touched: now id 2 is the oldest");
-        c.put(id(3), Arc::new(vec![0; 4]));
-        assert!(c.get(&id(2)).is_none() && c.get(&id(1)).is_some() && c.get(&id(3)).is_some());
-        assert_eq!(c.used, 8);
-        c.put(id(4), Arc::new(vec![0; 11]));
-        assert!(c.get(&id(4)).is_none(), "larger than the whole cache: never kept");
-        assert_eq!(c.used, 8, "and it evicted nothing");
-        c.put(id(5), Arc::new(vec![0; 10]));
-        assert_eq!((c.held.len(), c.used), (1, 10), "one big entry pushes the rest out");
     }
 
     #[test]
