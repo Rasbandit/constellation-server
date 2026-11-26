@@ -36,6 +36,7 @@ use serde::Deserialize;
 use spec_rng::SpecRng;
 
 use crate::fill::{FillError, Instance, Plan};
+use crate::level;
 use crate::live::Live;
 use crate::par::{for_each_mut, map_ordered};
 use crate::reach::{Msg, Reach, Stats};
@@ -210,6 +211,13 @@ pub struct RoomFilled {
     pub beatable: Vec<bool>,
     /// Per player: existing locations reached with everything collected.
     pub reached: Vec<usize>,
+    /// The placements are the asked opt-in mode's own (`false`: the exact fill's, asked for or
+    /// fallen back to). A seed bundle has no field for this (`docs/seed-bundle-v2.md`).
+    pub fast: bool,
+    /// Level fill: times the drawn order was reordered and solved again, over all attempts.
+    pub repairs: u32,
+    /// Attempts an opt-in mode gave up on and the exact fill placed instead.
+    pub fallbacks: u32,
 }
 
 impl RoomFilled {
@@ -252,6 +260,38 @@ impl Path {
     }
 }
 
+/// The dials of the opt-in fill modes. The defaults (`config::FILL_DEPTH_PERCENT`,
+/// `config::FILL_GOAL_ONLY`) are uniform picks and every progression item collectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dials {
+    /// Where a progression item goes among the locations it may take, percent: 0 uniform,
+    /// above 0 towards locations opened later, below 0 towards earlier ones.
+    pub depth: i32,
+    /// Only every player's goal has to be reachable, not every progression item.
+    pub goal_only: bool,
+}
+
+impl Default for Dials {
+    fn default() -> Self {
+        Dials { depth: config::FILL_DEPTH_PERCENT, goal_only: config::FILL_GOAL_ONLY }
+    }
+}
+
+/// How the progression items that have no placement group are placed. Confined items before
+/// them and everything else after them are placed the same way in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Algorithm {
+    /// Assumed fill: every item is placed against a state that holds what is not yet placed.
+    /// The default and the reference.
+    #[default]
+    Exact,
+    /// Level fill (see `level.rs`): draw an order of the items, label every location with the
+    /// number of order items held when one forward solve first reaches it, and give item `k` a
+    /// location of a level below `k`. About one solve instead of one per item or round; an
+    /// order that cannot be made to work falls back to [`Algorithm::Exact`] for that attempt.
+    Level(Dials),
+}
+
 /// Fill a room. Retries the whole fill with the next draws from `rng` when stuck. A room large
 /// enough for the forward path takes `config::ROOM_FORWARD_WORKERS` threads at most; a caller
 /// with a worker count of its own passes [`Path::of`] to [`fill_room_on`].
@@ -292,7 +332,23 @@ pub fn fill_room_on(
     max_attempts: u32,
     path: Path,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    let (f, s) = fill_on(seats, rng, max_attempts, true, path, true)?;
+    fill_room_by(seats, rng, max_attempts, path, Algorithm::Exact)
+}
+
+/// [`fill_room_on`] with the mode that places the progression items. `path` still says how an
+/// exact fill finds its states, and how many threads a forward solve of any mode may take.
+///
+/// # Errors
+/// As [`fill_room`], and [`FillError::Invalid`] when an opt-in mode's result fails its own
+/// check (a bug).
+pub fn fill_room_by(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    max_attempts: u32,
+    path: Path,
+    algorithm: Algorithm,
+) -> Result<(RoomFilled, RoomSpheres), FillError> {
+    let (f, s) = fill_by(seats, rng, max_attempts, (true, path, algorithm), true)?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -508,6 +564,16 @@ fn fill_on(
     path: Path,
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
+    fill_by(seats, rng, max_attempts, (extend, path, Algorithm::Exact), want_spheres)
+}
+
+fn fill_by(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    max_attempts: u32,
+    (extend, path, algorithm): (bool, Path, Algorithm),
+    want_spheres: bool,
+) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
     check(seats)?;
     let mut last = None;
     let mut s = Steps {
@@ -519,6 +585,10 @@ fn fill_on(
         stats: Stats::default(),
         extend,
         path,
+        algorithm,
+        fast: false,
+        repairs: 0,
+        fallbacks: 0,
     };
     for attempt in 1..=max_attempts {
         match s.try_fill(rng) {
@@ -534,6 +604,9 @@ fn fill_on(
                     beatable,
                     reached,
                     placed,
+                    fast: s.fast,
+                    repairs: s.repairs,
+                    fallbacks: s.fallbacks,
                 };
                 return Ok((filled, sp));
             }
@@ -631,6 +704,49 @@ impl<'a, 'w> Linked<'a, 'w> {
         // Every state starts over, so the ranks are the room's again unless supersteps follow.
         self.ranked = true;
         self.settle();
+    }
+
+    /// Level fill's solve. The room is solved with nothing of `order` held (`none`: no extra
+    /// items for any player), then the order's items are added one at a time, each run to the
+    /// fixed point before the next. Returns the room's next rank with `k` items held, for `k`
+    /// from 0 to one less than the items (a location reached at a rank below entry `k` was
+    /// reached with at most `k` held), and the number of items held when every goal first held
+    /// (the number of items when that needs all of them, or never happens).
+    ///
+    /// The first solve settles as the room is set to (`forward`); the steps run one state at a
+    /// time off the ready list, since one item wakes few states.
+    fn levels(
+        &mut self,
+        order: &[Given],
+        none: &[Vec<u16>],
+        placed: &[Vec<Option<Given>>],
+    ) -> (Vec<u32>, usize) {
+        let forward = self.forward;
+        self.solve(none, placed);
+        self.forward = None;
+        // Supersteps leave every state ranks of its own: go on above all of them, so a later
+        // rank is a later step in every state.
+        self.seq = self.models.iter().map(Reach::seq).fold(self.seq, u32::max);
+        let mut marks = Vec::with_capacity(order.len());
+        let (mut met, mut goal) = (0, order.len());
+        for (k, g) in order.iter().enumerate() {
+            while met < self.models.len() && self.models[met].goal() {
+                met += 1;
+            }
+            if met == self.models.len() {
+                goal = goal.min(k);
+            }
+            marks.push(self.seq);
+            // What only the last item opens is of no use to any item.
+            if k + 1 < order.len() {
+                let o = usize::from(g.to);
+                self.with(o, |m| m.add(g.item, 1));
+                self.mark(o);
+                self.settle();
+            }
+        }
+        self.forward = forward;
+        (marks, goal)
     }
 
     /// Location `loc` of player `p`'s world holds `g`.
@@ -841,6 +957,19 @@ struct Steps<'a, 'w> {
     stats: Stats,
     extend: bool,
     path: Path,
+    algorithm: Algorithm,
+    /// The last attempt's progression was placed by the opt-in mode, not the exact fill.
+    fast: bool,
+    repairs: u32,
+    fallbacks: u32,
+}
+
+/// What a finished opt-in fill must show in the final solve, by construction.
+struct Proof {
+    /// Locations that hold a progression item that has to be collectable.
+    reach: Vec<(u16, u32)>,
+    /// Every player's goal holds (asked only where the mode's own solve reached them).
+    goals: bool,
 }
 
 impl Steps<'_, '_> {
@@ -882,11 +1011,26 @@ impl Steps<'_, '_> {
         self.restrictive(&groups(confined, false), &prog, &mut locs, &mut placed, &mut prev)?;
         locs.retain(|(p, l)| !seats[usize::from(p)].plan.excluded[l as usize]);
         // From here on nothing is taken back on the forward path: every round is a fresh solve.
-        self.room.forward = match self.path {
+        let forward = match self.path {
             Path::Forward { workers } => Some(workers),
             Path::Carry => None,
         };
-        self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
+        self.room.forward = forward;
+        let proof = match self.algorithm {
+            Algorithm::Exact => None,
+            Algorithm::Level(dials) => {
+                // The mode solves the room for itself: nothing is carried past it.
+                prev.clear();
+                let proof = self.level(&prog, &locs, &mut placed, rng, dials)?;
+                self.room.forward = forward;
+                self.fallbacks += u32::from(proof.is_none());
+                proof
+            }
+        };
+        self.fast = proof.is_some();
+        if proof.is_none() {
+            self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
+        }
         // Everything else goes anywhere left, excluded locations included.
         rng.shuffle(&mut rest);
         let mut left: Vec<(u16, u32)> = free
@@ -918,7 +1062,73 @@ impl Steps<'_, '_> {
                 self.solves += 1;
             }
         }
+        if let Some(proof) = proof {
+            self.room.absorb(&mut self.stats);
+            let models = &self.room.models;
+            let lost = proof.reach.iter().find(|(p, l)| !models[usize::from(*p)].reached(*l));
+            if lost.is_some() || (proof.goals && !models.iter().all(Reach::goal)) {
+                debug_assert!(false, "an opt-in fill is not what it was built to be: {lost:?}");
+                return Err(FillError::Invalid(format!(
+                    "{:?}: unreachable progression at {lost:?}, or a goal lost",
+                    self.algorithm
+                )));
+            }
+        }
         Ok(placed)
+    }
+
+    /// Level fill of the progression items `prog` (none has a placement group) over the free
+    /// locations `locs` that may hold progression: the order is `prog` as drawn. `None` when no
+    /// order tried is feasible; nothing is placed and nothing drawn from `rng` then, so the
+    /// exact fill that follows places what it would have without this try.
+    fn level(
+        &mut self,
+        prog: &[Given],
+        locs: &Live<(u16, u32)>,
+        placed: &mut [Vec<Option<Given>>],
+        rng: &mut SpecRng,
+        dials: Dials,
+    ) -> Result<Option<Proof>, FillError> {
+        let items = prog.len();
+        let mut order = prog.to_vec();
+        self.held.iter_mut().for_each(Vec::clear);
+        for round in 0..=config::LEVEL_FILL_MAX_REPAIRS {
+            let (marks, goal) = self.room.levels(&order, &self.held, placed);
+            self.solves += 1;
+            self.room.absorb(&mut self.stats);
+            // Goal only: what opens once every goal holds is as good as open then, and so is
+            // what never opens.
+            let cap = if dials.goal_only { goal } else { items };
+            let mut levels = vec![Vec::new(); items];
+            let models = &self.room.models;
+            for (p, l) in locs.iter() {
+                let rank = models[usize::from(p)].loc_rank(l);
+                let v = marks.partition_point(|m| *m <= rank).min(cap);
+                if v < items {
+                    levels[v].push((p, l));
+                }
+            }
+            if level::feasible(&levels) {
+                let mut picker = level::Picker::new(levels);
+                let mut reach = Vec::with_capacity(items);
+                for k in (1..=items).rev() {
+                    let Some((v, (p, l))) = picker.take(k, rng, dials.depth) else {
+                        debug_assert!(false, "a feasible order ran out of locations at item {k}");
+                        return Err(FillError::Invalid(format!("level fill: no place for {k}")));
+                    };
+                    placed[usize::from(p)][l as usize] = Some(order[k - 1]);
+                    if v < goal || !dials.goal_only {
+                        reach.push((p, l));
+                    }
+                }
+                return Ok(Some(Proof { reach, goals: dials.goal_only && goal < items }));
+            }
+            if round == config::LEVEL_FILL_MAX_REPAIRS || !level::repair(&mut order, &levels) {
+                break;
+            }
+            self.repairs += 1;
+        }
+        Ok(None)
     }
 
     /// Place each group in turn against a state that holds none of the group (but everything
@@ -1024,11 +1234,112 @@ fn confined_ok(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
     !owner.plan.confined(g.item) || (player == g.to && owner.plan.allowed(g.item, loc))
 }
 
+/// Fill `seed` with the opt-in `mode` and hold the result against the exact fill of the same
+/// seed: every placement permitted, the report a fresh solve's, the goals and the locations
+/// reached the exact fill's (with full accessibility), no progression out of reach, and the
+/// exact fill's own placements where the mode fell back. `None` when the exact fill is stuck on
+/// this seed: nothing to hold it against.
+#[cfg(test)]
+pub(crate) fn assert_fast(
+    seats: &[Seat<'_>],
+    seed: u64,
+    path: Path,
+    mode: Algorithm,
+) -> Option<RoomFilled> {
+    let fill = |mode| {
+        fill_room_by(seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS, path, mode)
+    };
+    let (exact, _) = fill(Algorithm::Exact).ok()?;
+    let (f, sp) = fill(mode).unwrap_or_else(|e| panic!("seed {seed}, {mode:?}: {e:?}"));
+    let what = format!("seed {seed}, {mode:?}, fast {}", f.fast);
+    assert_eq!((f.beatable.clone(), f.reached.clone()), validate_room(seats, &f.placed).unwrap());
+    assert_eq!(f.beatable, exact.beatable, "{what}");
+    let Algorithm::Level(dials) = mode else { panic!("an opt-in mode") };
+    if !f.fast {
+        assert_eq!(f.placed, exact.placed, "{what}: a fallback is the exact fill");
+    }
+    if !dials.goal_only || !f.fast {
+        assert_eq!(f.reached, exact.reached, "{what}");
+    }
+    let progression = |g: &Given| seats[usize::from(g.to)].progression[usize::from(g.item)];
+    for (p, row) in f.placed.iter().enumerate() {
+        for (l, g) in row.iter().enumerate() {
+            let (p, l) = (u16::try_from(p).unwrap(), u32::try_from(l).unwrap());
+            let here = seats[usize::from(p)].plan.included.contains(&l);
+            assert_eq!(g.is_some(), here, "{what}: location {l} of player {p}");
+            if let Some(g) = g {
+                // Confined items are placed before either mode, the same for the same draws
+                // (the exact fill lets one sit on an excluded location of its group).
+                let shared = exact.placed[usize::from(p)][l as usize] == Some(*g)
+                    && seats[usize::from(g.to)].plan.confined(g.item);
+                assert!(shared || permits(seats, *g, p, l), "{what}: {g:?} at {l} of player {p}");
+                let stranded = progression(g) && sp.unreachable.contains(&(p, l));
+                assert!(!stranded || dials.goal_only, "{what}: {g:?} out of reach");
+            }
+        }
+    }
+    let count = |f: &RoomFilled| {
+        let mut all: Vec<Given> = f.placed.iter().flatten().flatten().copied().collect();
+        all.sort_unstable();
+        all
+    };
+    assert_eq!(count(&f), count(&exact), "{what}: the same items are placed");
+    Some(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fill::tests::world_with;
     use crate::reach::assert_same;
+
+    /// The hand-written world (thresholds, events, a stay rule, clocks for one player), alone
+    /// and as a room of three, plain and with locations excluded and items locked.
+    #[test]
+    fn level_fill_of_the_hand_written_worlds_is_beatable_and_reaches_what_the_exact_fill_does() {
+        let (mut fast, mut fell, mut repaired) = (0, 0, 0);
+        for change in 0..3 {
+            let built: Vec<(World, Instance)> = [false, true, false]
+                .iter()
+                .map(|c| {
+                    let (w, mut inst) = world_with(*c);
+                    if change == 1 {
+                        inst.excluded = ["l1", "l5", "l17"].map(str::to_owned).to_vec();
+                    }
+                    if change == 2 {
+                        // A key locked at the start, a coin locked deep in.
+                        inst.locked.insert("l2".to_owned(), "key".to_owned());
+                        inst.locked.insert("l12".to_owned(), "coin".to_owned());
+                        for k in ["key", "coin"] {
+                            let at = inst.pool.iter().position(|x| x == k).unwrap();
+                            inst.pool.remove(at);
+                        }
+                    }
+                    (w, inst)
+                })
+                .collect();
+            let plans: Vec<Plan> = built.iter().map(|(w, i)| Plan::new(w, i).unwrap()).collect();
+            let prog: Vec<Vec<bool>> = built.iter().map(|(w, i)| i.progression(w)).collect();
+            let seats: Vec<Seat<'_>> = (0..3)
+                .map(|p| Seat { w: &built[p].0, plan: &plans[p], progression: &prog[p] })
+                .collect();
+            for seed in 1u64..=60 {
+                for room in [&seats[..], &seats[..1], &seats[1..2]] {
+                    for goal_only in [false, true] {
+                        let dials = Dials { goal_only, depth: [0, 150, -150][change] };
+                        let f =
+                            assert_fast(room, seed, Path::Carry, Algorithm::Level(dials)).unwrap();
+                        fast += u32::from(f.fast);
+                        fell += f.fallbacks;
+                        repaired += f.repairs;
+                    }
+                }
+            }
+        }
+        assert!(fast > 500, "level fill placed {fast} of 1080 rooms itself");
+        assert!(repaired > 0, "no order was repaired");
+        println!("fast {fast}, fallbacks {fell}, repairs {repaired}");
+    }
 
     fn rng(seed: u64) -> SpecRng {
         SpecRng::from_u64(seed)

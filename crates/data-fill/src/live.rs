@@ -34,6 +34,11 @@ impl<T: Copy> Live<T> {
         x
     }
 
+    /// The live entries, in order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.items[self.first..].iter().filter_map(|x| *x)
+    }
+
     /// Keep only the live entries `keep` accepts, in order (and drop the tombstones).
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(T) -> bool) {
         self.items.retain(|x| x.is_some_and(&mut keep));

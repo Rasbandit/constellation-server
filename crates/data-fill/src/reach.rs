@@ -717,6 +717,12 @@ impl<'w> Reach<'w> {
         self.reached.contains(l as usize)
     }
 
+    /// The rank location `l` was reached at (`u32::MAX`: not reached). Ranks grow with every
+    /// fact a forward run derives, so they tell what was reached before what.
+    pub(crate) fn loc_rank(&self, l: u32) -> u32 {
+        self.loc_rank[l as usize]
+    }
+
     /// Set what a location holds; it is collected when the location is reached. A location
     /// holds one item: holding the same again changes nothing.
     pub fn hold(&mut self, loc: u32, item: u16) {

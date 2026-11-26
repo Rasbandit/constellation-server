@@ -311,6 +311,23 @@ pub const ROOM_FORWARD_WORKERS: usize = 4;
 /// would cost more than the step (a design value, not measured).
 pub const ROOM_FORWARD_MIN_PENDING: usize = 2048;
 
+/// Times a level fill (`data_fill::room::Algorithm::Level`) reorders its drawn item order and
+/// solves again when the order leaves too few open locations, before the seed falls back to
+/// the exact fill (each costs one forward solve; a design value).
+pub const LEVEL_FILL_MAX_REPAIRS: u32 = 8;
+
+/// Depth dial of the opt-in fill modes (`data_fill::room::Dials`), percent: where a progression
+/// item goes among the locations it may take. 0 is uniform. Above 0 favours locations opened
+/// later (longer chains): one more draw per 100, the remainder as a chance of one more, and the
+/// deepest drawn wins. Below 0 the same towards locations opened earlier. A design value; the
+/// exact fill does not read it.
+pub const FILL_DEPTH_PERCENT: i32 = 0;
+
+/// Accessibility dial of the opt-in fill modes: `false` asks that every progression item can
+/// be collected, `true` only that every player's goal can be reached (items the goal does not
+/// need may then lie out of reach). A design value; the exact fill does not read it.
+pub const FILL_GOAL_ONLY: bool = false;
+
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
 pub const FILL_MAX_WORKERS: usize = 64;
