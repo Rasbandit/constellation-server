@@ -323,7 +323,7 @@ pub(crate) fn job_on(
             loaded
         }
     };
-    data_fill::job::fill_on(&world, head)
+    data_fill::job::fill_on(&world, head).map(|x| x.0)
 }
 
 /// Run `argv` (program first) with `input` on its stdin, and return its stdout (at most

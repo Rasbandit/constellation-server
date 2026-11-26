@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::prepared::{self, Prepared};
-use crate::seed::{Player, checked_name, encode_on, generate_by, generate_on, manifest_game};
+use crate::seed::{
+    FillReport, Player, checked_name, encode_on, generate_by, generate_on, manifest_game,
+};
 use crate::world::World;
 
 /// A fill request less its world: who plays, and the seed's name and random stream.
@@ -72,16 +74,34 @@ pub fn unframe(framed: &[u8]) -> Result<(&[u8], &[u8]), String> {
     rest.split_at_checked(u32::from_le_bytes(*len) as usize).ok_or_else(cut)
 }
 
-/// Fill the room a request describes; the seed bundle as JSON text.
+/// Fill the room a request describes; the seed bundle as JSON text. When the asked mode fell
+/// back to the exact fill, one line on stderr says so (stdout is the bundle and nothing else).
 ///
 /// # Errors
 /// A message for a request that does not parse, or for what [`crate::seed::generate`] refuses.
 pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (bundle, report) = generate_reported(input)?;
+    said(&report);
+    Ok(bundle)
+}
+
+/// One line on stderr when the asked mode fell back to the exact fill.
+fn said(report: &FillReport) {
+    if report.fallbacks > 0 {
+        eprintln!("fill: the asked mode fell back to the exact fill: {report:?}");
+    }
+}
+
+/// [`generate`], and how the progression was placed (whether the asked mode fell back).
+///
+/// # Errors
+/// As [`generate`].
+pub fn generate_reported(input: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
     let r: Request = serde_json::from_slice(input).map_err(|e| format!("bad fill request: {e}"))?;
     let f = r.fill;
-    let bundle =
+    let (bundle, report) =
         generate_by(&r.manifest, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    serde_json::to_vec(&bundle).map_err(|e| e.to_string())
+    Ok((serde_json::to_vec(&bundle).map_err(|e| e.to_string())?, report))
 }
 
 /// Fill a room on a prepared world: the input is a [`frame`] of the request (JSON:
@@ -94,6 +114,16 @@ pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
 /// A message for a frame or request that does not parse, a file that is not a prepared world
 /// of this layout, what [`crate::seed::generate`] refuses, or a seed over its cap.
 pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (seed, report) = fill_reported(input)?;
+    said(&report);
+    Ok(seed)
+}
+
+/// [`fill`], and how the progression was placed (whether the asked mode fell back).
+///
+/// # Errors
+/// As [`fill`].
+pub fn fill_reported(input: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
     let (head, file) = unframe(input)?;
     fill_on(&Prepared::open(file)?, head)
 }
@@ -103,11 +133,11 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 /// As [`fill`], less what loading the world refuses.
-pub fn fill_on(world: &Prepared, head: &[u8]) -> Result<Vec<u8>, String> {
+pub fn fill_on(world: &Prepared, head: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
     let f: Fill = serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
-    let mut bundle =
+    let (mut bundle, report) =
         generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    encode_on(world, &mut bundle, f.seed_max_bytes)
+    Ok((encode_on(world, &mut bundle, f.seed_max_bytes)?, report))
 }
 
 /// A manifest's game and version, checked.

@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use data_fill::fairness::{
-    Flat, report, report_named, sample, sample_room, sample_room_by, shape, shape_report,
+    FILLS, Flat, OTHER_FILLS, report, report_named, sample, sample_room, sample_room_by, shape,
+    shape_report,
 };
 use data_fill::room::{self, Algorithm};
 use data_fill::{Instance, Plan, World};
@@ -90,7 +91,8 @@ fn room_report(
     finish(r, s.failed == 0, t, m)
 }
 
-/// Every mode of `--modes` over the same room and fill seeds: its shape (spheres, where
+/// Every mode of `--modes` over the same room and the same fill seeds (another stream than the
+/// exact fill reference's): its shape (spheres, where
 /// progression lies, waiting, required spheres for the first `--required` seeds), its distance
 /// from the exact fill, and with `--baseline N` (a small world) from N uniform beatable rooms.
 fn modes_report(
@@ -126,11 +128,14 @@ fn modes_report(
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
     let t = Instant::now();
     let err = |e| format!("{e:?}");
-    let exact = shape(&seats, seeds, Algorithm::Exact, required).map_err(err)?;
+    // The reference is the exact fill on one stream of seeds; every row, an `exact` one too,
+    // is filled on another, so its distance from the reference is between independent samples
+    // and the `exact` row is the noise floor.
+    let exact = shape(&seats, (seeds, FILLS), Algorithm::Exact, 0).map_err(err)?;
     let mut rows = Vec::new();
     for name in modes.split_whitespace() {
         let mode: Algorithm = name.parse()?;
-        let s = shape(&seats, seeds, mode, required).map_err(err)?;
+        let s = shape(&seats, (seeds, OTHER_FILLS), mode, required).map_err(err)?;
         let mut row = shape_report(&s, Some(&exact));
         row["mode"] = json!(name);
         if baseline > 0 {

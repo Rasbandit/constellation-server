@@ -26,8 +26,9 @@
 //! `Sync`; placing is sequential. Choices where the legacy multiplayer fill has options
 //! (see `docs/world-rules-section.md`): rounds of one item per player; one shared pool and one shuffled list of locations
 //! over all players; an item with a placement group stays in its owner's world; progression
-//! never goes on an excluded location; every player's goal must hold (accessibility is not
-//! required beyond that); no local-item option (#91), no accessibility modes or progression balancing (#92).
+//! never goes on an excluded location; every player's goal must hold (the exact fill asks for
+//! no accessibility beyond that; the opt-in modes have `Dials::goal_only`); no local-item
+//! option (#91), no progression balancing (#92).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -223,12 +224,15 @@ pub struct RoomFilled {
     /// The placements are the asked opt-in mode's own (`false`: the exact fill's, asked for or
     /// fallen back to). A seed bundle has no field for this (`docs/seed-bundle-v2.md`).
     pub fast: bool,
-    /// Level fill: times the drawn order was reordered and solved again, over all attempts.
+    /// Level fill: times the drawn order was reordered and solved again for these placements
+    /// (0 when the attempt that made them fell back).
     pub repairs: u32,
-    /// Attempts an opt-in mode gave up on and the exact fill placed instead.
+    /// Attempts (not seeds) an opt-in mode gave up on and the exact fill placed, or was stuck
+    /// on, instead: with `fast` and a count above 0, an earlier attempt fell back, was stuck,
+    /// and the mode placed a later one.
     pub fallbacks: u32,
-    /// Shuffle fill: progression items moved into reach, over all attempts (0 with `fast`: the
-    /// seed is the uniform shuffle as drawn).
+    /// Shuffle fill: progression items moved into reach in these placements (0 with `fast`:
+    /// they are the uniform shuffle as drawn; 0 too when the attempt fell back).
     pub swaps: u32,
     /// Rule evaluations of the opt-in mode's own solves, out of `stats.evals` (the rest are
     /// the confined items' steps and the final solve that checks and reports the seed).
@@ -290,6 +294,23 @@ pub struct Dials {
     /// skipped checks is left out too, and `RoomFilled::reached` then counts only locations
     /// whose check was evaluated.
     pub skip_empty: bool,
+}
+
+impl Dials {
+    /// The dials are within their limits (`config::FILL_DEPTH_MAX_PERCENT` either way).
+    ///
+    /// # Errors
+    /// [`FillError::Instance`] naming the limit.
+    pub fn check(&self) -> Result<(), FillError> {
+        let most = config::FILL_DEPTH_MAX_PERCENT;
+        if self.depth.checked_abs().is_none_or(|d| d > most) {
+            return Err(FillError::Instance(format!(
+                "depth {} is not in -{most} to {most}",
+                self.depth
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Dials {
@@ -354,6 +375,7 @@ impl std::str::FromStr for Algorithm {
                 _ => return Err(format!("mode setting {part:?}: depth=N, goal or noskip")),
             }
         }
+        d.check().map_err(|e| format!("{e:?}"))?;
         match name {
             "exact" if d == Dials::default() => Ok(Algorithm::Exact),
             "level" => Ok(Algorithm::Level(d)),
@@ -445,13 +467,20 @@ pub fn validate_room(
 /// `false` for a player, owner or location that is not in the room.
 #[must_use]
 pub fn permits(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
-    let (Some(owner), Some(here)) = (seats.get(usize::from(g.to)), seats.get(usize::from(player)))
+    let (Some(_), Some(here)) = (seats.get(usize::from(g.to)), seats.get(usize::from(player)))
     else {
         return false;
     };
     let Some(excluded) = here.plan.excluded.get(loc as usize) else { return false };
-    let progression = owner.progression.get(usize::from(g.item)).copied().unwrap_or(false);
-    confined_ok(seats, g, player, loc) && !(progression && *excluded)
+    confined_ok(seats, g, player, loc) && !(is_progression(seats, g) && *excluded)
+}
+
+/// Whether `g` counts as held: a progression item of its owner (`false` for an owner or item
+/// that is not in the room). The one reading of it.
+#[must_use]
+pub fn is_progression(seats: &[Seat<'_>], g: Given) -> bool {
+    let owner = seats.get(usize::from(g.to));
+    owner.and_then(|s| s.progression.get(usize::from(g.item))).copied().unwrap_or(false)
 }
 
 /// Per player's world, per location: the locked item (owned by that player).
@@ -541,8 +570,7 @@ pub fn cross_world_share(
     let mut out = vec![(0, 0); seats.len()];
     for (p, row) in placed.iter().enumerate() {
         for g in row.iter().flatten() {
-            if seats[usize::from(g.to)].progression.get(usize::from(g.item)).copied() == Some(true)
-            {
+            if is_progression(seats, *g) {
                 let o = &mut out[usize::from(g.to)];
                 o.0 += usize::from(usize::from(g.to) != p);
                 o.1 += 1;
@@ -646,6 +674,8 @@ fn fill_by(
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
     check(seats)?;
+    // The one door every caller's dials come through, a fill request's included.
+    algorithm.dials().map_or(Ok(()), |d| d.check())?;
     let mut last = None;
     let mut s = Steps {
         room: Linked::new(seats),
@@ -772,9 +802,7 @@ impl<'a, 'w> Linked<'a, 'w> {
         awake: Option<&dyn Fn(usize, u32) -> bool>,
     ) {
         let seats = self.seats;
-        let held = |g: &Given| {
-            awake.is_none() || seats[usize::from(g.to)].progression[usize::from(g.item)]
-        };
+        let held = |g: &Given| awake.is_none() || is_progression(seats, *g);
         // Rank 1 is the first fact of the first state: the room's sequence starts over.
         self.seq = 1;
         for (p, held) in extra.iter().enumerate() {
@@ -1090,10 +1118,29 @@ struct Proof {
     goals: bool,
 }
 
+impl Proof {
+    /// Whether the final solve (`models`) shows what the mode built: in release builds too,
+    /// this is what stands between a bug in a mode and a seed that cannot be finished.
+    ///
+    /// # Errors
+    /// [`FillError::Invalid`], which no retry follows.
+    fn holds(&self, models: &[Reach<'_>], mode: Algorithm) -> Result<(), FillError> {
+        let lost = self.reach.iter().find(|(p, l)| !models[usize::from(*p)].reached(*l));
+        if lost.is_some() || (self.goals && !models.iter().all(Reach::goal)) {
+            return Err(FillError::Invalid(format!(
+                "{mode:?}: unreachable progression at {lost:?}, or a goal lost"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Steps<'_, '_> {
     fn try_fill(&mut self, rng: &mut SpecRng) -> Result<Vec<Vec<Option<Given>>>, FillError> {
         let seats = self.room.seats;
         self.rounds = 0;
+        // What the seed returned was built with: an abandoned attempt's moves are not in it.
+        (self.swaps, self.repairs) = (0, 0);
         // Confined items are carried on either path: their first solve is in rank order.
         self.room.forward = None;
         let mut placed = locked_placed(seats);
@@ -1158,6 +1205,9 @@ impl Steps<'_, '_> {
             prev.clear();
             self.room.forward = forward;
             self.fallbacks += u32::from(proof.is_none());
+            if proof.is_none() {
+                (self.swaps, self.repairs) = (0, 0);
+            }
             self.mode_evals += self.stats.evals - before;
         }
         self.fast = proof.is_some();
@@ -1200,15 +1250,9 @@ impl Steps<'_, '_> {
         }
         if let Some(proof) = proof {
             self.room.absorb(&mut self.stats);
-            let models = &self.room.models;
-            let lost = proof.reach.iter().find(|(p, l)| !models[usize::from(*p)].reached(*l));
-            if lost.is_some() || (proof.goals && !models.iter().all(Reach::goal)) {
-                debug_assert!(false, "an opt-in fill is not what it was built to be: {lost:?}");
-                return Err(FillError::Invalid(format!(
-                    "{:?}: unreachable progression at {lost:?}, or a goal lost",
-                    self.algorithm
-                )));
-            }
+            let held = proof.holds(&self.room.models, self.algorithm);
+            debug_assert!(held.is_ok(), "an opt-in fill is not what it was built to be: {held:?}");
+            held?;
         }
         Ok(placed)
     }
@@ -1249,6 +1293,13 @@ impl Steps<'_, '_> {
                     levels[v].push((p, l));
                 }
             }
+            // The counting condition is exact only while every order item may take every
+            // location of `locs`: confined items were placed before and excluded locations are
+            // out of the list. Per-item permissions (local items, #91) would need more.
+            debug_assert!(
+                order.iter().all(|g| !self.room.seats[usize::from(g.to)].plan.confined(g.item)),
+                "an order item with a placement group"
+            );
             if level::feasible(&levels) {
                 let mut picker = level::Picker::new(levels);
                 let mut reach = Vec::with_capacity(items);
@@ -1338,15 +1389,22 @@ impl Steps<'_, '_> {
             moves.clear();
             let mut left = 0;
             for (o, mine) in lost.iter_mut().enumerate() {
+                let models = &mut self.room.models;
                 mine.retain(|((p, l), _)| !models[usize::from(*p)].reached(*l));
                 left += mine.len();
-                // One answer per kind of item: copies share it.
-                let mut asked: Vec<Option<bool>> = vec![None; seats[o].w.items()];
+                // One answer per kind of item (copies share it): 2 when one more copy opens a
+                // rule on the frontier now, 1 when a rule there reads it, 0 otherwise. A move
+                // uses up a reached location, so the best kind there is goes first.
+                let mut asked: Vec<Option<u8>> = vec![None; seats[o].w.items()];
+                let mut rate = |item: u16| {
+                    *asked[usize::from(item)].get_or_insert_with(|| match models[o].wants(item) {
+                        true => 1 + u8::from(models[o].opens(item)),
+                        false => 0,
+                    })
+                };
+                let best = mine.iter().map(|x| rate(x.1)).max().filter(|b| *b > 0);
                 wanted.clear();
-                wanted.extend((0..mine.len()).filter(|i| {
-                    let item = mine[*i].1;
-                    *asked[usize::from(item)].get_or_insert_with(|| models[o].wants(item))
-                }));
+                wanted.extend((0..mine.len()).filter(|i| Some(rate(mine[*i].1)) == best));
                 if let Some(n) = rng.below(wanted.len() as u64) {
                     moves.push((o, wanted[usize::try_from(n).unwrap_or(0)]));
                 }
@@ -1389,8 +1447,9 @@ impl Steps<'_, '_> {
             self.room.settle();
         }
         self.room.absorb(&mut self.stats);
-        let progression = |g: Given| seats[usize::from(g.to)].progression[usize::from(g.item)];
-        let holds = |x: &&(u16, u32)| work[usize::from(x.0)][x.1 as usize].is_some_and(progression);
+        let holds = |x: &&(u16, u32)| {
+            work[usize::from(x.0)][x.1 as usize].is_some_and(|g| is_progression(seats, g))
+        };
         let reach =
             if dials.goal_only { Vec::new() } else { open.iter().filter(holds).copied().collect() };
         let goals = self.room.models.iter().all(Reach::goal);
@@ -1585,7 +1644,7 @@ pub(crate) fn assert_fast(
     if !dials.goal_only || !f.fast {
         assert_eq!(f.reached, exact.reached, "{what}");
     }
-    let progression = |g: &Given| seats[usize::from(g.to)].progression[usize::from(g.item)];
+    let progression = |g: &Given| is_progression(seats, *g);
     for (p, row) in f.placed.iter().enumerate() {
         for (l, g) in row.iter().enumerate() {
             let (p, l) = (u16::try_from(p).unwrap(), u32::try_from(l).unwrap());
@@ -1768,6 +1827,99 @@ mod tests {
             }
         }
         assert!(fell > 0 && filled > 0, "{fell} fallbacks, {filled} filled");
+    }
+
+    /// The dial buys draws for every pick, and a fill request carries it: beyond the limit it
+    /// is refused before any work, by name and at the fill's own door.
+    #[test]
+    fn a_depth_beyond_the_limit_is_refused() {
+        let most = config::FILL_DEPTH_MAX_PERCENT;
+        for ok in [most, -most, 0] {
+            assert!(format!("level,depth={ok}").parse::<Algorithm>().is_ok(), "{ok}");
+        }
+        let t = Three::new();
+        let seats = t.seats();
+        for bad in [most + 1, -most - 1, i32::MAX, i32::MIN] {
+            assert!(format!("shuffle,depth={bad}").parse::<Algorithm>().is_err(), "{bad}");
+            for mode in [Algorithm::Level, Algorithm::Shuffle] {
+                let dials = Dials { depth: bad, ..Dials::default() };
+                let e = fill_room_by(&seats, &mut rng(1), 1, Path::Carry, mode(dials)).unwrap_err();
+                assert!(matches!(&e, FillError::Instance(m) if m.contains("depth")), "{e:?}");
+            }
+        }
+    }
+
+    /// The guard behind every opt-in seed, driven into its failing branch: progression the
+    /// final solve does not reach, or a goal it does not hold, is `Invalid`.
+    #[test]
+    fn a_seed_whose_progression_the_final_solve_misses_is_invalid() {
+        let t = Three::new();
+        let seats = t.seats();
+        let mut room = Linked::new(&seats);
+        // Nothing placed but the locked items: the start is reached, the rest is not.
+        room.solve(&vec![Vec::new(); 3], &locked_placed(&seats));
+        let (open, shut) = (t.worlds[0].loc("l1").unwrap(), t.worlds[0].loc("l11").unwrap());
+        assert!(room.models[0].reached(open) && !room.models[0].reached(shut));
+        let mode = Algorithm::Level(Dials::default());
+        let holds = |reach, goals| Proof { reach, goals }.holds(&room.models, mode);
+        assert_eq!(holds(vec![(0, open)], false), Ok(()));
+        for (reach, goals) in [(vec![(0, shut)], false), (vec![(0, open)], true)] {
+            let e = holds(reach, goals).unwrap_err();
+            assert!(matches!(e, FillError::Invalid(_)), "{e:?}");
+        }
+    }
+
+    /// The labelling itself, on a chain: a location's level is the number of order items held
+    /// when it opens, and what only the last item opens (or nothing opens) is past every level.
+    #[test]
+    fn levels_are_the_number_of_order_items_held_when_a_location_opens() {
+        use serde_json::json;
+        let check = |l: &str, rule: serde_json::Value| json!({"loc": l, "rule": rule});
+        let t = json!({"true": {}});
+        let region = |key: &str, checks: serde_json::Value, exits: serde_json::Value| {
+            json!({"key": key, "can_stay": false, "checks": checks, "exits": exits,
+                   "events": [], "stays": []})
+        };
+        let m = json!({
+            "options": [],
+            "items": [{"key": "a", "id": 1}, {"key": "b", "id": 2}, {"key": "junk", "id": 3}],
+            "locations": (0..4).map(|i| json!({"key": format!("l{i}"), "id": i + 1}))
+                .collect::<Vec<_>>(),
+            "start": "ra", "x.time": {"slices": 1, "start_mask": 1}, "defs": {},
+            "regions": [
+                region("ra", json!([check("l0", t.clone()), check("l3", json!({"has": "b"}))]),
+                       json!([{"to": "rb", "rule": {"has": "a"}}])),
+                region("rb", json!([check("l1", t.clone())]),
+                       json!([{"to": "rc", "rule": {"has": "b"}}])),
+                region("rc", json!([check("l2", t)]), json!([])),
+            ],
+            "goal": {"reach": "region:rb"}
+        });
+        let pool = ["a", "b", "junk", "junk"];
+        let class = |k: &str| if k == "junk" { "filler" } else { "progression" };
+        let inst = Instance {
+            locations: (0..4).map(|i| format!("l{i}")).collect(),
+            pool: pool.map(str::to_owned).to_vec(),
+            pool_class: pool.iter().map(|k| ((*k).to_owned(), class(k).to_owned())).collect(),
+            ..Instance::default()
+        };
+        let w = World::load(&m).unwrap();
+        let plan = Plan::new(&w, &inst).unwrap();
+        let prog = inst.progression(&w);
+        let seats = [Seat { w: &w, plan: &plan, progression: &prog }];
+        let (a, b) = (w.item("a").unwrap(), w.item("b").unwrap());
+        let levels = |order: [u16; 2]| {
+            let order = order.map(|item| Given { to: 0, item });
+            let mut room = Linked::new(&seats);
+            let (marks, goal) =
+                room.levels(&order, &[Vec::new()], &locked_placed(&seats), &|_, _| true);
+            let level = |l: u32| marks.partition_point(|m| *m <= room.models[0].loc_rank(l));
+            ([0, 1, 2, 3].map(level), goal)
+        };
+        // a then b: l1 opens with a held; l2 and l3 need b, the last item, which no item can use.
+        assert_eq!(levels([a, b]), ([0, 1, 2, 2], 1), "the goal (rb) holds with one item held");
+        // b then a: l3 opens with b held; l1 and l2 need a, the last item.
+        assert_eq!(levels([b, a]), ([0, 2, 2, 1], 2), "the goal needs the last item");
     }
 
     #[test]

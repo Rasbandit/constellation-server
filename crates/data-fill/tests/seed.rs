@@ -128,9 +128,16 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     let level: SeedBundle = serde_json::from_slice(&level).unwrap();
     let dials = data_fill::room::Dials { depth: 100, ..Default::default() };
     let mode = data_fill::room::Algorithm::Level(dials);
-    let same = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
+    let (same, report) = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
+    // The job says how the seed was placed, since the bundle cannot.
+    let said = data_fill::job::generate_reported(asked.to_string().as_bytes()).unwrap().1;
+    assert_eq!(said, report);
+    assert_eq!(report.placed_by_the_mode, report.fallbacks == 0, "one attempt: {report:?}");
     assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
     assert_eq!(level.slots.len(), direct.slots.len());
+    // The depth dial is bounded where the request comes in.
+    asked["algorithm"] = json!({"shuffle": {"depth": i32::MAX}});
+    assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("depth"));
     asked["algorithm"] = json!("fastest");
     assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("bad"));
 
