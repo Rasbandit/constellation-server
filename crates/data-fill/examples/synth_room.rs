@@ -10,7 +10,9 @@
 //! What is done once per world version is timed apart from what every seed pays. Once per
 //! world: `prepare_ms` compiles every world of the room into its stored ready form
 //! ([`data_fill::prepared::build`], on one thread), and `load_ms` loads those stored forms
-//! ([`Prepared::open`]). Per seed: `setup_ms` resolves every player's instance against their
+//! ([`Prepared::open`]); `bit_rules_ms` is the part of it that builds the worlds' bit rules,
+//! measured by building them once more, so `load_ms - bit_rules_ms` is the load without them.
+//! Per seed: `setup_ms` resolves every player's instance against their
 //! loaded world (on `--workers` threads; drawing the synthetic manifests is not timed), and
 //! `fill_ms` is the median of `reps` fills of the same seed (the work is identical, so the
 //! spread is timing noise only).
@@ -44,8 +46,8 @@
 //! `--rules bytecode` leaves every rule as bytecode (`Plan::interpreted`) and `--absent check`
 //! also evaluates the checks of absent locations (`Plan::with_absent_checks`): the engine as it
 //! was before each, for a before and after on one runner. The placements hash must not move.
-//! `rules` is the first player's `Plan::rules_report` (rule sites per class and what the seed's
-//! fold leaves, all counted).
+//! `rules_report` is the first player's `Plan::rules_report` (rule sites per class, what the
+//! seed's fold leaves and what the steps not built could remove, all counted).
 //!
 //! `row_s` is the wall time the whole row took (drawing, preparing, every fill and replay), and
 //! `fill_reps` how many fills the median is over: `--reps`, or two once a fill takes over a
@@ -162,6 +164,11 @@ fn one(
     let loaded: Vec<Prepared> =
         files.iter().map(|f| Prepared::open(f)).collect::<Result<_, _>>()?;
     let load_ms = ms(t);
+    // Of `load_ms`: building every world's bit rules, done once more and timed alone.
+    let t = Instant::now();
+    let rebuilt: usize = loaded.iter().map(|p| p.world().build_bit_rules()).sum();
+    std::hint::black_box(rebuilt);
+    let bit_rules_ms = ms(t);
     let insts: Vec<&Instance> = (0..players).map(|p| &drawn[p % count].1).collect();
     // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
     let t = Instant::now();
@@ -291,9 +298,9 @@ fn one(
     // One fill's rounds (the first, untimed fill's): counted, and its wall time by phase.
     out["rounds_profile"] = json!({
         "world_solves": r.solved, "changed_share": share(r.changed),
-        "touched_share": share(r.touched),
         "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
     });
+    out["bit_rules_ms"] = json!(fine(bit_rules_ms));
     out["fill_reps"] = json!(reps);
     out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     Ok(out)
