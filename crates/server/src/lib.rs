@@ -14,6 +14,7 @@
 
 mod accounts;
 mod catalogue;
+mod checks;
 mod manifests;
 mod room_admins;
 mod room_view;

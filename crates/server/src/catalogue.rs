@@ -4,7 +4,7 @@
 //! every signed-in account to read; only an owner changes a game: adds or removes owners, posts
 //! a version, withdraws one. A version names an `.apworld` already uploaded through
 //! `PUT /api/apworlds` (which applies the upload limits and inspects it) and starts as
-//! `checking`; the checks that make it live are #189.
+//! `checking`, and its checks start at once ([`crate::checks`]).
 
 use crate::accounts::{Identity, clean_name};
 use crate::worlds::{Worlds, json_reply, percent_decode, raw_param};
@@ -73,6 +73,7 @@ fn version_json(v: &GameVersion) -> Value {
     json!({
         "version": v.version, "note": v.note, "apworld": crate::hex(&v.apworld),
         "generator": v.generator, "state": v.state.as_str(), "error": v.error,
+        "scan": v.scan.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
     })
 }
 
@@ -247,7 +248,10 @@ async fn add_version(
         by = who.name,
         "catalogue version added"
     );
-    page(&w, &who, &game, StatusCode::CREATED).await
+    // The answer shows it as added (`checking`), whatever its check does next.
+    let added = page(&w, &who, &game, StatusCode::CREATED).await;
+    crate::checks::start(&w, &game.name, &new.version);
+    added
 }
 
 /// `POST /api/games/{game}/versions/{version}/withdraw`: an owner withdraws a version, for
