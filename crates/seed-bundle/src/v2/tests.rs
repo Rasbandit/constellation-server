@@ -947,3 +947,17 @@ fn the_hash_takes_the_games_as_canonical_json_made_earlier() {
         assert_eq!(package::data_json(b"{}", "G"), None);
     }
 }
+
+/// Fails without the rule in `Seed::check`: a seed file in which two slots share a name is
+/// refused when it is opened, as the v1 check refuses the bundle, so a seed that did not come
+/// through that check (the fill's own file, a stored seed) cannot bring one in.
+#[test]
+fn a_seed_file_with_two_slots_of_one_name_is_refused() {
+    let mut v = small();
+    v["slots"][1]["name"] = json!("B");
+    v["connect_names"] = json!({"B": [0, 2]});
+    let b: SeedBundle = serde_json::from_value(v).unwrap();
+    assert!(b.validate().unwrap_err().to_string().contains("repeats"));
+    let e = Seed::from_v1(&b, &[0; 32], 1 << 20).unwrap_err().to_string();
+    assert!(e.contains("slot name \"B\" repeats"), "{e}");
+}

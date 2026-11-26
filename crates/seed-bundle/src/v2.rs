@@ -965,11 +965,15 @@ impl Seed {
         if n == 0 || !self.ids.windows(2).all(|w| w[0] < w[1]) || self.ids[0].0 == 0 {
             return Err(bad("slots must be ids from 1, strictly ascending"));
         }
+        let mut names = std::collections::BTreeSet::new();
         for s in self.slots() {
             let at = s.at();
             let id = s.id();
             if !ok_str(at + 8) || self.str_at(at + 8).is_none() {
                 return Err(bad(format!("slot {id} name out of range")));
+            }
+            if !names.insert(s.name()) {
+                return Err(bad(format!("slot name {:?} repeats", s.name())));
             }
             let game = usize::from(r.u16(at + 16));
             let Some(g) = self.games.get(game) else {
