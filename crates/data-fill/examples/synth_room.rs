@@ -1,4 +1,5 @@
-//! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
+//! `synth_room [--profile light|heavy|wide] [--rules bits|bytecode] [--absent skip|check]
+//! [--path auto|carry|forward] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
@@ -40,6 +41,12 @@
 //! nothing held and with every progression item held, and the bytecode nodes and def bodies an
 //! evaluation reads (counted).
 //!
+//! `--rules bytecode` leaves every rule as bytecode (`Plan::interpreted`) and `--absent check`
+//! also evaluates the checks of absent locations (`Plan::with_absent_checks`): the engine as it
+//! was before each, for a before and after on one runner. The placements hash must not move.
+//! `rules` is the first player's `Plan::rules_report` (rule sites per class and what the seed's
+//! fold leaves, all counted).
+//!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
 //! fallbacks, and the rule evaluations of the mode's own solves.
@@ -50,7 +57,7 @@ use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Shape, world};
-use data_fill::{Instance, World};
+use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
@@ -131,6 +138,7 @@ fn one(
     players: usize,
     reps: usize,
     (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
+    (bits, skip): (bool, bool),
 ) -> Result<Value, String> {
     let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
@@ -153,8 +161,11 @@ fn one(
     // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
     let t = Instant::now();
     let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
-    let c = Compiled::resolve(worlds, &insts, workers)?;
+    let mut c = Compiled::resolve(worlds, &insts, workers)?;
     let setup_ms = ms(t);
+    let plain = |p: Plan| if bits { p } else { p.interpreted() };
+    let whole = |p: Plan| if skip { p } else { p.with_absent_checks() };
+    c.plans = c.plans.into_iter().map(|p| whole(plain(p))).collect();
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
@@ -239,6 +250,10 @@ fn one(
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
         "rule_evals": s.evals,
         "rule_evals_ranked": s.ranked,
+        "rule_evals_bits": s.bits,
+        "rules": if bits { "bits" } else { "bytecode" },
+        "absent": if skip { "skip" } else { "check" },
+        "rules_report": seats[0].plan.rules_report(seats[0].w),
         "eval_only": replay,
         "ns_per_eval": (fill_ms * 1e6 / s.evals.max(1) as f64 * 10.0).round() / 10.0,
         "removals": s.removals,
@@ -283,7 +298,8 @@ fn main() -> Result<(), String> {
     let d = match profile.as_str() {
         "light" => Shape::default(),
         "heavy" => Shape::heavy(),
-        x => return Err(format!("--profile: light or heavy, got {x}")),
+        "wide" => Shape::wide(),
+        x => return Err(format!("--profile: light, heavy or wide, got {x}")),
     };
     let on = |b: bool| if b { "on" } else { "off" }.to_owned();
     let shape = Shape {
@@ -313,6 +329,12 @@ fn main() -> Result<(), String> {
         "one" => true,
         x => return Err(format!("--worlds: each or one, got {x}")),
     };
+    let pick = |name: &str, on: &str, off: &str| match arg(&args, name, on.to_owned())?.as_str() {
+        x if x == on => Ok(true),
+        x if x == off => Ok(false),
+        x => Err(format!("{name}: {on} or {off}, got {x}")),
+    };
+    let engine = (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?);
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -321,7 +343,7 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world))?;
+        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world), engine)?;
         row["profile"] = json!(profile);
         row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
@@ -331,6 +353,8 @@ fn main() -> Result<(), String> {
     println!(
         "{}",
         json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
+               "rules": if engine.0 { "bits" } else { "bytecode" },
+               "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },
                "fitted_exponent": fitted, "points": points})
     );
