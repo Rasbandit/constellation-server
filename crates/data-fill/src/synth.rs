@@ -182,6 +182,46 @@ mod tests {
         (f.placed, f.stats, sp.spheres.len())
     }
 
+    /// The exact placements of fixed seeds, room and single player, with and without clocks,
+    /// with `p0` confined to a placement group: pinned, so a change to how the fill scans its
+    /// locations or looks up groups must keep every byte.
+    #[test]
+    fn placements_of_fixed_seeds_are_pinned() {
+        let mut out = String::new();
+        for clocks in [false, true] {
+            let shape = small(clocks);
+            let built: Vec<(Value, Instance)> = (0..3)
+                .map(|p| {
+                    let (m, mut inst) = world(&shape, 11, p);
+                    // 60 checks make 7 regions: these are the locations of the first two.
+                    inst.item_groups.insert("p0".to_owned(), "home".to_owned());
+                    for l in (0..shape.checks).filter(|l| l % 7 < 2) {
+                        inst.location_groups.insert(format!("l{l}"), "home".to_owned());
+                    }
+                    (m, inst)
+                })
+                .collect();
+            let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
+            let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
+            let c = Compiled::new(&manifests, &insts, 1).unwrap();
+            for seed in 1..=4 {
+                out += &format!("{:?}\n", fill(&c, seed).0);
+                let one = crate::fill(
+                    &c.worlds[0],
+                    &c.plans[0],
+                    &mut SpecRng::from_u64(seed),
+                    config::FILL_MAX_ATTEMPTS,
+                )
+                .unwrap();
+                assert!(one.beatable, "seed {seed}");
+                out += &format!("{:?}\n", one.placed);
+            }
+        }
+        let p0 = |row: &str| row.matches("item: 0 }").count();
+        assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
+        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
     #[test]
     fn a_small_synthetic_room_is_beatable_and_the_same_for_a_seed() {
         for clocks in [false, true] {
