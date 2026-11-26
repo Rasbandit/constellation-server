@@ -271,13 +271,13 @@ impl World {
             w.hot.target[*site] = *to;
         }
         if !exits.is_empty() {
-            w.hot.into[EXITS] = w.into_index(EXITS, w.counts[REGIONS]);
+            w.hot.into[EXITS] = w.sites_by_target(EXITS, w.counts[REGIONS]);
         }
         w
     }
 
     /// Sites of group `g` by target (`n` targets), the reverse of `hot.target`.
-    fn into_index(&self, g: usize, n: usize) -> (Vec<u32>, Vec<u32>) {
+    fn sites_by_target(&self, g: usize, n: usize) -> (Vec<u32>, Vec<u32>) {
         let mut at = vec![0u32; n + 1];
         let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
         let sites = || (0..self.hot.target.len()).filter(of_g);
@@ -541,7 +541,7 @@ impl World {
             }
         }
         for (g, n) in [c[REGIONS], c[COUNTERS], c[LOCS]].into_iter().enumerate() {
-            self.hot.into[g] = self.into_index(g, n);
+            self.hot.into[g] = self.sites_by_target(g, n);
         }
         if self.defs.len != c[DEFS] || self.vanilla.len != c[LOCS] {
             return Err(bad("def or location table length"));

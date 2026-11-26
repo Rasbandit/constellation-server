@@ -54,6 +54,32 @@ D2.5 has `counter` ("derived, monotone increments") and `reach_event`. Here an e
 ### 3. `x.roll@0`: a seeded integer per location
 Some prices are drawn per location at seed setup (an integer range) and rules compare against them. `{"x.roll": "price", "at": loc}` reads the drawn value, folded to a constant before the fill. The draw itself belongs in the `select` family of doc 07 section 2.3 (integer range, named stream, one value per row). Until that primitive exists, the instance supplies the values.
 
+### 4. `shuffles`: things assigned to slots (first slice of design doc 17)
+One construct for randomization that is not item placement (`crates/data-fill/src/shuffle.rs`). A shuffle gives each slot one thing under a permission table that rows only narrow. Built so far: two kinds, with everything else in doc 17 refused at load by name.
+
+```json
+"regions": [{"key": "village", "exits": [
+    {"to": "cave", "rule": {"has": "lantern"}, "key": "cave_mouth", "door": "cave_mouth", "group": "cave"},
+    {"to": "pond", "rule": {"true": {}}, "key": "well_drop", "group": "drop"}]}],
+"shuffles": {
+  "entrances": {"check": "layout", "coupled": true,
+    "slots": {"type": "exit", "names": ["cave_mouth", "mill_door", "well_drop", "chute"]},
+    "allow": [{"slots": {"groups": ["cave"]}, "only": {"groups": ["cave"]}}]},
+  "guardians": {"check": "none",
+    "slots": {"type": "name", "names": ["marsh_hall", "spire_hall"]},
+    "things": {"golem": {"rule": {"has": "hammer"}}, "hydra": {"rule": {"has": "spear"}, "group": "large"}},
+    "allow": [{"slots": {"names": ["spire_hall"]}, "deny": {"groups": ["large"]}}]}}
+```
+
+- **Exits.** An exit a shuffle names carries a `key`, and may carry a `group` and a `door`. Two exits with the same `door` are the two sides of one door and must be each other's way back; an exit without a second side is one-way.
+- **`layout` (slots of type `exit`).** Every listed exit is a slot (leaving through it) and a thing (arriving where it leads unshuffled). The exit's own rule stays on the exit. One-way exits trade only with one-way exits. With `coupled: true` the shuffle lists one side of each door and the other side follows, so a door leads back where it was entered; without it every listed side is its own slot.
+- **`none` (slots of type `name`).** Slots are names the shuffle lists; things may carry a `rule` and a `group`. A rule reads the result as `{"at": [shuffle, slot]}`: where a rule is expected it is the rule of the thing there, and inside `eq` or `ne` against a thing name it tests which thing is there. Both fold to constants per seed.
+- **Rows.** `{"slots": S, "only": T}`, `{"slots": S, "deny": T}`, `{"things": T, "only_in": S}`, `{"things": T, "deny_in": S}`, where `S` and `T` are `{"names": [...]}`, `{"groups": [...]}` or both.
+- **Order.** A shuffle runs after every shuffle its things' rules read, ties by key; a cycle is a load error that lists each read. The layout is solved once per world, after them.
+- **Per seed.** `data_fill::shuffle::stage` runs before the fill: the `none` draws, one joint layout solve, then the whole-world check (holding the whole pool, every region and every check that exists is reached and the goal holds). A failed attempt starts again, at most `config::SHUFFLE_MAX_ATTEMPTS` times, then the generation fails naming the player, the world and the shuffle. A world without `shuffles` is not staged and draws nothing.
+- **Output.** Each slot's `slot_data` gets `{"shuffles": {shuffle: {slot: thing}}}`, both sides of a coupled door included.
+- Limits are in `crates/config` (`SHUFFLE_*`, `SHUFFLES_MAX`). A slot of a `none` shuffle takes one of the 256 options a world's rules can read.
+
 ### No addition needed
 - Option-disabled checks that still hand out their vanilla item when reached: the location carries `vanilla`, and a location absent from the seed grants it on reach (doc 07's event-location idea).
 - Items confined to their own area (for example keys): an item group may only go to its location group (doc 07 `item_rule`).

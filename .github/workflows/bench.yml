@@ -65,6 +65,19 @@ jobs:
               --players "$PLAYERS" --checks "$CHECKS" \
               | tee -a bench-room.jsonl
           done; done
+      # Entrance shuffle (`data_fill::shuffle`) against the same fill without it: heavy worlds
+      # with and without shuffled two-way doors, one thread, the path a room of that size takes.
+      # Its own file, so the tables below keep the rows they select.
+      - name: entrance shuffle
+        env:
+          CHECKS: ${{ inputs.checks || '1000' }}
+        run: |
+          set -o pipefail
+          for entrances in off on; do
+            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
+              --profile heavy --path auto --workers 1 --players 1,100 --checks "$CHECKS" \
+              --entrances "$entrances" | tee -a bench-shuffle.jsonl
+          done
       # Skipping the checks of empty locations must not change a seed: every `noskip` row has to
       # carry the placements hash of its skipping row.
       - name: skipping changes no placement
@@ -96,6 +109,16 @@ jobs:
       - name: summary
         run: |
           {
+            echo "### Entrance shuffle against the exact fill (heavy profile, one thread, a world per player; measured on this runner, release build)"
+            echo
+            echo "Shuffle ms is what staging adds per seed over resolving the instances: the layout solve, the fold and the whole-world check of every player. The shuffled room fills on other layouts, so its fill time differs from the plain room's for that reason too. Both shares are of the plain room's fill."
+            echo
+            echo "| players | path | fill ms plain (median) | fill ms shuffled (median) | shuffle ms (median) | shuffle ms per world | shuffle, share of the plain fill % | shuffle plus the change in fill, share of the plain fill % | restarts | shuffled exits per world |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances) as $on
+              | ($r[] | select((.entrances | not) and .players == $on.players)) as $off
+              | "| \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \(($on.shuffle.shuffle_ms / $off.fill_ms * 1000 | round) / 10) | \((($on.shuffle.shuffle_ms + $on.fill_ms - $off.fill_ms) / $off.fill_ms * 1000 | round) / 10) | \($on.shuffle.restarts) | \($on.shuffle.exits) |"' bench-shuffle.jsonl
+            echo
             echo "### One game per room, one thread: what is done once per world and what each seed pays (measured on a GitHub-hosted ubuntu-latest runner, release build)"
             echo
             echo "Every player plays one world, as the server generates a room. Prepare (compile to the stored ready form) is paid once per world and server build. Load (open the stored form) is paid by every generation while each runs in its own process. Per seed: setup (resolve the players), fill, assemble (the bundle, on the prepared tables), encode (check, hash, seed file, in the child) and open (the server opens the seed file on the world's package). v1 import is what the path before did in place of encode and open together (JSON text, parsed, encoded, the package deflated, opened). Peak RSS is the whole process's high-water mark when the row was printed, drawing the synthetic manifest and every smaller room included."
@@ -154,4 +177,5 @@ jobs:
           name: bench-room
           path: |
             bench-room.jsonl
+            bench-shuffle.jsonl
             quality-*.json

@@ -1,7 +1,7 @@
 //! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--entrances on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
@@ -33,6 +33,14 @@
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
+//! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`) and stages
+//! every player's world before the fill ([`data_fill::shuffle::room`]). The row's `shuffle`
+//! then holds, as medians of `reps`: `stage_ms` (the shuffles, the fold, the whole-world check
+//! and resolving the instances, every player, one thread), `plans_ms` (resolving the instances
+//! alone on the staged worlds, which a room without shuffles pays too) and `shuffle_ms`, their
+//! difference: what the shuffles add per seed. `restarts` counts attempts after the first over
+//! the room, `exits` the shuffled exits of the first world.
+//!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
 //! fallbacks, and the rule evaluations of the mode's own solves.
@@ -40,7 +48,7 @@
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
+use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by, plans};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Shape, world};
 use data_fill::{Instance, World};
@@ -127,10 +135,37 @@ fn one(
         files.iter().map(|f| Prepared::open(f)).collect::<Result<_, _>>()?;
     let load_ms = ms(t);
     let insts: Vec<&Instance> = (0..players).map(|p| &drawn[p % count].1).collect();
-    // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
+    let mut shuffle_row = Value::Null;
     let t = Instant::now();
-    let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
-    let c = Compiled::resolve(worlds, &insts, workers)?;
+    let c = if shape.doors {
+        // Staging copies each player's world itself, as `seed::generate_on` has it do.
+        let base: Vec<&World> = loaded.iter().map(Prepared::world).collect();
+        let stage = || data_fill::shuffle::room(&base, &insts, seed).map(|x| x.0);
+        let c = stage()?;
+        let (stage_ms, _) = median(reps, || stage().map(drop))?;
+        let pairs: Vec<(&World, &Instance)> =
+            (0..players).map(|p| (c.world(p), insts[p])).collect();
+        let (plans_ms, _) =
+            median(reps, || plans(&pairs, 1).map(drop).map_err(|e| format!("{e:?}")))?;
+        let mut restarts = 0;
+        for (p, inst) in insts.iter().enumerate() {
+            let staged = data_fill::shuffle::stage(base[p % count], inst, seed, p as u32)?;
+            restarts += staged.map_or(0, |s| s.attempts.saturating_sub(1));
+        }
+        let shuffle_ms = stage_ms - plans_ms;
+        shuffle_row = json!({
+            "stage_ms": fine(stage_ms), "plans_ms": fine(plans_ms), "shuffle_ms": fine(shuffle_ms),
+            "per_world_ms": (shuffle_ms / players as f64 * 1e3).round() / 1e3,
+            "restarts": restarts,
+            "exits": drawn[0].0["shuffles"]["entrances"]["slots"]["names"].as_array().map(Vec::len),
+        });
+        c
+    } else {
+        // A room owns its worlds: the copy is part of what a seed pays, as in
+        // `seed::generate_on`.
+        let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
+        Compiled::resolve(worlds, &insts, workers)?
+    };
     let setup_ms = ms(t);
     let seats = c.seats();
     let fill = || {
@@ -197,6 +232,8 @@ fn one(
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks,
+        "entrances": shape.doors,
+        "shuffle": shuffle_row,
         "world": if one_world { "one" } else { "each" },
         "worlds": count,
         "prepare_ms": fine(prepare_ms),
@@ -262,6 +299,11 @@ fn main() -> Result<(), String> {
             "on" => true,
             "off" => false,
             x => return Err(format!("--clocks: on or off, got {x}")),
+        },
+        doors: match arg(&args, "--entrances", on(d.doors))?.as_str() {
+            "on" => true,
+            "off" => false,
+            x => return Err(format!("--entrances: on or off, got {x}")),
         },
         ..d
     };

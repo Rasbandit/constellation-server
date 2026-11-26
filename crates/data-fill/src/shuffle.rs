@@ -886,10 +886,10 @@ impl Layout {
         let regions = w.regions();
         let small = |r: usize| u16::try_from(r).unwrap_or(u16::MAX);
         let (mut fixed, mut back) = (vec![Vec::new(); regions], vec![Vec::new(); regions]);
-        for r in 0..regions {
+        for (r, out) in fixed.iter_mut().enumerate() {
             for site in w.group(r, EXITS).filter(|site| !moved.contains(site)) {
                 let to = w.site_target(site) as usize;
-                fixed[r].push(small(to));
+                out.push(small(to));
                 back[to].push(r);
             }
         }
@@ -1102,7 +1102,7 @@ pub fn stage(w: &World, inst: &Instance, seed: u64, player: u32) -> R<Option<Sta
 ///
 /// # Errors
 /// As [`stage`] and [`Plan::new`], naming the player.
-pub fn room(worlds: &[World], insts: &[&Instance], seed: u64) -> R<(Compiled, Vec<Table>)> {
+pub fn room(worlds: &[&World], insts: &[&Instance], seed: u64) -> R<(Compiled, Vec<Table>)> {
     too_many(insts.len()).map_err(|e| format!("{e:?}"))?;
     let mut c = Compiled { worlds: Vec::new(), plans: Vec::new(), progression: Vec::new() };
     let mut tables = Vec::with_capacity(insts.len());
@@ -1114,7 +1114,7 @@ pub fn room(worlds: &[World], insts: &[&Instance], seed: u64) -> R<(Compiled, Ve
             Some(staged) => staged,
             None => Staged {
                 plan: Plan::new(w, inst).map_err(|e| who(format!("{e:?}")))?,
-                world: w.clone(),
+                world: (*w).clone(),
                 table: Table::new(),
                 attempts: 0,
             },
