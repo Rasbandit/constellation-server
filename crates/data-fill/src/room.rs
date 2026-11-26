@@ -13,6 +13,12 @@
 //! orders derivations over the whole room and a fact's support is checked against the room as
 //! of its rank, exactly as for one player. No full rescan happens after the first solve.
 //!
+//! A room of `config::ROOM_FORWARD_MIN_PLAYERS` players or more places its rounds on a second
+//! path ([`Path::Forward`]): instead of taking a round's items back one cascade at a time, it
+//! solves the room afresh for the round, forward only. A round's state is the least fixed point
+//! of monotone rules for what is held and placed, which is unique, and placement reads nothing
+//! but what that state reaches, so both paths place every item in the same location.
+//!
 //! Per-player state is owned by the room and shared data (`World`, `Plan`) is immutable and
 //! `Sync`; only the fill is sequential. Choices where the legacy multiplayer fill has options
 //! (see `docs/world-rules-section.md`): rounds of one item per player; one shared pool and one shuffled list of locations
@@ -190,6 +196,28 @@ impl RoomFilled {
     }
 }
 
+/// How the state a round of one item per player is placed against is found. The placements
+/// are the same on both paths (see the module text); only the work differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    /// Carry every state from round to round: the last round's items are held where they were
+    /// put, then each item of this round is taken back by truth maintenance.
+    Carry,
+    /// Solve the room afresh for every round with none of the round's items held, forward
+    /// only: nothing is retracted. Confined items, placed one at a time before the rounds, are
+    /// still carried.
+    Forward,
+}
+
+impl Path {
+    /// The path a room of `players` takes: one removal retracts more the larger the room, a
+    /// fresh solve costs the same per player.
+    #[must_use]
+    pub fn of(players: usize) -> Self {
+        if players >= config::ROOM_FORWARD_MIN_PLAYERS { Path::Forward } else { Path::Carry }
+    }
+}
+
 /// Fill a room. Retries the whole fill with the next draws from `rng` when stuck.
 ///
 /// # Errors
@@ -200,7 +228,7 @@ pub fn fill_room(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<RoomFilled, FillError> {
-    fill_with(seats, rng, max_attempts, true, false).map(|x| x.0)
+    fill_on(seats, rng, max_attempts, true, Path::of(seats.len()), false).map(|x| x.0)
 }
 
 /// [`fill_room`] and the room's spheres, from the fill's own final states.
@@ -212,7 +240,21 @@ pub fn fill_room_spheres(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    let (f, s) = fill_with(seats, rng, max_attempts, true, true)?;
+    fill_room_on(seats, rng, max_attempts, Path::of(seats.len()))
+}
+
+/// [`fill_room_spheres`] on a given path, whatever the room's size (measurements, and the
+/// tests that hold the two paths against each other).
+///
+/// # Errors
+/// As [`fill_room`].
+pub fn fill_room_on(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    max_attempts: u32,
+    path: Path,
+) -> Result<(RoomFilled, RoomSpheres), FillError> {
+    let (f, s) = fill_on(seats, rng, max_attempts, true, path, true)?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -407,13 +449,25 @@ pub fn check_placed(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> Result
     Ok(())
 }
 
-/// The fill. `extend` off solves the whole room fresh at every step (the reference the
-/// carried states are tested against).
+/// The fill on the carried path. `extend` off solves the whole room fresh at every step, in
+/// rank order (the reference the carried states are tested against).
+#[cfg(test)]
 fn fill_with(
     seats: &[Seat<'_>],
     rng: &mut SpecRng,
     max_attempts: u32,
     extend: bool,
+    want_spheres: bool,
+) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
+    fill_on(seats, rng, max_attempts, extend, Path::Carry, want_spheres)
+}
+
+fn fill_on(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    max_attempts: u32,
+    extend: bool,
+    path: Path,
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
     check(seats)?;
@@ -426,6 +480,7 @@ fn fill_with(
         rounds: 0,
         stats: Stats::default(),
         extend,
+        path,
     };
     for attempt in 1..=max_attempts {
         match s.try_fill(rng) {
@@ -474,6 +529,9 @@ struct Linked<'a, 'w> {
     suspects: BinaryHeap<Reverse<(u32, usize)>>,
     /// Players handed a `Move` since the last look (their suspects changed).
     moved: Vec<usize>,
+    /// Settle in supersteps ([`Linked::supersteps`]) instead of in rank order: for states no
+    /// removal will read.
+    forward: bool,
 }
 
 impl<'a, 'w> Linked<'a, 'w> {
@@ -492,6 +550,7 @@ impl<'a, 'w> Linked<'a, 'w> {
             outboxes: Vec::new(),
             suspects: BinaryHeap::new(),
             moved: Vec::new(),
+            forward: false,
         }
     }
 
@@ -539,6 +598,9 @@ impl<'a, 'w> Linked<'a, 'w> {
 
     /// Run states and pass their messages on until nothing is left to do.
     fn settle(&mut self) {
+        if self.forward {
+            return self.supersteps();
+        }
         loop {
             // Ascending by player, as every delivery has always been: ranks and counters follow.
             self.outboxes.sort_unstable();
@@ -553,6 +615,31 @@ impl<'a, 'w> Linked<'a, 'w> {
                 self.with(p, Reach::run);
                 self.deliver(p);
             }
+        }
+    }
+
+    /// [`Linked::settle`] without the room's rank order: every state with something to run goes
+    /// to its own fixed point, then all their messages are handed over in player order, until
+    /// nothing is left. The fixed point is the same one (the rules are monotone); the ranks are
+    /// each state's own and order nothing across states, so no removal may follow on these
+    /// states before a [`Linked::solve`] in rank order.
+    fn supersteps(&mut self) {
+        loop {
+            for p in 0..self.models.len() {
+                if !self.models[p].outbox.is_empty() {
+                    self.deliver(p);
+                }
+            }
+            self.outboxes.clear();
+            let mut busy = false;
+            while let Some(Reverse(p)) = self.ready.pop() {
+                self.queued[p] = false;
+                busy |= !self.models[p].idle();
+            }
+            if !busy {
+                return;
+            }
+            self.models.iter_mut().filter(|m| !m.idle()).for_each(Reach::run);
         }
     }
 
@@ -689,12 +776,15 @@ struct Steps<'a, 'w> {
     rounds: u32,
     stats: Stats,
     extend: bool,
+    path: Path,
 }
 
 impl Steps<'_, '_> {
     fn try_fill(&mut self, rng: &mut SpecRng) -> Result<Vec<Vec<Option<Given>>>, FillError> {
         let seats = self.room.seats;
         self.rounds = 0;
+        // Confined items are carried on either path: their first solve is in rank order.
+        self.room.forward = false;
         let mut placed = locked_placed(seats);
         // Every player's free locations and items, in player order.
         let mut free: Vec<(u16, u32)> = Vec::new();
@@ -727,6 +817,8 @@ impl Steps<'_, '_> {
         let mut prev = Vec::new();
         self.restrictive(&groups(confined, false), &prog, &mut locs, &mut placed, &mut prev)?;
         locs.retain(|(p, l)| !seats[usize::from(p)].plan.excluded[l as usize]);
+        // From here on nothing is taken back on the forward path: every round is a fresh solve.
+        self.room.forward = self.path == Path::Forward;
         self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
         // Everything else goes anywhere left, excluded locations included.
         rng.shuffle(&mut rest);
@@ -764,7 +856,11 @@ impl Steps<'_, '_> {
 
     /// Place each group in turn against a state that holds none of the group (but everything
     /// not yet placed outside it, and everything placed): every item goes to the first location
-    /// of `locs` that is reached in that state and allows it.
+    /// of `locs` that is reached in that state and allows it. The state is one per group: an
+    /// item of the group sees the locations the items before it took, never what they open.
+    ///
+    /// That state is carried from the last group's (its items held where they were put, this
+    /// group's taken back), or solved afresh when the room settles forward only.
     fn restrictive(
         &mut self,
         groups: &[Vec<Given>],
@@ -776,7 +872,7 @@ impl Steps<'_, '_> {
         let seats = self.room.seats;
         for (k, group) in groups.iter().enumerate() {
             self.rounds += 1;
-            let carried = if !prev.is_empty() && self.extend {
+            let carried = if !prev.is_empty() && self.extend && !self.room.forward {
                 // The last group goes where it was put, then this group is taken back.
                 self.room.reset_stats();
                 for ((p, l), g) in prev.drain(..) {

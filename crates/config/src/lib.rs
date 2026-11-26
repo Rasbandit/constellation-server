@@ -294,6 +294,12 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
+/// Players from which a room's fill places its rounds against a fresh forward solve of the
+/// room instead of taking the round's items back by truth maintenance (`data_fill::room::Path`;
+/// both give the same placements). Measured on the synthetic rooms of the `bench-room` CI job:
+/// see `docs/port-check.md`, "Scaling with players".
+pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
+
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
 pub const FILL_MAX_WORKERS: usize = 64;

@@ -32,31 +32,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
       # Inputs go through the environment, never into the script text. Both profiles of
-      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on).
+      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), each
+      # on both ways of placing rounds (`data_fill::room::Path`), so the two are timed on one runner.
       - name: synth_room
         env:
           PLAYERS: ${{ inputs.players || '1,10,20,50,100' }}
           CHECKS: ${{ inputs.checks || '1000' }}
         run: |
           set -o pipefail
-          for profile in light heavy; do
+          for profile in light heavy; do for path in carry forward; do
             cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --players "$PLAYERS" --checks "$CHECKS" | tee -a bench-room.jsonl
-          done
+              --profile "$profile" --path "$path" --players "$PLAYERS" --checks "$CHECKS" \
+              | tee -a bench-room.jsonl
+          done; done
       - name: summary
         run: |
           {
             echo "### Room fill scaling (measured on a GitHub-hosted ubuntu-latest runner, release build)"
-            for profile in light heavy; do
+            echo
+            echo "A room of at least \`config::ROOM_FORWARD_MIN_PLAYERS\` players takes the forward path, a smaller one the carried path."
+            for profile in light heavy; do for path in carry forward; do
               echo
-              echo "#### Profile: $profile"
+              echo "#### Profile: $profile, path: $path"
               echo
-              echo "| players | checks | clocks | setup ms | fill ms (median) | rule evals | ns/eval | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes | beatable |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .profile == $p) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
+              echo "| players | checks | clocks | setup ms | fill ms (median) | rule evals | ns/eval | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes | beatable |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" --arg t "$path" 'select(has("players") and .profile == $p and .path == $t) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
               echo
-              jq -r --arg p "$profile" 'select(has("fitted_exponent") and .profile == $p) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
-            done
+              jq -r --arg p "$profile" --arg t "$path" 'select(has("fitted_exponent") and .profile == $p and .path == $t) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
+            done; done
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with: { name: bench-room, path: bench-room.jsonl }

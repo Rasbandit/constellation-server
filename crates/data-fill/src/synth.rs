@@ -363,6 +363,64 @@ mod tests {
         }
     }
 
+    /// A round's state is the unique least fixed point for what is held and placed, and
+    /// placement reads only what that state reaches: so a fresh forward solve per round
+    /// (`Path::Forward`) must place every item exactly where truth maintenance (`Path::Carry`)
+    /// does. Rooms of 1 to 5 players, both profiles, clocks on and off, with and without a
+    /// confined item (confined items go one at a time, carried, on both paths).
+    #[test]
+    fn a_forward_solve_per_round_places_what_truth_maintenance_does() {
+        use crate::room::{Path, fill_room_on};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut rooms, mut fresh, mut retracted) = (0, 0, 0);
+        for (shape, confine) in
+            [(small(false), false), (small(true), true), (heavy, false), (heavy, true)]
+        {
+            for players in [1usize, 2, 3, 5] {
+                let built: Vec<(Value, Instance)> = (0..players as u64)
+                    .map(|p| {
+                        let (m, mut inst) = world(&shape, 23, p);
+                        if confine {
+                            inst.item_groups.insert("p0".to_owned(), "home".to_owned());
+                            for l in (0..shape.checks).filter(|l| l % 5 < 2) {
+                                inst.location_groups.insert(format!("l{l}"), "home".to_owned());
+                            }
+                        }
+                        (m, inst)
+                    })
+                    .collect();
+                let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
+                let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
+                let c = Compiled::new(&manifests, &insts, 1).unwrap();
+                let seats = c.seats();
+                for seed in 1..=4 {
+                    let on = |path| {
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path).unwrap()
+                    };
+                    let ((a, sa), (b, sb)) = (on(Path::Carry), on(Path::Forward));
+                    let what =
+                        format!("{shape:?}, confined {confine}, {players} players, seed {seed}");
+                    assert_eq!(a.placed, b.placed, "{what}");
+                    assert_eq!(sa, sb, "spheres, {what}");
+                    assert_eq!(
+                        (a.attempts, a.rounds, &a.beatable, &a.reached),
+                        (b.attempts, b.rounds, &b.beatable, &b.reached),
+                        "{what}"
+                    );
+                    assert!(a.all_beatable(), "{what}");
+                    // The forward path solved afresh per round and took nothing back there.
+                    assert!(b.solves > a.solves, "{what}");
+                    assert!(confine || b.stats.removals == 0, "{what}");
+                    rooms += 1;
+                    fresh += b.solves;
+                    retracted += a.stats.retractions;
+                }
+            }
+        }
+        assert!(rooms == 64 && fresh > 0 && retracted > 0, "both paths ran");
+    }
+
     #[test]
     fn a_small_synthetic_room_is_beatable_and_the_same_for_a_seed() {
         for clocks in [false, true] {

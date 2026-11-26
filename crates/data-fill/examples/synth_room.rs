@@ -1,6 +1,8 @@
-//! `synth_room [--profile light|heavy] [--players 1,10,20,50,100] [--checks 1000] [--layers 6]
-//! [--branching 2] [--progression 0.19] [--clocks on|off] [--seed 1] [--reps 5]`: room fill
-//! scaling on synthetic worlds ([`data_fill::synth`]; the heavy profile has clocks on). One JSON object per player count, then one with the
+//! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--players 1,10,20,50,100]
+//! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
+//! [--seed 1] [--reps 5]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! heavy profile has clocks on). `--path` forces one way of placing rounds
+//! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
 //! `setup_ms` draws, compiles and resolves every player's world. `fill_ms` is the median of
@@ -10,7 +12,7 @@
 
 use std::time::Instant;
 
-use data_fill::room::{Compiled, cross_world_share, fill_room_spheres};
+use data_fill::room::{Compiled, Path, cross_world_share, fill_room_on};
 use data_fill::synth::{Shape, room};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -43,13 +45,20 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
-fn one(shape: &Shape, seed: u64, players: usize, reps: usize) -> Result<Value, String> {
+fn one(
+    shape: &Shape,
+    seed: u64,
+    players: usize,
+    reps: usize,
+    path: Option<Path>,
+) -> Result<Value, String> {
+    let path = path.unwrap_or(Path::of(players));
     let t = Instant::now();
     let c: Compiled = room(shape, seed, players, config::FILL_SETUP_WORKERS)?;
     let setup_ms = ms(t);
     let seats = c.seats();
     let fill =
-        || fill_room_spheres(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS);
+        || fill_room_on(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS, path);
     let (first, heap) = peak(fill);
     let (f, sp) = first.map_err(|e| format!("{players} players: {e:?}"))?;
     if !f.all_beatable() {
@@ -72,6 +81,8 @@ fn one(shape: &Shape, seed: u64, players: usize, reps: usize) -> Result<Value, S
     let work = s.summary(1, u64::from(f.solves));
     Ok(json!({
         "players": players,
+        "path": format!("{path:?}").to_lowercase(),
+        "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks,
         "setup_ms": (setup_ms * 10.0).round() / 10.0,
@@ -127,6 +138,12 @@ fn main() -> Result<(), String> {
         },
         ..d
     };
+    let path = match arg(&args, "--path", "auto".to_owned())?.as_str() {
+        "auto" => None,
+        "carry" => Some(Path::Carry),
+        "forward" => Some(Path::Forward),
+        x => return Err(format!("--path: auto, carry or forward, got {x}")),
+    };
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -135,12 +152,16 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps)?;
+        let mut row = one(&shape, seed, n, reps, path)?;
         row["profile"] = json!(profile);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
     }
     let fitted = exponent(&points);
-    println!("{}", json!({"profile": profile, "fitted_exponent": fitted, "points": points}));
+    let path = path.map_or("auto".to_owned(), |p| format!("{p:?}").to_lowercase());
+    println!(
+        "{}",
+        json!({"profile": profile, "path": path, "fitted_exponent": fitted, "points": points})
+    );
     Ok(())
 }
