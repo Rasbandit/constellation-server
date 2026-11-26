@@ -31,12 +31,12 @@ const REPS: usize = if cfg!(debug_assertions) { 3 } else { 21 };
 const CHECKS: usize = if cfg!(debug_assertions) { 100 } else { 1000 };
 const PLAYERS: [usize; 2] = [1, 10];
 
-/// The server binary cargo built beside this test binary (`target/<profile>/`).
+/// The server binary cargo built for this test binary's profile: in the nearest folder above
+/// it (`target/<profile>/`; how deep the test binary sits under it depends on the cargo).
 fn server_binary() -> PathBuf {
     let test = std::env::current_exe().unwrap();
-    let bin = test.parent().and_then(Path::parent).unwrap().join("constellation-server");
-    assert!(bin.is_file(), "build the server binary of this profile first: {}", bin.display());
-    bin
+    let bin = test.ancestors().map(|dir| dir.join("constellation-server")).find(|b| b.is_file());
+    bin.unwrap_or_else(|| panic!("build the server binary of this profile first: {test:?}"))
 }
 
 fn ms(since: Instant) -> f64 {
