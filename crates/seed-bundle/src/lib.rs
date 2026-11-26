@@ -202,6 +202,33 @@ pub struct GameData {
     pub hint_blacklist: BTreeSet<String>,
 }
 
+impl GameData {
+    /// Bytes this data holds, itself and on the heap: every name's bytes, and its maps' nodes
+    /// as an upper bound (`package::map_bytes`). What a cache that keeps it counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        let ids = |m: &BTreeMap<String, i64>| package::map_bytes(m, |k, _| k.capacity());
+        let groups = |m: &BTreeMap<String, Vec<String>>| {
+            package::map_bytes(m, |k, v| {
+                k.capacity()
+                    + v.capacity() * size_of::<String>()
+                    + v.iter().map(String::capacity).sum::<usize>()
+            })
+        };
+        size_of::<Self>()
+            + ids(&self.item_name_to_id)
+            + ids(&self.location_name_to_id)
+            + self.checksum.capacity()
+            + groups(&self.item_name_groups)
+            + groups(&self.location_name_groups)
+            + self
+                .hint_blacklist
+                .iter()
+                .map(|n| n.capacity() + 2 * size_of::<String>())
+                .sum::<usize>()
+    }
+}
+
 /// Why a bundle was refused. Names the first rule that failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleError {

@@ -56,6 +56,10 @@ jobs:
       # The data-only fill engine's integration tests (damaged sections, fixtures, fairness).
       - if: steps.scope.outputs.code != 'false'
         run: cargo test -p data-fill --tests --locked
+      # What a loaded world counts itself as holding, against a counting allocator (the cap
+      # of a fill worker's kept worlds rests on it).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p data-fill --features memory-harness --test memory --locked
       # The generation sidecar's checks (zip traversal, bombs, yaml) and the bundle converter.
       - if: steps.scope.outputs.code != 'false'
         uses: actions/setup-python@v5

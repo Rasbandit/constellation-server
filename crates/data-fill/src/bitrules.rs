@@ -92,6 +92,24 @@ pub(crate) struct Bits {
     pub classes: [u32; 5],
 }
 
+/// Heap bytes a vector holds.
+pub(crate) fn vec_bytes<T>(x: &Vec<T>) -> usize {
+    x.capacity() * size_of::<T>()
+}
+
+impl Bits {
+    /// Heap bytes the bit rules hold (see `World::held_bytes`).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        vec_bytes(&self.rules)
+            + vec_bytes(&self.terms)
+            + vec_bytes(&self.tests)
+            + vec_bytes(&self.times)
+            + vec_bytes(&self.atoms)
+            + self.by.iter().map(|(a, b)| vec_bytes(a) + vec_bytes(b)).sum::<usize>()
+            + vec_bytes(&self.statics)
+    }
+}
+
 /// No bit rules: every rule stays bytecode.
 pub(crate) static NONE: Bits = Bits {
     rules: Vec::new(),

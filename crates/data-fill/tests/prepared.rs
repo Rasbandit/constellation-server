@@ -119,10 +119,7 @@ fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
         let (m, p) = room(n);
         let (_, file) = prepared(&m);
         let loaded = Prepared::open(&file).unwrap();
-        let on = |rng| {
-            let head = serde_json::to_vec(&asked(&p, rng, 1, Algorithm::Exact)).unwrap();
-            job::fill_on(&loaded, &head).unwrap()
-        };
+        let on = |rng| job::fill_on(&loaded, &asked(&p, rng, 1, Algorithm::Exact)).unwrap();
         for rng in 1..=20 {
             let (seed, report) = on(rng);
             let alone = job::fill_reported(&request(&file, &p, rng, 1)).unwrap();
@@ -132,9 +129,47 @@ fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
         }
         // An earlier seed again, after nineteen others on the same loaded world.
         assert_eq!(on(1).0, job::fill(&request(&file, &p, 1, 1)).unwrap());
-        assert!(job::fill_on(&loaded, b"{").unwrap_err().contains("bad fill request"));
+        assert!(job::request(b"{").unwrap_err().contains("bad fill request"));
     }
     assert_eq!(hex(&key_of(&all)), PINNED);
+}
+
+/// A fill leaves nothing in the loaded world it ran on: after fills in every mode, for one and
+/// ten players, and after fills that are refused, the world prints exactly as it did when it
+/// was loaded. A worker that keeps a world between jobs rests on this; a fill that staged
+/// anything per seed in the prepared form would fail here.
+#[test]
+fn fills_leave_a_loaded_world_exactly_as_it_was_loaded() {
+    let modes = [
+        Algorithm::Exact,
+        Algorithm::Level(Dials::default()),
+        Algorithm::Shuffle(Dials::default()),
+    ];
+    let (m, ten) = room(10);
+    let (_, file) = prepared(&m);
+    let loaded = Prepared::open(&file).unwrap();
+    let before = format!("{loaded:?}");
+    let mut filled = 0;
+    for mode in modes {
+        for players in [&ten[..1], &ten[..]] {
+            for rng in 1..=3 {
+                filled += usize::from(job::fill_on(&loaded, &asked(players, rng, 1, mode)).is_ok());
+            }
+        }
+    }
+    assert!(filled >= 15, "only {filled} of 18 fills ran to the end");
+    // Refused before the fill (a name twice) and inside it (an item the world lacks).
+    let twice = [ten[0].clone(), ten[0].clone()];
+    assert!(job::fill_on(&loaded, &asked(&twice, 1, 1, Algorithm::Exact)).is_err());
+    let mut lacking = ten[0].clone();
+    lacking.instance.pool.push("no such item".to_owned());
+    for mode in modes {
+        assert!(job::fill_on(&loaded, &asked(&[lacking.clone()], 1, 1, mode)).is_err());
+    }
+    assert!(format!("{loaded:?}") == before, "a fill changed the loaded world");
+    // And it still fills as a world loaded now does.
+    let again = job::fill_on(&loaded, &asked(&ten, 2, 1, Algorithm::Exact)).unwrap().0;
+    assert_eq!(again, job::fill(&request(&file, &ten, 2, 1)).unwrap());
 }
 
 #[test]
