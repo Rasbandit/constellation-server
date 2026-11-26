@@ -309,7 +309,22 @@ impl SeedBundle {
         self.slots.iter().map(|s| SlotNo(s.id))
     }
 
-    fn validate(&self) -> Result<(), BundleError> {
+    /// The [`bundle_hash`] of this bundle's JSON text, from the bundle itself: the canonical
+    /// form is built from its values, so no text is written and parsed back.
+    ///
+    /// # Errors
+    /// Never in practice (a bundle always has a JSON form).
+    pub fn hash(&self) -> Result<[u8; 32], String> {
+        let v = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        Ok(Sha256::digest(package::canonical(v)).into())
+    }
+
+    /// Check every rule a room trusts (what [`SeedBundle::from_json`] checks after parsing): a
+    /// bundle built in this process is checked with this before it is encoded.
+    ///
+    /// # Errors
+    /// [`BundleError::Invalid`] naming the first broken rule.
+    pub fn validate(&self) -> Result<(), BundleError> {
         ensure!(self.format == FORMAT, "format {} is not {FORMAT}", self.format);
         ensure!(!self.slots.is_empty(), "no slots");
         ensure!(self.server_options.hint_cost <= 100, "hint_cost above 100 percent");

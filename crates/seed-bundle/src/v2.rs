@@ -315,18 +315,39 @@ struct Indexed {
 /// # Errors
 /// When the bundle is too large for the format's fields or for `max_bytes`.
 pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded, BundleError> {
-    let games: Vec<(&String, &GameData)> = b.games.iter().collect();
-    let packages: Vec<Vec<u8>> = games
+    let packages: Vec<Vec<u8>> = b
+        .games
         .iter()
         .map(|(name, g)| GamePackage::file(name, g))
         .collect::<Result<_, _>>()
         .map_err(|e| bad(e.to_string()))?;
-    let tables: Vec<GamePackage> = games
+    let tables: Vec<GamePackage> = b
+        .games
         .iter()
         .zip(&packages)
         .map(|((name, g), f)| GamePackage::new(package::key_of(f), name, g))
         .collect();
-    let game_of = |name: &str| games.iter().position(|(n, _)| n.as_str() == name);
+    Ok(Encoded { seed: encode_on(b, hash, max_bytes, &tables)?, packages })
+}
+
+/// [`encode`] on packages made earlier: `tables` is the package of each of `b`'s games, in
+/// their order (by name). A game's package depends only on the game's names and ids, so one
+/// made once per world serves every seed of it, and no seed pays for making it again.
+///
+/// # Errors
+/// As [`encode`], or when `tables` are not the packages of `b`'s games.
+pub fn encode_on(
+    b: &SeedBundle,
+    hash: &[u8; 32],
+    max_bytes: u64,
+    tables: &[GamePackage],
+) -> Result<Vec<u8>, BundleError> {
+    let games: Vec<&String> = b.games.keys().collect();
+    if games.len() != tables.len() || games.iter().zip(tables).any(|(n, t)| n.as_str() != t.name())
+    {
+        return Err(bad("the packages given are not those of the bundle's games"));
+    }
+    let game_of = |name: &str| games.iter().position(|n| n.as_str() == name);
     let mut slots: Vec<&Slot> = b.slots.iter().collect();
     slots.sort_by_key(|s| s.id);
     let pos_of = |id: u32| slots.iter().position(|s| s.id == id);
@@ -349,7 +370,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
             s.start_inventory.iter().map(|&i| own.item_index(i).ok_or_else(missing)).collect();
         indexed.push(Indexed { game: g, placed, start: start? });
     }
-    let hint_data = hint_data(b, &slots, &indexed, &tables)?;
+    let hint_data = hint_data(b, &slots, &indexed, tables)?;
     let max = |f: fn(&(usize, usize, usize, u8)) -> u64| {
         indexed.iter().flat_map(|x| x.placed.iter().map(f)).max().unwrap_or(0)
     };
@@ -499,7 +520,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     out.extend_from_slice(hash);
     out.extend_from_slice(&[0; 32]);
     out.extend_from_slice(&room);
-    for t in &tables {
+    for t in tables {
         out.extend_from_slice(t.key());
     }
     out.extend_from_slice(&slot_table);
@@ -509,7 +530,7 @@ pub fn encode(b: &SeedBundle, hash: &[u8; 32], max_bytes: u64) -> Result<Encoded
     debug_assert_eq!(out.len(), total);
     let body = body_hash(&out);
     out.get_mut(64..96).ok_or_else(missing)?.copy_from_slice(&body);
-    Ok(Encoded { seed: out, packages })
+    Ok(out)
 }
 
 /// The hint data of `b` as indexes: start hints, spheres and entrances (validated bundle).

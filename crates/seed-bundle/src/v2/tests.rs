@@ -898,3 +898,26 @@ fn no_entrance_name_past_the_table() {
     seed.bytes.copy_within(table..table + 8, table + 8 * count);
     assert_eq!(seed.entrance_name(count), None);
 }
+
+/// Fails without `encode_on`: a seed encoded on packages made earlier (once per world) is the
+/// seed `encode` makes, and packages of other games than the bundle's are refused.
+#[test]
+fn encoding_on_packages_made_earlier_gives_the_same_seed() {
+    let text = fixture_text();
+    let b = SeedBundle::from_json(&text).unwrap();
+    let hash = b.hash().unwrap();
+    assert_eq!(hash.to_vec(), crate::bundle_hash(&text).unwrap(), "no text round trip needed");
+    let whole = encode(&b, &hash, 1 << 24).unwrap();
+    let tables: Vec<GamePackage> = b
+        .games
+        .iter()
+        .zip(&whole.packages)
+        .map(|((name, g), file)| GamePackage::new(package::key_of(file), name, g))
+        .collect();
+    assert_eq!(encode_on(&b, &hash, 1 << 24, &tables).unwrap(), whole.seed);
+    assert!(encode_on(&b, &hash, 1 << 24, &tables[1..]).is_err(), "a game's package is missing");
+    let other = GamePackage::new([0; 32], "Another Game", &GameData::default());
+    let mut wrong = vec![other];
+    wrong.extend(tables.into_iter().skip(1));
+    assert!(encode_on(&b, &hash, 1 << 24, &wrong).is_err(), "not the bundle's game");
+}
