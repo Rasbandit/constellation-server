@@ -1249,24 +1249,24 @@ mod tests {
         assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
     }
 
-    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it goes forward, on
-    /// the workers asked for, capped by `config::ROOM_FORWARD_WORKERS` and never below one.
+    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it takes the split
+    /// path, whatever the workers asked for.
     #[test]
     fn the_path_changes_at_the_configured_room_size() {
-        let (at, cap) = (config::ROOM_FORWARD_MIN_PLAYERS, config::ROOM_FORWARD_WORKERS);
+        let at = config::ROOM_FORWARD_MIN_PLAYERS;
         assert_eq!(Path::of(1, 4), Path::Carry);
         assert_eq!(Path::of(at - 1, 4), Path::Carry);
-        assert_eq!(Path::of(at, 1), Path::Forward { workers: 1 });
-        assert_eq!(Path::of(at + 1, 0), Path::Forward { workers: 1 });
-        let Path::Forward { workers } = Path::of(at, usize::MAX) else { panic!("forward") };
-        let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        assert_eq!(workers, cap.min(cores), "the cap, or the machine's cores when fewer");
-        // The room fill takes that path: a room at the threshold solves afresh per round.
+        assert_eq!(Path::of(at, 1), Path::Split);
+        assert_eq!(Path::of(at + 1, 0), Path::Split);
+        assert_eq!(Path::of(at, usize::MAX), Path::Split);
+        // The room fill takes that path: a room at the threshold solves once, takes nothing
+        // back by truth maintenance, and undoes what it added for its rounds.
         let c = room(&small(false), 5, at, 1).unwrap();
         let (f, _) =
             fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
                 .unwrap();
-        assert!(f.solves > 1 && f.stats.removals == 0, "solves {}", f.solves);
+        assert!(f.solves == 1 && f.stats.removals == 0, "solves {}", f.solves);
+        assert!(f.profile.undone > 0, "nothing was undone");
     }
 
     #[test]

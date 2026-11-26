@@ -14,9 +14,10 @@
 //! of its rank, exactly as for one player. On this carried path no full rescan happens after
 //! the first solve.
 //!
-//! A room of `config::ROOM_FORWARD_MIN_PLAYERS` players or more places its rounds on a second
-//! path ([`Path::Forward`]): instead of taking a round's items back one cascade at a time, it
-//! solves the room afresh for the round, forward only. A round's state is the least fixed point
+//! A room of `config::ROOM_FORWARD_MIN_PLAYERS` players or more places its rounds on the
+//! split path ([`Path::Split`]): one solve, then every round's state by adding to it and
+//! taking the additions back. A third path ([`Path::Forward`]), for a caller that names it,
+//! solves the room afresh for every round instead, forward only. A round's state is the least fixed point
 //! of monotone rules for what is held and placed, which is unique, and placement reads nothing
 //! but what that state reaches, so both paths place every item in the same location. On that
 //! path the states of a room run on several threads, each to its own fixed point, and exchange
@@ -292,17 +293,14 @@ pub enum Path {
 }
 
 impl Path {
-    /// The path a room of `players` takes: one removal retracts more the larger the room, a
-    /// fresh solve costs the same per player. The forward path gets the `workers` the caller
-    /// asks for, at most `config::ROOM_FORWARD_WORKERS` and the cores this process may use,
-    /// at least one.
+    /// The path a room of `players` takes: one removal retracts more the larger the room, so
+    /// a room of `config::ROOM_FORWARD_MIN_PLAYERS` or more takes the split path, on one
+    /// thread whatever `workers` is (measured on the `bench-room` job: 100 players fill 5 to
+    /// 10 times faster than on the forward path, which four threads do not make up). The
+    /// forward path stays for a caller that names it.
     #[must_use]
-    pub fn of(players: usize, workers: usize) -> Self {
-        if players < config::ROOM_FORWARD_MIN_PLAYERS {
-            return Path::Carry;
-        }
-        let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        Path::Forward { workers: workers.min(config::ROOM_FORWARD_WORKERS).min(cores).max(1) }
+    pub fn of(players: usize, _workers: usize) -> Self {
+        if players < config::ROOM_FORWARD_MIN_PLAYERS { Path::Carry } else { Path::Split }
     }
 }
 
@@ -412,9 +410,9 @@ impl std::str::FromStr for Algorithm {
     }
 }
 
-/// Fill a room. Retries the whole fill with the next draws from `rng` when stuck. A room large
-/// enough for the forward path takes `config::ROOM_FORWARD_WORKERS` threads at most; a caller
-/// with a worker count of its own passes [`Path::of`] to [`fill_room_on`].
+/// Fill a room, on the path a room of its size takes ([`Path::of`]). Retries the whole fill
+/// with the next draws from `rng` when stuck. A caller that wants another path names it to
+/// [`fill_room_on`].
 ///
 /// # Errors
 /// [`FillError`] when every attempt is stuck, the counts do not match, or there are no or too
