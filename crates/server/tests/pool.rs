@@ -408,3 +408,23 @@ async fn a_dropped_job_and_a_dropped_pool_leave_no_process() {
     drop(pool);
     until("the dropped pool's worker is gone", || running(&bin).is_empty()).await;
 }
+
+/// A worker whose server is gone (killed, so nothing told the worker) ends by itself: its
+/// stdin closes, and it exits cleanly without a job. A pooled worker's command line, as
+/// `ps` shows one: this binary in job mode, its limits in the job's name.
+#[test]
+fn a_worker_whose_server_is_gone_exits_by_itself() {
+    let mut worker = std::process::Command::new(BIN)
+        .args(["fill-job", "worker=1048576,1048576"])
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(worker.stdin.take());
+    assert!(worker.wait().unwrap().success());
+    // And a job name that only looks like a worker's is refused, not served.
+    let bad = std::process::Command::new(BIN).args(["fill-job", "worker=1"]).output().unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("bad worker caps"));
+}
