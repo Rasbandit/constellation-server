@@ -266,6 +266,30 @@ pub trait ManifestStore: Send + Sync + 'static {
         id: &BlobKey,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send;
 
+    /// Record that manifest `id`, prepared by engine `engine` (a text naming the file layout
+    /// and the build that made it), is the blob `package` ([`BlobStore`]). A later put for the
+    /// same manifest and engine replaces the key.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// The blob key of manifest `id` prepared by `engine`, if one was recorded. Another
+    /// engine's record is not this one's: a world prepared by an older build reads as none.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> impl Future<Output = Result<Option<BlobKey>, StoreError>> + Send;
+
     /// Up to `limit` records ascending by id, after `after`, of `game` when given.
     ///
     /// # Errors

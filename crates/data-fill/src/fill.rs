@@ -15,7 +15,7 @@ use crate::world::World;
 
 /// One seed's instance: what generation decided before the fill (see the proposal doc for
 /// which of these could become data primitives).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 #[serde(default)]
 pub struct Instance {
     /// Option values.

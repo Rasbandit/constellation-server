@@ -813,6 +813,60 @@ impl crate::ManifestStore for PgLogStore {
         }
     }
 
+    /// In the `prepared_worlds` table (migration 0011).
+    async fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> Result<(), StoreError> {
+        let (id, engine, package) = (id.to_vec(), engine.to_owned(), package.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO prepared_worlds (manifest, engine, package) VALUES ($1, $2, $3) \
+                     ON CONFLICT (manifest, engine) DO UPDATE SET package = EXCLUDED.package",
+                )
+                .bind(&id)
+                .bind(&engine)
+                .bind(&package)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        let (id, engine) = (id.to_vec(), engine.to_owned());
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT package FROM prepared_worlds WHERE manifest = $1 AND engine = $2",
+                    )
+                    .bind(&id)
+                    .bind(&engine)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        found
+            .map(|k| {
+                k.try_into()
+                    .map_err(|_| StoreError::Corrupt("a prepared key is not 32 bytes".into()))
+            })
+            .transpose()
+    }
+
     async fn manifest_list(
         &self,
         game: Option<&str>,

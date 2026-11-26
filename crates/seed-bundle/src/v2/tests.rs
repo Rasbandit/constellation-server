@@ -898,3 +898,66 @@ fn no_entrance_name_past_the_table() {
     seed.bytes.copy_within(table..table + 8, table + 8 * count);
     assert_eq!(seed.entrance_name(count), None);
 }
+
+/// Fails without `encode_on`: a seed encoded on packages made earlier (once per world) is the
+/// seed `encode` makes, and packages of other games than the bundle's are refused.
+#[test]
+fn encoding_on_packages_made_earlier_gives_the_same_seed() {
+    let text = fixture_text();
+    let b = SeedBundle::from_json(&text).unwrap();
+    let hash = b.hash().unwrap();
+    assert_eq!(hash.to_vec(), crate::bundle_hash(&text).unwrap(), "no text round trip needed");
+    let whole = encode(&b, &hash, 1 << 24).unwrap();
+    let tables: Vec<GamePackage> = b
+        .games
+        .iter()
+        .zip(&whole.packages)
+        .map(|((name, g), file)| GamePackage::new(package::key_of(file), name, g))
+        .collect();
+    assert_eq!(encode_on(&b, &hash, 1 << 24, &tables).unwrap(), whole.seed);
+    assert!(encode_on(&b, &hash, 1 << 24, &tables[1..]).is_err(), "a game's package is missing");
+    let other = GamePackage::new([0; 32], "Another Game", &GameData::default());
+    let mut wrong = vec![other];
+    wrong.extend(tables.into_iter().skip(1));
+    assert!(encode_on(&b, &hash, 1 << 24, &wrong).is_err(), "not the bundle's game");
+}
+
+/// Fails without `hash_with_games`: the hash of a bundle whose games were taken out, given
+/// the canonical JSON of those games as a package's content holds it, is the bundle's hash.
+#[test]
+fn the_hash_takes_the_games_as_canonical_json_made_earlier() {
+    for text in [fixture_text(), small().to_string()] {
+        let mut b = SeedBundle::from_json(&text).unwrap();
+        let hash = b.hash().unwrap();
+        let mut games = b"{".to_vec();
+        for (k, (name, g)) in b.games.iter().enumerate() {
+            let content = GamePackage::content(name, g);
+            let data = package::data_json(&content, name).unwrap();
+            assert_eq!(data, package::canonical(serde_json::to_value(g).unwrap()));
+            games.extend_from_slice(if k == 0 { b"" } else { b"," });
+            games.extend_from_slice(serde_json::to_string(name).unwrap().as_bytes());
+            games.push(b':');
+            games.extend_from_slice(data);
+        }
+        games.push(b'}');
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash, "its own games are not read");
+        b.games.clear();
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash);
+        assert_ne!(b.hash_with_games(b"{}").unwrap(), hash);
+        assert_eq!(package::data_json(b"{}", "G"), None);
+    }
+}
+
+/// Fails without the rule in `Seed::check`: a seed file in which two slots share a name is
+/// refused when it is opened, as the v1 check refuses the bundle, so a seed that did not come
+/// through that check (the fill's own file, a stored seed) cannot bring one in.
+#[test]
+fn a_seed_file_with_two_slots_of_one_name_is_refused() {
+    let mut v = small();
+    v["slots"][1]["name"] = json!("B");
+    v["connect_names"] = json!({"B": [0, 2]});
+    let b: SeedBundle = serde_json::from_value(v).unwrap();
+    assert!(b.validate().unwrap_err().to_string().contains("repeats"));
+    let e = Seed::from_v1(&b, &[0; 32], 1 << 20).unwrap_err().to_string();
+    assert!(e.contains("slot name \"B\" repeats"), "{e}");
+}

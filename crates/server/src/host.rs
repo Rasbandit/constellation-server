@@ -150,7 +150,7 @@ async fn import_work(from: LoadFrom, loaded: Loaded, list: bool, limits: Limits)
 
 /// A room's stored seed and the package files this process lacks, each checked against its
 /// key ([`BlobStore::get`]), with this process's copies of the others held so they stay.
-type Fetched = (Vec<u8>, BTreeMap<BlobKey, Vec<u8>>, Vec<Arc<GamePackage>>);
+pub(crate) type Fetched = (Vec<u8>, BTreeMap<BlobKey, Vec<u8>>, Vec<Arc<GamePackage>>);
 
 async fn fetch_seed<S: LogStore + BlobStore>(s: &S, seed: Vec<u8>) -> Result<Fetched, String> {
     let keys = seed_bundle::v2::package_keys(&seed).map_err(|e| e.to_string())?;
@@ -196,7 +196,10 @@ async fn export<S: LogStore + BlobStore>(
 }
 
 /// Open a fetched seed (CPU work: run it off the runtime).
-fn open_fetched((seed, files, _held): Fetched, limits: &Limits) -> Result<Loaded, String> {
+pub(crate) fn open_fetched(
+    (seed, files, _held): Fetched,
+    limits: &Limits,
+) -> Result<Loaded, String> {
     let fetch = |k: &BlobKey| {
         files.get(k).cloned().ok_or_else(|| seed_bundle::BundleError::Parse("unfetched".into()))
     };

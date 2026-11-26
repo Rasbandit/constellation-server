@@ -1,7 +1,8 @@
 //! The fill's output as a seed: [`generate`] compiles a manifest, fills every player's world
 //! together and assembles the [`SeedBundle`] a room runs on, with each item's class, the
-//! spheres (when a location is first reachable) and slot details. `seed_bundle::v2::encode`
-//! (or `seed_bundle::import_v1`) writes it as a v2 seed (`docs/seed-bundle-v2.md`).
+//! spheres (when a location is first reachable) and slot details. [`generate_on`] does the same
+//! on a world prepared earlier ([`crate::prepared`]), and [`encode_on`] writes its bundle as a
+//! v2 seed (`docs/seed-bundle-v2.md`); `seed_bundle::import_v1` does that for a bundle's JSON.
 
 use std::collections::BTreeMap;
 
@@ -10,12 +11,13 @@ use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
 use crate::fill::Instance;
+use crate::prepared::Prepared;
 use crate::room::{self, Seat};
 use crate::spheres::RoomSpheres;
 use crate::world::World;
 
 /// One player: the slot name and the resolved instance of their world.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Player {
     /// The slot's name, which is also its connect name.
     pub name: String,
@@ -106,6 +108,50 @@ pub fn generate_by(
     algorithm: room::Algorithm,
 ) -> Result<(SeedBundle, FillReport), String> {
     let game = manifest_game(manifest)?;
+    named(players)?;
+    let w = World::load(manifest)?;
+    let data = game_data(&w)?;
+    fill_on((&w, game, data), seed_name, players, rng_seed, workers, algorithm)
+}
+
+/// [`generate_by`] on a prepared world: nothing is compiled and the game's tables are not
+/// built again, the fill starts from the stored form. The same bundle as the manifest gives.
+///
+/// # Errors
+/// As [`generate`], less what only a manifest can get wrong.
+pub fn generate_on(
+    prepared: &Prepared,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+    algorithm: room::Algorithm,
+) -> Result<(SeedBundle, FillReport), String> {
+    named(players)?;
+    let on = (prepared.world(), prepared.game(), prepared.data().clone());
+    fill_on(on, seed_name, players, rng_seed, workers, algorithm)
+}
+
+/// The bundle of a room filled on a prepared world: `placed` (one row per seat) and the
+/// `spheres` that reached them. The step of [`generate_on`] after the fill, for callers that
+/// time the steps apart.
+///
+/// # Errors
+/// An instance naming an item the world lacks, or more slots than a seed takes.
+pub fn assemble_on(
+    prepared: &Prepared,
+    seed_name: &str,
+    players: &[Player],
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<room::Given>>],
+    spheres: &RoomSpheres,
+) -> Result<SeedBundle, String> {
+    let on = (prepared.world(), prepared.game(), prepared.data().clone());
+    assemble(on, seed_name, players, seats, placed, spheres)
+}
+
+/// Every player has a name, and no two share one.
+fn named(players: &[Player]) -> Result<(), String> {
     for (k, p) in players.iter().enumerate() {
         if p.name.trim().is_empty() {
             return Err(format!("player {} has no name", k + 1));
@@ -114,9 +160,49 @@ pub fn generate_by(
             return Err(format!("player name {:?} repeats", p.name));
         }
     }
+    Ok(())
+}
+
+/// The seed file (v2, `docs/seed-bundle-v2.md`) of a `bundle` assembled on a prepared world,
+/// at most `max_bytes`: checked as an imported bundle is, hashed as its JSON text would be
+/// ([`seed_bundle::bundle_hash`]) and encoded on the world's package. Nothing is written as
+/// JSON and parsed back, and what is the same for every seed of the world (the package, and
+/// the game's names and ids in the hash) is taken from the prepared world. `bundle` is left
+/// as it was.
+///
+/// # Errors
+/// A bundle that breaks a rule a room trusts, or is too large for a seed file.
+pub fn encode_on(
+    prepared: &Prepared,
+    bundle: &mut SeedBundle,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    bundle.validate().map_err(|e| e.to_string())?;
+    // Out of the bundle while it is hashed, so the games' JSON is not built: it is prepared.
+    let games = std::mem::take(&mut bundle.games);
+    let hash = bundle.hash_with_games(prepared.games_json());
+    bundle.games = games;
+    let tables = std::slice::from_ref(prepared.table());
+    seed_bundle::v2::encode_on(bundle, &hash?, max_bytes, tables).map_err(|e| e.to_string())
+}
+
+/// A loaded world, its game's name and the game's tables ([`game_data`], which depend only on
+/// the world).
+type On<'a> = (&'a World, &'a str, GameData);
+
+/// Fill a room of `players` on a loaded world and assemble its seed.
+fn fill_on(
+    on: On<'_>,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+    algorithm: room::Algorithm,
+) -> Result<(SeedBundle, FillReport), String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
-    let room = room::Compiled::shared(World::load(manifest)?, &insts, workers)?;
-    let (w, seats) = (room.world(0), room.seats());
+    // The room owns its world: a copy of the loaded bytes, small beside a fill.
+    let room = room::Compiled::shared(on.0.clone(), &insts, workers)?;
+    let seats = room.seats();
     let (filled, spheres) = room::fill_room_by(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
@@ -135,13 +221,12 @@ pub fn generate_by(
         swaps: filled.swaps,
         repairs: filled.repairs,
     };
-    Ok((assemble(w, game, seed_name, players, &seats, &filled.placed, &spheres)?, report))
+    Ok((assemble(on, seed_name, players, &seats, &filled.placed, &spheres)?, report))
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.
 fn assemble(
-    w: &World,
-    game: &str,
+    (w, game, data): On<'_>,
     seed_name: &str,
     players: &[Player],
     seats: &[Seat<'_>],
@@ -193,7 +278,7 @@ fn assemble(
         },
         slots,
         connect_names,
-        games: BTreeMap::from([(game.to_owned(), game_data(w)?)]),
+        games: BTreeMap::from([(game.to_owned(), data)]),
         race_mode: 0,
         start_hints: Vec::new(),
     })
@@ -201,7 +286,7 @@ fn assemble(
 
 /// The world's names and ids as the game's data package; the checksum is the hash of both
 /// tables, so it changes with them.
-fn game_data(w: &World) -> Result<GameData, String> {
+pub(crate) fn game_data(w: &World) -> Result<GameData, String> {
     let items: BTreeMap<String, i64> = (0..u16::try_from(w.items()).map_err(|e| e.to_string())?)
         .map(|i| (w.item_key(i).to_owned(), w.item_id(i)))
         .collect();

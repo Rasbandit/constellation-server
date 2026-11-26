@@ -309,7 +309,47 @@ impl SeedBundle {
         self.slots.iter().map(|s| SlotNo(s.id))
     }
 
-    fn validate(&self) -> Result<(), BundleError> {
+    /// The [`bundle_hash`] of this bundle's JSON text, from the bundle itself: the canonical
+    /// form is built from its values, so no text is written and parsed back.
+    ///
+    /// # Errors
+    /// Never in practice (a bundle always has a JSON form).
+    pub fn hash(&self) -> Result<[u8; 32], String> {
+        let v = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        Ok(Sha256::digest(package::canonical(v)).into())
+    }
+
+    /// [`SeedBundle::hash`] with the canonical JSON of the bundle's `games` given (`games`: the
+    /// whole map, as [`package::canonical`] writes it), so the names and ids of every game,
+    /// which are the same for every seed of a world, are hashed from bytes made once. This
+    /// bundle's own `games` are not read: take them out first and nothing of them is written.
+    ///
+    /// # Errors
+    /// Never in practice (a bundle always has a JSON form).
+    pub fn hash_with_games(&self, games: &[u8]) -> Result<[u8; 32], String> {
+        let mut v = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        v.sort_all_objects();
+        let mut h = Sha256::new();
+        for (n, (key, value)) in v.as_object().into_iter().flatten().enumerate() {
+            h.update(if n == 0 { b"{" } else { b"," });
+            h.update(serde_json::Value::from(key.as_str()).to_string());
+            h.update(b":");
+            if key == "games" {
+                h.update(games);
+            } else {
+                h.update(value.to_string());
+            }
+        }
+        h.update(b"}");
+        Ok(h.finalize().into())
+    }
+
+    /// Check every rule a room trusts (what [`SeedBundle::from_json`] checks after parsing): a
+    /// bundle built in this process is checked with this before it is encoded.
+    ///
+    /// # Errors
+    /// [`BundleError::Invalid`] naming the first broken rule.
+    pub fn validate(&self) -> Result<(), BundleError> {
         ensure!(self.format == FORMAT, "format {} is not {FORMAT}", self.format);
         ensure!(!self.slots.is_empty(), "no slots");
         ensure!(self.server_options.hint_cost <= 100, "hint_cost above 100 percent");

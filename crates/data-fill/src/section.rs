@@ -377,8 +377,19 @@ fn counter_keys<'m>(v: &'m Value, out: &mut Vec<&'m str>) {
 /// A message naming the manifest path of the first malformed or unknown construct.
 pub fn compile(m: &Value) -> R<Vec<u8>> {
     let (rules, game) = sections(m)?;
+    package(rules, game, &[])
+}
+
+/// The package file of a compiled world's two sections, then `more` sections stored as is
+/// (id and bytes): the one place the file is laid out.
+///
+/// # Errors
+/// A section over 4 GiB.
+pub fn package(rules: Vec<u8>, game: Vec<u8>, more: &[(u16, &[u8])]) -> R<Vec<u8>> {
     let raw = |id, bytes| Section { id, bytes, deflate: false };
-    file_bytes(&[raw(SECTION_GAME, game), raw(SECTION_RULES, rules)]).map_err(|e| e.to_string())
+    let mut all = vec![raw(SECTION_GAME, game), raw(SECTION_RULES, rules)];
+    all.extend(more.iter().map(|(id, bytes)| raw(*id, bytes.to_vec())));
+    file_bytes(&all).map_err(|e| e.to_string())
 }
 
 /// The rules section and the game section stand-in.

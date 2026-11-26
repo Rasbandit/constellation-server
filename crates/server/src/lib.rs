@@ -13,6 +13,7 @@
 //! ([`worlds`], run in [`sandbox`]).
 
 mod accounts;
+mod cache;
 mod catalogue;
 mod checks;
 mod manifests;
@@ -176,13 +177,30 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
 /// Import a v1 bundle's bytes: validate and encode them to v2 (packages shared in-process).
 ///
 /// # Errors
-/// When it is not a valid v1 bundle (a v2 seed file is refused: seeds come from the store).
+/// When it is not a valid v1 bundle (a v2 seed file is refused: it names its packages by key,
+/// so it comes from the store, or with them through [`parse_seed`]).
 pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
     if seed_bundle::v2::is_v2(file) {
         return Err("a v2 seed file is not imported from disk; seeds live in the store".into());
     }
     let (seed, packages) = seed_bundle::import_v1(file, limits.bundle_max_bytes)?;
     Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages })
+}
+
+/// Import a v2 seed file with the package files it names (what the engine's fill prints, and
+/// the game's package of the world it filled): checked as a seed read from the store is, with
+/// nothing parsed as JSON or encoded again. `packages` are kept for the host to store.
+///
+/// # Errors
+/// When the seed breaks the format, or names a package that is not among `packages`.
+pub fn parse_seed(
+    seed: Vec<u8>,
+    packages: Vec<Vec<u8>>,
+    limits: &Limits,
+) -> Result<Loaded, String> {
+    let files = packages.iter().map(|f| (log::blob_key(f), f.clone())).collect();
+    let loaded = host::open_fetched((seed, files, Vec::new()), limits)?;
+    Ok(Loaded { packages, ..loaded })
 }
 
 /// A new room's state for a loaded bundle: the one place a room is built from a bundle.
@@ -288,9 +306,15 @@ fn version_string(version: &str, sha: Option<&str>) -> String {
     }
 }
 
+/// This build's version ([`version_string`]): what `GET /version` shows, and what a prepared
+/// world is stored under, so every build that says another version prepares its worlds again.
+pub(crate) fn build_version() -> String {
+    version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"))
+}
+
 /// `GET /version`: `{"version": "<version>[+<short sha>]"}`. The web UI compares it with its own.
 async fn version() -> impl IntoResponse {
-    let v = version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"));
+    let v = build_version();
     ([(header::CONTENT_TYPE, "application/json")], format!("{{\"version\":\"{v}\"}}"))
 }
 

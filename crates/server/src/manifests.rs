@@ -1,64 +1,32 @@
 //! Uploaded data-only world manifests: stored in the database once per content hash (never as
 //! files, so every server instance sees them), with the listing columns beside them so a listing
-//! never reads a manifest, and a size-bounded in-memory cache in front of the bytes a generation
-//! reads.
+//! never reads a manifest, and each one's prepared world (`data_fill::prepared`) as a blob found
+//! by manifest and engine (the file layout and the server build). A size-bounded in-memory cache is in front of the bytes a
+//! generation reads.
 
+use crate::cache::Cache;
 use crate::store::Db;
 use log::{BlobKey, ManifestRecord, StoreError};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
-
-/// Manifest bytes held in memory, at most `cap` in all: the least recently used go first. An
-/// entry larger than the cap is never kept.
-#[derive(Debug)]
-struct Cache {
-    cap: usize,
-    used: usize,
-    tick: u64,
-    /// id to (bytes, last use).
-    held: HashMap<BlobKey, (Arc<Vec<u8>>, u64)>,
-    /// last use to id: the first entry is the least recently used.
-    order: BTreeMap<u64, BlobKey>,
-}
-
-impl Cache {
-    fn new(cap: usize) -> Self {
-        Self { cap, used: 0, tick: 0, held: HashMap::new(), order: BTreeMap::new() }
-    }
-
-    fn get(&mut self, id: &BlobKey) -> Option<Arc<Vec<u8>>> {
-        self.tick += 1;
-        let (bytes, used) = self.held.get_mut(id)?;
-        self.order.remove(used);
-        *used = self.tick;
-        self.order.insert(self.tick, *id);
-        Some(Arc::clone(bytes))
-    }
-
-    fn put(&mut self, id: BlobKey, bytes: Arc<Vec<u8>>) {
-        if bytes.len() > self.cap || self.held.contains_key(&id) {
-            return;
-        }
-        while self.used + bytes.len() > self.cap {
-            let Some((_, oldest)) = self.order.pop_first() else { break };
-            if let Some((b, _)) = self.held.remove(&oldest) {
-                self.used -= b.len();
-            }
-        }
-        self.tick += 1;
-        self.used += bytes.len();
-        self.order.insert(self.tick, id);
-        self.held.insert(id, (bytes, self.tick));
-    }
-}
 
 /// The manifest store the admin API uses.
 #[derive(Debug)]
 pub(crate) struct Manifests {
     db: Db,
-    cache: Mutex<Cache>,
+    cache: Mutex<Cache<Vec<u8>>>,
     page_max: usize,
+    /// The engine prepared worlds are stored and found under ([`engine_key`] of this build).
+    pub(crate) engine: String,
+}
+
+/// What a prepared world is stored and found under beside its manifest: the layout of the file
+/// (`data_fill::prepared::layout`) and the server build that made it (`build`,
+/// [`crate::build_version`]). The compiled form is kept between generations, so a fix to the
+/// compiler would otherwise never reach a stored world: with the build in the key, each deploy
+/// prepares each world again on its first generation (a few milliseconds, once).
+pub(crate) fn engine_key(build: &str) -> String {
+    format!("{}@{build}", data_fill::prepared::layout())
 }
 
 /// The id as the 32 bytes it is the hex of. `id` must be 64 lowercase hex digits.
@@ -89,6 +57,7 @@ impl Manifests {
             db,
             cache: Mutex::new(Cache::new(limits.manifest_cache_bytes)),
             page_max: limits.list_page_max,
+            engine: engine_key(&crate::build_version()),
         }
     }
 
@@ -101,14 +70,54 @@ impl Manifests {
     /// The manifest's bytes: from the cache, else from the database (and then cached).
     pub(crate) async fn bytes(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
         let Some(key) = key_of(id) else { return Ok(None) };
-        let hit = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key);
-        if hit.is_some() {
-            return Ok(hit);
+        if let Some(hit) = self.cached(&key) {
+            return Ok(Some(hit));
         }
         let Some(bytes) = self.db.manifest_bytes(&key).await? else { return Ok(None) };
+        Ok(Some(self.cache(key, bytes)))
+    }
+
+    fn cached(&self, key: &BlobKey) -> Option<Arc<Vec<u8>>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(key)
+    }
+
+    fn cache(&self, key: BlobKey, bytes: Vec<u8>) -> Arc<Vec<u8>> {
         let bytes = Arc::new(bytes);
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).put(key, Arc::clone(&bytes));
-        Ok(Some(bytes))
+        bytes
+    }
+
+    /// Manifest `id`'s prepared world, from the cache or the blob store. `None` when it must be
+    /// prepared (again): never prepared by this engine, or its blob is missing or torn.
+    pub(crate) async fn prepared(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
+        let Some(key) = key_of(id) else { return Ok(None) };
+        let Some(package) = self.db.prepared_key(&key, &self.engine).await? else {
+            return Ok(None);
+        };
+        if let Some(hit) = self.cached(&package) {
+            return Ok(Some(hit));
+        }
+        match self.db.blob_get(&package).await {
+            Ok(Some(file)) => Ok(Some(self.cache(package, file))),
+            Ok(None) | Err(StoreError::Corrupt(_)) => {
+                tracing::warn!(id, "a prepared world's blob is missing or torn");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Store manifest `id`'s prepared world `file` as a blob, found under this engine.
+    pub(crate) async fn put_prepared(
+        &self,
+        id: &str,
+        file: Vec<u8>,
+    ) -> Result<Arc<Vec<u8>>, StoreError> {
+        let key = key_of(id).ok_or_else(|| StoreError::Corrupt("not a manifest id".into()))?;
+        let package = log::blob_key(&file);
+        self.db.blob_put(&package, &file).await?;
+        self.db.prepared_put(&key, &self.engine, &package).await?;
+        Ok(self.cache(package, file))
     }
 
     /// Store a checked manifest (`found` is what the check printed: game, version, items,
@@ -168,28 +177,27 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_stays_within_its_bytes_and_drops_the_least_recently_used() {
-        let mut c = Cache::new(10);
-        c.put(id(1), Arc::new(vec![0; 4]));
-        c.put(id(2), Arc::new(vec![0; 4]));
-        assert!(c.get(&id(1)).is_some(), "touched: now id 2 is the oldest");
-        c.put(id(3), Arc::new(vec![0; 4]));
-        assert!(c.get(&id(2)).is_none() && c.get(&id(1)).is_some() && c.get(&id(3)).is_some());
-        assert_eq!(c.used, 8);
-        c.put(id(4), Arc::new(vec![0; 11]));
-        assert!(c.get(&id(4)).is_none(), "larger than the whole cache: never kept");
-        assert_eq!(c.used, 8, "and it evicted nothing");
-        c.put(id(5), Arc::new(vec![0; 10]));
-        assert_eq!((c.held.len(), c.used), (1, 10), "one big entry pushes the rest out");
-    }
-
-    #[test]
     fn an_id_is_64_lowercase_hex_digits() {
         let k = id(0xab);
         assert_eq!(key_of(&crate::hex(&k)), Some(k));
         for bad in ["", "ab", &"AB".repeat(32), &"zz".repeat(32), &"ab".repeat(33)] {
             assert_eq!(key_of(bad), None, "{bad}");
         }
+    }
+
+    /// Fails without the build in the key: worlds are stored under this build's version and
+    /// the file layout, and another build or another layout is another key.
+    #[test]
+    fn prepared_worlds_are_keyed_by_the_file_layout_and_the_build() {
+        let here = manifests(&config::Limits::DESIGN).engine;
+        assert_eq!(here, engine_key(&crate::build_version()));
+        assert!(here.starts_with(&format!("{}@", data_fill::prepared::layout())), "{here}");
+        assert!(here.ends_with(env!("CARGO_PKG_VERSION")) || here.contains('+'), "{here}");
+        assert_ne!(engine_key("1.0.0+aaaaaaa"), engine_key("1.0.0+bbbbbbb"));
+        let layout = data_fill::prepared::layout();
+        let parts: Vec<&str> = layout.split('.').collect();
+        assert_eq!(parts.len(), 3, "rules section, package file, prepared layout: {layout}");
+        assert_eq!(parts[1], seed_bundle::package::VERSION.to_string());
     }
 
     fn manifests(limits: &config::Limits) -> Manifests {

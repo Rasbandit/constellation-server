@@ -64,6 +64,9 @@ pub(crate) struct Worlds {
     store: store::Db,
     /// How a manifest fill or check runs.
     jobs: JobRunner,
+    /// The jobs run so far, in order.
+    #[cfg(test)]
+    ran: std::sync::Mutex<Vec<String>>,
     /// Uploads and generation requests per client address (`admin_write_burst`).
     write_rate: edge_compat::RateTable<IpAddr>,
     /// Room view streams open at once (`view_streams`).
@@ -261,6 +264,8 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         manifests: Manifests::new(store::Db::Mem(Arc::clone(&mem)), &limits),
         store: store::Db::Mem(mem),
         jobs: JobRunner::Child(crate::sandbox::exe_path()?),
+        #[cfg(test)]
+        ran: std::sync::Mutex::default(),
         write_rate: edge_compat::RateTable::new(
             limits.admin_write_burst,
             limits.admin_write_refill_milli_per_sec,
@@ -396,7 +401,7 @@ impl Worlds {
         (before < self.limits.gen_queue_max).then_some(slot)
     }
 
-    /// Run a data-only job (`generate` or `inspect`) on `input`; see [`JobRunner`].
+    /// Run a data-only job (`prepare` or `fill`) on `input`; see [`JobRunner`].
     async fn run_job(
         &self,
         job: &str,
@@ -408,12 +413,9 @@ impl Worlds {
             #[cfg(test)]
             JobRunner::InProcess => {
                 let (job, input) = (job.to_owned(), input.to_vec());
+                self.ran.lock().unwrap_or_else(PoisonError::into_inner).push(job.clone());
                 tokio::task::spawn_blocking(move || {
-                    match job.as_str() {
-                        "generate" => data_fill::job::generate(&input),
-                        _ => data_fill::job::inspect(&input),
-                    }
-                    .map_err(Failure::Refused)
+                    data_fill::job::run(&job, &input).map_err(Failure::Refused)
                 })
                 .await
                 .unwrap_or_else(|e| Err(Failure::Broken(e.to_string())))
@@ -977,8 +979,40 @@ async fn put_manifest(State(w): State<Arc<Worlds>>, RawQuery(q): RawQuery, body:
     upload_manifest(&w, q.as_deref(), &body).await
 }
 
+/// Check `manifest` in a capped child process (the same engine that will fill it) and keep what
+/// the check compiled: the found record and the prepared world's file (`data_fill::prepared`).
+async fn prepare_manifest(w: &Worlds, manifest: &[u8]) -> Result<(Value, Vec<u8>), Failure> {
+    let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
+    let out = w.run_job("prepare", manifest, timeout).await?;
+    let (found, file) = data_fill::job::unframe(&out).map_err(Failure::Broken)?;
+    let found = serde_json::from_slice(found)
+        .map_err(|e| Failure::Broken(format!("the manifest check printed bad JSON: {e}")))?;
+    Ok((found, file.to_vec()))
+}
+
+/// Manifest `id`'s prepared world: the stored one, or, when that is stale or lost (prepared by
+/// another build or layout, or its blob is missing or torn), prepared again from the stored
+/// manifest and stored.
+async fn prepared_world(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+    match w.manifests.prepared(id).await.map_err(|e| format!("{e:?}"))? {
+        Some(stored) => Ok(stored),
+        None => prepare_again(w, id).await,
+    }
+}
+
+/// Prepare manifest `id`'s world from the stored manifest and store it in place of what was
+/// stored for this engine.
+async fn prepare_again(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+    let manifest = w.manifests.bytes(id).await.map_err(|e| format!("{e:?}"))?;
+    let manifest = manifest.ok_or("the manifest is gone")?;
+    tracing::info!(id, engine = w.manifests.engine, "preparing a world again");
+    let (_, prepared) = prepare_manifest(w, &manifest).await.map_err(|e| e.to_string())?;
+    w.manifests.put_prepared(id, prepared).await.map_err(|e| format!("{e:?}"))
+}
+
 /// Check a manifest in a capped child process (the same engine that will fill it), then store it
-/// in the database. The same content again returns the stored record without a check.
+/// and its prepared world in the database. The same content again returns the stored record
+/// without a check.
 async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]) -> Reply {
     let name = upload_name(query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let cap = w.limits.manifest_max_bytes;
@@ -1003,14 +1037,17 @@ async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]) -> Reply 
     let Ok(_check) = w.checks.try_acquire() else {
         return Ok(busy(w, "too many manifests are being checked"));
     };
-    let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
-    let found = w.run_job("inspect", body, timeout).await.map_err(|e| match e {
+    let (found, prepared) = prepare_manifest(w, body).await.map_err(|e| match e {
         Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
         Failure::Broken(why) => internal(why),
     })?;
-    let found: Value = serde_json::from_slice(&found)
-        .map_err(|e| internal(format!("the manifest check printed bad JSON: {e}")))?;
     let stored = w.manifests.put(&name, body, &found).await.map_err(store_error)?;
+    // What the check compiled is kept: a generation fills from it and compiles nothing. The
+    // manifest is stored by now, and a generation prepares a world that has no stored form, so
+    // failing to keep it is not the upload failing.
+    if let Err(e) = w.manifests.put_prepared(&id, prepared).await {
+        tracing::warn!(id, error = ?e, "the prepared world was not stored; a generation will");
+    }
     tracing::info!(id, name, "manifest stored");
     Ok(json_reply(StatusCode::CREATED, &stored))
 }
@@ -1414,17 +1451,6 @@ struct PlayerReq {
     instance: Value,
 }
 
-/// What a fill child reads on stdin (`data_fill::job`): the manifest as it was uploaded, not
-/// parsed here.
-#[derive(serde::Serialize)]
-struct FillReq<'a> {
-    manifest: &'a serde_json::value::RawValue,
-    seed_name: &'a str,
-    players: Vec<PlayerReq>,
-    rng_seed: u64,
-    workers: usize,
-}
-
 /// The players' files as fill request players. Real YAML player files are not read for manifest
 /// worlds yet (see #114).
 fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String> {
@@ -1438,6 +1464,25 @@ fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String
             Ok(PlayerReq { name: name.to_owned(), instance: doc.clone() })
         })
         .collect()
+}
+
+/// The head of a generation's fill request (`data_fill::job::Fill`, JSON), which the prepared
+/// world follows: on `config::GENERATION_WORKERS` threads, for a seed of at most
+/// `seed_max_bytes`.
+fn fill_head(
+    seed_name: &str,
+    files: &[(String, Vec<u8>)],
+    (rng_seed, seed_max_bytes): (u64, u64),
+) -> Result<Vec<u8>, String> {
+    let head = data_fill::job::Fill {
+        seed_name: seed_name.to_owned(),
+        players: player_requests(files)?,
+        rng_seed,
+        workers: config::GENERATION_WORKERS,
+        algorithm: data_fill::room::Algorithm::Exact,
+        seed_max_bytes,
+    };
+    serde_json::to_vec(&head).map_err(|e| e.to_string())
 }
 
 /// Each chosen player file from the store, with the name it was uploaded under (for errors).
@@ -1456,8 +1501,8 @@ async fn player_files(w: &Worlds, yamls: &[String]) -> Result<Vec<(String, Vec<u
 /// permit, status file and publish path as a legacy world.
 async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value), String> {
     let id = status["id"].as_str().unwrap_or("");
-    let manifest = w.manifests.bytes(status["manifest"].as_str().unwrap_or("")).await;
-    let manifest = manifest.map_err(|e| format!("{e:?}"))?.ok_or("the manifest is gone")?;
+    let manifest = status["manifest"].as_str().unwrap_or("");
+    let mut prepared = prepared_world(w, manifest).await?;
     let yamls: Vec<String> = status["yamls"]
         .as_array()
         .into_iter()
@@ -1471,26 +1516,34 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     let files = player_files(w, &yamls).await?;
     let players = yamls.len();
     // Building the request is blocking work.
-    let input = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let text = String::from_utf8(manifest.to_vec()).map_err(|e| e.to_string())?;
-        let raw = serde_json::value::RawValue::from_string(text).map_err(|e| e.to_string())?;
-        let req = FillReq {
-            manifest: &raw,
-            seed_name: &seed_name,
-            players: player_requests(&files)?,
-            rng_seed,
-            workers: config::FILL_SETUP_WORKERS,
-        };
-        serde_json::to_vec(&req).map_err(|e| e.to_string())
+    let limits = w.limits;
+    let head = tokio::task::spawn_blocking(move || {
+        fill_head(&seed_name, &files, (rng_seed, limits.bundle_max_bytes))
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
     let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
-    let bundle = w.run_job("generate", &input, timeout).await.map_err(|e| e.to_string())?;
-    let limits = w.limits;
-    let loaded = tokio::task::spawn_blocking(move || parse_bundle(&bundle, &limits))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))?;
+    // The child prints the seed file itself; it names the game's package of the prepared world.
+    let mut first = true;
+    let seed = loop {
+        let input = data_fill::job::frame(&head, &prepared)?;
+        match w.run_job("fill", &input, timeout).await {
+            // A stored world this engine cannot load (it hashes to its key, so the store gave
+            // it back) would fail every generation of its manifest: prepare it again, once.
+            Err(Failure::Refused(why)) if first && why.contains(data_fill::job::UNLOADABLE) => {
+                tracing::warn!(manifest, why, "the stored prepared world does not load");
+                prepared = prepare_again(w, manifest).await?;
+                first = false;
+            }
+            done => break done.map_err(|e| e.to_string())?,
+        }
+    };
+    let loaded = tokio::task::spawn_blocking(move || {
+        let game = data_fill::prepared::seed_game(&prepared)?.to_vec();
+        crate::parse_seed(seed, vec![game], &limits)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))?;
     publish_loaded(w, loaded.clone()).await?;
     let report = json!({"engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players});
     Ok((loaded, report))
@@ -2581,6 +2634,16 @@ mod tests {
         panic!("the world never finished and listed");
     }
 
+    /// A generation asks for one thread: the product's default (a caller of the fill job may
+    /// still ask for more). Fails with the old four.
+    #[test]
+    fn a_generation_asks_the_fill_for_one_worker() {
+        let head = fill_head("s", &[], (1, 64)).unwrap();
+        let req: Value = serde_json::from_slice(&head).unwrap();
+        assert_eq!(req["workers"], 1);
+        assert_eq!(config::GENERATION_WORKERS, 1);
+    }
+
     /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
     /// in a child (here in process), the seed stored in the host and its room listed and loaded.
     /// Fails without `generate_data_only` (the world fails: it would run the legacy path).
@@ -2623,6 +2686,127 @@ mod tests {
         let both = json!({"manifest": manifest_id, "yamls": yamls, "apworlds": ["x"]});
         let e = create_world(State(w), me(), Bytes::from(both.to_string())).await.unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The upload keeps what its check compiled, and the generation fills from that: one
+    /// `prepare` for the world, then only `fill`s. Fails without the stored prepared world.
+    #[tokio::test]
+    async fn an_upload_stores_the_prepared_world_and_generations_fill_from_it() {
+        let root = temp("prepared");
+        let w = hosting(&root).await;
+        finished_world(&w, &me()).await;
+        let other = accounts::Identity { subject: "pw:bo".into(), name: "bo".into() };
+        finished_world(&w, &other).await;
+        assert_eq!(*w.ran.lock().unwrap(), ["prepare", "fill", "fill"], "compiled once");
+        let file = w.manifests.prepared(&content_id(&manifest(|_| {}))).await.unwrap().unwrap();
+        let world = data_fill::prepared::Prepared::open(&file).unwrap();
+        assert_eq!(world.game(), "Fixture Game");
+    }
+
+    /// The seed a generation stores is, byte for byte, the seed the path before stored for the
+    /// same inputs: the manifest compiled and filled, the bundle written as JSON and imported.
+    /// So are its hash and its package. Fails if the fill's own seed file differs anywhere.
+    #[tokio::test]
+    async fn the_stored_seed_is_the_one_the_json_import_path_stored() {
+        let root = temp("prepared-bytes");
+        let w = hosting(&root).await;
+        let id = finished_world(&w, &me()).await;
+        let status = read_status(&w, &id).await.unwrap();
+        let (name, rng) =
+            (status["seed_name"].as_str().unwrap(), &status["generation"]["rng_seed"]);
+        let store::Db::Mem(mem) = &w.store else { panic!("the test host is in memory") };
+        let stored = log::LogStore::seed_get(&**mem, crate::room_id(name)).await.unwrap().unwrap();
+
+        let world: Value = serde_json::from_slice(&manifest(|_| {})).unwrap();
+        let ann = json!({"name": "Ann", "instance": fixture_instances()[0]});
+        let players = [serde_json::from_value(ann).unwrap()];
+        let bundle =
+            data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap(), 1).unwrap();
+        let old = parse_bundle(&serde_json::to_vec(&bundle).unwrap(), &Limits::DESIGN).unwrap();
+        assert_eq!(stored, old.bundle.bytes());
+        assert_eq!(status["bundle_hash"], crate::hex(&old.hash), "{status}");
+        for package in &old.packages {
+            let key = log::blob_key(package);
+            assert_eq!(w.store.blob_get(&key).await.unwrap().as_ref(), Some(package));
+        }
+        // A seed cut short is refused (its body hash no longer matches).
+        let cut = stored[..stored.len() - 1].to_vec();
+        assert!(crate::parse_seed(cut, old.packages.clone(), &Limits::DESIGN).is_err());
+    }
+
+    /// A world prepared by another build is stale: the generation sees no prepared world for
+    /// its own build, prepares the stored manifest again and stores that. So a fix to the
+    /// compiler reaches every stored world with the deploy that carries it.
+    #[tokio::test]
+    async fn a_world_prepared_by_another_build_is_prepared_again() {
+        let root = temp("prepared-stale");
+        let mut w = hosting(&root).await;
+        let body = manifest(|_| {});
+        upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        // A new build is deployed: it is no longer the one the world was stored under.
+        Arc::get_mut(&mut w).unwrap().manifests.engine = manifests::engine_key("9.9.9+another");
+        let id = content_id(&body);
+        assert!(w.manifests.prepared(&id).await.unwrap().is_none(), "stale: not this build's");
+        finished_world(&w, &me()).await;
+        assert_eq!(*w.ran.lock().unwrap(), ["prepare", "prepare", "fill"]);
+        assert!(w.manifests.prepared(&id).await.unwrap().is_some(), "stored for this build");
+    }
+
+    /// A stored world the fill cannot load (here bytes that are no prepared world, stored
+    /// whole under their own hash) does not fail its manifest's generations for good: the
+    /// generation prepares the manifest again, stores that and fills. Fails without the retry
+    /// (the world ends as failed).
+    #[tokio::test]
+    async fn a_stored_world_the_fill_cannot_load_is_prepared_again() {
+        let root = temp("prepared-unloadable");
+        let w = hosting(&root).await;
+        let body = manifest(|_| {});
+        upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        let id = content_id(&body);
+        w.manifests.put_prepared(&id, b"not a prepared world".to_vec()).await.unwrap();
+        finished_world(&w, &me()).await;
+        assert_eq!(*w.ran.lock().unwrap(), ["prepare", "fill", "prepare", "fill"]);
+        let file = w.manifests.prepared(&id).await.unwrap().unwrap();
+        assert!(data_fill::prepared::Prepared::open(&file).is_ok(), "the stored one loads now");
+    }
+
+    /// A prepared world whose stored bytes were torn (they no longer hash to their key) is
+    /// refused by the store, prepared again from the manifest, and the put heals the blob.
+    #[tokio::test]
+    async fn a_prepared_world_whose_blob_is_torn_is_prepared_again() {
+        let root = temp("prepared-torn");
+        let mut w = hosting(&root).await;
+        let body = manifest(|_| {});
+        upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        let id = content_id(&body);
+        let engine = w.manifests.engine.clone();
+        let key = w.store.prepared_key(&hex_key(&id), &engine).await.unwrap().unwrap();
+        let store::Db::Mem(mem) = w.store.clone() else { panic!("the test host is in memory") };
+        mem.tear_blob_for_tests(&key);
+        // Another server instance: nothing of the world is in its memory.
+        Arc::get_mut(&mut w).unwrap().manifests =
+            Manifests::new(store::Db::Mem(Arc::clone(&mem)), &Limits::DESIGN);
+        assert!(w.store.blob_get(&key).await.is_err(), "the store refuses the torn blob");
+        assert!(w.manifests.prepared(&id).await.unwrap().is_none(), "so it reads as not prepared");
+        finished_world(&w, &me()).await;
+        assert_eq!(*w.ran.lock().unwrap(), ["prepare", "prepare", "fill"]);
+        assert!(w.store.blob_get(&key).await.unwrap().is_some(), "healed by the put");
+    }
+
+    /// A prepared world whose blob is not in the store is prepared again from the manifest.
+    #[tokio::test]
+    async fn a_prepared_world_whose_blob_is_missing_is_prepared_again() {
+        let root = temp("prepared-missing");
+        let w = hosting(&root).await;
+        let body = manifest(|_| {});
+        upload_manifest(&w, Some("name=m.json"), &body).await.unwrap();
+        let id = content_id(&body);
+        let engine = w.manifests.engine.clone();
+        w.store.prepared_put(&hex_key(&id), &engine, &[9; 32]).await.unwrap();
+        assert!(w.manifests.prepared(&id).await.unwrap().is_none(), "no such blob");
+        finished_world(&w, &me()).await;
+        assert_eq!(*w.ran.lock().unwrap(), ["prepare", "prepare", "fill"]);
+        assert!(w.manifests.prepared(&id).await.unwrap().is_some(), "stored again");
     }
 
     /// A world made for an account is recorded as its room: its list has it, another account's
