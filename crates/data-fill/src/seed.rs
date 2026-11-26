@@ -200,8 +200,15 @@ fn fill_on(
     algorithm: room::Algorithm,
 ) -> Result<(SeedBundle, FillReport), String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
-    // The room owns its world: a copy of the loaded bytes, small beside a fill.
-    let room = room::Compiled::shared(on.0.clone(), &insts, workers)?;
+    // A world that declares shuffles is staged per player first: each gets their own layout,
+    // and the fill below sees ordinary worlds.
+    let (room, tables) = if on.0.has_shuffles() {
+        crate::shuffle::room(std::slice::from_ref(on.0), &insts, rng_seed)
+            .map_err(|e| format!("world {:?}: {e}", on.1))?
+    } else {
+        // The room owns its world: a copy of the loaded bytes, small beside a fill.
+        (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
+    };
     let seats = room.seats();
     let (filled, spheres) = room::fill_room_by(
         &seats,
@@ -221,7 +228,13 @@ fn fill_on(
         swaps: filled.swaps,
         repairs: filled.repairs,
     };
-    Ok((assemble(on, seed_name, players, &seats, &filled.placed, &spheres)?, report))
+    let mut bundle = assemble(on, seed_name, players, &seats, &filled.placed, &spheres)?;
+    // Each world's shuffle results, slot to thing by name: `slot_data` reaches the game client
+    // and needs no change to the seed format.
+    for (slot, table) in bundle.slots.iter_mut().zip(tables) {
+        slot.slot_data = json!({"shuffles": table});
+    }
+    Ok((bundle, report))
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.

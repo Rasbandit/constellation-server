@@ -139,6 +139,12 @@ impl Plan {
     /// Unknown keys, and start counts below 0 or above the location count.
     pub fn new(w: &World, inst: &Instance) -> Result<Self, FillError> {
         let e = FillError::Instance;
+        if w.has_shuffles() {
+            // Its exits and its `at` options are not this seed's yet.
+            return Err(e("the world declares shuffles that have not run for this seed \
+                          (`data_fill::shuffle::stage`)"
+                .to_owned()));
+        }
         let mut opts = Vec::with_capacity(w.options());
         for k in 0..w.options() {
             let key = w.option_key(k);

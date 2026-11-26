@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 
 use bits::{Packer, width};
-use seed_bundle::package::{SECTION_GAME, SECTION_RULES, Section, file_bytes};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, SECTION_SHUFFLES, Section, file_bytes};
 use serde_json::{Map, Value, json};
+
+use crate::shuffle::Decl;
 
 /// Layout version in the rules header.
 pub const VERSION: u16 = 1;
@@ -307,11 +309,11 @@ impl Reads {
     }
 }
 
-fn arr<'a>(v: &'a Value, path: &str) -> R<&'a Vec<Value>> {
+pub(crate) fn arr<'a>(v: &'a Value, path: &str) -> R<&'a Vec<Value>> {
     v.as_array().ok_or_else(|| format!("{path}: expected an array"))
 }
 
-fn s<'a>(v: &'a Value, path: &str) -> R<&'a str> {
+pub(crate) fn s<'a>(v: &'a Value, path: &str) -> R<&'a str> {
     v.as_str().ok_or_else(|| format!("{path}: expected a string"))
 }
 
@@ -349,6 +351,8 @@ struct Compiler<'m> {
     dedupe: HashMap<Vec<u8>, u32>,
     /// Item groups: (item, cap) members, `None` for an uncapped count.
     groups: Vec<Vec<(u16, Option<u16>)>>,
+    /// The world's shuffles: what an `at` read stands for ([`crate::shuffle`]).
+    shuffles: Option<&'m Decl>,
     w: Widths,
 }
 
@@ -377,7 +381,9 @@ fn counter_keys<'m>(v: &'m Value, out: &mut Vec<&'m str>) {
 /// A message naming the manifest path of the first malformed or unknown construct.
 pub fn compile(m: &Value) -> R<Vec<u8>> {
     let (rules, game) = sections(m)?;
-    package(rules, game, &[])
+    let shuffles = crate::shuffle::section(m)?;
+    let more: Vec<(u16, &[u8])> = shuffles.iter().map(|b| (SECTION_SHUFFLES, &b[..])).collect();
+    package(rules, game, &more)
 }
 
 /// The package file of a compiled world's two sections, then `more` sections stored as is
@@ -398,6 +404,7 @@ pub fn package(rules: Vec<u8>, game: Vec<u8>, more: &[(u16, &[u8])]) -> R<Vec<u8
 /// As [`compile`].
 #[allow(clippy::too_many_lines)] // one pass in section order reads best as one function
 pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
+    let shuffles = Decl::of(m)?;
     let mut item_rows = Vec::new();
     let mut items = HashMap::new();
     for (k, it) in arr(&m["items"], "items")?.iter().enumerate() {
@@ -447,6 +454,25 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         defaults.push(i32::try_from(d).map_err(|_| format!("{p}: {d} does not fit 32 bits"))?);
         options.push(key);
     }
+    // A `none` shuffle's result is one more option per slot: the index of the thing there
+    // this seed, set by the shuffle stage and folded like any option.
+    if let Some(d) = &shuffles {
+        if let Some(k) = options.iter().find(|k| k.starts_with("at.")) {
+            return Err(format!("options[{k:?}]: `at.` names are kept for shuffle results"));
+        }
+        for key in d.option_keys() {
+            defaults.push(0);
+            options.push(key);
+        }
+        // An option is one byte in a rule.
+        let most = usize::from(u8::MAX) + 1;
+        if options.len() > most {
+            return Err(format!(
+                "shuffles: {} options and slots that rules can read, at most {most} together",
+                options.len()
+            ));
+        }
+    }
     small::<u8>(options.len().saturating_sub(1), "options")?;
     let rolls: Vec<&str> = m
         .get("rolls")
@@ -477,10 +503,18 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         code: vec![op::TRUE, op::FALSE],
         dedupe: HashMap::new(),
         groups: Vec::new(),
+        shuffles: shuffles.as_ref(),
         w,
     };
     for k in 0..raw_defs.len() {
         c.def(k)?;
+    }
+    // Every thing's rule is a rule like any other: checked here under its own path.
+    for sh in shuffles.iter().flat_map(|d| &d.shuffles) {
+        for (t, rule) in sh.things.iter().filter_map(|t| Some((t, t.rule.as_ref()?))) {
+            let path = format!("shuffles.{}.things.{}.rule", sh.name, t.name);
+            c.rule(rule, &path, &mut Reads::default(), false)?;
+        }
     }
 
     let t = &m["x.time"];
@@ -796,6 +830,12 @@ impl<'m> Compiler<'m> {
             let [x, y] = arr(a, &p)?.as_slice() else {
                 return Err(format!("{p}: expected two operands"));
             };
+            // A test of which thing a shuffle put in a slot is a test of that slot's option.
+            if let Some(d) = self.shuffles
+                && let Some(test) = d.name_test(k, x, y, &p)?
+            {
+                return self.b_node(&test, path, out, r, goal);
+            }
             out.extend_from_slice(&[op::CMP, u8::try_from(cmp).unwrap_or(0)]);
             let (mut rx, mut ry) = (Reads::default(), Reads::default());
             self.i(x, &format!("{p}[0]"), out, &mut rx)?;
@@ -937,6 +977,11 @@ impl<'m> Compiler<'m> {
                         put(out, u16::try_from(k).unwrap_or(0), self.w.def);
                     }
                 }
+            }
+            // The rule of the thing a shuffle put in a slot.
+            "at" => {
+                let d = self.shuffles.ok_or_else(|| format!("{p}: the world has no shuffles"))?;
+                return self.b_node(&d.rule_form(a, &p)?, &p, out, r, goal);
             }
             _ => return Err(format!("{path}: unknown rule node {k:?}")),
         }

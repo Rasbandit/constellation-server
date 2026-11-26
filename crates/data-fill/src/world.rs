@@ -5,14 +5,17 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use bits::{BitSet, PackedRef, bytes_for, read};
-use seed_bundle::package::{SECTION_GAME, SECTION_RULES, stored};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, SECTION_SHUFFLES, stored};
 use serde_json::Value;
 
 use crate::section::{
-    self, CMP_OPS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths, node, sub,
+    self, CMP_OPS, EXITS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths,
+    node, sub,
 };
+use crate::shuffle::Bound;
 
 type R<T> = Result<T, String>;
 
@@ -139,6 +142,9 @@ pub struct World {
     groups: (List, List, List),
     /// Per item, the groups it is a member of and its cap there (computed at load).
     item_groups: (Vec<u32>, Vec<(u16, u16)>),
+    /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
+    /// `None` for a world that declares none, and for a seed's staged world.
+    shuffles: Option<Arc<Bound>>,
 }
 
 const ITEMS: usize = 0;
@@ -229,7 +235,62 @@ impl World {
         let section = |id| stored(file, id).map_err(|e| e.to_string());
         let rules = section(SECTION_RULES)?.ok_or("package: no rules section")?;
         let game = section(SECTION_GAME)?.ok_or("package: no game section")?;
-        Self::from_sections(rules.to_vec(), game.to_vec())
+        Self::from_sections(rules.to_vec(), game.to_vec())?
+            .with_shuffles(section(SECTION_SHUFFLES)?)
+    }
+
+    /// This world with the shuffles its package declares (the shuffle section,
+    /// [`crate::shuffle::section`]), checked against its regions, exits and options.
+    ///
+    /// # Errors
+    /// A section that does not parse, or names what the world lacks.
+    pub fn with_shuffles(mut self, section: Option<&[u8]>) -> R<Self> {
+        if let Some(bytes) = section {
+            self.shuffles = Some(Arc::new(Bound::bind(&self, bytes)?));
+        }
+        Ok(self)
+    }
+
+    /// The shuffles still to run for a seed of this world.
+    pub(crate) fn shuffles(&self) -> Option<&Bound> {
+        self.shuffles.as_deref()
+    }
+
+    /// Whether the world declares shuffles that a seed has to run before its fill.
+    #[must_use]
+    pub fn has_shuffles(&self) -> bool {
+        self.shuffles.is_some()
+    }
+
+    /// One seed's world: this one with every exit site of `exits` leading to its new region,
+    /// and no shuffle left to run. To the solver it is an ordinary world.
+    pub(crate) fn staged(&self, exits: &[(usize, u32)]) -> World {
+        let mut w = self.clone();
+        w.shuffles = None;
+        for (site, to) in exits {
+            w.hot.target[*site] = *to;
+        }
+        if !exits.is_empty() {
+            w.hot.into[EXITS] = w.into_index(EXITS, w.counts[REGIONS]);
+        }
+        w
+    }
+
+    /// Sites of group `g` by target (`n` targets), the reverse of `hot.target`.
+    fn into_index(&self, g: usize, n: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut at = vec![0u32; n + 1];
+        let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
+        let sites = || (0..self.hot.target.len()).filter(of_g);
+        sites().for_each(|s| at[self.hot.target[s] as usize + 1] += 1);
+        (0..n).for_each(|k| at[k + 1] += at[k]);
+        let mut fill = at.clone();
+        let mut v = vec![0u32; at[n] as usize];
+        for s in sites() {
+            let t = self.hot.target[s] as usize;
+            v[fill[t] as usize] = u32::try_from(s).unwrap_or(0);
+            fill[t] += 1;
+        }
+        (at, v)
     }
 
     /// Load from the two sections' bytes.
@@ -357,6 +418,7 @@ impl World {
             loc_ids,
             groups: (g_starts, g_items, g_caps),
             item_groups: (Vec::new(), Vec::new()),
+            shuffles: None,
             game,
             rules: Vec::new(),
         };
@@ -479,19 +541,7 @@ impl World {
             }
         }
         for (g, n) in [c[REGIONS], c[COUNTERS], c[LOCS]].into_iter().enumerate() {
-            let mut at = vec![0u32; n + 1];
-            let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
-            let sites = || (0..self.hot.target.len()).filter(of_g);
-            sites().for_each(|s| at[self.hot.target[s] as usize + 1] += 1);
-            (0..n).for_each(|k| at[k + 1] += at[k]);
-            let mut fill = at.clone();
-            let mut v = vec![0u32; at[n] as usize];
-            for s in sites() {
-                let t = self.hot.target[s] as usize;
-                v[fill[t] as usize] = u32::try_from(s).unwrap_or(0);
-                fill[t] += 1;
-            }
-            self.hot.into[g] = (at, v);
+            self.hot.into[g] = self.into_index(g, n);
         }
         if self.defs.len != c[DEFS] || self.vanilla.len != c[LOCS] {
             return Err(bad("def or location table length"));

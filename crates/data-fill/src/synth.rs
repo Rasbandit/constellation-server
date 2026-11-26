@@ -46,6 +46,10 @@ pub struct Shape {
     /// Longer rules: three checks in eight are gated like exits, half the gates carry a second
     /// condition, defs read other defs and time, and time leaves test a window of slices.
     pub rich: bool,
+    /// Entrance shuffle ([`crate::shuffle`]): the first exit into every region is the outside
+    /// of a two-way door with an open way back, and one coupled `layout` shuffle moves all of
+    /// them inside two type groups. With `branching` 1 a door is the only way into a region.
+    pub doors: bool,
 }
 
 impl Default for Shape {
@@ -62,6 +66,7 @@ impl Default for Shape {
             defs: 0.125,
             absent: 0.0,
             rich: false,
+            doors: false,
         }
     }
 }
@@ -163,9 +168,18 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut exits: Vec<Vec<Value>> = vec![Vec::new(); regions];
     for r in 1..regions {
         let d = layer(r);
-        for _ in 0..shape.branching.max(1) {
+        for b in 0..shape.branching.max(1) {
             let from = in_layer[d - 1][pick(in_layer[d - 1].len())];
-            exits[from].push(json!({"to": format!("r{r}"), "rule": gate(d, &mut pick)}));
+            let mut exit = json!({"to": format!("r{r}"), "rule": gate(d, &mut pick)});
+            if shape.doors && b == 0 {
+                let door = format!("d{r}");
+                exit["key"] = json!(format!("e{r}"));
+                exit["group"] = json!(format!("g{}", r % 2));
+                exits[r].push(json!({"to": format!("r{from}"), "rule": {"true": {}},
+                                     "key": format!("b{r}"), "door": door}));
+                exit["door"] = json!(door);
+            }
+            exits[from].push(exit);
         }
     }
     // Every fourth region past the start can wait into the later slice.
@@ -212,7 +226,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut items: Vec<Value> = (0..kinds).map(|k| json!({"key": p(k), "id": k + 1})).collect();
     items.push(json!({"key": "useful", "id": kinds + 1}));
     items.push(json!({"key": "filler", "id": kinds + 2}));
-    let manifest = json!({
+    let mut manifest = json!({
         "options": [],
         "items": items,
         "locations": (0..locations).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
@@ -223,6 +237,14 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
         "regions": regions_json,
         "goal": {"all": goal},
     });
+    if shape.doors {
+        let group = |g: &str| json!({"slots": {"groups": [g]}, "only": {"groups": [g]}});
+        manifest["shuffles"] = json!({"entrances": {
+            "coupled": true,
+            "slots": {"type": "exit", "names": (1..regions).map(|r| format!("e{r}")).collect::<Vec<_>>()},
+            "allow": [group("g0"), group("g1")],
+        }});
+    }
     let mut pool: Vec<String> = (0..kinds).flat_map(|k| vec![p(k); copies(k)]).collect();
     let rest = checks - pool.len();
     pool.extend((0..rest).map(|i| if i % 4 == 0 { "useful" } else { "filler" }.to_owned()));

@@ -30,6 +30,9 @@ pub const SECTION_RULES: u16 = 2;
 /// Section of a prepared world (`data_fill::prepared`): the whole package file of the game as
 /// seeds of that world name it ([`GamePackage::file`]), stored as is.
 pub const SECTION_SEED_GAME: u16 = 3;
+/// Section of a compiled world that declares shuffles (`data_fill::shuffle`): the declarations
+/// and the exits they name, as JSON. A world without shuffles has no such section.
+pub const SECTION_SHUFFLES: u16 = 4;
 /// Bytes of one table of contents entry.
 const ENTRY: usize = 48;
 /// Section flag: the bytes are raw deflate.

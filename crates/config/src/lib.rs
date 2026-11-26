@@ -301,7 +301,30 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// sections the file holds and what is in them. Raise it with any change to that. A world is
 /// also prepared again by every new server build, so this guards builds that share a version
 /// text (local and test builds).
-pub const PREPARED_WORLD_LAYOUT: u16 = 1;
+pub const PREPARED_WORLD_LAYOUT: u16 = 2;
+
+/// Attempts one world's shuffles get per seed (`data_fill::shuffle`): a failed layout or
+/// whole-world check starts every shuffle of that world again on the next attempt's random
+/// streams, and at the cap the room's generation fails naming the world and the shuffle (a
+/// design value, doc 17 section 4.7 of the design docs).
+pub const SHUFFLE_MAX_ATTEMPTS: u32 = 4;
+
+/// Most shuffles one world may declare (a design value).
+pub const SHUFFLES_MAX: usize = 64;
+
+/// Most slots over all shuffles of one world, and most things of one shuffle (a design value:
+/// the largest entrance shuffle we know of is reported at 611 exits). Bounds the permission
+/// tables, which hold a cell per slot and thing.
+pub const SHUFFLE_MAX_SLOTS: usize = 1024;
+
+/// Longest shuffle name in bytes: a name keys a random stream, and a stream label is short
+/// (`spec_rng::derive`).
+pub const SHUFFLE_NAME_MAX_BYTES: usize = 48;
+
+/// Most (region, shuffled exit) pairs of "this region reaches that exit's region by exits
+/// that are not shuffled" a world's layout may have: the index the layout solve tells a branch
+/// from a dead end by, about 2 bytes a pair (a design value).
+pub const SHUFFLE_MAX_BEHIND: usize = 1 << 20;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. The price is wall time for rooms on the
@@ -369,7 +392,8 @@ pub const SHUFFLE_FILL_MAX_PROBES: u32 = 32;
 pub const FILL_MAX_WORKERS: usize = 64;
 
 /// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
-/// listing columns and an index).
+/// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a
+/// thing, a group, an exit key, a door).
 pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 
 /// The generator version a data-only seed records (what clients of the compatible protocol

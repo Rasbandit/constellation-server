@@ -36,7 +36,8 @@ pub fn manifest(w: &World) -> Value {
             let mut groups = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
             for (g, out) in groups.iter_mut().enumerate().take(GROUPS) {
                 for s in w.group(ri, g) {
-                    let (t, at) = w.site(s);
+                    // The target a solve walks: a seed's staged world moves exits.
+                    let (t, at) = (w.site_target(s), w.site(s).1);
                     let target = match g {
                         EXITS => json!({"to": w.region_key(t)}),
                         EVENTS => json!({"event": w.counter_key(t as usize)}),
