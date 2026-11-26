@@ -1,7 +1,10 @@
 name: bench
-# Room fill scaling on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build.
-# Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints a table to
-# the job summary and uploads the JSON lines as an artifact; nothing here gates a merge yet.
+# The exact fill on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build:
+# light and heavy, 1, 10 and 100 players, one thread, as the engine was and as it is, on one
+# runner. Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints
+# tables to the job summary and uploads the JSON lines as an artifact. About three minutes;
+# the summary says how long the compile and each row took. The opt-in fill modes, four threads,
+# rooms on one world and the seed-shape report run only on a dispatch with `full` set to `on`.
 # A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
 # through its concurrency group, cancel the run already in progress.
 on:
@@ -9,13 +12,15 @@ on:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
-      players: { description: "Player counts, comma separated", default: "1,10,20,50,100" }
+      players: { description: "Player counts, comma separated", default: "1,10,100" }
       checks: { description: "Checks per world", default: "1000" }
+      full: { description: "on: also the fill modes, four threads, one-world rooms, seed shape", default: "off" }
 concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
+  FULL: ${{ inputs.full || 'off' }}
 permissions:
   contents: read
 jobs:
@@ -31,62 +36,66 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
+      # Compiled apart from the rows, so the summary can say where the job's time goes.
+      - name: build
+        run: |
+          start=$SECONDS
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+          echo $((SECONDS - start)) > build_s
       # Inputs go through the environment, never into the script text. Both profiles of
-      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), each
-      # on both ways of placing rounds (`data_fill::room::Path`), the forward one on 1 thread and
-      # on 4, so the algorithm and the threads are timed apart and on one runner.
+      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), on
+      # one thread. Three engines per profile: as it is (bit rules, absent checks skipped), as it
+      # was (every rule as bytecode, absent checks evaluated) and bit rules alone. The carried
+      # path (`data_fill::room::Path::Carry`) only at 1 and 10 players: it is what a room under
+      # `config::ROOM_FORWARD_MIN_PLAYERS` takes, and at 100 players a row of it took half a minute.
       - name: synth_room
         env:
-          PLAYERS: ${{ inputs.players || '1,10,20,50,100' }}
+          PLAYERS: ${{ inputs.players || '1,10,100' }}
           CHECKS: ${{ inputs.checks || '1000' }}
         run: |
           set -o pipefail
-          # A room as the server generates it: every player on one world, prepared once and
-          # loaded from its stored form, on one thread, on the path a room of that size takes.
-          # First, so its peak RSS is not that of the per-player worlds below.
-          for profile in light heavy; do
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path auto --workers 1 --worlds one \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
-          done
-          for profile in light heavy; do for run in "carry 1" "forward 1" "forward 4"; do
-            read -r path workers <<< "$run"
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path "$path" --workers "$workers" \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
-          done; done
-          # The engine before this branch's two changes, on the same runner, one thread: every
-          # rule as bytecode with the absent locations' checks evaluated (before), then bit
-          # rules alone. The rows above and below are both changes together.
-          for profile in light heavy; do for engine in "bytecode check" "bits check"; do
+          bench() { target/release/examples/synth_room "$@" | tee -a bench-room.jsonl; }
+          for profile in light heavy; do for engine in "bits skip" "bytecode check" "bits check"; do
             read -r rules absent <<< "$engine"
-            for run in "carry exact" "forward exact" "forward level"; do
-              read -r path mode <<< "$run"
-              cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-                --profile "$profile" --path "$path" --mode "$mode" --workers 1 \
-                --rules "$rules" --absent "$absent" --players "$PLAYERS" --checks "$CHECKS" \
-                | tee -a bench-room.jsonl
-            done
+            bench --profile "$profile" --path carry --workers 1 --rules "$rules" --absent "$absent" \
+              --players 1,10 --checks "$CHECKS"
+            bench --profile "$profile" --path forward --workers 1 --rules "$rules" --absent "$absent" \
+              --players "$PLAYERS" --checks "$CHECKS"
           done; done
           # One region of deep rules (`Shape::wide`, 131 checks), carried, with and without bit rules.
           for rules in bits bytecode; do
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile wide --path carry --workers 1 --rules "$rules" --players 1,10 \
-              | tee -a bench-room.jsonl
+            bench --profile wide --path carry --workers 1 --rules "$rules" --players 1,10
           done
-          # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
-          # exact fill's rows above: with and without skipping the checks of empty locations.
-          for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path forward --workers 1 --mode "$mode" \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
-          done; done
+          if [ "$FULL" = on ]; then
+            # A room as the server generates it: every player on one world, prepared once and
+            # loaded from its stored form, on one thread, on the path a room of that size takes.
+            # First, so its peak RSS is not that of the per-player worlds below.
+            for profile in light heavy; do
+              bench \
+                --profile "$profile" --path auto --workers 1 --worlds one \
+                --players "$PLAYERS" --checks "$CHECKS" \
+                | tee -a bench-room.jsonl
+            done
+            for profile in light heavy; do for run in "forward 4"; do
+              read -r path workers <<< "$run"
+              bench \
+                --profile "$profile" --path "$path" --workers "$workers" \
+                --players "$PLAYERS" --checks "$CHECKS" \
+                | tee -a bench-room.jsonl
+            done; done
+            # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
+            # exact fill's rows above: with and without skipping the checks of empty locations.
+            for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
+              bench \
+                --profile "$profile" --path forward --workers 1 --mode "$mode" \
+                --players "$PLAYERS" --checks "$CHECKS" \
+                | tee -a bench-room.jsonl
+            done; done
+          fi
       # Skipping the checks of empty locations must not change a seed: every `noskip` row has to
       # carry the placements hash of its skipping row.
       - name: skipping changes no placement
+        if: env.FULL == 'on'
         run: |
           jq -s -e '
             [.[] | select(has("players") and .rules == "bits" and .absent == "skip" and .path == "forward" and .workers == 1)] as $rows
@@ -112,9 +121,19 @@ jobs:
                | select($v.placements_hash != $now.placements_hash or $v.rule_evals != $bits.rule_evals)
                | "\($v.profile) \($v.path) \($v.mode) \($v.players) \($v.rules) \($v.absent)"]
             | if length == 0 then true else error("variants differ: \(.)") end' bench-room.jsonl
+          # The carried path and the forward path place the same, at every size both ran.
+          jq -s -e '
+            [.[] | select(.players != null and .world == "each" and .mode == "exact" and .workers == 1)] as $rows
+            | [$rows[] | select(.path == "carry") as $c
+               | ($rows[] | select(.path == "forward" and .profile == $c.profile and .rules == $c.rules
+                                   and .absent == $c.absent and .players == $c.players)) as $f
+               | select($c.placements_hash != $f.placements_hash)
+               | "\($c.profile) \($c.players) \($c.rules) \($c.absent)"]
+            | if length == 0 then true else error("paths differ: \(.)") end' bench-room.jsonl
       # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
       # on the two small fixture worlds against uniform beatable placements.
       - name: quality
+        if: env.FULL == 'on'
         env:
           CHECKS: ${{ inputs.checks || '1000' }}
           MODES: exact level level,depth=100 level,depth=300 level,depth=-100 level,goal shuffle shuffle,depth=100 shuffle,depth=300 shuffle,depth=-100 shuffle,goal
@@ -131,6 +150,15 @@ jobs:
       - name: summary
         run: |
           {
+            echo "### Where the job's time went (measured: wall seconds on this runner)"
+            echo
+            echo "Compile of the bench example, release: $(cat build_s) s. Rows: $(jq -s '[.[] | select(.players != null) | .row_s] | add | round' bench-room.jsonl) s over $(jq -s '[.[] | select(.players != null)] | length' bench-room.jsonl) rows (a row draws and prepares its worlds, fills once for the heap figure and then \`fill reps\` times for the median)."
+            echo
+            echo "| profile | path | rules | absent checks | players | row s | fill ms (median) | fill reps |"
+            echo "|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null) | "| \(.profile) | \(.path) \(.mode) \(.workers) | \(.rules) | \(.absent) | \(.players) | \(.row_s) | \(.fill_ms) | \(.fill_reps) |"' bench-room.jsonl
+            if [ "$FULL" = on ]; then
+            echo
             echo "### One game per room, one thread: what is done once per world and what each seed pays (measured on a GitHub-hosted ubuntu-latest runner, release build)"
             echo
             echo "Every player plays one world, as the server generates a room. Prepare (compile to the stored ready form) is paid once per world and server build. Load (open the stored form) is paid by every generation while each runs in its own process. Per seed: setup (resolve the players), fill, assemble (the bundle, on the prepared tables), encode (check, hash, seed file, in the child) and open (the server opens the seed file on the world's package). v1 import is what the path before did in place of encode and open together (JSON text, parsed, encoded, the package deflated, opened). Peak RSS is the whole process's high-water mark when the row was printed, drawing the synthetic manifest and every smaller room included."
@@ -142,6 +170,7 @@ jobs:
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
               jq -r --arg p "$profile" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.open_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
             done
+            fi
             echo
             echo "### Rule evaluation before and after (same runner, same run, one thread, a world per player)"
             echo
@@ -174,6 +203,7 @@ jobs:
             echo "| rules | players | fill ms (median) | rule evals (counted) | as of a rank | answered by bit rules | fill ns per eval | eval-only ns (nothing / all held) | bytecode nodes per eval (nothing / all held) | removals | retractions per removal |"
             echo "|---|---|---|---|---|---|---|---|---|---|---|"
             jq -r 'select(.players != null and .profile == "wide") | "| \(.rules) | \(.players) | \(.fill_ms) | \(.rule_evals) | \(.rule_evals_ranked) | \(.rule_evals_bits) | \(.ns_per_eval) | \(.eval_only.nothing_held.ns_per_eval) / \(.eval_only.all_held.ns_per_eval) | \(.eval_only.nothing_held.nodes_per_eval) / \(.eval_only.all_held.nodes_per_eval) | \(.removals) | \(.retractions_per_removal.mean) |"' bench-room.jsonl
+            if [ "$FULL" = on ]; then
             echo
             echo "### Room fill scaling (same runner; a world per player)"
             echo
@@ -215,6 +245,7 @@ jobs:
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
               jq -r 'def r(n): if . == null then "n/a" else (. * n | round) / n end; .modes[] | "| \(.mode) | \(.failed) | \(.placed_by_the_mode) | \(.fell_back_seeds) | \(.untouched_share | r(1000)) | \(.swaps_per_seed | r(100)) | \(.repairs) | \(.fallback_attempts) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.location_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.progression_location_entropy_normalized | r(1000)) | \(.stuck_share_mean | r(1000)) | \(.stuck_share_worst_5_percent | r(1000)) | \(.against_exact.sphere_distribution_distance | r(1000)) | \(.against_exact.location_chi2_per_dof | r(100)) | \(.against_uniform.max_deviation.value | r(1000)) | \(.against_uniform.chi2 | r(1)) (\(.against_uniform.dof)) | \(.against_uniform.coverage_gaps | if . == null then "n/a" else length end) | \(.fill_ms_median | r(100)) | \(.fill_ms_worst_1_percent | r(100)) |"' "$q"
             done
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:

@@ -47,6 +47,10 @@
 //! `rules` is the first player's `Plan::rules_report` (rule sites per class and what the seed's
 //! fold leaves, all counted).
 //!
+//! `row_s` is the wall time the whole row took (drawing, preparing, every fill and replay), and
+//! `fill_reps` how many fills the median is over: `--reps`, or two once a fill takes over a
+//! second.
+//!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
 //! fallbacks, and the rule evaluations of the mode's own solves.
@@ -140,6 +144,7 @@ fn one(
     (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
     (bits, skip): (bool, bool),
 ) -> Result<Value, String> {
+    let row = Instant::now();
     let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
     let drawn: Vec<(Value, Instance)> = (0..count as u64)
@@ -171,7 +176,11 @@ fn one(
         let mut rng = SpecRng::from_u64(seed);
         fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
     };
+    let t = Instant::now();
     let (first, heap) = peak(fill);
+    // A fill of over a second is timed twice more, not `reps` times: its noise is small
+    // against it, and the job's time goes to these rows.
+    let reps = if ms(t) > 1e3 { reps.min(2) } else { reps };
     let (f, sp) = first.map_err(|e| format!("{players} players: {e:?}"))?;
     if !f.all_beatable() {
         return Err(format!("{players} players: not beatable: {:?}", f.beatable));
@@ -229,7 +238,7 @@ fn one(
     let replay = json!({"nothing_held": eval_only(&seats[0], &[]),
                         "all_held": eval_only(&seats[0], &pool)});
     let work = s.summary(1, u64::from(f.solves));
-    Ok(json!({
+    let mut out = json!({
         "players": players,
         "path": if path == Path::Carry { "carry" } else { "forward" },
         "workers": match path {
@@ -275,7 +284,10 @@ fn one(
         "peak_heap_bytes": heap,
         "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
-    }))
+    });
+    out["fill_reps"] = json!(reps);
+    out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+    Ok(out)
 }
 
 /// Least-squares slope of `ln y` over `ln x`: `y` grows about as `x` to this power.
