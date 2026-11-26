@@ -558,7 +558,12 @@ impl<'a, 'w> Linked<'a, 'w> {
     /// Take one assumed copy of `item` back from `owner`, across the room.
     fn take_back(&mut self, owner: u16, item: u16) -> bool {
         let o = usize::from(owner);
-        let Some(before) = self.models[o].start_removal(item) else { return false };
+        if !self.models[o].start_removal(item) {
+            return false;
+        }
+        // Retractions over the room: the cascade reaches other players' states.
+        let retracted = |m: &[Reach<'_>]| m.iter().map(|m| m.stats.retractions).sum::<u64>();
+        let before = retracted(&self.models);
         for q in self.touched_list.drain(..) {
             self.touched[q] = false;
         }
@@ -582,7 +587,8 @@ impl<'a, 'w> Linked<'a, 'w> {
                 self.suspect(q);
             }
         }
-        self.models[o].end_cascade(before);
+        let n = retracted(&self.models) - before;
+        self.models[o].end_cascade(n);
         self.rederiving = true;
         // Ascending by player: re-deriving hands out ranks.
         self.touched_list.sort_unstable();
@@ -943,7 +949,7 @@ mod tests {
     fn taking_items_back_across_players_matches_a_fresh_solve() {
         let t = Three::new();
         let seats = t.seats();
-        let (mut lit, mut crossed_back) = (false, false);
+        let (mut lit, mut crossed_back, mut spread, mut churned) = (false, false, false, false);
         for seed in 1u64..=100 {
             let mut r = rng(seed);
             let mut items: Vec<Given> = Vec::new();
@@ -977,7 +983,19 @@ mod tests {
             for g in items[cut..].iter().rev() {
                 let pos = held[usize::from(g.to)].iter().rposition(|i| *i == g.item).unwrap();
                 held[usize::from(g.to)].remove(pos);
+                let sum = |room: &Linked<'_, '_>, f: fn(&Stats) -> u64| -> u64 {
+                    room.models.iter().map(|m| f(&m.stats)).sum()
+                };
+                let (gone, back) = (sum(&room, |s| s.retractions), sum(&room, |s| s.churn));
                 room.take_back(g.to, g.item);
+                // One removal's counters cover every state it reached, not only the owner's.
+                let (gone, back) =
+                    (sum(&room, |s| s.retractions) - gone, sum(&room, |s| s.churn) - back);
+                let most = room.models.iter().map(|m| m.stats.max_retractions).max().unwrap();
+                assert!(most >= gone, "seed {seed}: max {most} below this removal's {gone}");
+                assert!(back <= gone, "seed {seed}: churn {back} above retractions {gone}");
+                spread |= room.models.iter().filter(|m| m.stats.retractions > 0).count() > 1;
+                churned |= back > 0 && back < gone;
                 let mut fresh = Linked::new(&seats);
                 fresh.solve(&held, &placed);
                 for (p, seat) in seats.iter().enumerate() {
@@ -996,5 +1014,6 @@ mod tests {
             }
         }
         assert!(lit && crossed_back, "counters and cross-world retractions were exercised");
+        assert!(spread && churned, "retractions in several states, and partial churn, were seen");
     }
 }

@@ -430,6 +430,9 @@ pub struct Stats {
     pub retractions: u64,
     /// The most facts one removal retracted.
     pub max_retractions: u64,
+    /// Retracted facts that hold again once the same removal re-derived (churn); the rest of
+    /// `retractions` are facts the removal lost for good.
+    pub churn: u64,
 }
 
 impl Stats {
@@ -449,6 +452,9 @@ impl Stats {
             "removals": self.removals,
             "retractions_per_removal": {"mean": per(self.retractions, self.removals),
                                         "max": self.max_retractions},
+            "churn": {"rederived": self.churn, "net_lost": self.retractions - self.churn,
+                      "share": (self.churn as f64 / self.retractions.max(1) as f64 * 1e3).round()
+                          / 1e3},
         })
     }
 
@@ -462,6 +468,7 @@ impl Stats {
         self.removals += o.removals;
         self.retractions += o.retractions;
         self.max_retractions = self.max_retractions.max(o.max_retractions);
+        self.churn += o.churn;
     }
 }
 
@@ -577,6 +584,8 @@ struct Tms {
     out_list: Vec<u32>,
     /// Regions that lost a slice.
     lost: Vec<u32>,
+    /// Growths retracted by this removal: region and the slices it lost.
+    lost_grows: Vec<(u32, u64)>,
     lost_flag: BitSet,
     /// Re-deriving after a removal: only retracted sites are evaluated.
     active: bool,
@@ -637,6 +646,7 @@ impl<'w> Reach<'w> {
                 out: BitSet::new(sites + halves),
                 out_list: Vec::new(),
                 lost: Vec::new(),
+                lost_grows: Vec::new(),
                 lost_flag: BitSet::new(n),
                 active: false,
             },
@@ -872,32 +882,33 @@ impl<'w> Reach<'w> {
     /// get new ranks); nothing that did not hold before is evaluated, since the new fixed point
     /// is inside the old one.
     pub fn remove(&mut self, item: u16) {
-        let Some(before) = self.start_removal(item) else { return };
+        let before = self.stats.retractions;
+        if !self.start_removal(item) {
+            return;
+        }
         self.cascade();
-        self.end_cascade(before);
+        self.end_cascade(self.stats.retractions - before);
         self.rederive();
     }
 
     /// The first half of [`Reach::remove`]: the copy goes and its readers are queued for a
-    /// support check. `None` when nothing can change (saturated); else the retraction count
-    /// to hand to [`Reach::end_cascade`].
-    pub(crate) fn start_removal(&mut self, item: u16) -> Option<u64> {
+    /// support check. `false` when nothing can change (saturated).
+    pub(crate) fn start_removal(&mut self, item: u16) -> bool {
         let i = usize::from(item);
         self.adjust[i] -= 1;
         self.count_change(item, -1);
         if self.adjust[i] >= self.plan.saturated_at(item) {
-            return None;
+            return false;
         }
         self.forget_defs();
         self.stats.removals += 1;
-        let before = self.stats.retractions;
         let w = self.w;
         self.suspect_readers(w.item_sites(i), 0, NONE);
-        Some(before)
+        true
     }
 
-    pub(crate) fn end_cascade(&mut self, before: u64) {
-        let n = self.stats.retractions - before;
+    /// A removal's cascade is over: it retracted `n` facts, over every state it reached.
+    pub(crate) fn end_cascade(&mut self, n: u64) {
         self.stats.max_retractions = self.stats.max_retractions.max(n);
     }
 
@@ -998,6 +1009,7 @@ impl<'w> Reach<'w> {
             return;
         }
         self.stats.retractions += 1;
+        self.tm.lost_grows.push((u32::try_from(r).unwrap_or(0), lost));
         if kept == 0 {
             self.grows[r].remove(i);
         } else {
@@ -1255,8 +1267,16 @@ impl<'w> Reach<'w> {
 
     pub(crate) fn end_rederive(&mut self) {
         self.tm.active = false;
+        // Churn: retracted facts that hold again now (each retraction pushed one entry).
+        let sc = self.w.site_count();
         for s in self.tm.out_list.drain(..) {
-            self.tm.out.remove(s as usize);
+            let s = s as usize;
+            self.tm.out.remove(s);
+            let back = if s < sc { self.fired[s] } else { self.half_rank[s - sc] };
+            self.stats.churn += u64::from(back != NONE);
+        }
+        for (r, lost) in self.tm.lost_grows.drain(..) {
+            self.stats.churn += u64::from(self.masks[r as usize] & lost == lost);
         }
         for r in self.tm.lost.drain(..) {
             self.tm.lost_flag.remove(r as usize);
@@ -1698,7 +1718,62 @@ mod tests {
         r.remove(item("boot"));
         // The waited slice of `a`, the copies of it `b` and `c` got, and the check reading it.
         assert_eq!(r.stats.retractions, 4, "{:?}", r.stats);
+        assert_eq!(r.stats.churn, 0, "nothing retracted holds again: {:?}", r.stats);
         assert!(r.reached(w.loc("lc").unwrap()));
         assert!(!r.reached(w.loc("late").unwrap()));
+    }
+
+    /// `a` opens with `key`, or with the `gem` lying in `b` (open from the start, but its gem is
+    /// found after `a` opened); `la` in `a` is free and `lk` needs `key`.
+    fn two_ways() -> (World, Instance) {
+        let t = json!({"true": {}});
+        let m = json!({
+            "options": [],
+            "items": [{"key": "key", "id": 1}, {"key": "gem", "id": 2}],
+            "locations": [{"key": "la", "id": 1}, {"key": "lk", "id": 2}, {"key": "lb", "id": 3}],
+            "start": "s",
+            "x.time": {"slices": 1, "start_mask": 1},
+            "defs": {},
+            "regions": [
+                {"key": "s", "can_stay": false, "checks": [], "events": [], "stays": [],
+                 "exits": [{"to": "a", "rule": {"any": [{"has": "key"}, {"has": "gem"}]}},
+                           {"to": "b", "rule": t}]},
+                {"key": "a", "can_stay": false, "events": [], "stays": [], "exits": [],
+                 "checks": [{"loc": "la", "rule": t}, {"loc": "lk", "rule": {"has": "key"}}]},
+                {"key": "b", "can_stay": false, "checks": [{"loc": "lb", "rule": t}],
+                 "events": [], "stays": [], "exits": []}
+            ],
+            "goal": {"true": {}}
+        });
+        let inst = Instance {
+            locations: ["la", "lk", "lb"].map(str::to_owned).to_vec(),
+            pool: ["key", "gem"].map(str::to_owned).to_vec(),
+            pool_class: ["key", "gem"]
+                .iter()
+                .map(|k| ((*k).to_owned(), "progression".to_owned()))
+                .collect(),
+            ..Instance::default()
+        };
+        (World::load(&m).unwrap(), inst)
+    }
+
+    #[test]
+    fn churn_counts_retracted_facts_that_the_same_removal_derives_again() {
+        let (w, inst) = two_ways();
+        let plan = Plan::new(&w, &inst).unwrap();
+        let item = |k: &str| w.item(k).unwrap();
+        let mut placed = vec![None; w.locations()];
+        placed[w.loc("lb").unwrap() as usize] = Some(item("gem"));
+        let mut r = plan.state(&w, &[item("key")], &placed);
+        r.stats = Stats::default();
+        r.remove(item("key"));
+        // The exit into `a` (derived with `key`, before the gem was found), `a`'s growth, `la`
+        // and `lk` go; the gem derives the exit, the growth and `la` again, `lk` stays lost.
+        assert_eq!(r.stats.retractions, 4, "{:?}", r.stats);
+        assert_eq!(r.stats.churn, 3, "{:?}", r.stats);
+        assert!(r.reached(w.loc("la").unwrap()));
+        assert!(!r.reached(w.loc("lk").unwrap()));
+        let s = r.stats.summary(1, 1);
+        assert_eq!(s["churn"], serde_json::json!({"rederived": 3, "net_lost": 1, "share": 0.75}));
     }
 }
