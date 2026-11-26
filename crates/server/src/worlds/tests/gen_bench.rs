@@ -16,6 +16,9 @@
 //! - `request_ms`: a whole request, from `create_world` to its status reading done (polled),
 //!   and `phase_ms`: that generation's own laps (its report's `ms`).
 //!
+//! Then the same room through the fill pool (runner `pool`, see [`by_pool`]), and one line of
+//! a worker's resident memory as its cache fills ([`memory`]).
+//!
 //! The store is the in-memory one and no HTTP is parsed. Only CI's numbers count (the `bench`
 //! workflow); a debug build runs a small room, to show the bench itself works.
 
@@ -26,6 +29,10 @@ use data_fill::prepared::Prepared;
 use data_fill::seed::{Player, encode_on, generate_on};
 use data_fill::synth::{Shape, world};
 use std::collections::BTreeMap;
+
+/// Shared with the pool's tests: worlds and requests made without a server.
+#[path = "../../../tests/support/fills.rs"]
+mod fills;
 
 const REPS: usize = if cfg!(debug_assertions) { 3 } else { 21 };
 const CHECKS: usize = if cfg!(debug_assertions) { 100 } else { 1000 };
@@ -108,10 +115,20 @@ async fn requests(w: &Arc<Worlds>, body: &Value) -> (f64, BTreeMap<String, f64>)
     (median(walls), laps.into_iter().map(|(k, v)| (k, median(v))).collect())
 }
 
-async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value {
-    let root = temp(&format!("gen-bench-{profile}-{players}"));
+/// A server with one synthetic world uploaded and `players` player files on it, and a
+/// generation's fill request for them as the server builds it.
+struct Room {
+    w: Arc<Worlds>,
+    /// The body of the request for a world of these players.
+    asks: Value,
+    prepared: PreparedWorld,
+    head: Vec<u8>,
+}
+
+async fn room(name: &str, shape: &Shape, players: usize, exe: &Path, pool: Option<Pool>) -> Room {
+    let root = temp(&format!("gen-bench-{name}-{players}"));
     let limits = Limits::DESIGN;
-    let w = hosting_on(&root, limits, JobRunner::Child(exe.to_owned())).await;
+    let w = hosting_on(&root, limits, JobRunner::Child(exe.to_owned()), pool).await;
     let (mut manifest, instance) = world(shape, 1, 0);
     manifest["game"] = json!("Synth");
     manifest["version"] = json!("1");
@@ -124,11 +141,15 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
         let meta = player_yaml(&w, &format!("P{p}"), "Synth", &instance).await;
         yamls.push(meta["id"].as_str().unwrap().to_owned());
     }
-
-    // The job's input as a generation builds it.
     let files = player_files(&w, &yamls).await.unwrap();
     let prepared = prepared_world(&w, &manifest_id).await.unwrap();
     let head = fill_head("bench", &files, (7, limits.bundle_max_bytes)).unwrap();
+    Room { w, asks: json!({"manifest": manifest_id, "yamls": yamls}), prepared, head }
+}
+
+/// Step by step through a job process of its own: the row of runner `child`, and the seed.
+async fn by_child(exe: &Path, profile: &str, shape: &Shape, players: usize) -> (Value, Vec<u8>) {
+    let Room { w, asks, prepared, head } = room(profile, shape, players, exe, None).await;
     let input = data_fill::job::frame(&head, &prepared).unwrap();
 
     let (start_ms, nothing) = job_timed(exe, "none", &[]).await;
@@ -146,18 +167,111 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
     let (encode_ms, encoded) = timed(|| encode_on(&loaded, &mut bundle, f.seed_max_bytes).unwrap());
     assert_eq!(encoded, seed, "the child's seed is the one the steps timed here make");
 
-    let (request_ms, phase_ms) =
-        requests(&w, &json!({"manifest": manifest_id, "yamls": yamls})).await;
+    let (request_ms, phase_ms) = requests(&w, &asks).await;
     let pipe_in_ms = fed_ms - start_ms;
     let rest_ms = job_ms - start_ms - pipe_in_ms - load_ms - fill_ms - encode_ms;
-    let fine = |ms: f64| (ms * 1e3).round() / 1e3;
-    json!({
+    let row = json!({
         "bench": "gen", "runner": "child", "profile": profile, "players": players,
         "checks": shape.checks, "reps": REPS, "prepared_bytes": prepared.len(),
         "request_bytes": head.len(), "seed_bytes": seed.len(),
         "start_ms": start_ms, "pipe_in_ms": fine(pipe_in_ms), "load_ms": load_ms,
         "fill_ms": fill_ms, "encode_ms": encode_ms, "job_ms": job_ms, "rest_ms": fine(rest_ms),
         "request_ms": request_ms, "phase_ms": phase_ms,
+    });
+    (row, seed)
+}
+
+fn fine(ms: f64) -> f64 {
+    (ms * 1e3).round() / 1e3
+}
+
+/// The resident memory of process `pid`, bytes (`VmRSS`).
+fn rss(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).unwrap();
+    kb.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap() * 1024
+}
+
+/// The same room through the pool: the row of runner `pool`. Its jobs: `cold_ms` on a pool
+/// that has no worker yet (a process start and the world's load), `miss_ms` on a worker that
+/// is up and does not hold the world, `warm_ms` on one that holds it. Its requests:
+/// `request_first_ms` is the server's first (one sample: worker start and load), `request_ms`
+/// the ones after. `rss_idle_bytes` is the worker's resident memory after those jobs, holding
+/// the one world. `seed` is what the job in a process of its own made: the pool must too.
+async fn by_pool(exe: &Path, profile: &str, shape: &Shape, players: usize, seed: &[u8]) -> Value {
+    let l = Limits::DESIGN;
+    let pool = || Pool::new(exe.to_owned(), l);
+    let name = format!("{profile}-pool");
+    let Room { w, asks, prepared, head } = room(&name, shape, players, exe, Some(pool())).await;
+    let (key, file) = (&prepared.key, &prepared.file);
+    assert_eq!(fills::alone(&head, file).unwrap(), seed);
+    // Another world, to have a worker up that does not hold this room's.
+    let (other_key, other_file, instance) = fills::prepared(&fills::small(), 2);
+    let other = fills::head(&["P0"], &instance, 1, data_fill::room::Algorithm::Exact);
+
+    let (mut cold, mut miss, mut warm) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..REPS {
+        let fresh = pool();
+        let t = Instant::now();
+        assert_eq!(fresh.fill(&head, key, file).await.unwrap(), seed);
+        cold.push(ms(t));
+        let up = pool();
+        up.fill(&other, &other_key, &other_file).await.unwrap();
+        let t = Instant::now();
+        assert_eq!(up.fill(&head, key, file).await.unwrap(), seed);
+        miss.push(ms(t));
+    }
+    let kept = pool();
+    kept.fill(&head, key, file).await.unwrap();
+    for _ in 0..REPS {
+        let t = Instant::now();
+        assert_eq!(kept.fill(&head, key, file).await.unwrap(), seed);
+        warm.push(ms(t));
+    }
+    let pids = kept.idle_pids();
+    assert_eq!(pids.len(), 1, "one worker took every warm job");
+
+    let (request_first_ms, _) = request(&w, &asks).await;
+    let (request_ms, phase_ms) = requests(&w, &asks).await;
+    json!({
+        "bench": "gen", "runner": "pool", "profile": profile, "players": players,
+        "checks": shape.checks, "reps": REPS, "cold_ms": median(cold), "miss_ms": median(miss),
+        "warm_ms": median(warm), "request_first_ms": fine(request_first_ms),
+        "request_ms": request_ms, "phase_ms": phase_ms, "rss_idle_bytes": rss(pids[0]),
+    })
+}
+
+/// A worker's resident memory as its cache fills: one worker (never replaced here, so this is
+/// the most a worker can come to hold) fills one player on world after world, each a different
+/// heavy world, until the files of the worlds it was sent pass `config::PREPARED_CACHE_BYTES`
+/// and the cache has begun to drop the oldest. A debug build stops after a few worlds.
+async fn memory(exe: &Path) -> Value {
+    let l = Limits { fill_worker_jobs: usize::MAX, ..Limits::DESIGN };
+    let pool = Pool::new(exe.to_owned(), l);
+    let shape = Shape { checks: CHECKS, ..Shape::heavy() };
+    let most = if cfg!(debug_assertions) { 3 } else { usize::MAX };
+    let full = config::PREPARED_CACHE_BYTES;
+    let (mut worlds, mut sent, mut file_bytes) = (0_usize, 0_usize, 0);
+    let (mut pid, mut rss_one_world) = (0, 0);
+    // A tenth past the cap, so the cache is full and has dropped worlds.
+    while sent <= full + full / 10 && worlds < most {
+        let (key, file, instance) = fills::prepared(&shape, 100 + worlds as u64);
+        let head = fills::head(&["P0"], &instance, 1, data_fill::room::Algorithm::Exact);
+        pool.fill(&head, &key, &file).await.unwrap();
+        let pids = pool.idle_pids();
+        if worlds == 0 {
+            (pid, rss_one_world) = (pids[0], rss(pids[0]));
+        }
+        assert_eq!(pids, [pid], "the same worker throughout");
+        worlds += 1;
+        sent += file.len();
+        file_bytes = file.len();
+    }
+    json!({
+        "bench": "gen-memory", "profile": "heavy", "checks": shape.checks, "worlds": worlds,
+        "bytes_per_prepared_file": file_bytes, "prepared_bytes_sent": sent,
+        "cache_cap_bytes": full, "cache_full": sent > full,
+        "rss_one_world_bytes": rss_one_world, "rss_full_cache_bytes": rss(pid),
     })
 }
 
@@ -168,7 +282,10 @@ async fn gen_bench_times_a_generation_part_by_part() {
     for (profile, shape) in shapes {
         let shape = Shape { checks: CHECKS, ..shape };
         for players in PLAYERS {
-            println!("{}", room(&exe, profile, &shape, players).await);
+            let (row, seed) = by_child(&exe, profile, &shape, players).await;
+            println!("{row}");
+            println!("{}", by_pool(&exe, profile, &shape, players, &seed).await);
         }
     }
+    println!("{}", memory(&exe).await);
 }

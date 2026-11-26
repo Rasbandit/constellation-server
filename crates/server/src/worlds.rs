@@ -2649,11 +2649,16 @@ mod tests {
     }
 
     async fn hosting_with(root: &Path, limits: Limits) -> Arc<Worlds> {
-        hosting_on(root, limits, JobRunner::InProcess).await
+        hosting_on(root, limits, JobRunner::InProcess, None).await
     }
 
-    /// [`hosting_with`], its data-only jobs run by `jobs`.
-    async fn hosting_on(root: &Path, limits: Limits, jobs: JobRunner) -> Arc<Worlds> {
+    /// [`hosting_with`], its data-only jobs run by `jobs` and its fills by `pool` when given.
+    async fn hosting_on(
+        root: &Path,
+        limits: Limits,
+        jobs: JobRunner,
+        pool: Option<Pool>,
+    ) -> Arc<Worlds> {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
@@ -2662,6 +2667,7 @@ mod tests {
         tokio::spawn(async move { host.supervise().await });
         let mut w = worlds(root, limits);
         w.jobs = jobs;
+        w.pool = pool;
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
         w.store = db.clone();

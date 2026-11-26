@@ -255,7 +255,17 @@ jobs:
             echo
             echo "| runner | profile | players | start ms | pipe in ms | load ms | fill ms | encode ms | rest ms | job ms | start plus load, share of job | request ms | laps: store | request | job | open | publish | prepared bytes | request bytes | seed bytes | reps |"
             echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-            jq -r '"| \(.runner) | \(.profile) | \(.players) | \(.start_ms) | \(.pipe_in_ms) | \(.load_ms) | \(.fill_ms) | \(.encode_ms) | \(.rest_ms) | \(.job_ms) | \(((.start_ms + .load_ms) / .job_ms * 1000 | round) / 10)% | \(.request_ms) | \(.phase_ms.store) | \(.phase_ms.request) | \(.phase_ms.job) | \(.phase_ms.open) | \(.phase_ms.publish) | \(.prepared_bytes) | \(.request_bytes) | \(.seed_bytes) | \(.reps) |"' gen-bench.jsonl
+            jq -r 'select(.runner == "child") | "| \(.runner) | \(.profile) | \(.players) | \(.start_ms) | \(.pipe_in_ms) | \(.load_ms) | \(.fill_ms) | \(.encode_ms) | \(.rest_ms) | \(.job_ms) | \(((.start_ms + .load_ms) / .job_ms * 1000 | round) / 10)% | \(.request_ms) | \(.phase_ms.store) | \(.phase_ms.request) | \(.phase_ms.job) | \(.phase_ms.open) | \(.phase_ms.publish) | \(.prepared_bytes) | \(.request_bytes) | \(.seed_bytes) | \(.reps) |"' gen-bench.jsonl
+            echo
+            echo "#### The same rooms through the fill pool (workers that stay up), beside the job in a process of its own"
+            echo
+            echo "Job, own process: the row above. Cold: a pool with no worker yet (a process start and the world's load). Miss: a worker that is up and does not hold the world. Warm: a worker that holds it. First request: the server's first (one sample, a worker start and a load in it). Idle worker RSS: the worker's resident memory after those jobs, holding the one world. Every pooled seed was compared with the own-process seed, byte for byte."
+            echo
+            echo "| profile | players | job ms, own process | pool cold | pool miss | pool warm | warm saves | request ms, own process | pool, first (n=1) | pool, after | request saves | idle worker RSS bytes | reps |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r -s '[.[] | select(.runner == "child")] as $own | .[] | select(.runner == "pool") as $p | ($own[] | select(.profile == $p.profile and .players == $p.players)) as $c | "| \($p.profile) | \($p.players) | \($c.job_ms) | \($p.cold_ms) | \($p.miss_ms) | \($p.warm_ms) | \((($c.job_ms - $p.warm_ms) / $c.job_ms * 1000 | round) / 10)% | \($c.request_ms) | \($p.request_first_ms) | \($p.request_ms) | \((($c.request_ms - $p.request_ms) / $c.request_ms * 1000 | round) / 10)% | \($p.rss_idle_bytes) | \($p.reps) |"' gen-bench.jsonl
+            echo
+            jq -r 'select(.bench == "gen-memory") | "Resident memory of a worker as its cache fills (one worker, never replaced, one player on a new \(.profile) world of \(.checks) checks per job): \(.rss_one_world_bytes) bytes holding one world, \(.rss_full_cache_bytes) bytes after \(.worlds) worlds (\(.prepared_bytes_sent) bytes of prepared files sent, \(.bytes_per_prepared_file) each, cap \(.cache_cap_bytes), cache full: \(.cache_full))."' gen-bench.jsonl
             echo
             echo "### Where the job's time went (measured: wall seconds on this runner)"
             echo
