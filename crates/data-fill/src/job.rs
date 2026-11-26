@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::seed::{Player, checked_name, generate as fill, manifest_game};
+use crate::seed::{Player, checked_name, generate_by as fill, manifest_game};
 use crate::world::World;
 
 /// A fill request: the manifest, who plays it, and the seed's name and random stream.
@@ -16,6 +16,9 @@ struct Request {
     players: Vec<Player>,
     rng_seed: u64,
     workers: usize,
+    /// How progression is placed; a request without it gets the exact fill.
+    #[serde(default)]
+    algorithm: crate::room::Algorithm,
 }
 
 /// Fill the room a request describes; the seed bundle as JSON text.
@@ -24,7 +27,7 @@ struct Request {
 /// A message for a request that does not parse, or for what [`crate::seed::generate`] refuses.
 pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
     let r: Request = serde_json::from_slice(input).map_err(|e| format!("bad fill request: {e}"))?;
-    let bundle = fill(&r.manifest, &r.seed_name, &r.players, r.rng_seed, r.workers)?;
+    let bundle = fill(&r.manifest, &r.seed_name, &r.players, r.rng_seed, r.workers, r.algorithm)?;
     serde_json::to_vec(&bundle).map_err(|e| e.to_string())
 }
 

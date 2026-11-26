@@ -262,7 +262,8 @@ impl Path {
 
 /// The dials of the opt-in fill modes. The defaults (`config::FILL_DEPTH_PERCENT`,
 /// `config::FILL_GOAL_ONLY`) are uniform picks and every progression item collectable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Dials {
     /// Where a progression item goes among the locations it may take, percent: 0 uniform,
     /// above 0 towards locations opened later, below 0 towards earlier ones.
@@ -278,8 +279,10 @@ impl Default for Dials {
 }
 
 /// How the progression items that have no placement group are placed. Confined items before
-/// them and everything else after them are placed the same way in every mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// them and everything else after them are placed the same way in every mode. In a fill
+/// request: `"exact"`, or `{"level": {}}` with any of the dials inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Algorithm {
     /// Assumed fill: every item is placed against a state that holds what is not yet placed.
     /// The default and the reference.

@@ -70,6 +70,22 @@ pub fn generate(
     rng_seed: u64,
     workers: usize,
 ) -> Result<SeedBundle, String> {
+    generate_by(manifest, seed_name, players, rng_seed, workers, room::Algorithm::Exact)
+}
+
+/// [`generate`] with the mode that places the progression items ([`room::Algorithm`]). The
+/// bundle has no field that names the mode: the same bundle shape whichever made it.
+///
+/// # Errors
+/// As [`generate`].
+pub fn generate_by(
+    manifest: &Value,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+    algorithm: room::Algorithm,
+) -> Result<SeedBundle, String> {
     let game = manifest_game(manifest)?;
     for (k, p) in players.iter().enumerate() {
         if p.name.trim().is_empty() {
@@ -82,11 +98,12 @@ pub fn generate(
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
     let room = room::Compiled::shared(World::load(manifest)?, &insts, workers)?;
     let (w, seats) = (room.world(0), room.seats());
-    let (filled, spheres) = room::fill_room_on(
+    let (filled, spheres) = room::fill_room_by(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
         config::FILL_MAX_ATTEMPTS,
         room::Path::of(seats.len(), workers),
+        algorithm,
     )
     .map_err(|e| format!("{e:?}"))?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {

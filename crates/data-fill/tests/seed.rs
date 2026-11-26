@@ -119,6 +119,20 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     let back: SeedBundle = serde_json::from_slice(&out).unwrap();
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
     assert!(data_fill::job::generate(b"{").unwrap_err().contains("bad fill request"));
+    // The mode is a field of the request: without it, and with "exact", the exact fill.
+    let mut asked = req.clone();
+    asked["algorithm"] = json!("exact");
+    assert_eq!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap(), out);
+    asked["algorithm"] = json!({"level": {"depth": 100}});
+    let level = data_fill::job::generate(asked.to_string().as_bytes()).unwrap();
+    let level: SeedBundle = serde_json::from_slice(&level).unwrap();
+    let dials = data_fill::room::Dials { depth: 100, ..Default::default() };
+    let mode = data_fill::room::Algorithm::Level(dials);
+    let same = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
+    assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
+    assert_eq!(level.slots.len(), direct.slots.len());
+    asked["algorithm"] = json!("fastest");
+    assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("bad"));
 
     let found = data_fill::job::inspect(m.to_string().as_bytes()).unwrap();
     let found: Value = serde_json::from_slice(&found).unwrap();
