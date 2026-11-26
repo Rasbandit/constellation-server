@@ -33,6 +33,13 @@
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
+//! `rule_evals` are counted by the solver, `rule_evals_ranked` the removals' support checks among
+//! them, and `ns_per_eval` is the fill's wall time over that count, so it carries the solver's
+//! bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
+//! every exit, event and check rule of the reached regions, timed over `REPLAYS` passes), with
+//! nothing held and with every progression item held, and the bytecode nodes and def bodies an
+//! evaluation reads (counted).
+//!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
 //! fallbacks, and the rule evaluations of the mode's own solves.
@@ -40,7 +47,7 @@
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
+use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Shape, world};
 use data_fill::{Instance, World};
@@ -95,6 +102,22 @@ fn median(
     }
     times.sort_by(f64::total_cmp);
     Ok((times[times.len() / 2], times))
+}
+
+/// Passes of [`data_fill::Reach::replay`] that `eval_only` times.
+const REPLAYS: u32 = 200;
+
+/// Evaluation alone on one seat's world holding `extra`: counted work, and ns per evaluation.
+fn eval_only(seat: &Seat<'_>, extra: &[u16]) -> Value {
+    let r = seat.plan.state(seat.w, extra, &[]);
+    let [evals, held, nodes, bodies] = r.replay();
+    let t = Instant::now();
+    let again: u64 = (0..REPLAYS).map(|_| std::hint::black_box(&r).replay()[1]).sum();
+    let ns = t.elapsed().as_secs_f64() * 1e9 / (f64::from(REPLAYS) * evals.max(1) as f64);
+    let per = |x: u64| (x as f64 / evals.max(1) as f64 * 100.0).round() / 100.0;
+    json!({"evals": evals, "held": held, "same_every_pass": again == held * u64::from(REPLAYS),
+           "ns_per_eval": (ns * 10.0).round() / 10.0,
+           "nodes_per_eval": per(nodes), "def_bodies_per_eval": per(bodies)})
 }
 
 /// To a hundredth of a millisecond.
@@ -186,6 +209,14 @@ fn one(
         .iter()
         .fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
     let s = &f.stats;
+    let pool: Vec<u16> = insts[0]
+        .pool
+        .iter()
+        .filter_map(|k| seats[0].w.item(k).ok())
+        .filter(|i| seats[0].progression[usize::from(*i)])
+        .collect();
+    let replay = json!({"nothing_held": eval_only(&seats[0], &[]),
+                        "all_held": eval_only(&seats[0], &pool)});
     let work = s.summary(1, u64::from(f.solves));
     Ok(json!({
         "players": players,
@@ -207,6 +238,8 @@ fn one(
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
         "rule_evals": s.evals,
+        "rule_evals_ranked": s.ranked,
+        "eval_only": replay,
         "ns_per_eval": (fill_ms * 1e6 / s.evals.max(1) as f64 * 10.0).round() / 10.0,
         "removals": s.removals,
         "retractions": s.retractions,

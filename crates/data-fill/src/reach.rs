@@ -109,6 +109,8 @@ struct DefMemo {
     stamp: Cell<u64>,
     /// Def bodies evaluated (memo misses), for the complexity tests.
     bodies: Cell<u64>,
+    /// Bytecode nodes read, for [`Reach::replay`].
+    nodes: Cell<u64>,
 }
 
 impl DefMemo {
@@ -143,6 +145,7 @@ impl<V: View> Env<'_, V> {
     /// The boolean node at `pc` against region mask `t`, and the offset after it.
     fn b(&self, pc: usize, t: u64) -> (bool, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (false, pc + 1) };
+        self.memo.nodes.set(self.memo.nodes.get() + 1);
         match n {
             Node::Const(v) => (v, at),
             Node::All(k, len) | Node::Any(k, len) => {
@@ -210,6 +213,7 @@ impl<V: View> Env<'_, V> {
     // Upgrade when the validator rejects manifests whose expressions can overflow.
     fn i(&self, pc: usize) -> (i64, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (0, pc + 1) };
+        self.memo.nodes.set(self.memo.nodes.get() + 1);
         match n {
             Node::Int(v) => (i64::from(v), at),
             Node::Count(i) => (self.count(i), at),
@@ -416,6 +420,8 @@ impl Sat<'_> {
 pub struct Stats {
     /// Rule evaluations (sites whose rule was run; stay and clock rules not counted).
     pub evals: u64,
+    /// Of `evals`: a removal's support checks, against the state as of a rank.
+    pub ranked: u64,
     /// Worklist pushes: regions queued plus sites queued.
     pub pushes: u64,
     /// Items collected during a run (each walks its dependency list once).
@@ -461,6 +467,7 @@ impl Stats {
     /// Add another run's counters.
     pub fn absorb(&mut self, o: &Stats) {
         self.evals += o.evals;
+        self.ranked += o.ranked;
         self.pushes += o.pushes;
         self.collected += o.collected;
         self.rechecks += o.rechecks;
@@ -1160,6 +1167,7 @@ impl<'w> Reach<'w> {
             let (r, _) = self.w.site_place(f);
             let t = self.mask_at(r, k);
             self.stats.evals += 1;
+            self.stats.ranked += 1;
             return t != 0 && self.eval_at(self.plan.folded.sites[f], t, k);
         }
         debug_assert!(f < hb, "a growth is checked by `check_grow`");
@@ -1440,6 +1448,23 @@ impl<'w> Reach<'w> {
     #[must_use]
     pub fn goal(&self) -> bool {
         self.env().eval(self.plan.folded.goal as usize, 0)
+    }
+
+    /// For measurements: evaluate the rule of every exit, event and check of every reached
+    /// region against the state as it is, changing nothing. Returns the rules evaluated, how
+    /// many hold, and the bytecode nodes and def bodies read for them (all counted).
+    #[must_use]
+    pub fn replay(&self) -> [u64; 4] {
+        let (w, memo) = (self.w, &self.def_memo);
+        let (nodes, bodies) = (memo.nodes.get(), memo.bodies.get());
+        let (mut evals, mut held) = (0, 0);
+        for (r, m) in self.masks.iter().enumerate().filter(|(_, m)| **m != 0) {
+            for s in [EXITS, EVENTS, CHECKS].into_iter().flat_map(|g| w.group(r, g)) {
+                evals += 1;
+                held += u64::from(self.env().eval(self.plan.folded.sites[s] as usize, *m));
+            }
+        }
+        [evals, held, memo.nodes.get() - nodes, memo.bodies.get() - bodies]
     }
 
     /// Reached regions with their masks.
@@ -1840,6 +1865,27 @@ mod tests {
         assert!(!r.reached(w.loc("la").unwrap()));
         let back = r.def_memo.bodies.get() - solve;
         assert!((1..=41 * 4).contains(&back), "take-back: {back} def bodies");
+    }
+
+    /// A forward solve checks nothing as of a rank, a removal does; and a replay of the fixed
+    /// point evaluates every exit, event and check of the reached regions, finding the ones
+    /// that are done.
+    #[test]
+    fn support_checks_and_a_replay_are_counted() {
+        let (w, inst) = cyclic();
+        let plan = Plan::new(&w, &inst).unwrap();
+        let item = |k: &str| w.item(k).unwrap();
+        let mut r = plan.state(&w, &[item("key"), item("boot")], &[]);
+        assert_eq!(r.stats.ranked, 0, "{:?}", r.stats);
+        // Every region is reached: 5 exits, 1 event and 4 checks, all holding.
+        let [evals, held, nodes, bodies] = r.replay();
+        assert_eq!((evals, held, bodies), (10, 10, 0));
+        assert!(nodes >= evals, "{nodes} nodes");
+        let before = r.stats;
+        r.remove(item("boot"));
+        assert!(r.stats.ranked > 0 && r.stats.ranked <= r.stats.evals - before.evals);
+        // Without the boot the late check does not hold.
+        assert_eq!(r.replay()[..2], [10, 9]);
     }
 
     #[test]
