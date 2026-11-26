@@ -555,15 +555,15 @@ mod tests {
         assert!(threaded, "one room has enough rule sites for a step to start threads");
     }
 
-    /// Level fill over both profiles, one player and rooms, with placement groups, excluded
+    /// Level fill and shuffle fill over both profiles, one player and rooms, with placement groups, excluded
     /// and locked locations, start items and clocks: every seed is held against the exact
     /// fill's (`assert_fast`), on the carried path and forward on one thread and on several,
     /// which must all place the same.
     #[test]
-    fn level_fill_is_beatable_reaches_what_the_exact_fill_does_and_ignores_the_worker_count() {
+    fn the_opt_in_modes_are_beatable_reach_what_the_exact_fill_does_and_ignore_the_worker_count() {
         use crate::room::{Algorithm, Dials, assert_fast};
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
-        let (mut fast, mut fell, mut all) = (0, 0, 0);
+        let (mut fast, mut fell, mut all, mut swaps) = (0, 0, 0, 0);
         for (shape, players, what) in [
             (small(false), 1, ""),
             (small(true), 1, "confined+excluded"),
@@ -576,9 +576,14 @@ mod tests {
         ] {
             let c = room_with(&shape, 17, players, |p, inst| change(what, p, inst)).unwrap();
             let seats = c.seats();
-            for seed in 1..=12 {
-                let dials = Dials { depth: [0, 100, -100][seed as usize % 3], goal_only: seed > 9 };
-                let mode = Algorithm::Level(dials);
+            for seed in 1..=24 {
+                let dials = Dials {
+                    depth: [0, 100, -100][seed as usize % 3],
+                    goal_only: seed % 12 > 9,
+                    skip_empty: seed % 4 < 2,
+                };
+                let mode =
+                    if seed > 12 { Algorithm::Shuffle(dials) } else { Algorithm::Level(dials) };
                 let Some(one) = assert_fast(&seats, seed, Path::Forward { workers: 1 }, mode)
                 else {
                     continue;
@@ -598,10 +603,14 @@ mod tests {
                 all += 1;
                 fast += u32::from(one.fast);
                 fell += one.fallbacks;
+                swaps += one.swaps;
             }
         }
-        println!("level fill placed {fast} of {all} rooms itself, {fell} fallbacks");
-        assert!(all > 80 && fast * 2 > all, "level fill placed {fast} of {all} rooms itself");
+        println!(
+            "the modes placed {fast} of {all} rooms themselves, {fell} fallbacks, {swaps} swaps"
+        );
+        assert!(all > 160 && fast * 2 > all, "the modes placed {fast} of {all} rooms themselves");
+        assert!(swaps > 0, "no shuffle needed a swap");
     }
 
     /// The point of the mode: far fewer rule evaluations than a solve per round, and the same

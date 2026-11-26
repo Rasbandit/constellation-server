@@ -328,6 +328,16 @@ pub const FILL_DEPTH_PERCENT: i32 = 0;
 /// need may then lie out of reach). A design value; the exact fill does not read it.
 pub const FILL_GOAL_ONLY: bool = false;
 
+/// Whether the opt-in fill modes leave the check of a location that holds no progression item
+/// unevaluated until it is needed (as a place to move an item to, for its level, or in one
+/// pass at the end): reaching such a location changes nothing. The result is the same either
+/// way; `false` is the reference the saving is measured against (a design value).
+pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
+
+/// Random reached-location draws a shuffle fill (`data_fill::room::Algorithm::Shuffle`) makes
+/// for one freed item before it checks every candidate in turn (a design value).
+pub const SHUFFLE_FILL_MAX_PROBES: u32 = 32;
+
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
 pub const FILL_MAX_WORKERS: usize = 64;
