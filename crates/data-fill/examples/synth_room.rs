@@ -27,7 +27,9 @@
 //! is left out: read it from a `--workers 1` run); without the feature, `null`.
 //! `peak_rss_bytes` is the whole process's resident high-water mark when the row is printed
 //! (`VmHWM` of `/proc/self/status`, Linux only): it never falls, so it covers setup and every
-//! smaller room before the row; `null` where the file is not there.
+//! smaller room before the row; `null` where the file is not there. The same mark is also read
+//! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
+//! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
@@ -146,6 +148,7 @@ fn one(
         Ok(())
     })?;
     // The seed of a room on one world, on the tables its world was prepared with.
+    let rss_after_fill = peak_rss();
     let mut seed_row = json!({});
     if let (true, Some(on)) = (one_world, loaded.first()) {
         let named: Vec<Player> = (0..players)
@@ -156,6 +159,7 @@ fn one(
         let seed_file = encode_on(on, &mut bundle, SEED_MAX_BYTES)?;
         let (assemble_ms, _) = median(reps, || assemble().map(drop))?;
         let (encode_ms, _) = median(reps, || encode_on(on, &mut bundle, SEED_MAX_BYTES).map(drop))?;
+        let rss_after_encode = peak_rss();
         let (validate_ms, _) = median(reps, || bundle.validate().map_err(|e| e.to_string()))?;
         let (hash_whole_ms, _) = median(reps, || bundle.hash().map(drop))?;
         let (import_v1_ms, _) = median(reps, || {
@@ -168,7 +172,8 @@ fn one(
         })?;
         seed_row = json!({"assemble_ms": fine(assemble_ms), "encode_ms": fine(encode_ms),
                           "validate_ms": fine(validate_ms), "hash_whole_ms": fine(hash_whole_ms),
-                          "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len()});
+                          "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len(),
+                          "peak_rss_after_encode_bytes": rss_after_encode});
     }
     let (crossed, all) = cross_world_share(&seats, &f.placed)
         .map_err(|e| format!("{e:?}"))?
@@ -213,6 +218,7 @@ fn one(
         "fallbacks": f.fallbacks,
         "mode_rule_evals": f.mode_evals,
         "peak_heap_bytes": heap,
+        "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
     }))
 }

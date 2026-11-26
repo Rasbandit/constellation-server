@@ -91,9 +91,9 @@ jobs:
               echo
               echo "#### Profile: $profile"
               echo
-              echo "| players | path | prepare ms | load ms | setup ms | fill ms (median) | assemble ms | encode ms | of it: check ms | hash with the names written again ms (not paid) | v1 import ms (before) | prepared file bytes | loaded bytes | seed bytes | peak heap bytes (fill) | peak RSS bytes |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.loaded_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
+              echo "| players | path | prepare ms | load ms | setup ms | fill ms (median) | assemble ms | encode ms | of it: check ms | hash with the names written again ms (not paid) | v1 import ms (before) | prepared file bytes | loaded bytes | seed bytes | peak heap bytes (fill) | peak RSS bytes after the fill | after the encode | at the end (with the comparison import) |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" 'select(has("players") and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.loaded_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
             done
             echo
             echo "### Room fill scaling (same runner; a world per player)"
