@@ -264,6 +264,21 @@ impl Plan {
         Ok(plan)
     }
 
+    /// The same plan with every rule left as bytecode: what the bit rules are tested and
+    /// measured against. Every solve of it gives what a solve of `self` gives.
+    #[must_use]
+    pub fn interpreted(mut self) -> Self {
+        self.folded.bits = crate::fold::Bits::default();
+        self
+    }
+
+    /// Rule sites per class of [`crate::fold::CLASSES`] (counted), and the bytes this seed's bit
+    /// rules take (counted from their lists' lengths).
+    #[must_use]
+    pub fn bit_rules(&self) -> ([u32; 5], usize) {
+        (self.folded.bits.classes, self.folded.bits.bytes())
+    }
+
     /// Copies of `item` that exist this seed.
     pub(crate) fn copies(&self, item: usize) -> usize {
         self.copies.get(item).map_or(0, |n| usize::try_from(*n).unwrap_or(0))

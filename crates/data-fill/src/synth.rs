@@ -521,6 +521,58 @@ mod tests {
         }
     }
 
+    /// A plan's bit rules answer what its bytecode does: fills with them, and with every rule
+    /// left as bytecode (`Plan::interpreted`), agree in everything they decide and in every work
+    /// counter but the one that says who answered. Both profiles, clocks on and off, start
+    /// items, locked, excluded and confined locations; one player and rooms; both paths and the
+    /// level mode.
+    #[test]
+    fn bit_rules_decide_what_the_bytecode_does() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut bits, mut evals) = (0, 0);
+        for (shape, what) in [
+            (small(false), ""),
+            (small(true), "confined+excluded+locked+start"),
+            (heavy, ""),
+            (heavy, "confined+locked+start"),
+        ] {
+            for players in [1u64, 3, 9] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                let plain = Compiled {
+                    plans: c.plans.iter().cloned().map(crate::Plan::interpreted).collect(),
+                    worlds: c.worlds.clone(),
+                    progression: c.progression.clone(),
+                };
+                for seed in 1..=2 {
+                    let at = format!("{shape:?}, {what:?}, {players} players, seed {seed}");
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        let (a, sa, solves) = outcome(&c, seed, path);
+                        let (b, sb, plainly) = outcome(&plain, seed, path);
+                        assert_eq!(sb.bits, 0, "{at}: bytecode only");
+                        assert_eq!(
+                            (a, crate::Stats { bits: 0, ..sa }, solves),
+                            (b, sb, plainly),
+                            "{at}, {path:?}"
+                        );
+                        bits += sa.bits;
+                        evals += sa.evals;
+                    }
+                    let level = |c: &Compiled| {
+                        let (path, mode) =
+                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.0.stats.evals, x.1))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    assert_eq!(level(&c), level(&plain), "{at}, level fill");
+                }
+            }
+        }
+        assert!(bits * 2 > evals, "bit rules answered {bits} of {evals} evaluations");
+    }
+
     /// The forward path's states run on several threads: the placements, the spheres and every
     /// work counter are the same with one worker and with many (the steps are the same ones;
     /// only who runs a state differs). The last room is large enough for threads to start.

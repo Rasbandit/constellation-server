@@ -21,6 +21,7 @@ pub mod synth;
 pub mod world;
 
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};
+pub use fold::CLASSES as RULE_CLASSES;
 pub use reach::{Reach, Stats};
 pub use room::{Given, RoomFilled, Seat, fill_room, fill_room_spheres};
 pub use world::World;

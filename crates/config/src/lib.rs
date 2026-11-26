@@ -285,6 +285,12 @@ pub struct Limits {
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
 pub const RULES_MAX_DEPTH: u32 = 256;
 
+/// Most terms a rule may take as a bit rule (`data_fill`'s fold: an OR of terms, each a set of
+/// atom bits that must all be set). Turning AND over OR into that form multiplies terms, so a
+/// rule that would need more, at any step of the way, stays bytecode (a design value: the real
+/// test world's rules are counted in the PR that added this).
+pub const RULE_BITS_MAX_TERMS: usize = 16;
+
 /// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
 /// the next draws of the seed's random stream; a design value).
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
