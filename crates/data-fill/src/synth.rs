@@ -569,6 +569,59 @@ mod tests {
         }
     }
 
+    /// A confined progression item never lands on an excluded location of its group (#203):
+    /// `p0` is confined to a group of 24 locations, every other one of them excluded. Over
+    /// many seeds, alone and in a room, on every path. And a group that could hold its item's
+    /// copies only by using excluded locations is refused when the instance is resolved, by
+    /// name, instead of being filled onto them or tried twenty times.
+    #[test]
+    fn a_confined_progression_item_never_takes_an_excluded_location() {
+        let shape = small(false);
+        let grouped = |inst: &mut Instance, most: usize| {
+            confine(inst, 5, 2);
+            inst.excluded = (0..inst.locations.len())
+                .filter(|l| l % 5 < 2)
+                .enumerate()
+                .filter(|(k, _)| k % 2 == 0 || *k >= most)
+                .map(|(_, l)| format!("l{l}"))
+                .collect();
+        };
+        let (mut fills, mut copies) = (0, 0);
+        let mut on_excluded = |c: &Compiled, placed: &[Vec<Option<Given>>], what: &str| {
+            for (p, row) in placed.iter().enumerate() {
+                let (w, plan) = (&c.worlds[p], &c.plans[p]);
+                let p0 = w.item("p0").unwrap();
+                for (l, g) in row.iter().enumerate() {
+                    if g.is_some_and(|g| g.item == p0 && usize::from(g.to) == p) {
+                        copies += 1;
+                        assert!(!plan.excluded[l], "{what}: p0 on excluded l{l} of player {p}");
+                    }
+                }
+            }
+            fills += 1;
+        };
+        for seed in 1..=30 {
+            let one = room_with(&shape, 23, 1, |_, inst| grouped(inst, 24)).unwrap();
+            let mut rng = SpecRng::from_u64(seed);
+            if let Ok(f) = crate::fill(&one.worlds[0], &one.plans[0], &mut rng, 20) {
+                let placed: Vec<Option<Given>> =
+                    f.placed.iter().map(|i| i.map(|item| Given { to: 0, item })).collect();
+                on_excluded(&one, &[placed], &format!("alone, seed {seed}"));
+            }
+            let room = room_with(&shape, 23, 3, |_, inst| grouped(inst, 24)).unwrap();
+            for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Split] {
+                let mut rng = SpecRng::from_u64(seed);
+                if let Ok((f, _)) = fill_room_on(&room.seats(), &mut rng, 20, path) {
+                    on_excluded(&room, &f.placed, &format!("{path:?}, seed {seed}"));
+                }
+            }
+        }
+        assert!(fills >= 100 && copies > 500, "{fills} fills, {copies} copies of p0 seen");
+        // Only two of the group's 24 locations take progression: fewer than p0's copies.
+        let e = room_with(&shape, 23, 1, |_, inst| grouped(inst, 4)).unwrap_err();
+        assert!(e.contains("p0") && e.contains("excluded"), "{e}");
+    }
+
     /// The same pin with the rooms forced onto the split path.
     #[test]
     fn the_pinned_placements_are_the_same_on_the_split_path() {

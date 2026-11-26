@@ -1652,7 +1652,9 @@ impl Steps<'_, '_> {
         for item in group {
             let models = &self.room.models;
             let free = locs.take_first(|(p, l)| {
-                models[usize::from(p)].reached(l) && confined_ok(seats, *item, p, l)
+                // Every item placed here is progression: `permits` keeps it off excluded
+                // locations, confined or not.
+                models[usize::from(p)].reached(l) && permits(seats, *item, p, l)
             });
             let Some((p, l)) = free else {
                 let w = seats[usize::from(item.to)].w;
@@ -1797,8 +1799,8 @@ fn groups(pool: Vec<Given>, per_player: bool) -> Vec<Vec<Given>> {
     }
 }
 
-/// The placement group rule alone (progression on excluded locations is handled by the
-/// phases' location lists).
+/// The placement group rule alone; [`permits`] adds that progression takes no excluded
+/// location, which is what a round is placed by.
 fn confined_ok(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
     let owner = &seats[usize::from(g.to)];
     !owner.plan.confined(g.item) || (player == g.to && owner.plan.allowed(g.item, loc))
@@ -1838,11 +1840,7 @@ pub(crate) fn assert_fast(
             let here = seats[usize::from(p)].plan.included.contains(&l);
             assert_eq!(g.is_some(), here, "{what}: location {l} of player {p}");
             if let Some(g) = g {
-                // Confined items are placed before either mode, the same for the same draws
-                // (the exact fill lets one sit on an excluded location of its group, see #203).
-                let shared = exact.placed[usize::from(p)][l as usize] == Some(*g)
-                    && seats[usize::from(g.to)].plan.confined(g.item);
-                assert!(shared || permits(seats, *g, p, l), "{what}: {g:?} at {l} of player {p}");
+                assert!(permits(seats, *g, p, l), "{what}: {g:?} at {l} of player {p}");
                 let stranded = progression(g) && sp.unreachable.contains(&(p, l));
                 assert!(!stranded || dials.goal_only, "{what}: {g:?} out of reach");
             }

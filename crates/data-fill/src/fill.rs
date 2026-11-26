@@ -229,6 +229,31 @@ impl Plan {
         for (k, g) in by_key(&inst.location_groups) {
             loc_group[loc(k)? as usize] = Some(gid(g));
         }
+        // A confined progression item takes only the locations of its group that are not
+        // excluded (`permits`). A group that has room for its copies only with the excluded
+        // ones counted can never be filled: say so here, by name. (A group too small either
+        // way is left to the fill, which reports it stuck.)
+        let mut confined: Vec<u16> =
+            progression.iter().copied().filter(|i| item_group[usize::from(*i)].is_some()).collect();
+        confined.sort_unstable();
+        for kind in confined.chunk_by(|a, b| a == b) {
+            let group = item_group[usize::from(kind[0])];
+            let open = |l: &&u32| {
+                loc_group[**l as usize] == group
+                    && locked.binary_search_by_key(*l, |x| x.0).is_err()
+            };
+            let all = included.iter().filter(open).count();
+            let free = included.iter().filter(open).filter(|l| !excluded[**l as usize]).count();
+            if free < kind.len() && all >= kind.len() {
+                return Err(e(format!(
+                    "item {:?}: {} progression copies are confined to a group with {free} \
+                     locations that take progression ({} more are excluded)",
+                    w.item_key(kind[0]),
+                    kind.len(),
+                    all - free
+                )));
+            }
+        }
         let mut held = vec![0i64; w.items()];
         start.iter().for_each(|(i, n)| held[usize::from(*i)] += n);
         let folded = fold(w, &opts, &rolls, &held);
@@ -697,7 +722,8 @@ impl Steps<'_> {
                 self.stats.absorb(&self.r.stats);
             }
             let (r, plan) = (&self.r, self.plan);
-            let Some(l) = locs.take_first(|l| r.reached(l) && plan.allowed(item, l)) else {
+            // Every item placed here is progression: none takes an excluded location.
+            let Some(l) = locs.take_first(|l| r.reached(l) && plan.permits(item, l, true)) else {
                 return Err(FillError::Stuck {
                     item: self.w.item_key(item).to_owned(),
                     attempts: 1,
