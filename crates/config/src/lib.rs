@@ -228,15 +228,24 @@ pub struct Limits {
     /// Wall-clock limit of one fill child process, after which it is killed (design value).
     pub fill_timeout_ms: u64,
     /// Fill worker processes that stay up and take one fill job after another
-    /// (`server::pool`); 0 runs each fill in a process of its own, as before the pool. One
-    /// worker is one core ([`GENERATION_WORKERS`] thread per fill), and never more are busy
-    /// than `gen_concurrency`, so more than that would only sit idle (design value;
-    /// `CONSTELLATION_FILL_POOL_WORKERS`). Each worker runs under the same caps as a fill
-    /// child process, and a job past `fill_timeout_ms` ends its worker.
+    /// (`server::pool`). 0, the default, is no pool: each fill runs in a process of its own.
+    /// With a pool, a fill needs a worker, so there must be one for every generation that may
+    /// run at once: the valid settings are 0, or `gen_concurrency` and up
+    /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
+    /// one core ([`GENERATION_WORKERS`] thread per fill). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// Each worker runs under the same caps as a fill child process, and a job past
+    /// `fill_timeout_ms` ends its worker.
     pub fill_pool_workers: usize,
-    /// Fill jobs a pooled worker takes before it is replaced by a fresh process, which bounds
-    /// what memory its fills leave fragmented (design value, not measured).
+    /// Fill jobs a pooled worker takes before it is replaced by a fresh process (design
+    /// value, not measured).
     pub fill_worker_jobs: usize,
+    /// Most memory the loaded worlds one pooled worker keeps between jobs may hold
+    /// ([`PREPARED_CACHE_BYTES`]).
+    pub fill_worker_cache_bytes: usize,
+    /// A pooled worker whose address space after a job is over this share of
+    /// `fill_memory_bytes`, in percent, is replaced by a fresh process: what earlier fills
+    /// left allocated must leave the next job at least the rest of the cap (design value).
+    pub fill_worker_recycle_percent: u64,
     /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
     pub gen_concurrency: usize,
     /// Most generations queued or running at once; a new one past it is refused as busy
@@ -333,19 +342,15 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
 
 /// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
-/// (`server::pool`), the least recently used going first. A loaded world is counted as its
-/// prepared file's length times [`PREPARED_HELD_PER_FILE_BYTE`], an estimate; the `bench` CI
-/// job measures a worker's resident memory with the cache full. The worker's address-space cap
-/// (`fill_memory_bytes`) is the hard bound either way (design value, from issue 200).
+/// (`server::pool`; the design value of `Limits::fill_worker_cache_bytes`), the least recently
+/// used going first. A kept world counts what it holds (`data_fill::prepared::Prepared::
+/// held_bytes`, checked against a counting allocator in CI). From issue 200.
 pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Bytes a loaded prepared world holds in memory per byte of its file, rounded: what
-/// [`PREPARED_CACHE_BYTES`] counts a kept world by. Estimated from one measurement (bench run
-/// 45907973588, a release build on a CI runner): a worker's resident memory grew by 278 MB
-/// while it came to keep about 468 heavy synthetic worlds of 1,000 checks, 71,687 file bytes
-/// each, which is 8.3 per file byte, memory its fills left unused included. The counts taken
-/// before the pool (issue 200: 0.23 MB and 0.46 MB a world) are 8.4 and 6.4 per file byte.
-pub const PREPARED_HELD_PER_FILE_BYTE: usize = 8;
+/// CPU time kept in hand when a pooled fill worker is judged fit for one more job: its
+/// process CPU cap (`fill_cpu_secs`) must cover what its jobs so far may have used, one more
+/// whole job, and this much for its start and what it does between jobs (design value).
+pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. A room's fill runs on one thread on
@@ -517,8 +522,10 @@ impl Limits {
         fill_cpu_secs: 120,
         fill_max_processes: 8192,
         fill_timeout_ms: 60_000,
-        fill_pool_workers: 1,
+        fill_pool_workers: 0,
         fill_worker_jobs: 256,
+        fill_worker_cache_bytes: PREPARED_CACHE_BYTES,
+        fill_worker_recycle_percent: 50,
         gen_concurrency: 1,
         gen_queue_max: 64,
         admin_write_burst: 30,
@@ -572,6 +579,15 @@ impl Limits {
         }
         if self.fill_worker_jobs == 0 {
             return Err("fill_worker_jobs must be at least 1");
+        }
+        // Generation treats a gen_concurrency of 0 as 1.
+        let generations = if self.gen_concurrency == 0 { 1 } else { self.gen_concurrency };
+        if self.fill_pool_workers != 0 && self.fill_pool_workers < generations {
+            return Err("fill_pool_workers must be 0 (no pool) or at least gen_concurrency: \
+                 with fewer, generations that could fill side by side would wait for a worker");
+        }
+        if self.fill_worker_recycle_percent == 0 || self.fill_worker_recycle_percent > 100 {
+            return Err("fill_worker_recycle_percent must be 1 to 100");
         }
         if self.password_hash_parallel == 0 {
             return Err("password_hash_parallel must be at least 1");
@@ -1129,18 +1145,33 @@ mod tests {
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
     }
 
-    /// The fill worker pool: on by default with one worker (one core, as one generation runs
-    /// at a time), each recycled after a fixed number of jobs, holding loaded worlds under the
-    /// cap issue 200 names. Zero workers is the one-process-per-job path.
+    /// The fill worker pool is off unless asked for (zero workers: each fill in a process of
+    /// its own). Asked for, it must have a worker for every generation that may run at once,
+    /// or fills that ran side by side would wait in line for a worker.
     #[test]
-    fn the_fill_pool_is_one_worker_recycled_after_a_fixed_number_of_jobs() {
+    fn the_fill_pool_is_off_by_default_and_never_smaller_than_gen_concurrency() {
         let l = Limits::DESIGN;
-        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (1, 256));
-        assert_eq!(l.fill_pool_workers, l.gen_concurrency, "never more workers than busy jobs");
-        assert_eq!((PREPARED_CACHE_BYTES, PREPARED_HELD_PER_FILE_BYTE), (32 << 20, 8));
-        assert!(Limits { fill_pool_workers: 0, ..l }.check().is_ok(), "zero turns the pool off");
+        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (0, 256));
+        assert_eq!((PREPARED_CACHE_BYTES, l.fill_worker_cache_bytes), (32 << 20, 32 << 20));
+        assert_eq!((l.fill_worker_recycle_percent, FILL_WORKER_CPU_MARGIN_MS), (50, 1000));
+        assert!(l.check().is_ok(), "off");
+        // On: 1 worker for 1 generation at a time, 4 or 6 for 4; never 1, 2 or 3 for 4.
+        let with = |fill_pool_workers, gen_concurrency| {
+            Limits { fill_pool_workers, gen_concurrency, ..l }.check()
+        };
+        for (workers, generations) in [(1, 1), (1, 0), (4, 4), (6, 4), (0, 4)] {
+            assert!(with(workers, generations).is_ok(), "{workers} for {generations}");
+        }
+        for (workers, generations) in [(1, 4), (3, 4), (1, 2)] {
+            let e = with(workers, generations).unwrap_err();
+            assert!(e.contains("fill_pool_workers"), "{workers} for {generations}: {e}");
+        }
         let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
         assert!(e.contains("fill_worker_jobs"), "{e}");
+        for percent in [0, 101] {
+            let e = Limits { fill_worker_recycle_percent: percent, ..l }.check().unwrap_err();
+            assert!(e.contains("fill_worker_recycle_percent"), "{e}");
+        }
     }
 
     #[test]
