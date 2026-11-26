@@ -243,6 +243,7 @@ pub struct RoomFilled {
 
 /// The fresh solves of a fill's rounds (a round solves every player's world, then places one
 /// item per player against what is reached), counted, and where the wall time went, measured.
+/// Kept only with feature `memory-harness` and in this crate's tests; all zero otherwise.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Rounds {
     /// Worlds solved, over all rounds.
@@ -756,6 +757,11 @@ fn fill_by(
     Err(FillError::Stuck { item: last.unwrap_or_default(), attempts: max_attempts })
 }
 
+/// A duration as nanoseconds, for the round profile.
+fn nanos(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Every player's state, linked.
 struct Linked<'a, 'w> {
     seats: &'a [Seat<'w>],
@@ -843,7 +849,7 @@ impl<'a, 'w> Linked<'a, 'w> {
         awake: Option<&dyn Fn(usize, u32) -> bool>,
     ) {
         let seats = self.seats;
-        let start = std::time::Instant::now();
+        let start = crate::COUNTED.then(std::time::Instant::now);
         let held = |g: &Given| awake.is_none() || is_progression(seats, *g);
         // Rank 1 is the first fact of the first state: the room's sequence starts over.
         self.seq = 1;
@@ -871,11 +877,12 @@ impl<'a, 'w> Linked<'a, 'w> {
         self.fresh = true;
         // Every state starts over, so the ranks are the room's again unless supersteps follow.
         self.ranked = true;
-        let set_up = start.elapsed();
+        let set_up = start.map(|t| t.elapsed());
         self.settle();
-        let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        self.nanos[0] += nanos(set_up);
-        self.nanos[1] += nanos(start.elapsed() - set_up);
+        if let (Some(start), Some(set_up)) = (start, set_up) {
+            self.nanos[0] += nanos(set_up);
+            self.nanos[1] += nanos(start.elapsed() - set_up);
+        }
     }
 
     /// Level fill's solve. The room is solved with nothing of `order` held (`none`: no extra
@@ -1117,8 +1124,10 @@ impl<'a, 'w> Linked<'a, 'w> {
     /// Take back everything added to the room since `marks` ([`Reach::undo_to`]); the room's
     /// ranks go on from where they stood then.
     fn undo(&mut self, (marks, seq): &(Vec<Mark>, u32)) {
-        let held: usize = self.models.iter().map(|m| m.mark().steps()).sum();
-        self.journal_peak = self.journal_peak.max(held);
+        if crate::COUNTED {
+            let held: usize = self.models.iter().map(|m| m.mark().steps()).sum();
+            self.journal_peak = self.journal_peak.max(held);
+        }
         for (m, mark) in self.models.iter_mut().zip(marks) {
             self.undone += m.undo_to(*mark) as u64;
         }
@@ -1615,9 +1624,10 @@ impl Steps<'_, '_> {
     }
 
     /// Count the worlds of a round's state, and those that reached another set of locations
-    /// than in the round before ([`Rounds`]).
+    /// than in the round before ([`Rounds`]); only where `crate::COUNTED`.
     fn note_reached(&mut self) {
-        for (m, last) in self.room.models.iter().zip(&mut self.last) {
+        let models = self.room.models.iter().zip(&mut self.last);
+        for (m, last) in models.filter(|_| crate::COUNTED) {
             self.profile.solved += 1;
             if last.as_slice() != m.reached_words() {
                 self.profile.changed += 1;
@@ -1638,7 +1648,7 @@ impl Steps<'_, '_> {
     ) -> Result<(), FillError> {
         let seats = self.room.seats;
         prev.clear();
-        let picking = std::time::Instant::now();
+        let picking = crate::COUNTED.then(std::time::Instant::now);
         for item in group {
             let models = &self.room.models;
             let free = locs.take_first(|(p, l)| {
@@ -1654,7 +1664,7 @@ impl Steps<'_, '_> {
             placed[usize::from(p)][l as usize] = Some(*item);
             prev.push(((p, l), *item));
         }
-        self.profile.nanos[2] += u64::try_from(picking.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.profile.nanos[2] += picking.map_or(0, |t| nanos(t.elapsed()));
         Ok(())
     }
 
@@ -1683,7 +1693,7 @@ impl Steps<'_, '_> {
         self.held.iter_mut().for_each(Vec::clear);
         self.room.solve(&self.held, placed);
         self.solves += 1;
-        let start = std::time::Instant::now();
+        let start = crate::COUNTED.then(std::time::Instant::now);
         let picked = self.profile.nanos[2];
         self.room.models.iter_mut().for_each(Reach::keep_journal);
         let mut put = vec![Vec::new(); groups.len()];
@@ -1693,8 +1703,8 @@ impl Steps<'_, '_> {
         self.profile.journaled = self.profile.journaled.max(self.room.journal_peak);
         *prev = put.pop().unwrap_or_default();
         // What the rounds took beyond the one solve, less the picking: adding and undoing.
-        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.room.nanos[1] += nanos.saturating_sub(self.profile.nanos[2] - picked);
+        let took = start.map_or(0, |t| nanos(t.elapsed()));
+        self.room.nanos[1] += took.saturating_sub(self.profile.nanos[2] - picked);
         done
     }
 
