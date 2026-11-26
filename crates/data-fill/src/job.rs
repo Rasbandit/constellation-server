@@ -111,12 +111,28 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
 /// As [`fill`].
 pub fn fill_reported(input: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
     let (head, file) = unframe(input)?;
-    let f: Fill<Player> =
-        serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
+    let f = request(head)?;
     let world = Prepared::open(file).map_err(|e| format!("{UNLOADABLE}{e}"))?;
+    filled(&world, &f)
+}
+
+/// [`fill_reported`] on a world already loaded, for a worker that stays up and keeps its
+/// worlds between jobs: `head` is the request ([`Fill`] as JSON). The world is only read.
+///
+/// # Errors
+/// As [`fill`], less what loading the world can refuse.
+pub fn fill_on(world: &Prepared, head: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
+    filled(world, &request(head)?)
+}
+
+fn request(head: &[u8]) -> Result<Fill<Player>, String> {
+    serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))
+}
+
+fn filled(world: &Prepared, f: &Fill<Player>) -> Result<(Vec<u8>, FillReport), String> {
     let (mut bundle, report) =
-        generate_on(&world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    Ok((encode_on(&world, &mut bundle, f.seed_max_bytes)?, report))
+        generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
+    Ok((encode_on(world, &mut bundle, f.seed_max_bytes)?, report))
 }
 
 /// A manifest's game and version, checked.

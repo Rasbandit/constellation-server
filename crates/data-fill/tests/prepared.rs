@@ -109,6 +109,34 @@ fn the_prepared_path_stores_the_bytes_the_manifest_path_does() {
     assert_eq!(hex(&key_of(&all)), PINNED);
 }
 
+/// A worker that stays up fills on a world it loaded before (`job::fill_on`): every seed of
+/// [`rooms`] filled on one loaded world, again and again, is the seed a job that loads the file
+/// itself makes, so the pin holds for it too. Fails if a fill left anything in the loaded world.
+#[test]
+fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
+    let mut all = Vec::new();
+    for n in [1, 10] {
+        let (m, p) = room(n);
+        let (_, file) = prepared(&m);
+        let loaded = Prepared::open(&file).unwrap();
+        let on = |rng| {
+            let head = serde_json::to_vec(&asked(&p, rng, 1, Algorithm::Exact)).unwrap();
+            job::fill_on(&loaded, &head).unwrap()
+        };
+        for rng in 1..=20 {
+            let (seed, report) = on(rng);
+            let alone = job::fill_reported(&request(&file, &p, rng, 1)).unwrap();
+            assert_eq!((&seed, format!("{report:?}")), (&alone.0, format!("{:?}", alone.1)));
+            all.extend(seed);
+            all.extend(prepared::seed_game(&file).unwrap());
+        }
+        // An earlier seed again, after nineteen others on the same loaded world.
+        assert_eq!(on(1).0, job::fill(&request(&file, &p, 1, 1)).unwrap());
+        assert!(job::fill_on(&loaded, b"{").unwrap_err().contains("bad fill request"));
+    }
+    assert_eq!(hex(&key_of(&all)), PINNED);
+}
+
 #[test]
 fn preparing_checks_a_manifest_and_the_file_opens_as_its_world() {
     let (m, p) = room(1);
