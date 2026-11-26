@@ -87,7 +87,15 @@ pub(crate) struct Worlds {
     generator: Option<String>,
     /// The catalogue's version checks running in this process.
     catalogue_checks: crate::checks::Checks,
+    /// Tests generate a world here instead of in the sandbox: what `ap_gen.py generate` would
+    /// print for the world folder.
+    #[cfg(test)]
+    fake_generation: Option<FakeGeneration>,
 }
+
+/// A test's stand-in for a legacy generation: what the sidecar prints for a world folder.
+#[cfg(test)]
+type FakeGeneration = Arc<dyn Fn(&Path) -> Vec<u8> + Send + Sync>;
 
 /// `status.engine` of a world the data-fill engine generates (a legacy world has none).
 const ENGINE_DATA_ONLY: &str = "data-only";
@@ -275,6 +283,8 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         proxy_header: None,
         generator,
         catalogue_checks: crate::checks::Checks::new(&limits),
+        #[cfg(test)]
+        fake_generation: None,
     })
 }
 
@@ -1169,6 +1179,43 @@ async fn chosen(
     Ok(metas)
 }
 
+/// The catalogue games in `body.games` (by name): each one's newest version that is live and
+/// was checked with the server's generator, as the upload record of its `.apworld` and what
+/// the world's status records (`{game, version, apworld}`). A game that has none is a 400.
+async fn chosen_games(
+    w: &Worlds,
+    body: &Value,
+) -> Result<(Vec<Value>, Vec<Value>), (StatusCode, String)> {
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let Some(names) = body.get("games") else { return Ok((Vec::new(), Vec::new())) };
+    let names = names.as_array().ok_or_else(|| bad("games must be a list".to_owned()))?;
+    let (mut metas, mut used) = (Vec::with_capacity(names.len()), Vec::with_capacity(names.len()));
+    for raw in names {
+        let name = raw.as_str().ok_or_else(|| bad(format!("games: bad name {raw}")))?;
+        let game = w.store.game_get(name).await.map_err(store_error)?;
+        let game = game.ok_or_else(|| bad(format!("games: no game {name:?}")))?;
+        if used.iter().any(|u: &Value| u["game"] == game.name.as_str()) {
+            return Err(bad(format!("games: {:?} is listed twice", game.name)));
+        }
+        // Without the server's generator version no version can be its match.
+        let live = match w.generator() {
+            Some(generator) => {
+                w.store.version_latest_live(&game.name, generator).await.map_err(store_error)?
+            }
+            None => None,
+        };
+        let v = live.ok_or_else(|| {
+            bad(format!("games: {:?} has no version that passed its checks", game.name))
+        })?;
+        let id = hex(&v.apworld);
+        let meta = w.upload_meta(Kind::Apworld, &id).await.map_err(internal)?;
+        let meta = meta.ok_or_else(|| internal(format!("catalogue upload {id} is missing")))?;
+        metas.push(meta);
+        used.push(json!({"game": game.name, "version": v.version, "apworld": id}));
+    }
+    Ok((metas, used))
+}
+
 /// Lay out a world folder: the chosen files, written from the store (apworlds named by
 /// module, as the generator loads them).
 async fn prepare(
@@ -1203,7 +1250,19 @@ async fn create_world(State(w): State<Arc<Worlds>>, who: Identity, body: Bytes) 
     if req.get("manifest").is_some() {
         return create_data_only_world(&w, &req, Some(who.subject.as_str()), slot).await;
     }
-    let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).await?;
+    let (games, used) = chosen_games(&w, &req).await?;
+    // A world of catalogue games only needs no uploaded ones.
+    let mut apworlds = if req.get("apworlds").is_none() && !games.is_empty() {
+        Vec::new()
+    } else {
+        chosen(&w, &req, "apworlds", Kind::Apworld).await?
+    };
+    for g in games {
+        if apworlds.iter().any(|m| m["id"] == g["id"]) {
+            return Err(bad(format!("apworlds: {} is also a chosen game's", g["id"])));
+        }
+        apworlds.push(g);
+    }
     let yamls = chosen(&w, &req, "yamls", Kind::Yaml).await?;
     if yamls.is_empty() {
         return Err(bad("choose at least one yaml".to_owned()));
@@ -1222,6 +1281,10 @@ async fn create_world(State(w): State<Arc<Worlds>>, who: Identity, body: Bytes) 
     }
     let mut status =
         json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
+    // The versions it uses: the room keeps them whatever happens to them later.
+    if !used.is_empty() {
+        status["games"] = Value::Array(used);
+    }
     with_owner(&mut status, Some(who.subject.as_str()));
     queue(&w, status, slot).await
 }
@@ -1278,8 +1341,10 @@ async fn create_data_only_world(
     slot: JobSlot,
 ) -> Reply {
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
-    if req.get("apworlds").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
-        return Err(bad("a manifest world takes no legacy world files".to_owned()));
+    if req.get("apworlds").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
+        || req.get("games").is_some()
+    {
+        return Err(bad("a manifest world takes no legacy world files or games".to_owned()));
     }
     let manifest_id = req["manifest"].as_str().filter(|i| valid_id(i));
     let manifest_id = manifest_id.ok_or_else(|| bad("manifest: bad id".to_owned()))?;
@@ -1399,6 +1464,10 @@ async fn generate_sandboxed(w: &Worlds, world: &Path) -> Result<(Loaded, Value),
     ];
     let args = ["generate", "--ap", AP, "--apworlds", &custom, "--yamls", &yamls, "--out", &out];
     let timeout = Duration::from_millis(w.limits.gen_timeout_ms);
+    #[cfg(test)]
+    if let Some(fake) = &w.fake_generation {
+        return publish(w, fake(world)).await;
+    }
     // The job folder (its copies of the inputs) goes when the job ends ([`generate`]).
     match w.sandbox.run(true, &mounts, &args, timeout).await {
         Ok(stdout) => publish(w, stdout).await,
@@ -2546,6 +2615,10 @@ mod tests {
     }
 
     async fn hosting_with(root: &Path, limits: Limits) -> Arc<Worlds> {
+        Arc::new(hosting_parts(root, limits).await)
+    }
+
+    async fn hosting_parts(root: &Path, limits: Limits) -> Worlds {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
@@ -2558,7 +2631,7 @@ mod tests {
         w.store = db.clone();
         w.accounts = Some(Arc::new(PasswordAuth::new(db.clone(), limits, None)));
         w.manifests = Manifests::new(db, &limits);
-        Arc::new(w)
+        w
     }
 
     /// A world `who` asked for, generated by the engine and hosted as a listed room; its id.
@@ -3136,6 +3209,132 @@ mod tests {
             }
         });
         (fake, ran)
+    }
+
+    /// A hosting router whose catalogue checks run [`fake_sandbox`] and whose legacy
+    /// generations print the two-slot fixture seed, with generator `gen-1`; ann is signed up
+    /// and owns the game `ww`, with versions 1 and 2 live. The `.apworld`s each generation was
+    /// handed are in the list.
+    async fn catalogue_host(
+        name: &str,
+    ) -> (Arc<Worlds>, Router, String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let limits = Limits { signup_burst: 10, catalogue_check_seeds: 1, ..Limits::DESIGN };
+        let mut w = hosting_parts(&temp(name), limits).await;
+        w.generator = Some("gen-1".to_owned());
+        w.catalogue_checks.fake = Some(fake_sandbox().0);
+        let handed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&handed);
+        let seed = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json"),
+        )
+        .unwrap();
+        w.fake_generation = Some(Arc::new(move |world: &Path| {
+            seen.lock().unwrap().push(std::fs::read(world.join("apworlds/ww.apworld")).unwrap());
+            format!(r#"{{"report":{{"slots":2}},"bundle":{seed}}}"#).into_bytes()
+        }));
+        let w = Arc::new(w);
+        let app = routes(Arc::clone(&w));
+        let ann = signed_up(&app, "ann").await;
+        let r = call(&app, "POST", "/api/games", &ann, r#"{"name":"ww"}"#).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        for v in ["1", "2"] {
+            let body = format!("world version {v}");
+            let meta = json!({"name": "ww.apworld", "module": "ww"});
+            let up = stored(&w, Kind::Apworld, body.as_bytes(), meta).await;
+            let req = json!({"version": v, "apworld": up["id"]}).to_string();
+            let r = call(&app, "POST", "/api/games/ww/versions", &ann, &req).await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+            assert_eq!(checked(&w, v).await.state, log::VersionState::Live);
+        }
+        (w, app, ann, handed)
+    }
+
+    /// A world made from a catalogue game uses its newest live version and records it; its
+    /// room keeps running after that version is withdrawn, while the next world gets the one
+    /// before, and a game with no live version left is refused.
+    #[tokio::test]
+    async fn a_room_made_from_a_catalogue_game_keeps_its_version() {
+        let (w, app, ann, handed) = catalogue_host("catalogue-room").await;
+        let yaml = stored(&w, Kind::Yaml, b"name: Alice", json!({"name": "a.yaml"})).await;
+        let req = json!({"games": ["WW"], "yamls": [yaml["id"]]}).to_string();
+        let r = call(&app, "POST", "/api/worlds", &ann, &req).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let id = json_of(r).await["id"].as_str().unwrap().to_owned();
+        let mut status = Value::Null;
+        for _ in 0..500 {
+            status = read_status(&w, &id).await.unwrap();
+            if status["status"] == "done" && hosted(&w, &status).is_some() {
+                break;
+            }
+            assert!(status["status"] != "failed", "{status}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(hosted(&w, &status).is_some(), "{status}");
+        let two = content_id(b"world version 2");
+        assert_eq!(status["games"], json!([{"game": "ww", "version": "2", "apworld": two}]));
+        assert_eq!(*handed.lock().unwrap(), [b"world version 2".to_vec()]);
+
+        let r = call(&app, "POST", "/api/games/ww/versions/2/withdraw", &ann, "").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let after = read_status(&w, &id).await.unwrap();
+        assert_eq!(after, status, "the world keeps the version it was made with");
+        assert!(hosted(&w, &after).is_some(), "its room keeps running");
+        let (_, used) = chosen_games(&w, &json!({"games": ["ww"]})).await.unwrap();
+        assert_eq!(used[0]["version"], "1", "a new world gets the one before");
+
+        let r = call(&app, "POST", "/api/games/ww/versions/1/withdraw", &ann, "").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let e = chosen_games(&w, &json!({"games": ["ww"]})).await.unwrap_err();
+        assert_eq!(
+            e,
+            (StatusCode::BAD_REQUEST, "games: \"ww\" has no version that passed its checks".into())
+        );
+    }
+
+    /// The games a world names are refused when one is unknown, listed twice, not a list,
+    /// the same file as a chosen upload, or asked of a manifest world; a server that cannot tell
+    /// its generator version has no live version of any game.
+    #[tokio::test]
+    async fn bad_catalogue_game_choices_are_refused() {
+        let (w, app, ann, handed) = catalogue_host("catalogue-bad").await;
+        let yaml = stored(&w, Kind::Yaml, b"name: Alice", json!({"name": "a.yaml"})).await;
+        let two = content_id(b"world version 2");
+        for (games, apworlds, want) in [
+            (json!(["nope"]), None, "games: no game \"nope\""),
+            (json!(["ww", "WW"]), None, "games: \"ww\" is listed twice"),
+            (json!("ww"), None, "games must be a list"),
+            (json!([1]), None, "games: bad name 1"),
+            (json!(["ww"]), Some(json!([two])), "is also a chosen game's"),
+        ] {
+            let mut req = json!({"games": games, "yamls": [yaml["id"]]});
+            if let Some(a) = apworlds {
+                req["apworlds"] = a;
+            }
+            let r = call(&app, "POST", "/api/worlds", &ann, &req.to_string()).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{req}");
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(want), "{req}: {body}");
+        }
+        let req = json!({"manifest": "x", "games": ["ww"], "yamls": [yaml["id"]]}).to_string();
+        let r = call(&app, "POST", "/api/worlds", &ann, &req).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(handed.lock().unwrap().is_empty(), "nothing was generated");
+
+        let (w, _app, _ann) = checking_with("catalogue-no-gen", 1, fake_sandbox().0, None).await;
+        let up = stored(&w, Kind::Apworld, b"w", json!({"name": "ww.apworld", "module": "ww"}));
+        let new = log::NewVersion {
+            game: "ww".to_owned(),
+            version: "1".to_owned(),
+            note: String::new(),
+            apworld: manifests::key_of(up.await["id"].as_str().unwrap()).unwrap(),
+            generator: String::new(),
+        };
+        assert_eq!(w.store.version_add(&new).await.unwrap(), log::VersionAdded::Added);
+        let live = log::VersionState::Live;
+        assert!(w.store.version_set("ww", "1", live, "gen-1", None).await.unwrap());
+        let e = chosen_games(&w, &json!({"games": ["ww"]})).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST, "no generator, so no version matches");
     }
 
     /// A version that passes every check goes live, checked with the server's generator and

@@ -284,8 +284,7 @@ impl Db {
         on!(self, s => s.version_scan_set(game, version, scan).await)
     }
 
-    /// What a new room of `game` uses (making a room from a game is #190).
-    #[cfg(test)]
+    /// What a new room of `game` uses.
     pub(crate) async fn version_latest_live(
         &self,
         game: &str,
