@@ -811,6 +811,41 @@ impl<'w> Reach<'w> {
         })
     }
 
+    /// Whether one more copy of `item` would make a rule on the frontier hold right now: one of
+    /// the rules [`Reach::wants`] names, evaluated with the copy counted. Call on a fixed
+    /// point; nothing is changed but the work counter.
+    pub(crate) fn opens(&mut self, item: u16) -> bool {
+        let w = self.w;
+        let sc = w.site_count();
+        // A def found true is cached as true for good (rules are monotone): what the extra
+        // copy makes true must not stay behind.
+        let reads = w.def_reads_item(usize::from(item));
+        let defs: Vec<u32> = self.def_cache.iter().filter(|_| reads).map(Cell::get).collect();
+        self.count_change(item, 1);
+        let mut evals = 0;
+        let hit = w.item_sites(usize::from(item)).iter().any(|s| {
+            let s = *s as usize;
+            if s >= sc {
+                return (0..self.half_rank.len()).any(|h| {
+                    self.half_rank[h] == NONE
+                        && self.env().eval(self.plan.folded.halves[h] as usize, 0)
+                });
+            }
+            let (r, g) = w.site_place(s);
+            let l = w.site_target(s) as usize;
+            let counts = g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
+            if !counts || g == STAYS || self.masks[r] == 0 || self.done.contains(s) {
+                return false;
+            }
+            evals += 1;
+            self.env().eval(self.plan.folded.sites[s] as usize, self.masks[r])
+        });
+        self.count_change(item, -1);
+        self.def_cache.iter().zip(defs).for_each(|(c, was)| c.set(was));
+        self.stats.evals += evals;
+        hit
+    }
+
     /// Set what a location holds; it is collected when the location is reached. A location
     /// holds one item: holding the same again changes nothing.
     pub fn hold(&mut self, loc: u32, item: u16) {

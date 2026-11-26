@@ -136,11 +136,7 @@ fn collect(
         for (p, l) in &new {
             taken[usize::from(*p)][*l as usize] = true;
             if let Some(g) = at(*p, *l)
-                && seats[usize::from(g.to)]
-                    .progression
-                    .get(usize::from(g.item))
-                    .copied()
-                    .unwrap_or(false)
+                && crate::room::is_progression(seats, g)
             {
                 models[usize::from(g.to)].add(g.item, 1);
             }

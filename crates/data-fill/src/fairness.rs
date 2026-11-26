@@ -469,7 +469,7 @@ pub fn sample_room_by(
         let s = crate::spheres::room_spheres(seats, &placed)?;
         let stranded = s.unreachable.iter().any(|(p, l)| {
             placed[usize::from(*p)][*l as usize]
-                .is_some_and(|g| seats[usize::from(g.to)].progression[usize::from(g.item)])
+                .is_some_and(|g| crate::room::is_progression(seats, g))
         });
         if s.all_beatable() && !stranded {
             out.accepted += 1;

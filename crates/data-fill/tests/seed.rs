@@ -131,6 +131,9 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     let same = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
     assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
     assert_eq!(level.slots.len(), direct.slots.len());
+    // The depth dial is bounded where the request comes in.
+    asked["algorithm"] = json!({"shuffle": {"depth": i32::MAX}});
+    assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("depth"));
     asked["algorithm"] = json!("fastest");
     assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("bad"));
 

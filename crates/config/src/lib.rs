@@ -323,6 +323,11 @@ pub const LEVEL_FILL_MAX_REPAIRS: u32 = 8;
 /// exact fill does not read it.
 pub const FILL_DEPTH_PERCENT: i32 = 0;
 
+/// The furthest the depth dial goes, either way (percent: at most ten further draws for every
+/// pick). A fill request carries the dial, so it is refused beyond this instead of being
+/// allowed to buy unbounded work (a design value).
+pub const FILL_DEPTH_MAX_PERCENT: i32 = 1000;
+
 /// Accessibility dial of the opt-in fill modes: `false` asks that every progression item can
 /// be collected, `true` only that every player's goal can be reached (items the goal does not
 /// need may then lie out of reach). A design value; the exact fill does not read it.
