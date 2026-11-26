@@ -8,8 +8,9 @@
 //!
 //! `setup_ms` draws, compiles and resolves every player's world. `fill_ms` is the median of
 //! `reps` fills of the same seed (the work is identical, so the spread is timing noise only).
-//! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated
-//! (`allocation-counter`); without it, `null`.
+//! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
+//! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
+//! is left out: read it from a `--workers 1` run); without the feature, `null`.
 
 use std::time::Instant;
 
@@ -51,9 +52,9 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    path: Option<Path>,
+    (path, workers): (Option<Path>, usize),
 ) -> Result<Value, String> {
-    let path = path.unwrap_or(Path::of(players, config::ROOM_FORWARD_WORKERS));
+    let path = path.unwrap_or(Path::of(players, workers));
     let t = Instant::now();
     let c: Compiled = room(shape, seed, players, config::FILL_SETUP_WORKERS)?;
     let setup_ms = ms(t);
@@ -143,12 +144,12 @@ fn main() -> Result<(), String> {
         },
         ..d
     };
-    let workers = config::ROOM_FORWARD_WORKERS;
+    let workers: usize = arg(&args, "--workers", config::ROOM_FORWARD_WORKERS)?;
     let path_arg = arg(&args, "--path", "auto".to_owned())?;
     let path = match path_arg.as_str() {
         "auto" => None,
         "carry" => Some(Path::Carry),
-        "forward" => Some(Path::Forward { workers: arg(&args, "--workers", workers)? }),
+        "forward" => Some(Path::Forward { workers }),
         x => return Err(format!("--path: auto, carry or forward, got {x}")),
     };
     let seed: u64 = arg(&args, "--seed", 1)?;
@@ -159,7 +160,7 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, path)?;
+        let mut row = one(&shape, seed, n, reps, (path, workers))?;
         row["profile"] = json!(profile);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
@@ -167,7 +168,8 @@ fn main() -> Result<(), String> {
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "path": path_arg, "fitted_exponent": fitted, "points": points})
+        json!({"profile": profile, "path": path_arg, "workers": workers,
+               "fitted_exponent": fitted, "points": points})
     );
     Ok(())
 }
