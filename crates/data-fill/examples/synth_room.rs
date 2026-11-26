@@ -19,7 +19,9 @@
 //! then is a seed assembled: `assemble_ms` builds the bundle on the prepared tables
 //! ([`data_fill::seed::assemble_on`]), `encode_ms` checks, hashes and encodes it as the seed
 //! file ([`data_fill::seed::encode_on`]), and `import_v1_ms` is what the path before did in
-//! its place (the bundle as JSON text, then `seed_bundle::import_v1`); medians of `reps`.
+//! its place (the bundle as JSON text, then `seed_bundle::import_v1`); medians of `reps`. Two
+//! parts of the encode are also timed alone: `validate_ms` (the check), and `hash_whole_ms`,
+//! the hash with the game's names and ids written again, which the encode does not pay.
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
 //! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
 //! is left out: read it from a `--workers 1` run); without the feature, `null`.
@@ -150,10 +152,12 @@ fn one(
             .map(|p| Player { name: format!("P{p}"), instance: drawn[0].1.clone() })
             .collect();
         let assemble = || assemble_on(on, "bench", &named, &seats, &f.placed, &sp);
-        let bundle = assemble()?;
-        let seed_file = encode_on(on, &bundle, SEED_MAX_BYTES)?;
+        let mut bundle = assemble()?;
+        let seed_file = encode_on(on, &mut bundle, SEED_MAX_BYTES)?;
         let (assemble_ms, _) = median(reps, || assemble().map(drop))?;
-        let (encode_ms, _) = median(reps, || encode_on(on, &bundle, SEED_MAX_BYTES).map(drop))?;
+        let (encode_ms, _) = median(reps, || encode_on(on, &mut bundle, SEED_MAX_BYTES).map(drop))?;
+        let (validate_ms, _) = median(reps, || bundle.validate().map_err(|e| e.to_string()))?;
+        let (hash_whole_ms, _) = median(reps, || bundle.hash().map(drop))?;
         let (import_v1_ms, _) = median(reps, || {
             let text = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
             let (old, _) = seed_bundle::import_v1(&text, SEED_MAX_BYTES)?;
@@ -163,6 +167,7 @@ fn one(
             Ok(())
         })?;
         seed_row = json!({"assemble_ms": fine(assemble_ms), "encode_ms": fine(encode_ms),
+                          "validate_ms": fine(validate_ms), "hash_whole_ms": fine(hash_whole_ms),
                           "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len()});
     }
     let (crossed, all) = cross_world_share(&seats, &f.placed)

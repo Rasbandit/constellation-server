@@ -324,6 +324,15 @@ fn sorted(names: &BTreeMap<String, i64>) -> (Box<[i64]>, Box<[Box<str>]>) {
     (v.iter().map(|p| p.0).collect(), v.iter().map(|p| p.1.into()).collect())
 }
 
+/// The canonical JSON of the game's data inside package `content` ([`GamePackage::content`]
+/// of game `name`): the bytes between its two keys, so they need not be written again. `None`
+/// when `content` is not laid out that way.
+#[must_use]
+pub fn data_json<'a>(content: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let tail = format!(",\"game\":{}}}", serde_json::Value::from(name));
+    content.strip_prefix(b"{\"data\":")?.strip_suffix(tail.as_bytes())
+}
+
 impl GamePackage {
     /// The content of the package for game `name`.
     #[must_use]

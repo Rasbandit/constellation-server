@@ -105,8 +105,9 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
 /// As [`fill`], less what loading the world refuses.
 pub fn fill_on(world: &Prepared, head: &[u8]) -> Result<Vec<u8>, String> {
     let f: Fill = serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
-    let bundle = generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
-    encode_on(world, &bundle, f.seed_max_bytes)
+    let mut bundle =
+        generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
+    encode_on(world, &mut bundle, f.seed_max_bytes)
 }
 
 /// A manifest's game and version, checked.

@@ -4,9 +4,10 @@
 //!
 //! The file is the compiled package ([`crate::section::compile`]: the rules section and the
 //! key tables) with one more section, `SECTION_SEED_GAME`: the game's package file as every
-//! seed of this world names it (the names and ids clients are sent, with their checksum).
+//! seed of this world names it (the names and ids clients are sent, with their checksum). Its
+//! content is also what a seed's hash reads of the game, so that is not written per seed.
 
-use seed_bundle::package::{self, SECTION_SEED_GAME};
+use seed_bundle::package::{self, SECTION_GAME, SECTION_SEED_GAME};
 use seed_bundle::{GameData, GamePackage};
 use serde_json::Value;
 
@@ -31,6 +32,9 @@ pub struct Prepared {
     data: GameData,
     /// The game's package as a seed file is encoded on it (ids to indexes), under its key.
     table: GamePackage,
+    /// The canonical JSON of a seed bundle's `games` (this one game's `data`), as its hash
+    /// reads it.
+    games_json: Vec<u8>,
 }
 
 /// The game's package file in a prepared world's `file`: what a seed of that world names by
@@ -64,10 +68,17 @@ impl Prepared {
     pub fn open(file: &[u8]) -> Result<Self, String> {
         let world = World::from_package(file)?;
         let seed_game = seed_game(file)?;
-        let (game, data) =
-            package::game_of(seed_game, GAME_MAX_BYTES).map_err(|e| e.to_string())?;
+        let content = package::section_of(seed_game, SECTION_GAME, GAME_MAX_BYTES)
+            .map_err(|e| e.to_string())?
+            .ok_or("prepared world: no game section in the seed game")?;
+        let (game, data) = GamePackage::parse(&content).map_err(|e| e.to_string())?;
+        // The package's content already holds the data as a bundle's hash reads it.
+        let data_json = package::data_json(&content, &game)
+            .ok_or("prepared world: the seed game's content is not canonical")?;
+        let name = Value::from(game.as_str()).to_string();
+        let games_json = [b"{", name.as_bytes(), b":", data_json, b"}"].concat();
         let table = GamePackage::new(package::key_of(seed_game), &game, &data);
-        Ok(Self { world, game, data, table })
+        Ok(Self { world, game, data, table, games_json })
     }
 
     /// The compiled world.
@@ -90,12 +101,20 @@ impl Prepared {
             + self.game.capacity()
             + self.data.held_bytes()
             + self.table.held_bytes()
+            + self.games_json.capacity()
     }
 
     /// The game's names, ids and checksum.
     #[must_use]
     pub const fn data(&self) -> &GameData {
         &self.data
+    }
+
+    /// The canonical JSON of the `games` of every seed bundle of this world
+    /// (`SeedBundle::hash_with_games`).
+    #[must_use]
+    pub fn games_json(&self) -> &[u8] {
+        &self.games_json
     }
 
     /// The game's package, keyed as seeds of this world name it.

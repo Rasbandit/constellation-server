@@ -921,3 +921,29 @@ fn encoding_on_packages_made_earlier_gives_the_same_seed() {
     wrong.extend(tables.into_iter().skip(1));
     assert!(encode_on(&b, &hash, 1 << 24, &wrong).is_err(), "not the bundle's game");
 }
+
+/// Fails without `hash_with_games`: the hash of a bundle whose games were taken out, given
+/// the canonical JSON of those games as a package's content holds it, is the bundle's hash.
+#[test]
+fn the_hash_takes_the_games_as_canonical_json_made_earlier() {
+    for text in [fixture_text(), small().to_string()] {
+        let mut b = SeedBundle::from_json(&text).unwrap();
+        let hash = b.hash().unwrap();
+        let mut games = b"{".to_vec();
+        for (k, (name, g)) in b.games.iter().enumerate() {
+            let content = GamePackage::content(name, g);
+            let data = package::data_json(&content, name).unwrap();
+            assert_eq!(data, package::canonical(serde_json::to_value(g).unwrap()));
+            games.extend_from_slice(if k == 0 { b"" } else { b"," });
+            games.extend_from_slice(serde_json::to_string(name).unwrap().as_bytes());
+            games.push(b':');
+            games.extend_from_slice(data);
+        }
+        games.push(b'}');
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash, "its own games are not read");
+        b.games.clear();
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash);
+        assert_ne!(b.hash_with_games(b"{}").unwrap(), hash);
+        assert_eq!(package::data_json(b"{}", "G"), None);
+    }
+}

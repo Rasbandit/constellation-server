@@ -146,20 +146,25 @@ fn named(players: &[Player]) -> Result<(), String> {
 
 /// The seed file (v2, `docs/seed-bundle-v2.md`) of a `bundle` assembled on a prepared world,
 /// at most `max_bytes`: checked as an imported bundle is, hashed as its JSON text would be
-/// ([`seed_bundle::bundle_hash`]) and encoded on the world's package, so nothing is written as
-/// JSON and parsed back and the package is not made again.
+/// ([`seed_bundle::bundle_hash`]) and encoded on the world's package. Nothing is written as
+/// JSON and parsed back, and what is the same for every seed of the world (the package, and
+/// the game's names and ids in the hash) is taken from the prepared world. `bundle` is left
+/// as it was.
 ///
 /// # Errors
 /// A bundle that breaks a rule a room trusts, or is too large for a seed file.
 pub fn encode_on(
     prepared: &Prepared,
-    bundle: &SeedBundle,
+    bundle: &mut SeedBundle,
     max_bytes: u64,
 ) -> Result<Vec<u8>, String> {
     bundle.validate().map_err(|e| e.to_string())?;
+    // Out of the bundle while it is hashed, so the games' JSON is not built: it is prepared.
+    let games = std::mem::take(&mut bundle.games);
+    let hash = bundle.hash_with_games(prepared.games_json());
+    bundle.games = games;
     let tables = std::slice::from_ref(prepared.table());
-    seed_bundle::v2::encode_on(bundle, &bundle.hash()?, max_bytes, tables)
-        .map_err(|e| e.to_string())
+    seed_bundle::v2::encode_on(bundle, &hash?, max_bytes, tables).map_err(|e| e.to_string())
 }
 
 /// A loaded world, its game's name and the game's tables ([`game_data`], which depend only on
