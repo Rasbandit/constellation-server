@@ -55,9 +55,9 @@ jobs:
               echo
               echo "#### Profile: $profile, path: $path"
               echo
-              echo "| players | checks | clocks | setup ms | fill ms (median) | rule evals | ns/eval | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes | beatable |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" --arg t "$path" 'select(has("players") and .profile == $p and .path == $t) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
+              echo "| players | checks | clocks | setup ms | fill ms (median) | rule evals | ns/eval | threads | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes | beatable |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" --arg t "$path" 'select(has("players") and .profile == $p and .path == $t) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.workers) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
               echo
               jq -r --arg p "$profile" --arg t "$path" 'select(has("fitted_exponent") and .profile == $p and .path == $t) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
             done; done

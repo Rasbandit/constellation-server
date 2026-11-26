@@ -1,4 +1,10 @@
-//! Parallel setup of independent units (one per player) with a fixed merge order.
+//! Independent units (one per player) on several threads, with a fixed merge order.
+
+/// Items per thread for `workers` threads (at most `config::FILL_MAX_WORKERS`): each takes one
+/// contiguous chunk.
+fn per(len: usize, workers: usize) -> usize {
+    len.div_ceil(workers.clamp(1, config::FILL_MAX_WORKERS)).max(1)
+}
 
 /// `f` over `items` on up to `workers` threads (at most `config::FILL_MAX_WORKERS`). The
 /// result is in item order whatever the
@@ -8,8 +14,7 @@ pub fn map_ordered<T: Sync, R: Send>(
     workers: usize,
     f: impl Fn(&T) -> R + Sync,
 ) -> Vec<R> {
-    let workers = workers.clamp(1, config::FILL_MAX_WORKERS);
-    let per = items.len().div_ceil(workers).max(1);
+    let per = per(items.len(), workers);
     if items.len() <= per {
         return items.iter().map(f).collect();
     }
@@ -26,9 +31,36 @@ pub fn map_ordered<T: Sync, R: Send>(
     })
 }
 
+/// `f` on every item in place, on up to `workers` threads (at most `config::FILL_MAX_WORKERS`).
+/// Each item is touched by one thread and `f` sees nothing else, so the result does not depend
+/// on the worker count. The caller's thread takes the first chunk.
+pub fn for_each_mut<T: Send>(items: &mut [T], workers: usize, f: impl Fn(&mut T) + Sync) {
+    let per = per(items.len(), workers);
+    let (first, rest) = items.split_at_mut(per.min(items.len()));
+    // A panic in a worker is raised again when the scope ends.
+    std::thread::scope(|s| {
+        let f = &f;
+        for chunk in rest.chunks_mut(per) {
+            s.spawn(move || chunk.iter_mut().for_each(f));
+        }
+        first.iter_mut().for_each(f);
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::map_ordered;
+    use super::{for_each_mut, map_ordered};
+
+    #[test]
+    fn every_item_is_changed_once_whatever_the_worker_count() {
+        for workers in [0, 1, 2, 3, 8, 64] {
+            let mut items: Vec<u32> = (0..23).collect();
+            for_each_mut(&mut items, workers, |x| *x = *x * *x + 1);
+            let want: Vec<u32> = (0..23).map(|x| x * x + 1).collect();
+            assert_eq!(items, want, "{workers} workers");
+        }
+        for_each_mut::<u32>(&mut [], 4, |x| *x += 1);
+    }
 
     #[test]
     fn the_result_order_does_not_depend_on_the_worker_count() {

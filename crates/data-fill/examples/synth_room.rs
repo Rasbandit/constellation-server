@@ -1,4 +1,5 @@
-//! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--players 1,10,20,50,100]
+//! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
+//! [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
@@ -81,7 +82,11 @@ fn one(
     let work = s.summary(1, u64::from(f.solves));
     Ok(json!({
         "players": players,
-        "path": format!("{path:?}").to_lowercase(),
+        "path": if path == Path::Carry { "carry" } else { "forward" },
+        "workers": match path {
+            Path::Carry => 1,
+            Path::Forward { workers } => workers,
+        },
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks,
@@ -138,10 +143,12 @@ fn main() -> Result<(), String> {
         },
         ..d
     };
-    let path = match arg(&args, "--path", "auto".to_owned())?.as_str() {
+    let workers = config::ROOM_FORWARD_WORKERS;
+    let path_arg = arg(&args, "--path", "auto".to_owned())?;
+    let path = match path_arg.as_str() {
         "auto" => None,
         "carry" => Some(Path::Carry),
-        "forward" => Some(Path::Forward),
+        "forward" => Some(Path::Forward { workers: arg(&args, "--workers", workers)? }),
         x => return Err(format!("--path: auto, carry or forward, got {x}")),
     };
     let seed: u64 = arg(&args, "--seed", 1)?;
@@ -158,10 +165,9 @@ fn main() -> Result<(), String> {
         println!("{row}");
     }
     let fitted = exponent(&points);
-    let path = path.map_or("auto".to_owned(), |p| format!("{p:?}").to_lowercase());
     println!(
         "{}",
-        json!({"profile": profile, "path": path, "fitted_exponent": fitted, "points": points})
+        json!({"profile": profile, "path": path_arg, "fitted_exponent": fitted, "points": points})
     );
     Ok(())
 }

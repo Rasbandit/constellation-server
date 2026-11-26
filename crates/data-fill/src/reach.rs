@@ -766,7 +766,12 @@ impl<'w> Reach<'w> {
 
     /// Whether there is nothing left to run.
     pub(crate) fn idle(&self) -> bool {
-        self.regions_q.is_empty() && self.sites_q.is_empty()
+        self.pending() == 0
+    }
+
+    /// Regions and sites queued for the next run: a rough size of it.
+    pub(crate) fn pending(&self) -> usize {
+        self.regions_q.len() + self.sites_q.len()
     }
 
     /// A copy of `item` for this player, found elsewhere at rank `rank`.

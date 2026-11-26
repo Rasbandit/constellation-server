@@ -398,7 +398,7 @@ mod tests {
                         let mut rng = SpecRng::from_u64(seed);
                         fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path).unwrap()
                     };
-                    let ((a, sa), (b, sb)) = (on(Path::Carry), on(Path::Forward));
+                    let ((a, sa), (b, sb)) = (on(Path::Carry), on(Path::Forward { workers: 1 }));
                     let what =
                         format!("{shape:?}, confined {confine}, {players} players, seed {seed}");
                     assert_eq!(a.placed, b.placed, "{what}");
@@ -419,6 +419,41 @@ mod tests {
             }
         }
         assert!(rooms == 64 && fresh > 0 && retracted > 0, "both paths ran");
+    }
+
+    /// The forward path's states run on several threads: the placements, the spheres and every
+    /// work counter are the same with one worker and with many (the steps are the same ones;
+    /// only who runs a state differs).
+    #[test]
+    fn the_forward_path_is_the_same_with_one_worker_and_with_many() {
+        use crate::room::{Path, fill_room_on};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        for shape in [small(false), small(true), heavy] {
+            for players in [2usize, 3, 5, 9] {
+                let c = room(&shape, 31, players, 1).unwrap();
+                let seats = c.seats();
+                for seed in 1..=3 {
+                    let on = |workers| {
+                        let mut rng = SpecRng::from_u64(seed);
+                        let path = Path::Forward { workers };
+                        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path).unwrap()
+                    };
+                    let (one, s1) = on(1);
+                    assert!(one.all_beatable() && one.stats.evals > 0);
+                    for workers in [2, 3, 64] {
+                        let (many, sm) = on(workers);
+                        let what = format!("{shape:?}, {players} players, seed {seed}, {workers}");
+                        assert_eq!(one.placed, many.placed, "{what}");
+                        assert_eq!(s1, sm, "spheres, {what}");
+                        assert_eq!(
+                            (one.attempts, one.solves, one.stats, &one.reached),
+                            (many.attempts, many.solves, many.stats, &many.reached),
+                            "{what}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
