@@ -217,18 +217,22 @@ pub enum Path {
 
 impl Path {
     /// The path a room of `players` takes: one removal retracts more the larger the room, a
-    /// fresh solve costs the same per player.
+    /// fresh solve costs the same per player. The forward path gets the `workers` the caller
+    /// asks for, at most `config::ROOM_FORWARD_WORKERS` and the cores this process may use,
+    /// at least one.
     #[must_use]
-    pub fn of(players: usize) -> Self {
-        if players >= config::ROOM_FORWARD_MIN_PLAYERS {
-            Path::Forward { workers: config::ROOM_FORWARD_WORKERS }
-        } else {
-            Path::Carry
+    pub fn of(players: usize, workers: usize) -> Self {
+        if players < config::ROOM_FORWARD_MIN_PLAYERS {
+            return Path::Carry;
         }
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        Path::Forward { workers: workers.min(config::ROOM_FORWARD_WORKERS).min(cores).max(1) }
     }
 }
 
-/// Fill a room. Retries the whole fill with the next draws from `rng` when stuck.
+/// Fill a room. Retries the whole fill with the next draws from `rng` when stuck. A room large
+/// enough for the forward path takes `config::ROOM_FORWARD_WORKERS` threads at most; a caller
+/// with a worker count of its own passes [`Path::of`] to [`fill_room_on`].
 ///
 /// # Errors
 /// [`FillError`] when every attempt is stuck, the counts do not match, or there are no or too
@@ -238,7 +242,8 @@ pub fn fill_room(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<RoomFilled, FillError> {
-    fill_on(seats, rng, max_attempts, true, Path::of(seats.len()), false).map(|x| x.0)
+    let path = Path::of(seats.len(), config::ROOM_FORWARD_WORKERS);
+    fill_on(seats, rng, max_attempts, true, path, false).map(|x| x.0)
 }
 
 /// [`fill_room`] and the room's spheres, from the fill's own final states.
@@ -250,11 +255,12 @@ pub fn fill_room_spheres(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    fill_room_on(seats, rng, max_attempts, Path::of(seats.len()))
+    fill_room_on(seats, rng, max_attempts, Path::of(seats.len(), config::ROOM_FORWARD_WORKERS))
 }
 
-/// [`fill_room_spheres`] on a given path, whatever the room's size (measurements, and the
-/// tests that hold the two paths against each other).
+/// [`fill_room_spheres`] on a given path, whatever the room's size: for a caller with a worker
+/// count of its own ([`Path::of`]), measurements, and the tests that hold the two paths
+/// against each other.
 ///
 /// # Errors
 /// As [`fill_room`].
@@ -544,6 +550,9 @@ struct Linked<'a, 'w> {
     forward: Option<usize>,
     /// A solve has just started: every state has its whole solve ahead.
     fresh: bool,
+    /// The ranks order every derivation of the room: no superstep has run since the last
+    /// solve in rank order. Truth maintenance needs it.
+    ranked: bool,
 }
 
 impl<'a, 'w> Linked<'a, 'w> {
@@ -564,6 +573,7 @@ impl<'a, 'w> Linked<'a, 'w> {
             moved: Vec::new(),
             forward: None,
             fresh: false,
+            ranked: true,
         }
     }
 
@@ -596,6 +606,8 @@ impl<'a, 'w> Linked<'a, 'w> {
             self.with(p, Reach::begin);
         }
         self.fresh = true;
+        // Every state starts over, so the ranks are the room's again unless supersteps follow.
+        self.ranked = true;
         self.settle();
     }
 
@@ -641,9 +653,12 @@ impl<'a, 'w> Linked<'a, 'w> {
     ///
     /// A run reads and writes its own state only, so the runs of one step go on up to `workers`
     /// threads: the steps, and every counter, are the same whatever the number. Threads are
-    /// started only for a step that is worth it: the first of a `fresh` solve (every state
-    /// solves from nothing), or one with enough queued.
-    fn supersteps(&mut self, workers: usize, mut fresh: bool) {
+    /// started only for a step with `config::ROOM_FORWARD_MIN_PENDING` evaluations ahead: what
+    /// is queued, or every rule site of the room in the first step of a `fresh` solve.
+    fn supersteps(&mut self, workers: usize, fresh: bool) {
+        self.ranked = false;
+        // A fresh state evaluates every rule site once; later steps only what is queued.
+        let mut ahead = if fresh { self.seats.iter().map(|s| s.w.site_count()).sum() } else { 0 };
         loop {
             for p in 0..self.models.len() {
                 if !self.models[p].outbox.is_empty() {
@@ -659,8 +674,8 @@ impl<'a, 'w> Linked<'a, 'w> {
             if pending == 0 {
                 return;
             }
-            let worth = fresh || pending >= config::ROOM_FORWARD_MIN_PENDING;
-            fresh = false;
+            let worth = pending.max(ahead) >= config::ROOM_FORWARD_MIN_PENDING;
+            ahead = 0;
             for_each_mut(&mut self.models, if worth { workers } else { 1 }, |m| {
                 if !m.idle() {
                     m.run();
@@ -721,6 +736,7 @@ impl<'a, 'w> Linked<'a, 'w> {
 
     /// Take one assumed copy of `item` back from `owner`, across the room.
     fn take_back(&mut self, owner: u16, item: u16) -> bool {
+        debug_assert!(self.ranked, "a removal after supersteps: the ranks do not order the room");
         let o = usize::from(owner);
         if !self.models[o].start_removal(item) {
             return false;
@@ -1062,6 +1078,57 @@ mod tests {
             }
         }
         assert!(room.models.iter().all(|m| !m.reached(l3)), "the cycle supports nothing");
+    }
+
+    /// Supersteps leave every state with ranks of its own, which truth maintenance cannot
+    /// read across states: a removal after them is refused until a solve in rank order.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a removal after supersteps")]
+    fn a_removal_never_follows_a_superstep() {
+        let t = Three::new();
+        let seats = t.seats();
+        let held: Vec<Vec<u16>> = seats.iter().map(|s| s.plan.progression.clone()).collect();
+        let mut room = Linked::new(&seats);
+        room.forward = Some(1);
+        room.solve(&held, &locked_placed(&seats));
+        room.take_back(0, held[0][0]);
+    }
+
+    #[test]
+    fn a_solve_in_rank_order_allows_removals_again() {
+        let t = Three::new();
+        let seats = t.seats();
+        let held: Vec<Vec<u16>> = seats.iter().map(|s| s.plan.progression.clone()).collect();
+        let placed = locked_placed(&seats);
+        let mut room = Linked::new(&seats);
+        room.forward = Some(1);
+        room.solve(&held, &placed);
+        assert!(!room.ranked);
+        room.forward = None;
+        room.solve(&held, &placed);
+        assert!(room.ranked);
+        room.take_back(0, held[0][0]);
+    }
+
+    /// The richer hand-written world (thresholds, a held-up `any`, events, clocks on for one
+    /// player) fills the same on the forward path as carried, on one thread and on three.
+    #[test]
+    fn the_forward_path_keeps_every_placement_of_the_three_world() {
+        let t = Three::new();
+        let seats = t.seats();
+        for seed in 1u64..=100 {
+            let on = |path| {
+                let (f, sp) =
+                    fill_on(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, true, path, true)
+                        .unwrap();
+                (f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached)
+            };
+            let carried = on(Path::Carry);
+            for workers in [1, 3] {
+                assert_eq!(carried, on(Path::Forward { workers }), "seed {seed}, {workers}");
+            }
+        }
     }
 
     #[test]

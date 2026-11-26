@@ -300,12 +300,14 @@ pub const FILL_SETUP_WORKERS: usize = 4;
 /// measured (see `docs/port-check.md`, "Scaling with players").
 pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
 
-/// Threads the players' states of a room run on while a round is solved forward (a design
-/// value: the cores of the smallest box a fill runs on; results never depend on this number).
+/// Most threads the players' states of a room run on while a round is solved forward: a fill
+/// takes the worker count of its request, at most this many and at most the cores the process
+/// may use (a design value; results never depend on the number).
 pub const ROOM_FORWARD_WORKERS: usize = 4;
 
-/// Queued regions and sites, over a room's states, from which one step of a forward solve
-/// starts threads; below it the states run on the caller's thread, since starting threads
+/// Rule evaluations ahead of one step of a forward solve (queued regions and sites over the
+/// room's states; every rule site of the room for the first step of a solve) from which the
+/// step starts threads; below it the states run on the caller's thread, since starting threads
 /// would cost more than the step (a design value, not measured).
 pub const ROOM_FORWARD_MIN_PENDING: usize = 2048;
 

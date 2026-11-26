@@ -223,6 +223,45 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
     assert!(outputs.windows(2).all(|p| p[0] == p[1]));
 }
 
+/// The fixture world on both ways of placing rounds: carried, forward on one thread and on
+/// three, and the path a room of that size takes by itself (forward from
+/// `config::ROOM_FORWARD_MIN_PLAYERS` players). Placements, spheres, attempts and rounds are
+/// the same, or the error is.
+#[test]
+fn the_fixture_fills_the_same_carried_and_forward() {
+    use data_fill::room::{Path, fill_room_on};
+    let mut forward = 0;
+    for n in [1usize, 2, 3, 7, 8, 9, 12] {
+        let r = players(n, 1);
+        let seats = r.seats();
+        for seed in 1u64..=12 {
+            let shown = |x: Result<(room::RoomFilled, _), data_fill::FillError>| match x {
+                Ok((f, sp)) => {
+                    let solves = f.solves;
+                    (Ok((lines(&seats, &f.placed), sp, f.attempts, f.rounds, f.beatable)), solves)
+                }
+                Err(e) => (Err(format!("{e:?}")), 0),
+            };
+            let on =
+                |path| shown(fill_room_on(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, path));
+            let (carried, _) = on(Path::Carry);
+            for workers in [1, 3] {
+                assert_eq!(carried, on(Path::Forward { workers }).0, "{n} players, seed {seed}");
+            }
+            let (auto, solves) =
+                shown(fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
+            assert_eq!(carried, auto, "{n} players, seed {seed}: the room's own path");
+            // A fill that worked solved once when carried, once per round when forward.
+            let took_forward = solves > 1;
+            if carried.is_ok() {
+                assert_eq!(took_forward, n >= config::ROOM_FORWARD_MIN_PLAYERS, "{n} players");
+            }
+            forward += u32::from(took_forward);
+        }
+    }
+    assert!(forward > 0, "rooms at and above the threshold filled forward");
+}
+
 #[test]
 fn a_room_of_one_fills_exactly_like_a_single_player() {
     let r = players(1, 1);

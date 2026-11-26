@@ -53,7 +53,7 @@ fn one(
     reps: usize,
     path: Option<Path>,
 ) -> Result<Value, String> {
-    let path = path.unwrap_or(Path::of(players));
+    let path = path.unwrap_or(Path::of(players, config::ROOM_FORWARD_WORKERS));
     let t = Instant::now();
     let c: Compiled = room(shape, seed, players, config::FILL_SETUP_WORKERS)?;
     let setup_ms = ms(t);

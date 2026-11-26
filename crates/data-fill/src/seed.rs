@@ -88,10 +88,11 @@ pub fn generate(
         .zip(&progression)
         .map(|(plan, progression)| Seat { w: &w, plan, progression })
         .collect();
-    let (filled, spheres) = room::fill_room_spheres(
+    let (filled, spheres) = room::fill_room_on(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
         config::FILL_MAX_ATTEMPTS,
+        room::Path::of(seats.len(), workers),
     )
     .map_err(|e| format!("{e:?}"))?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {

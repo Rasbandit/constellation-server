@@ -255,44 +255,69 @@ pub fn room(shape: &Shape, seed: u64, players: usize, workers: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room::{Given, fill_room_spheres};
+    use crate::room::{Given, Path, fill_room_on, fill_room_spheres};
+    use crate::spheres::RoomSpheres;
+    use crate::world::World;
 
     fn small(clocks: bool) -> Shape {
         Shape { checks: 60, layers: 3, clocks, ..Shape::default() }
     }
 
     fn fill(c: &Compiled, seed: u64) -> (Vec<Vec<Option<Given>>>, crate::Stats, usize) {
-        let (f, sp) =
-            fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
-                .unwrap();
+        fill_on(c, seed, None)
+    }
+
+    /// A beatable fill on `path` (`None`: the path a room of that size takes).
+    fn fill_on(
+        c: &Compiled,
+        seed: u64,
+        path: Option<Path>,
+    ) -> (Vec<Vec<Option<Given>>>, crate::Stats, usize) {
+        let (seats, mut rng) = (c.seats(), SpecRng::from_u64(seed));
+        let (f, sp) = match path {
+            None => fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS),
+            Some(path) => fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path),
+        }
+        .unwrap();
         assert!(f.all_beatable(), "seed {seed}: {:?}", f.beatable);
         (f.placed, f.stats, sp.spheres.len())
     }
 
-    /// The exact placements of fixed seeds, room and single player, with and without clocks,
-    /// with `p0` confined to a placement group: pinned, so a change to how the fill scans its
-    /// locations or looks up groups must keep every byte.
-    #[test]
-    fn placements_of_fixed_seeds_are_pinned() {
+    /// A room of `players` worlds of `shape` whose instances `change` adjusted (by player).
+    fn room_with(
+        shape: &Shape,
+        seed: u64,
+        players: u64,
+        change: impl Fn(u64, &mut Instance),
+    ) -> Result<Compiled, String> {
+        let built: Vec<(Value, Instance)> = (0..players)
+            .map(|p| {
+                let (m, mut inst) = world(shape, seed, p);
+                change(p, &mut inst);
+                (m, inst)
+            })
+            .collect();
+        let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
+        let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
+        Compiled::new(&manifests, &insts, 1)
+    }
+
+    /// Confine `p0` to the group `home`: the locations `l` with `l % every < most`.
+    fn confine(inst: &mut Instance, every: usize, most: usize) {
+        inst.item_groups.insert("p0".to_owned(), "home".to_owned());
+        for l in (0..inst.locations.len()).filter(|l| l % every < most) {
+            inst.location_groups.insert(format!("l{l}"), "home".to_owned());
+        }
+    }
+
+    /// The pinned fills as text: rooms of three on `path`, and player 1 alone.
+    fn pinned(path: Option<Path>) -> String {
         let mut out = String::new();
         for clocks in [false, true] {
-            let shape = small(clocks);
-            let built: Vec<(Value, Instance)> = (0..3)
-                .map(|p| {
-                    let (m, mut inst) = world(&shape, 11, p);
-                    // 60 checks make 7 regions: these are the locations of the first two.
-                    inst.item_groups.insert("p0".to_owned(), "home".to_owned());
-                    for l in (0..shape.checks).filter(|l| l % 7 < 2) {
-                        inst.location_groups.insert(format!("l{l}"), "home".to_owned());
-                    }
-                    (m, inst)
-                })
-                .collect();
-            let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
-            let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
-            let c = Compiled::new(&manifests, &insts, 1).unwrap();
+            // 60 checks make 7 regions: `home` is the locations of the first two.
+            let c = room_with(&small(clocks), 11, 3, |_, inst| confine(inst, 7, 2)).unwrap();
             for seed in 1..=4 {
-                out += &format!("{:?}\n", fill(&c, seed).0);
+                out += &format!("{:?}\n", fill_on(&c, seed, path).0);
                 let one = crate::fill(
                     &c.worlds[0],
                     &c.plans[0],
@@ -304,9 +329,28 @@ mod tests {
                 out += &format!("{:?}\n", one.placed);
             }
         }
+        out
+    }
+
+    /// The exact placements of fixed seeds, room and single player, with and without clocks,
+    /// with `p0` confined to a placement group: pinned, so a change to how the fill scans its
+    /// locations or looks up groups must keep every byte.
+    #[test]
+    fn placements_of_fixed_seeds_are_pinned() {
+        let out = pinned(None);
         let p0 = |row: &str| row.matches("item: 0 }").count();
         assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
         assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// The same pin with the rooms forced onto the forward path, on one thread and on four.
+    #[test]
+    fn the_pinned_placements_are_the_same_on_the_forward_path() {
+        for workers in [1, 4] {
+            let out = pinned(Some(Path::Forward { workers }));
+            let hash = format!("{:016x}", crate::check::fnv1a(out.as_bytes()));
+            assert_eq!(hash, "036064f5ec95175d", "{workers} workers");
+        }
     }
 
     /// Rule nodes of a rule in the manifest's JSON: one per object, plus its list operands.
@@ -363,97 +407,172 @@ mod tests {
         }
     }
 
+    /// Everything a fill decides, or the error it ends with as text.
+    type Outcome =
+        Result<(Vec<Vec<Option<Given>>>, RoomSpheres, u32, u32, Vec<bool>, Vec<usize>), String>;
+
+    fn outcome(c: &Compiled, seed: u64, path: Path) -> (Outcome, crate::Stats, u32) {
+        let mut rng = SpecRng::from_u64(seed);
+        match fill_room_on(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path) {
+            Ok((f, sp)) => {
+                (Ok((f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached)), f.stats, f.solves)
+            }
+            Err(e) => (Err(format!("{e:?}")), crate::Stats::default(), 0),
+        }
+    }
+
+    /// Instance changes the identity test mixes, by name.
+    fn change(what: &str, p: u64, inst: &mut Instance) {
+        let has = |k: &str| what.split('+').any(|w| w == k);
+        if has("confined") {
+            confine(inst, 5, 2);
+        }
+        if has("excluded") {
+            // A sixth of the locations take no progression; player 2's are others.
+            let off = usize::from(p == 1);
+            inst.excluded = (0..inst.locations.len())
+                .filter(|l| l % 6 == off)
+                .map(|l| format!("l{l}"))
+                .collect();
+        }
+        if has("locked") {
+            // A progression item and a filler leave the pool for fixed locations.
+            for (key, loc) in [("p1", "l3"), ("filler", "l10")] {
+                let at = inst.pool.iter().position(|k| k == key).unwrap();
+                inst.locked.insert(loc.to_owned(), inst.pool.remove(at));
+            }
+        }
+        if has("start") {
+            inst.start_inventory.push("p1".to_owned());
+            inst.logic_start.insert("p0".to_owned(), 1);
+        }
+        if has("half") {
+            inst.excluded = (0..inst.locations.len()).step_by(2).map(|l| format!("l{l}")).collect();
+        }
+        if has("cramped") {
+            // More copies of `p0` than its group has locations: every attempt is stuck.
+            confine(inst, inst.locations.len(), 1);
+        }
+    }
+
     /// A round's state is the unique least fixed point for what is held and placed, and
     /// placement reads only what that state reaches: so a fresh forward solve per round
-    /// (`Path::Forward`) must place every item exactly where truth maintenance (`Path::Carry`)
-    /// does. Rooms of 1 to 5 players, both profiles, clocks on and off, with and without a
-    /// confined item (confined items go one at a time, carried, on both paths).
+    /// (`Path::Forward`, on one thread and on four) must decide everything exactly as truth
+    /// maintenance (`Path::Carry`) does: placements, spheres, attempts, rounds, or the error.
+    /// Rooms below, at and above `config::ROOM_FORWARD_MIN_PLAYERS`; both profiles, clocks on
+    /// and off, a high progression share; excluded and locked locations, start items, confined
+    /// items (placed one at a time, carried, on both paths); fills that are stuck on every
+    /// attempt and fills that need a retry.
     #[test]
     fn a_forward_solve_per_round_places_what_truth_maintenance_does() {
-        use crate::room::{Path, fill_room_on};
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
-        let (mut rooms, mut fresh, mut retracted) = (0, 0, 0);
-        for (shape, confine) in
-            [(small(false), false), (small(true), true), (heavy, false), (heavy, true)]
-        {
-            for players in [1usize, 2, 3, 5] {
-                let built: Vec<(Value, Instance)> = (0..players as u64)
-                    .map(|p| {
-                        let (m, mut inst) = world(&shape, 23, p);
-                        if confine {
-                            inst.item_groups.insert("p0".to_owned(), "home".to_owned());
-                            for l in (0..shape.checks).filter(|l| l % 5 < 2) {
-                                inst.location_groups.insert(format!("l{l}"), "home".to_owned());
-                            }
-                        }
-                        (m, inst)
-                    })
-                    .collect();
-                let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
-                let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
-                let c = Compiled::new(&manifests, &insts, 1).unwrap();
-                let seats = c.seats();
-                for seed in 1..=4 {
-                    let on = |path| {
-                        let mut rng = SpecRng::from_u64(seed);
-                        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path).unwrap()
-                    };
-                    let ((a, sa), (b, sb)) = (on(Path::Carry), on(Path::Forward { workers: 1 }));
-                    let what =
-                        format!("{shape:?}, confined {confine}, {players} players, seed {seed}");
-                    assert_eq!(a.placed, b.placed, "{what}");
-                    assert_eq!(sa, sb, "spheres, {what}");
-                    assert_eq!(
-                        (a.attempts, a.rounds, &a.beatable, &a.reached),
-                        (b.attempts, b.rounds, &b.beatable, &b.reached),
-                        "{what}"
-                    );
-                    assert!(a.all_beatable(), "{what}");
-                    // The forward path solved afresh per round and took nothing back there.
-                    assert!(b.solves > a.solves, "{what}");
-                    assert!(confine || b.stats.removals == 0, "{what}");
+        let dense = Shape { progression: 0.7, ..small(true) };
+        let cases = [
+            (small(false), ""),
+            (small(true), "confined"),
+            (small(false), "excluded+locked+start"),
+            (heavy, ""),
+            (heavy, "confined+excluded+locked+start"),
+            (dense, "excluded"),
+            (dense, "confined+locked"),
+            (small(true), "cramped"),
+        ];
+        let (mut rooms, mut stuck, mut fresh, mut retracted) = (0, 0, 0, 0);
+        for (shape, what) in cases {
+            for players in [1u64, 3, 8, 9, 12] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                for seed in 1..=2 {
+                    let (a, sa, solves) = outcome(&c, seed, Path::Carry);
+                    let at = format!("{shape:?}, {what:?}, {players} players, seed {seed}");
+                    for workers in [1, 4] {
+                        let (b, sb, forward) = outcome(&c, seed, Path::Forward { workers });
+                        assert_eq!(a, b, "{at}, {workers} workers");
+                        // The forward path solved afresh per round and took nothing back there.
+                        assert!(a.is_err() || forward > solves, "{at}");
+                        assert!(what.contains("confined") || sb.removals == 0, "{at}");
+                        fresh += forward;
+                    }
                     rooms += 1;
-                    fresh += b.solves;
-                    retracted += a.stats.retractions;
+                    retracted += sa.retractions;
+                    match &a {
+                        Ok(f) => assert!(f.4.iter().all(|b| *b), "beatable, {at}"),
+                        Err(e) => {
+                            assert!(e.contains("Stuck") && what == "cramped", "{at}: {e}");
+                            stuck += 1;
+                        }
+                    }
                 }
             }
         }
-        assert!(rooms == 64 && fresh > 0 && retracted > 0, "both paths ran");
+        assert!(rooms == 80 && fresh > 0 && retracted > 0, "both paths ran");
+        assert_eq!(stuck, 10, "the cramped rooms, every size and seed");
+        // As much progression as locations that take it: these seeds are stuck at first and
+        // fill on a later attempt, with the same draws on every path.
+        let tight = Shape { progression: 0.5, ..small(true) };
+        for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
+            let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
+            let (a, ..) = outcome(&c, seed, Path::Carry);
+            let attempts = a.as_ref().map(|f| f.2).unwrap();
+            assert!(attempts > 1, "{players} players, seed {seed}: {attempts} attempts");
+            for workers in [1, 4] {
+                let (b, ..) = outcome(&c, seed, Path::Forward { workers });
+                assert_eq!(a, b, "{players} players, seed {seed}, {workers} workers");
+            }
+        }
     }
 
     /// The forward path's states run on several threads: the placements, the spheres and every
     /// work counter are the same with one worker and with many (the steps are the same ones;
-    /// only who runs a state differs).
+    /// only who runs a state differs). The last room is large enough for threads to start.
     #[test]
     fn the_forward_path_is_the_same_with_one_worker_and_with_many() {
-        use crate::room::{Path, fill_room_on};
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
-        for shape in [small(false), small(true), heavy] {
-            for players in [2usize, 3, 5, 9] {
-                let c = room(&shape, 31, players, 1).unwrap();
-                let seats = c.seats();
-                for seed in 1..=3 {
-                    let on = |workers| {
-                        let mut rng = SpecRng::from_u64(seed);
-                        let path = Path::Forward { workers };
-                        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path).unwrap()
-                    };
-                    let (one, s1) = on(1);
-                    assert!(one.all_beatable() && one.stats.evals > 0);
+        let large = Shape { checks: 150, ..heavy };
+        let mut threaded = false;
+        for (shape, sizes) in [
+            (small(false), &[2usize, 3, 9][..]),
+            (small(true), &[5]),
+            (heavy, &[9]),
+            (large, &[12]),
+        ] {
+            for players in sizes {
+                let c = room(&shape, 31, *players, 1).unwrap();
+                let sites: usize = c.worlds.iter().map(World::site_count).sum();
+                threaded |= sites >= config::ROOM_FORWARD_MIN_PENDING;
+                for seed in 1..=2 {
+                    let one = outcome(&c, seed, Path::Forward { workers: 1 });
+                    assert!(one.0.is_ok() && one.1.evals > 0);
                     for workers in [2, 3, 64] {
-                        let (many, sm) = on(workers);
-                        let what = format!("{shape:?}, {players} players, seed {seed}, {workers}");
-                        assert_eq!(one.placed, many.placed, "{what}");
-                        assert_eq!(s1, sm, "spheres, {what}");
+                        let many = outcome(&c, seed, Path::Forward { workers });
                         assert_eq!(
-                            (one.attempts, one.solves, one.stats, &one.reached),
-                            (many.attempts, many.solves, many.stats, &many.reached),
-                            "{what}"
+                            one, many,
+                            "{shape:?}, {players} players, seed {seed}, {workers}"
                         );
                     }
                 }
             }
         }
+        assert!(threaded, "one room has enough rule sites for a step to start threads");
+    }
+
+    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it goes forward, on
+    /// the workers asked for, capped by `config::ROOM_FORWARD_WORKERS` and never below one.
+    #[test]
+    fn the_path_changes_at_the_configured_room_size() {
+        let (at, cap) = (config::ROOM_FORWARD_MIN_PLAYERS, config::ROOM_FORWARD_WORKERS);
+        assert_eq!(Path::of(1, 4), Path::Carry);
+        assert_eq!(Path::of(at - 1, 4), Path::Carry);
+        assert_eq!(Path::of(at, 1), Path::Forward { workers: 1 });
+        assert_eq!(Path::of(at + 1, 0), Path::Forward { workers: 1 });
+        let Path::Forward { workers } = Path::of(at, usize::MAX) else { panic!("forward") };
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        assert_eq!(workers, cap.min(cores), "the cap, or the machine's cores when fewer");
+        // The room fill takes that path: a room at the threshold solves afresh per round.
+        let c = room(&small(false), 5, at, 1).unwrap();
+        let (f, _) =
+            fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
+                .unwrap();
+        assert!(f.solves > 1 && f.stats.removals == 0, "solves {}", f.solves);
     }
 
     #[test]
