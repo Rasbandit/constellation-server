@@ -208,12 +208,12 @@ The max of 601 is the most-read item (one entry per site that reads it); it is w
 
 The section is 68 KB against the 66 KB estimate; the peak is above the 160 KB estimate because the typed instance (0.27 MB, the first open question below) and the instance parser's buffers are live while the plan is built, and the game stand-in keeps every key. Fills are byte-identical to the tree-walking engine for seeds 1 to 20 on both instances (the `golden` example), and `port-check` (5 legacy seeds, 50 inventories, 200 sanity fills) passes every check.
 
-## What is not decided here
-
-- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. Today's typed JSON instance is 0.27 MB held, which alone fits the budget but is most of it.
-- Whether the dependency index stays in the section. The converter computes it and the loader rebuilds it from the rules and refuses a section whose index differs (a missing reader would never be rechecked); the item group membership index is computed at load. `reach` is allowed in the goal only, by compiler and loader, so no index of region readers is needed.
 ## Prepared worlds
 
 A manifest is compiled once, when it is uploaded, and kept in its ready form (`crates/data-fill/src/prepared.rs`): the package file above with one more section, `SECTION_SEED_GAME` (3), which holds the game's package file as seeds of that world name it (names, ids and checksum, `seed_bundle::GamePackage::file`). The server stores that file as a blob by content hash and finds it by the manifest's id and the engine layout (`data_fill::prepared::LAYOUT`: this section's format version and `config::PREPARED_WORLD_LAYOUT`; table `prepared_worlds`). A generation sends the stored file to its fill child, which loads it, fills and prints the seed file (v2) itself. A world with no stored form for the server's layout, or whose blob is missing or torn, is prepared again from the stored manifest by the generation that needs it. A fill worker keeps loaded worlds in a cache capped in bytes (`config::PREPARED_CACHE_BYTES`); with one child process per generation that cache starts empty each time (see #200).
 
+## What is not decided here
+
+- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. Today's typed JSON instance is 0.27 MB held, which alone fits the budget but is most of it.
+- Whether the dependency index stays in the section. The converter computes it and the loader rebuilds it from the rules and refuses a section whose index differs (a missing reader would never be rechecked); the item group membership index is computed at load. `reach` is allowed in the goal only, by compiler and loader, so no index of region readers is needed.
 - Versioning: a change to any layout here bumps the header's format version; section 2 is listed as unstable in the v2 document until the first release.
