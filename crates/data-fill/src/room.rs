@@ -11,7 +11,8 @@
 //!
 //! All states take ranks from one sequence (the room hands it from state to state), so a rank
 //! orders derivations over the whole room and a fact's support is checked against the room as
-//! of its rank, exactly as for one player. No full rescan happens after the first solve.
+//! of its rank, exactly as for one player. On this carried path no full rescan happens after
+//! the first solve.
 //!
 //! A room of `config::ROOM_FORWARD_MIN_PLAYERS` players or more places its rounds on a second
 //! path ([`Path::Forward`]): instead of taking a round's items back one cascade at a time, it
