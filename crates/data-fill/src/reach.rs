@@ -1044,12 +1044,12 @@ impl<'w> Reach<'w> {
     pub(crate) fn keep_journal(&mut self) {
         debug_assert!(self.ran && self.idle(), "a journal starts at a fixed point");
         self.journaling = true;
-        // Room for one state's worth of steps, once: every site and half-day, a first visit
-        // and a few growths per region, something held per location, every copy of the seed.
-        let (w, plan) = (self.w, self.plan);
-        let copies: usize = (0..w.items()).map(|i| plan.copies(i)).sum();
-        let steps = w.site_count() + self.half_rank.len() + w.regions() * (1 + GROWS);
-        self.journal.reserve_exact(steps + w.locations() + copies);
+    }
+
+    /// Steps the journal has room for without growing (what it holds on the heap).
+    #[cfg(test)]
+    pub(crate) fn journal_room(&self) -> usize {
+        self.journal.capacity()
     }
 
     /// Stop keeping the journal and forget it: nothing more is taken back.
@@ -2003,6 +2003,25 @@ mod tests {
     use super::*;
     use crate::fill::Instance;
     use serde_json::json;
+
+    /// A journal takes room only for what is journaled: starting one reserves nothing, however
+    /// many copies an instance starts with (start items are never journaled), and it grows
+    /// with the steps taken.
+    #[test]
+    fn a_journal_holds_room_only_for_its_steps() {
+        let (w, mut inst) = clock_world(&[]);
+        inst.logic_start.insert("dawn".to_owned(), 1);
+        inst.start_inventory = vec!["dusk".to_owned(); 1];
+        let plan = Plan::new(&w, &inst).unwrap();
+        let mut r = plan.solve(&w, &[]);
+        r.keep_journal();
+        assert_eq!(r.journal_room(), 0, "room reserved before a step was taken");
+        let mark = r.mark();
+        r.add(w.item("dawn").unwrap(), 1);
+        r.run();
+        assert!((1..=16).contains(&r.journal_room()), "{} steps of room", r.journal_room());
+        assert!(r.undo_to(mark) >= 1);
+    }
 
     /// A rank never reaches the values that stand for a support or for "none": a state that
     /// would hand one out stops, in every build, instead of wrapping.

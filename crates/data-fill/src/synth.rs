@@ -622,6 +622,45 @@ mod tests {
         assert!(e.contains("p0") && e.contains("excluded"), "{e}");
     }
 
+    /// An opt-in mode in a room of several players: whether it places the seed itself or
+    /// gives up and the exact fill places it, the split path decides what the carried and the
+    /// forward path decide. Tight rooms, where the modes do fall back.
+    #[test]
+    fn a_mode_in_a_room_places_the_same_on_the_split_path_fallen_back_or_not() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let tight = Shape { checks: 60, ..Shape::hostile(Hostile::Tight) };
+        let (mut fell, mut fast, mut filled) = (0, 0, 0);
+        for (shape, players) in [(tight, 3), (tight, 9), (small(true), 4)] {
+            let c = room_with(&shape, 23, players, |_, _| {}).unwrap();
+            let seats = c.seats();
+            for seed in 1..=8 {
+                for mode in
+                    [Algorithm::Shuffle(Dials::default()), Algorithm::Level(Dials::default())]
+                {
+                    let on = |path| {
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|(f, sp)| (f.placed, f.fast, f.fallbacks, f.attempts, sp))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    let split = on(Path::Split);
+                    let at = format!("{players} players, seed {seed}, {mode:?}");
+                    assert_eq!(split, on(Path::Carry), "{at}");
+                    assert_eq!(split, on(Path::Forward { workers: 1 }), "{at}");
+                    if let Ok(f) = split {
+                        fell += f.2;
+                        fast += u32::from(f.1);
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            fell > 0 && fast > 0 && filled > 20,
+            "{fell} fallbacks, {fast} fast, {filled} filled"
+        );
+    }
+
     /// The same pin with the rooms forced onto the split path.
     #[test]
     fn the_pinned_placements_are_the_same_on_the_split_path() {
