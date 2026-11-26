@@ -6,13 +6,19 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::fairness::{Flat, report, report_named, sample, sample_room};
-use data_fill::room;
+use data_fill::fairness::{
+    FILLS, Flat, OTHER_FILLS, report, report_named, sample, sample_room, sample_room_by, shape,
+    shape_report,
+};
+use data_fill::room::{self, Algorithm};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: fill-fairness (--world <world.json> | --manifest <m.json> --instance <i.json>)
-    [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]";
+    [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]
+  or, to compare fill modes on one room (the exact fill is always the reference):
+    fill-fairness (--world <world.json> | --synth light|heavy [--players N] [--checks N] [--room-seed S])
+    --modes \"exact level level,depth=100 shuffle,goal\" [--seeds N] [--required N] [--baseline N]";
 
 fn read(p: &str) -> Result<Value, String> {
     serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?)
@@ -31,6 +37,9 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     let num = |k: &str, d: u64| {
         m.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|e| format!("{k}: {e}")))
     };
+    if let Some(modes) = m.get("--modes") {
+        return modes_report(modes, &m, &num);
+    }
     // A room: `--world` with an `instances` list is one world played by several players.
     if let Some(w) = m.get("--world") {
         let v = read(w)?;
@@ -80,6 +89,64 @@ fn room_report(
     let mut r = report_named(&|i| flat.item(i), &|l| flat.loc(l), &s);
     r["players"] = json!(seats.len());
     finish(r, s.failed == 0, t, m)
+}
+
+/// Every mode of `--modes` over the same room and the same fill seeds (another stream than the
+/// exact fill reference's): its shape (spheres, where
+/// progression lies, waiting, required spheres for the first `--required` seeds), its distance
+/// from the exact fill, and with `--baseline N` (a small world) from N uniform beatable rooms.
+fn modes_report(
+    modes: &str,
+    m: &HashMap<&str, &str>,
+    num: &dyn Fn(&str, u64) -> Result<u64, String>,
+) -> Result<(Value, bool), String> {
+    let c = match (m.get("--world"), m.get("--synth")) {
+        (Some(w), _) => {
+            let v = read(w)?;
+            let one = [v["instance"].clone()];
+            let insts = room::instances(v["instances"].as_array().map_or(&one[..], Vec::as_slice))?;
+            let insts: Vec<&Instance> = insts.iter().collect();
+            room::Compiled::shared(World::load(&v["manifest"])?, &insts, 1)?
+        }
+        (None, Some(profile)) => {
+            let d = match *profile {
+                "light" => data_fill::synth::Shape::default(),
+                "heavy" => data_fill::synth::Shape::heavy(),
+                x => return Err(format!("--synth: light or heavy, got {x}")),
+            };
+            let checks = usize::try_from(num("--checks", 1000)?).map_err(|e| e.to_string())?;
+            let players = usize::try_from(num("--players", 1)?).map_err(|e| e.to_string())?;
+            let shape = data_fill::synth::Shape { checks, ..d };
+            data_fill::synth::room(&shape, num("--room-seed", 1)?, players, 1)?
+        }
+        _ => return Err(USAGE.into()),
+    };
+    let seats = c.seats();
+    let flat = Flat::new(&seats)?;
+    let (seeds, required, baseline) =
+        (num("--seeds", 200)?, num("--required", 0)?, num("--baseline", 0)?);
+    let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
+    let t = Instant::now();
+    let err = |e| format!("{e:?}");
+    // The reference is the exact fill on one stream of seeds; every row, an `exact` one too,
+    // is filled on another, so its distance from the reference is between independent samples
+    // and the `exact` row is the noise floor.
+    let exact = shape(&seats, (seeds, FILLS), Algorithm::Exact, 0).map_err(err)?;
+    let mut rows = Vec::new();
+    for name in modes.split_whitespace() {
+        let mode: Algorithm = name.parse()?;
+        let s = shape(&seats, (seeds, OTHER_FILLS), mode, required).map_err(err)?;
+        let mut row = shape_report(&s, Some(&exact));
+        row["mode"] = json!(name);
+        if baseline > 0 {
+            let sampled = sample_room_by(&seats, &flat, (seeds, baseline, max_attempts), mode)
+                .map_err(err)?;
+            row["against_uniform"] =
+                report_named(&|i| flat.item(i), &|l| flat.loc(l), &sampled)["baseline"].clone();
+        }
+        rows.push(row);
+    }
+    finish(json!({"players": seats.len(), "seeds": seeds, "modes": rows}), true, t, m)
 }
 
 /// Add timing and the gates, write `--out`.

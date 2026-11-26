@@ -717,6 +717,135 @@ impl<'w> Reach<'w> {
         self.reached.contains(l as usize)
     }
 
+    /// The rank location `l` was reached at (`u32::MAX`: not reached). Ranks grow with every
+    /// fact a forward run derives, so they tell what was reached before what.
+    pub(crate) fn loc_rank(&self, l: u32) -> u32 {
+        self.loc_rank[l as usize]
+    }
+
+    /// Put to sleep the checks of every location that holds nothing, is not reached and that
+    /// `awake` does not ask for: reaching such a location changes nothing, so its rule is not
+    /// evaluated until [`Reach::probe`] or [`Reach::wake`]. Forward runs only: a sleeping check
+    /// is marked done without a rank, which truth maintenance must never see. Call after the
+    /// holds are set.
+    pub(crate) fn sleep(&mut self, awake: impl Fn(u32) -> bool) {
+        for l in 0..self.holds.len() {
+            let empty = self.holds[l].is_none() && self.away[l].is_none();
+            if empty && !self.reached.contains(l) && !awake(u32::try_from(l).unwrap_or(0)) {
+                self.doze(l);
+            }
+        }
+    }
+
+    /// Location `l`'s checks that have not held go to sleep.
+    fn doze(&mut self, l: usize) {
+        for &s in self.w.sites_into(CHECKS, l) {
+            if self.fired[s as usize] == NONE {
+                self.done.insert(s as usize);
+            }
+        }
+    }
+
+    /// Whether location `l` is reached, evaluating now every check of it that has not held:
+    /// the sleeping ones, and the awake ones too, which may be waiting in the queue for an item
+    /// counted since the last run (the answer must not depend on which they are). A location
+    /// that was asleep and is not reached sleeps on.
+    pub(crate) fn probe(&mut self, l: u32) -> bool {
+        let (w, mut slept) = (self.w, false);
+        for &s in w.sites_into(CHECKS, l as usize) {
+            let s = s as usize;
+            if !self.reached(l) && self.fired[s] == NONE {
+                if self.done.contains(s) {
+                    self.done.remove(s);
+                    slept = true;
+                }
+                self.site(s);
+            }
+        }
+        if slept && !self.reached(l) {
+            self.doze(l as usize);
+        }
+        self.reached(l)
+    }
+
+    /// Wake every sleeping check: those of a reached region are queued for the next run.
+    pub(crate) fn wake(&mut self) {
+        let w = self.w;
+        for s in 0..w.site_count() {
+            if self.done.contains(s) && self.fired[s] == NONE {
+                self.done.remove(s);
+                if self.masks[w.site_place(s).0] != 0 {
+                    self.push_site(u32::try_from(s).unwrap_or(0));
+                }
+            }
+        }
+    }
+
+    /// Location `loc`, not reached, holds nothing any more (its item moved elsewhere); with
+    /// `sleep` its checks go to sleep.
+    pub(crate) fn unhold(&mut self, loc: u32, sleep: bool) {
+        debug_assert!(!self.reached(loc), "a collected item cannot be taken out of a forward run");
+        self.holds[loc as usize] = None;
+        self.away[loc as usize] = None;
+        if sleep {
+            self.doze(loc as usize);
+        }
+    }
+
+    /// Whether a rule that is one step from open reads `item`: an exit, event or check of a
+    /// reached region that does not hold yet (the check of a location that holds nothing does
+    /// not count, asleep or not: reaching it changes nothing), or a half-day not yet owned.
+    /// Stay rules are left out: they have no state of their own to ask.
+    pub(crate) fn wants(&self, item: u16) -> bool {
+        let w = self.w;
+        let sc = w.site_count();
+        w.item_sites(usize::from(item)).iter().any(|s| {
+            let s = *s as usize;
+            if s >= sc {
+                return self.half_rank.contains(&NONE);
+            }
+            let (r, g) = w.site_place(s);
+            let l = w.site_target(s) as usize;
+            let opens = g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
+            opens && g != STAYS && self.masks[r] != 0 && !self.done.contains(s)
+        })
+    }
+
+    /// Whether one more copy of `item` would make a rule on the frontier hold right now: one of
+    /// the rules [`Reach::wants`] names, evaluated with the copy counted. Call on a fixed
+    /// point; nothing is changed but the work counter.
+    pub(crate) fn opens(&mut self, item: u16) -> bool {
+        let w = self.w;
+        let sc = w.site_count();
+        // A def found true is cached as true for good (rules are monotone): what the extra
+        // copy makes true must not stay behind.
+        let reads = w.def_reads_item(usize::from(item));
+        let defs: Vec<u32> = self.def_cache.iter().filter(|_| reads).map(Cell::get).collect();
+        self.count_change(item, 1);
+        let mut evals = 0;
+        let hit = w.item_sites(usize::from(item)).iter().any(|s| {
+            let s = *s as usize;
+            if s >= sc {
+                return (0..self.half_rank.len()).any(|h| {
+                    self.half_rank[h] == NONE
+                        && self.env().eval(self.plan.folded.halves[h] as usize, 0)
+                });
+            }
+            let (r, g) = w.site_place(s);
+            let l = w.site_target(s) as usize;
+            let counts = g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
+            if !counts || g == STAYS || self.masks[r] == 0 || self.done.contains(s) {
+                return false;
+            }
+            evals += 1;
+            self.env().eval(self.plan.folded.sites[s] as usize, self.masks[r])
+        });
+        self.count_change(item, -1);
+        self.def_cache.iter().zip(defs).for_each(|(c, was)| c.set(was));
+        self.stats.evals += evals;
+        hit
+    }
+
     /// Set what a location holds; it is collected when the location is reached. A location
     /// holds one item: holding the same again changes nothing.
     pub fn hold(&mut self, loc: u32, item: u16) {

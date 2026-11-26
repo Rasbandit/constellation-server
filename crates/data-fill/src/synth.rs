@@ -555,6 +555,122 @@ mod tests {
         assert!(threaded, "one room has enough rule sites for a step to start threads");
     }
 
+    /// Level fill and shuffle fill over both profiles, one player and rooms, with placement groups, excluded
+    /// and locked locations, start items and clocks: every seed is held against the exact
+    /// fill's (`assert_fast`), on the carried path and forward on one thread and on several,
+    /// which must all place the same.
+    #[test]
+    fn the_opt_in_modes_are_beatable_reach_what_the_exact_fill_does_and_ignore_the_worker_count() {
+        use crate::room::{Algorithm, Dials, assert_fast};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut fast, mut fell, mut all, mut swaps) = (0, 0, 0, 0);
+        for (shape, players, what) in [
+            (small(false), 1, ""),
+            (small(true), 1, "confined+excluded"),
+            (small(false), 3, "confined+excluded+locked"),
+            (small(true), 3, "locked+start"),
+            (heavy, 1, "locked"),
+            (heavy, 3, "confined"),
+            (heavy, 9, "excluded"),
+            (small(false), 2, "half"),
+        ] {
+            let c = room_with(&shape, 17, players, |p, inst| change(what, p, inst)).unwrap();
+            let seats = c.seats();
+            for seed in 1..=24 {
+                let dials = Dials {
+                    depth: [0, 100, -100][seed as usize % 3],
+                    goal_only: seed % 12 > 9,
+                    skip_empty: seed % 4 < 2,
+                };
+                let mode =
+                    if seed > 12 { Algorithm::Shuffle(dials) } else { Algorithm::Level(dials) };
+                let Some(one) = assert_fast(&seats, seed, Path::Forward { workers: 1 }, mode)
+                else {
+                    continue;
+                };
+                for path in [Path::Carry, Path::Forward { workers: 4 }] {
+                    let other = assert_fast(&seats, seed, path, mode).unwrap();
+                    assert_eq!(one.placed, other.placed, "{what}, seed {seed}, {path:?}");
+                    assert_eq!(
+                        (one.fast, one.repairs, one.fallbacks),
+                        (other.fast, other.repairs, other.fallbacks),
+                        "{what}, seed {seed}, {path:?}"
+                    );
+                    // The same steps on any number of threads; the carried path's first solve
+                    // runs in rank order, which evaluates in another order.
+                    assert!(path == Path::Carry || one.stats == other.stats, "{what}, {seed}");
+                }
+                all += 1;
+                fast += u32::from(one.fast);
+                fell += one.fallbacks;
+                swaps += one.swaps;
+            }
+        }
+        println!(
+            "the modes placed {fast} of {all} rooms themselves, {fell} fallbacks, {swaps} swaps"
+        );
+        assert!(all > 160 && fast * 2 > all, "the modes placed {fast} of {all} rooms themselves");
+        assert!(swaps > 0, "no shuffle needed a swap");
+    }
+
+    /// Rooms where a round moves several items: a move that lands in its owner's own world is
+    /// counted at once, and the moves after it in the round must see the same reached
+    /// locations whether the checks of empty locations sleep or not.
+    #[test]
+    fn skipping_empty_checks_places_the_same_in_rooms_of_several_moves_a_round() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut rooms, mut moved) = (0, 0);
+        for (shape, players) in [(small(false), 3), (small(true), 4), (heavy, 3), (heavy, 6)] {
+            let c = room(&shape, 23, players, 1).unwrap();
+            let seats = c.seats();
+            for seed in 1..=40 {
+                let run = |skip_empty| {
+                    let mode = Algorithm::Shuffle(Dials { skip_empty, ..Dials::default() });
+                    let mut rng = SpecRng::from_u64(seed);
+                    fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, Path::Carry, mode)
+                        .map(|x| (x.0.placed, x.0.swaps, x.0.fast, x.1))
+                        .map_err(|e| format!("{e:?}"))
+                };
+                let (with, without) = (run(true), run(false));
+                assert_eq!(
+                    with, without,
+                    "{players} players, clocks {}, seed {seed}",
+                    shape.clocks
+                );
+                rooms += 1;
+                moved += with.map_or(0, |x| x.1);
+            }
+        }
+        assert!(moved > rooms / 2, "{moved} moves in {rooms} rooms: too few to test rounds");
+    }
+
+    /// The point of the mode: far fewer rule evaluations than a solve per round, and the same
+    /// seed for the same draws.
+    #[test]
+    fn level_fill_evaluates_far_fewer_rules_and_is_deterministic() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let c = room(&Shape { checks: 200, ..Shape::default() }, 5, 9, 1).unwrap();
+        let seats = c.seats();
+        let path = Path::Forward { workers: 1 };
+        let run = |seed, mode| {
+            let mut rng = SpecRng::from_u64(seed);
+            fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode).unwrap().0
+        };
+        let (mut exact, mut level) = (0, 0);
+        for seed in 1..=3 {
+            let mode = Algorithm::Level(Dials::default());
+            let (a, b) = (run(seed, mode), run(seed, mode));
+            assert_eq!(a.placed, b.placed, "seed {seed}");
+            assert_ne!(a.placed, run(seed + 100, mode).placed, "seed {seed}: seeds differ");
+            if a.fast {
+                exact += run(seed, Algorithm::Exact).stats.evals;
+                level += a.stats.evals;
+            }
+        }
+        assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
+    }
+
     /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it goes forward, on
     /// the workers asked for, capped by `config::ROOM_FORWARD_WORKERS` and never below one.
     #[test]

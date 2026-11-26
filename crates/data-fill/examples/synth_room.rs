@@ -1,5 +1,5 @@
 //! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
-//! [--players 1,10,20,50,100]
+//! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
@@ -11,10 +11,17 @@
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
 //! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
 //! is left out: read it from a `--workers 1` run); without the feature, `null`.
+//! `peak_rss_bytes` is the whole process's resident high-water mark when the row is printed
+//! (`VmHWM` of `/proc/self/status`, Linux only): it never falls, so it covers setup and every
+//! smaller room before the row; `null` where the file is not there.
+//!
+//! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
+//! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
+//! fallbacks, and the rule evaluations of the mode's own solves.
 
 use std::time::Instant;
 
-use data_fill::room::{Compiled, Path, cross_world_share, fill_room_on};
+use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
 use data_fill::synth::{Shape, room};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -47,20 +54,29 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// The process's resident high-water mark, bytes (Linux).
+fn peak_rss() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmHWM:"))?;
+    kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
+}
+
 fn one(
     shape: &Shape,
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers): (Option<Path>, usize),
+    (path, workers, mode): (Option<Path>, usize, Algorithm),
 ) -> Result<Value, String> {
     let path = path.unwrap_or(Path::of(players, workers));
     let t = Instant::now();
     let c: Compiled = room(shape, seed, players, config::FILL_SETUP_WORKERS)?;
     let setup_ms = ms(t);
     let seats = c.seats();
-    let fill =
-        || fill_room_on(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS, path);
+    let fill = || {
+        let mut rng = SpecRng::from_u64(seed);
+        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+    };
     let (first, heap) = peak(fill);
     let (f, sp) = first.map_err(|e| format!("{players} players: {e:?}"))?;
     if !f.all_beatable() {
@@ -105,7 +121,15 @@ fn one(
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
+        "placed_by_the_mode": mode == Algorithm::Exact || f.fast,
+        // The same hash in two rows means the same placements (the `noskip` rows against theirs).
+        "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
+        "repairs": f.repairs,
+        "swaps": f.swaps,
+        "fallbacks": f.fallbacks,
+        "mode_rule_evals": f.mode_evals,
         "peak_heap_bytes": heap,
+        "peak_rss_bytes": peak_rss(),
     }))
 }
 
@@ -152,6 +176,8 @@ fn main() -> Result<(), String> {
         "forward" => Some(Path::Forward { workers }),
         x => return Err(format!("--path: auto, carry or forward, got {x}")),
     };
+    let mode_arg = arg(&args, "--mode", "exact".to_owned())?;
+    let mode: Algorithm = mode_arg.parse()?;
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -160,15 +186,16 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers))?;
+        let mut row = one(&shape, seed, n, reps, (path, workers, mode))?;
         row["profile"] = json!(profile);
+        row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
     }
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "path": path_arg, "workers": workers,
+        json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
                "fitted_exponent": fitted, "points": points})
     );
     Ok(())

@@ -121,6 +121,8 @@ pub enum FillError {
         /// Attempts made.
         attempts: u32,
     },
+    /// A fill mode's own check of its result failed: a bug in the mode, never the input.
+    Invalid(String),
     /// More items than locations, or the reverse.
     Count {
         /// Items to place.
