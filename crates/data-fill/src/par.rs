@@ -1,5 +1,7 @@
 //! Independent units (one per player) on several threads, with a fixed merge order.
 
+use std::sync::Mutex;
+
 /// Items per thread for `workers` threads (at most `config::FILL_MAX_WORKERS`): each takes one
 /// contiguous chunk.
 fn per(len: usize, workers: usize) -> usize {
@@ -7,49 +9,66 @@ fn per(len: usize, workers: usize) -> usize {
 }
 
 /// `f` over `items` on up to `workers` threads (at most `config::FILL_MAX_WORKERS`). The
-/// result is in item order whatever the
-/// worker count, because each worker takes one contiguous chunk and chunks are joined in order.
+/// result is in item order whatever the worker count: each result lands in its item's slot.
 pub fn map_ordered<T: Sync, R: Send>(
     items: &[T],
     workers: usize,
     f: impl Fn(&T) -> R + Sync,
 ) -> Vec<R> {
-    let per = per(items.len(), workers);
-    if items.len() <= per {
-        return items.iter().map(f).collect();
-    }
-    std::thread::scope(|s| {
-        let f = &f;
-        let tasks: Vec<_> = items
-            .chunks(per)
-            .map(|chunk| s.spawn(move || chunk.iter().map(f).collect::<Vec<R>>()))
-            .collect();
-        tasks
-            .into_iter()
-            .flat_map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
-    })
+    let mut slots: Vec<(&T, Option<R>)> = items.iter().map(|x| (x, None)).collect();
+    for_each_mut(&mut slots, workers, |(x, r)| *r = Some(f(x)));
+    slots.into_iter().filter_map(|(_, r)| r).collect()
 }
 
 /// `f` on every item in place, on up to `workers` threads (at most `config::FILL_MAX_WORKERS`).
 /// Each item is touched by one thread and `f` sees nothing else, so the result does not depend
-/// on the worker count. The caller's thread takes the first chunk.
+/// on the worker count, nor on how many threads the system gives: the caller's thread takes the
+/// first chunk and then every chunk no thread has taken, so a thread that cannot be started
+/// (the process is at a cap) costs time, never the result.
 pub fn for_each_mut<T: Send>(items: &mut [T], workers: usize, f: impl Fn(&mut T) + Sync) {
     let per = per(items.len(), workers);
     let (first, rest) = items.split_at_mut(per.min(items.len()));
+    if rest.is_empty() {
+        return first.iter_mut().for_each(f);
+    }
+    // A chunk waits in its slot for whoever takes it first.
+    let slots: Vec<Mutex<Option<&mut [T]>>> =
+        rest.chunks_mut(per).map(|c| Mutex::new(Some(c))).collect();
+    let run = |slot: &Mutex<Option<&mut [T]>>| {
+        let chunk = slot.lock().ok().and_then(|mut c| c.take());
+        chunk.into_iter().flatten().for_each(&f);
+    };
     // A panic in a worker is raised again when the scope ends.
     std::thread::scope(|s| {
-        let f = &f;
-        for chunk in rest.chunks_mut(per) {
-            s.spawn(move || chunk.iter_mut().for_each(f));
+        let run = &run;
+        for slot in &slots {
+            if !refused() {
+                // An error leaves the chunk in its slot for the caller's thread below.
+                let _ = std::thread::Builder::new().spawn_scoped(s, move || run(slot));
+            }
         }
-        first.iter_mut().for_each(f);
+        first.iter_mut().for_each(&f);
+        slots.iter().for_each(run);
     });
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Tests: behave as if the system gave this thread no further threads.
+    static REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether to skip starting threads (only ever true in this module's tests).
+fn refused() -> bool {
+    #[cfg(test)]
+    return REFUSE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{for_each_mut, map_ordered};
+    use super::{REFUSE, for_each_mut, map_ordered};
 
     #[test]
     fn every_item_is_changed_once_whatever_the_worker_count() {
@@ -60,6 +79,19 @@ mod tests {
             assert_eq!(items, want, "{workers} workers");
         }
         for_each_mut::<u32>(&mut [], 4, |x| *x += 1);
+    }
+
+    /// With no thread to be had the work is still done, all of it on the caller's thread.
+    #[test]
+    fn a_thread_that_cannot_start_leaves_its_chunk_to_the_caller() {
+        REFUSE.with(|r| r.set(true));
+        let here = std::thread::current().id();
+        let mut items: Vec<(u32, bool)> = (0..23).map(|x| (x, false)).collect();
+        for_each_mut(&mut items, 4, |x| *x = (x.0 + 1, std::thread::current().id() == here));
+        let want: Vec<(u32, bool)> = (1..24).map(|x| (x, true)).collect();
+        assert_eq!(items, want);
+        assert_eq!(map_ordered(&[1u32, 2, 3, 4, 5], 3, |x| x * 2), vec![2, 4, 6, 8, 10]);
+        REFUSE.with(|r| r.set(false));
     }
 
     #[test]
