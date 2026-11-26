@@ -41,7 +41,7 @@ fn key<'a>(v: &'a Value, path: &str) -> R<&'a str> {
 
 /// An error text cut to [`config::SHUFFLE_ERROR_MAX_BYTES`]: it may quote a name whose length
 /// nothing has bounded yet.
-fn clip(mut e: String) -> String {
+pub(super) fn clip(mut e: String) -> String {
     let mut cut = config::SHUFFLE_ERROR_MAX_BYTES;
     if e.len() > cut {
         while !e.is_char_boundary(cut) {

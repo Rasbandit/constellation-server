@@ -96,6 +96,11 @@ pub(crate) struct Bound {
 impl Bound {
     /// Check a stored shuffle section against the world it came with.
     pub(crate) fn bind(w: &World, section: &[u8]) -> R<Bound> {
+        // A stored name is quoted in an error at whatever length the section gives it.
+        Self::bound(w, section).map_err(decl::clip)
+    }
+
+    fn bound(w: &World, section: &[u8]) -> R<Bound> {
         let decl = Decl::load(section)?;
         for option in decl.option_keys() {
             if !(0..w.options()).any(|k| w.option_key(k) == option) {
