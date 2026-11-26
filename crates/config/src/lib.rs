@@ -295,8 +295,9 @@ pub const FILL_SETUP_WORKERS: usize = 4;
 
 /// Players from which a room's fill places its rounds against a fresh forward solve of the
 /// room instead of taking the round's items back by truth maintenance (`data_fill::room::Path`;
-/// both give the same placements). Measured on the synthetic rooms of the `bench-room` CI job:
-/// see `docs/port-check.md`, "Scaling with players".
+/// both give the same placements). The forward solve is slower for one player and faster at
+/// ten on the synthetic rooms of the `bench-room` CI job; where the two cross in between is not
+/// measured (see `docs/port-check.md`, "Scaling with players").
 pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
 
 /// Threads the players' states of a room run on while a round is solved forward (a design

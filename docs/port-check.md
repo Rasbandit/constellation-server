@@ -180,6 +180,32 @@ Two things this run found. The start inventory of the player with shuffled clock
 - Every fill is one full solve, then incremental steps (`solves` 1 in all rows).
 
 
+### Rooms of 8 players or more: a forward solve per round
+
+The table above is the carried path (`room::Path::Carry`). A room of `config::ROOM_FORWARD_MIN_PLAYERS` (8) players or more now places its rounds on `room::Path::Forward`: the room is solved afresh for each round with none of the round's items held, forward only, each player's state on one of `config::ROOM_FORWARD_WORKERS` (4) threads. The placements are the same on both paths: a round's state is the unique least fixed point for what is held and placed, and placing reads only what it reaches (tests `a_forward_solve_per_round_places_what_truth_maintenance_does` and `the_forward_path_is_the_same_with_one_worker_and_with_many`).
+
+The test world cannot be committed, so CI measures synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`). The heavy profile follows the test world's counts per check (0.21 regions, 2.4 rule sites, 0.07 defs, 45 time slices, clocks on, 2.4 nodes per rule site against about 2.6). Measured on one GitHub-hosted runner by the `bench-room` job (release build, fill ms as the median of 5, 2026-11-26, commit d7d4ce3); runs on other runners differed by about 20 percent.
+
+| Profile | Players | Carried: fill ms | Carried: rule evaluations | Forward, 4 threads: fill ms | Forward: rule evaluations |
+|---|---|---|---|---|---|
+| light | 1 | 3.5 | 43,855 | 6.9 | 253,458 |
+| light | 10 | 112.8 | 1,117,203 | 78.8 | 2,687,618 |
+| light | 20 | 278.8 | 2,553,983 | 140.2 | 5,361,691 |
+| light | 50 | 1,347.9 | 11,441,303 | 334.5 | 13,425,303 |
+| light | 100 | 3,552.9 | 27,459,539 | 639.7 | 26,840,369 |
+| heavy | 1 | 18.5 | 149,132 | 27.0 | 488,289 |
+| heavy | 10 | 582.3 | 4,204,093 | 237.7 | 5,364,638 |
+| heavy | 20 | 1,606.2 | 11,060,637 | 416.2 | 10,518,266 |
+| heavy | 50 | 7,658.5 | 48,917,059 | 1,015.1 | 26,224,539 |
+| heavy | 100 | 24,772.6 | 145,327,726 | 2,030.7 | 52,251,328 |
+
+Fitted exponent of fill time over players: carried 1.51 (light) and 1.56 (heavy), forward 0.98 and 0.93.
+
+- **How close the heavy profile is to the test world.** The test world's fills above, scaled by checks (1,000 of 1,516), are 12.7, 699 and 2,373 ms at 1, 10 and 20 players. The heavy profile's carried fills are 18.5, 582 and 1,606 ms in this run (46 percent above, 17 and 32 percent below) and 21.8, 702 and 1,913 ms in the run before (72 percent above, level, 19 percent below). The rooms are near; one player is heavier than the test world per check, and the profile grows more slowly from 1 to 10 players (about 32 times against 55). The two were measured on different machines, so the comparison is rough. Rule evaluations, which do not depend on the machine: 149 thousand, 4.2 million and 11.1 million against the test world's 96 thousand, 3.78 million and 10.6 million (not scaled).
+- **Where the two paths cross is not measured** between 1 and 10 players; the forward path is slower for one player and faster at 10 on both profiles. 8 is a cautious pick.
+- **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
+- The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
+
 ## Fairness
 
 ### Tier 1: port sanity (part of `port-check`)
