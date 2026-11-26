@@ -17,7 +17,7 @@ use crate::spheres::RoomSpheres;
 use crate::world::World;
 
 /// One player: the slot name and the resolved instance of their world.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Player {
     /// The slot's name, which is also its connect name.
     pub name: String,

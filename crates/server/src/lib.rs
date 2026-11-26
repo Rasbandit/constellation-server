@@ -305,9 +305,15 @@ fn version_string(version: &str, sha: Option<&str>) -> String {
     }
 }
 
+/// This build's version ([`version_string`]): what `GET /version` shows, and what a prepared
+/// world is stored under, so every build that says another version prepares its worlds again.
+pub(crate) fn build_version() -> String {
+    version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"))
+}
+
 /// `GET /version`: `{"version": "<version>[+<short sha>]"}`. The web UI compares it with its own.
 async fn version() -> impl IntoResponse {
-    let v = version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"));
+    let v = build_version();
     ([(header::CONTENT_TYPE, "application/json")], format!("{{\"version\":\"{v}\"}}"))
 }
 

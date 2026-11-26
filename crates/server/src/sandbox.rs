@@ -19,12 +19,9 @@
 //! program, which needs libseccomp or a hand-written filter), and CPU is bounded only by the
 //! time limit.
 
-use crate::cache::Cache;
 use config::{Generation, Limits};
-use data_fill::prepared::Prepared;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -292,38 +289,8 @@ pub fn fill_job(job: &str) -> Result<(), String> {
     use std::io::{Read, Write};
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
-    // One job per process today, so these worlds are gone when it ends: the cache is what a
-    // worker that stays up for many jobs would keep (see #200).
-    let mut worlds = Cache::new(config::PREPARED_CACHE_BYTES);
-    let out = job_on(&mut worlds, job, &input)?;
+    let out = data_fill::job::run(job, &input)?;
     std::io::stdout().write_all(&out).map_err(|e| e.to_string())
-}
-
-/// Run job `job` on `input` as a fill worker does: a `fill` takes its prepared world from
-/// `worlds` when it is loaded there (found by the hash of its file) and loads and keeps it
-/// when not; every other job is run as it is.
-///
-/// # Errors
-/// What the job refuses.
-pub(crate) fn job_on(
-    worlds: &mut Cache<Prepared>,
-    job: &str,
-    input: &[u8],
-) -> Result<Vec<u8>, String> {
-    if job != "fill" {
-        return data_fill::job::run(job, input);
-    }
-    let (head, file) = data_fill::job::unframe(input)?;
-    let key = log::blob_key(file);
-    let world = match worlds.get(&key) {
-        Some(loaded) => loaded,
-        None => {
-            let loaded = Arc::new(Prepared::open(file)?);
-            worlds.put(key, Arc::clone(&loaded));
-            loaded
-        }
-    };
-    data_fill::job::fill_on(&world, head).map(|x| x.0)
 }
 
 /// Run `argv` (program first) with `input` on its stdin, and return its stdout (at most

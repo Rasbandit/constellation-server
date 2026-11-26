@@ -1,7 +1,7 @@
 //! Uploaded data-only world manifests: stored in the database once per content hash (never as
 //! files, so every server instance sees them), with the listing columns beside them so a listing
 //! never reads a manifest, and each one's prepared world (`data_fill::prepared`) as a blob found
-//! by manifest and engine layout. A size-bounded in-memory cache is in front of the bytes a
+//! by manifest and engine (the file layout and the server build). A size-bounded in-memory cache is in front of the bytes a
 //! generation reads.
 
 use crate::cache::Cache;
@@ -16,8 +16,17 @@ pub(crate) struct Manifests {
     db: Db,
     cache: Mutex<Cache<Vec<u8>>>,
     page_max: usize,
-    /// The engine layout prepared worlds are stored and found under.
-    pub(crate) layout: u32,
+    /// The engine prepared worlds are stored and found under ([`engine_key`] of this build).
+    pub(crate) engine: String,
+}
+
+/// What a prepared world is stored and found under beside its manifest: the layout of the file
+/// (`data_fill::prepared::layout`) and the server build that made it (`build`,
+/// [`crate::build_version`]). The compiled form is kept between generations, so a fix to the
+/// compiler would otherwise never reach a stored world: with the build in the key, each deploy
+/// prepares each world again on its first generation (a few milliseconds, once).
+pub(crate) fn engine_key(build: &str) -> String {
+    format!("{}@{build}", data_fill::prepared::layout())
 }
 
 /// The id as the 32 bytes it is the hex of. `id` must be 64 lowercase hex digits.
@@ -48,7 +57,7 @@ impl Manifests {
             db,
             cache: Mutex::new(Cache::new(limits.manifest_cache_bytes)),
             page_max: limits.list_page_max,
-            layout: data_fill::prepared::LAYOUT,
+            engine: engine_key(&crate::build_version()),
         }
     }
 
@@ -79,10 +88,10 @@ impl Manifests {
     }
 
     /// Manifest `id`'s prepared world, from the cache or the blob store. `None` when it must be
-    /// prepared (again): never prepared at this engine layout, or its blob is missing or torn.
+    /// prepared (again): never prepared by this engine, or its blob is missing or torn.
     pub(crate) async fn prepared(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
         let Some(key) = key_of(id) else { return Ok(None) };
-        let Some(package) = self.db.prepared_key(&key, self.layout).await? else {
+        let Some(package) = self.db.prepared_key(&key, &self.engine).await? else {
             return Ok(None);
         };
         if let Some(hit) = self.cached(&package) {
@@ -98,7 +107,7 @@ impl Manifests {
         }
     }
 
-    /// Store manifest `id`'s prepared world `file` as a blob, found under this engine layout.
+    /// Store manifest `id`'s prepared world `file` as a blob, found under this engine.
     pub(crate) async fn put_prepared(
         &self,
         id: &str,
@@ -107,7 +116,7 @@ impl Manifests {
         let key = key_of(id).ok_or_else(|| StoreError::Corrupt("not a manifest id".into()))?;
         let package = log::blob_key(&file);
         self.db.blob_put(&package, &file).await?;
-        self.db.prepared_put(&key, self.layout, &package).await?;
+        self.db.prepared_put(&key, &self.engine, &package).await?;
         Ok(self.cache(package, file))
     }
 
@@ -174,6 +183,21 @@ mod tests {
         for bad in ["", "ab", &"AB".repeat(32), &"zz".repeat(32), &"ab".repeat(33)] {
             assert_eq!(key_of(bad), None, "{bad}");
         }
+    }
+
+    /// Fails without the build in the key: worlds are stored under this build's version and
+    /// the file layout, and another build or another layout is another key.
+    #[test]
+    fn prepared_worlds_are_keyed_by_the_file_layout_and_the_build() {
+        let here = manifests(&config::Limits::DESIGN).engine;
+        assert_eq!(here, engine_key(&crate::build_version()));
+        assert!(here.starts_with(&format!("{}@", data_fill::prepared::layout())), "{here}");
+        assert!(here.ends_with(env!("CARGO_PKG_VERSION")) || here.contains('+'), "{here}");
+        assert_ne!(engine_key("1.0.0+aaaaaaa"), engine_key("1.0.0+bbbbbbb"));
+        let layout = data_fill::prepared::layout();
+        let parts: Vec<&str> = layout.split('.').collect();
+        assert_eq!(parts.len(), 3, "rules section, package file, prepared layout: {layout}");
+        assert_eq!(parts[1], seed_bundle::package::VERSION.to_string());
     }
 
     fn manifests(limits: &config::Limits) -> Manifests {

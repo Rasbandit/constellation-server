@@ -290,22 +290,16 @@ pub const RULES_MAX_DEPTH: u32 = 256;
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
 
 /// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
-/// sections the file holds and what is in them. Raise it with any change to that; a world
-/// prepared at another version is prepared again from its manifest.
+/// sections the file holds and what is in them. Raise it with any change to that. A world is
+/// also prepared again by every new server build, so this guards builds that share a version
+/// text (local and test builds).
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
 
-/// Bytes of loaded prepared worlds one fill worker process keeps in memory, least recently used
-/// out first (`server::cache`). A design value, not measured under load: a loaded world of 1000
-/// checks was counted at about 0.2 MB (light synthetic profile) to 0.4 MB (heavy), so this
-/// keeps on the order of a hundred such worlds ready in a worker, and a world not held loads
-/// from its stored form in about a millisecond. Small on purpose: it is paid once per worker
-/// process, beside the fill's own memory.
-pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
-
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
-/// generation costs one core and many run side by side. The parallel path stays for a caller of
-/// the fill that asks for more, up to [`ROOM_FORWARD_WORKERS`] (results never depend on the
-/// number).
+/// generation costs one core and many run side by side. The price is wall time for rooms on the
+/// forward path (8 players and up): measured on the `bench-room` CI job, 100 players filled in
+/// about half the time on 4 threads. The parallel path stays for a caller of the fill that asks
+/// for more, up to [`ROOM_FORWARD_WORKERS`] (results never depend on the number).
 pub const GENERATION_WORKERS: usize = 1;
 
 /// Worker threads that compile worlds and resolve instances of a room's players in parallel

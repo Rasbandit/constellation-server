@@ -4,9 +4,10 @@
 //! compiles the world once (`job::prepare`) and fills from the stored form (`job::fill`), whose
 //! output is the seed file itself: no JSON bundle is written, parsed and encoded again.
 
-use data_fill::job;
+use data_fill::job::{self, Fill};
 use data_fill::prepared::{self, Prepared};
-use data_fill::seed::{Player, generate};
+use data_fill::room::{Algorithm, Dials};
+use data_fill::seed::{Player, generate, generate_by};
 use data_fill::synth::{Shape, world};
 use seed_bundle::package::key_of;
 use serde_json::{Value, json};
@@ -42,22 +43,19 @@ fn prepared(manifest: &Value) -> (Value, Vec<u8>) {
 }
 
 /// The fill request of `players` on a prepared world, as the server sends it.
+fn asked(players: &[Player], rng: u64, workers: usize, algorithm: Algorithm) -> Fill<Player> {
+    Fill {
+        seed_name: format!("s{rng}"),
+        players: players.to_vec(),
+        rng_seed: rng,
+        workers,
+        algorithm,
+        seed_max_bytes: MAX,
+    }
+}
+
 fn request(file: &[u8], players: &[Player], rng: u64, workers: usize) -> Vec<u8> {
-    let players: Vec<Value> = players
-        .iter()
-        .map(|p| {
-            let i = &p.instance;
-            json!({"name": p.name, "instance": {
-                "options": i.options, "rolls": i.rolls, "locations": i.locations,
-                "excluded": i.excluded, "locked": i.locked, "pool": i.pool,
-                "pool_class": i.pool_class, "start_inventory": i.start_inventory,
-                "logic_start": i.logic_start, "item_groups": i.item_groups,
-                "location_groups": i.location_groups,
-            }})
-        })
-        .collect();
-    let head = json!({"seed_name": format!("s{rng}"), "players": players, "rng_seed": rng, "workers": workers});
-    job::frame(head.to_string().as_bytes(), file)
+    asked(players, rng, workers, Algorithm::Exact).framed(file).unwrap()
 }
 
 /// The seed file and package files the prepared path stores: the fill's output as it is (a
@@ -112,12 +110,12 @@ fn the_prepared_path_stores_the_bytes_the_manifest_path_does() {
 }
 
 #[test]
-fn preparing_checks_a_manifest_as_inspect_does_and_the_file_opens_as_its_world() {
+fn preparing_checks_a_manifest_and_the_file_opens_as_its_world() {
     let (m, p) = room(1);
     let (found, file) = prepared(&m);
-    let inspected: Value =
-        serde_json::from_slice(&job::inspect(m.to_string().as_bytes()).unwrap()).unwrap();
-    assert_eq!(found, inspected);
+    let w = data_fill::World::load(&m).unwrap();
+    let record = json!({"game": "Synth", "version": "1", "items": w.items(), "locations": 200});
+    assert_eq!(found, record);
     let world = Prepared::open(&file).unwrap();
     assert_eq!((world.game(), world.world().locations()), ("Synth", 200));
     // The same manifest prepares to the same bytes: the stored form is found by content.
@@ -171,6 +169,91 @@ fn the_fill_prints_a_seed_file_with_the_hash_of_its_bundle() {
     let (head, world) = job::unframe(&framed).unwrap();
     let mut head: Value = serde_json::from_slice(head).unwrap();
     head["seed_max_bytes"] = json!(64);
-    let small = job::frame(head.to_string().as_bytes(), world);
+    let small = job::frame(head.to_string().as_bytes(), world).unwrap();
     assert!(job::fill(&small).unwrap_err().contains("cap"));
+    // A field the reader does not know is refused, not dropped: a misspelt cap cannot pass.
+    head["seed_max_byte"] = json!(64);
+    let misspelt = job::frame(head.to_string().as_bytes(), world).unwrap();
+    assert!(job::fill(&misspelt).unwrap_err().contains("bad fill request"));
+    // A world that does not load says so in the words the server looks for.
+    let junk = asked(&p, 5, 1, Algorithm::Exact).framed(b"not a prepared world").unwrap();
+    assert!(job::fill(&junk).unwrap_err().starts_with(job::UNLOADABLE));
+}
+
+/// A room of three players on one world, each instance changed as `what` says (the changes
+/// the fill's own path test uses): start items, excluded locations, locked locations.
+fn varied(shape: &Shape, what: &str) -> (Value, Vec<Player>) {
+    let (mut manifest, instance) = world(shape, 1, 0);
+    manifest["game"] = json!("Synth");
+    manifest["version"] = json!("1");
+    let players = (0..3)
+        .map(|p| {
+            let mut i = instance.clone();
+            if what.contains("start") {
+                i.start_inventory.push("p1".to_owned());
+                i.logic_start.insert("p0".to_owned(), 1);
+            }
+            if what.contains("excluded") {
+                // A sixth of the locations take no progression; other ones for each player.
+                i.excluded = (0..i.locations.len())
+                    .filter(|l| l % 6 == p)
+                    .map(|l| format!("l{l}"))
+                    .collect();
+            }
+            if what.contains("locked") {
+                // A progression item and a filler leave the pool for fixed locations.
+                for (key, loc) in [("p1", "l3"), ("filler", "l10")] {
+                    let at = i.pool.iter().position(|k| k == key).unwrap();
+                    i.locked.insert(loc.to_owned(), i.pool.remove(at));
+                }
+            }
+            Player { name: format!("P{p}"), instance: i }
+        })
+        .collect();
+    (manifest, players)
+}
+
+/// The prepared path against the manifest path beyond plain rooms: start items (which the
+/// seed file encodes through the prepared package), excluded and locked locations, the heavy
+/// profile, and the opt-in fill modes. Every seed, or its refusal, is the same on both.
+#[test]
+fn the_prepared_path_matches_on_start_items_excluded_and_locked_locations_and_fill_modes() {
+    let (light, heavy) =
+        (Shape { checks: 200, ..Shape::default() }, Shape { checks: 200, ..Shape::heavy() });
+    let modes = [
+        Algorithm::Exact,
+        Algorithm::Level(Dials::default()),
+        Algorithm::Shuffle(Dials::default()),
+    ];
+    let mut made = 0;
+    for (shape, what) in [
+        (&light, "start"),
+        (&light, "excluded"),
+        (&light, "locked"),
+        (&light, "start+excluded+locked"),
+        (&heavy, "start+excluded+locked"),
+    ] {
+        let (m, p) = varied(shape, what);
+        let (_, file) = prepared(&m);
+        let game = prepared::seed_game(&file).unwrap().to_vec();
+        for mode in modes {
+            for rng in 1..=3 {
+                let old =
+                    generate_by(&m, &format!("s{rng}"), &p, rng, 1, mode).map(|(b, report)| {
+                        let text = serde_json::to_vec(&b).unwrap();
+                        let (seed, packages) = seed_bundle::import_v1(&text, MAX).unwrap();
+                        (seed.bytes().to_vec(), packages, report)
+                    });
+                let new = job::fill_reported(&asked(&p, rng, 1, mode).framed(&file).unwrap())
+                    .map(|(seed, report)| (seed, vec![game.clone()], report));
+                assert_eq!(new, old, "{what}, {mode:?}, seed {rng}");
+                made += usize::from(old.is_ok());
+                if let (Ok(seed), true) = (&old, what.contains("start")) {
+                    let back = seed_bundle::v2::decode(seed.0.clone(), |_| Ok(game.clone()), MAX);
+                    assert!(back.unwrap().slots.iter().all(|s| s.start_inventory.len() == 1));
+                }
+            }
+        }
+    }
+    assert!(made >= 40, "most of the 45 rooms fill: {made}");
 }

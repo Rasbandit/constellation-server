@@ -141,18 +141,18 @@ impl Db {
     pub(crate) async fn prepared_put(
         &self,
         id: &BlobKey,
-        layout: u32,
+        engine: &str,
         package: &BlobKey,
     ) -> Result<(), StoreError> {
-        on!(self, s => s.prepared_put(id, layout, package).await)
+        on!(self, s => s.prepared_put(id, engine, package).await)
     }
 
     pub(crate) async fn prepared_key(
         &self,
         id: &BlobKey,
-        layout: u32,
+        engine: &str,
     ) -> Result<Option<BlobKey>, StoreError> {
-        on!(self, s => s.prepared_key(id, layout).await)
+        on!(self, s => s.prepared_key(id, engine).await)
     }
 
     /// Store a blob under its content hash (`log::BlobStore`).

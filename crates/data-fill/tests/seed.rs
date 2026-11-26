@@ -98,69 +98,70 @@ fn a_manifest_without_a_game_or_players_without_names_are_refused() {
     assert!(generate(&m, "s", &[], 1, 1).is_err());
 }
 
+/// The found record and the prepared world file of a manifest's bytes, as `job::prepare`
+/// prints them.
+fn prepare(manifest: &[u8]) -> Result<(Value, Vec<u8>), String> {
+    let out = data_fill::job::prepare(manifest)?;
+    let (found, file) = data_fill::job::unframe(&out)?;
+    Ok((serde_json::from_slice(found).map_err(|e| e.to_string())?, file.to_vec()))
+}
+
 #[test]
 fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
+    use data_fill::job::{Fill, fill, fill_reported, frame};
     let (m, p) = players();
     let direct = generate(&m, "seed-one", &p, 7, 1).unwrap();
-    let players: Vec<Value> = p
-        .iter()
-        .map(|x| {
-            let mut v = json!({"name": x.name});
-            v["instance"] = json!({
-                "options": x.instance.options, "locations": x.instance.locations,
-                "pool": x.instance.pool, "pool_class": x.instance.pool_class,
-                "start_inventory": x.instance.start_inventory,
-            });
-            v
-        })
-        .collect();
-    let req = json!({"manifest": m, "seed_name": "seed-one", "players": players, "rng_seed": 7, "workers": 1});
-    let out = data_fill::job::generate(req.to_string().as_bytes()).unwrap();
-    let back: SeedBundle = serde_json::from_slice(&out).unwrap();
+    let (found, file) = prepare(m.to_string().as_bytes()).unwrap();
+    let game = data_fill::prepared::seed_game(&file).unwrap().to_vec();
+    let bundle = |seed: Vec<u8>| v2::decode(seed, |_| Ok(game.clone()), 1 << 24).unwrap();
+    let head = Fill {
+        seed_name: "seed-one".to_owned(),
+        players: p.clone(),
+        rng_seed: 7,
+        workers: 1,
+        algorithm: data_fill::room::Algorithm::Exact,
+        seed_max_bytes: 1 << 24,
+    };
+    let req = serde_json::to_value(&head).unwrap();
+    let framed = |head: &Value| frame(head.to_string().as_bytes(), &file).unwrap();
+    let out = fill(&framed(&req)).unwrap();
+    let back: SeedBundle = bundle(out.clone());
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
-    assert!(data_fill::job::generate(b"{").unwrap_err().contains("bad fill request"));
+    assert!(fill(&frame(b"{", &file).unwrap()).unwrap_err().contains("bad fill request"));
     // The mode is a field of the request: without it, and with "exact", the exact fill.
     let mut asked = req.clone();
+    asked.as_object_mut().unwrap().remove("algorithm");
+    assert_eq!(fill(&framed(&asked)).unwrap(), out);
     asked["algorithm"] = json!("exact");
-    assert_eq!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap(), out);
+    assert_eq!(fill(&framed(&asked)).unwrap(), out);
     asked["algorithm"] = json!({"level": {"depth": 100}});
-    let level = data_fill::job::generate(asked.to_string().as_bytes()).unwrap();
-    let level: SeedBundle = serde_json::from_slice(&level).unwrap();
+    let level = fill(&framed(&asked)).unwrap();
+    let level: SeedBundle = bundle(level);
     let dials = data_fill::room::Dials { depth: 100, ..Default::default() };
     let mode = data_fill::room::Algorithm::Level(dials);
     let (same, report) = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
     // The job says how the seed was placed, since the bundle cannot.
-    let said = data_fill::job::generate_reported(asked.to_string().as_bytes()).unwrap().1;
+    let said = fill_reported(&framed(&asked)).unwrap().1;
     assert_eq!(said, report);
     assert_eq!(report.placed_by_the_mode, report.fallbacks == 0, "one attempt: {report:?}");
     assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
     assert_eq!(level.slots.len(), direct.slots.len());
     // The depth dial is bounded where the request comes in.
     asked["algorithm"] = json!({"shuffle": {"depth": i32::MAX}});
-    assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("depth"));
+    assert!(fill(&framed(&asked)).unwrap_err().contains("depth"));
     asked["algorithm"] = json!("fastest");
-    assert!(data_fill::job::generate(asked.to_string().as_bytes()).unwrap_err().contains("bad"));
+    assert!(fill(&framed(&asked)).unwrap_err().contains("bad"));
 
-    let found = data_fill::job::inspect(m.to_string().as_bytes()).unwrap();
-    let found: Value = serde_json::from_slice(&found).unwrap();
     assert_eq!(
         (&found["game"], &found["version"], &found["items"]),
         (&json!("Fixture"), &json!("1"), &json!(4))
     );
     let mut padded = m.clone();
     padded["game"] = json!("  Fixture ");
-    assert_eq!(
-        serde_json::from_slice::<Value>(
-            &data_fill::job::inspect(padded.to_string().as_bytes()).unwrap()
-        )
-        .unwrap()["game"],
-        "Fixture"
-    );
+    assert_eq!(prepare(padded.to_string().as_bytes()).unwrap().0["game"], "Fixture");
     padded.as_object_mut().unwrap().remove("version");
-    assert!(
-        data_fill::job::inspect(padded.to_string().as_bytes()).unwrap_err().contains("version")
-    );
-    assert!(data_fill::job::inspect(b"[]").is_err());
+    assert!(prepare(padded.to_string().as_bytes()).unwrap_err().contains("version"));
+    assert!(prepare(b"[]").is_err());
 }
 
 #[test]
@@ -169,7 +170,7 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
     let check = |key: &str, value: &str| {
         let mut m = m.clone();
         m[key] = json!(value);
-        data_fill::job::inspect(m.to_string().as_bytes()).map(|_| ())
+        data_fill::job::prepare(m.to_string().as_bytes()).map(|_| ())
     };
     for key in ["game", "version"] {
         assert!(

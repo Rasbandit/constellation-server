@@ -275,21 +275,21 @@ async fn blobs_are_stored_once_by_key_and_checked_on_write<S: Store>(s: Arc<S>) 
     assert_eq!(s.get(&kb).await.unwrap(), None, "the refused put wrote nothing");
 }
 
-/// A prepared world is found by its manifest and the engine layout it was prepared at: another
-/// layout or another manifest reads as none, and a later put replaces the key.
+/// A prepared world is found by its manifest and the engine that prepared it: another engine
+/// (an older build) or another manifest reads as none, and a later put replaces the key.
 async fn a_prepared_world_is_found_by_manifest_and_layout<S: Store>(s: Arc<S>) {
     let (m, other) = (blob_key(b"manifest"), blob_key(b"another manifest"));
     let (a, b) = (blob_key(b"prepared a"), blob_key(b"prepared b"));
-    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), None);
-    s.prepared_put(&m, 1, &a).await.unwrap();
-    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), Some(a));
-    assert_eq!(s.prepared_key(&m, 2).await.unwrap(), None, "an older layout's is stale");
-    assert_eq!(s.prepared_key(&other, 1).await.unwrap(), None);
-    s.prepared_put(&m, 2, &b).await.unwrap();
-    s.prepared_put(&m, 1, &b).await.unwrap();
-    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), Some(b), "rebuilt: the key is replaced");
-    assert_eq!(s.prepared_key(&m, 2).await.unwrap(), Some(b));
-    assert_eq!(s.prepared_key(&m, u32::MAX).await.unwrap(), None);
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@a", &a).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(a));
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), None, "another build's is stale");
+    assert_eq!(s.prepared_key(&other, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@b", &b).await.unwrap();
+    s.prepared_put(&m, "1@a", &b).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(b), "rebuilt: the key is replaced");
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), Some(b));
+    assert_eq!(s.prepared_key(&m, "").await.unwrap(), None);
 }
 
 fn manifest(name: &str, game: &str, body: &[u8]) -> ManifestRecord {

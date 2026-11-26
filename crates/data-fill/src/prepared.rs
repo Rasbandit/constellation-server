@@ -15,13 +15,18 @@ use crate::section;
 use crate::seed::{game_data, manifest_game};
 use crate::world::World;
 
-/// The layout a prepared world is stored and found under: the rules section's version and
-/// `config::PREPARED_WORLD_LAYOUT`. A file of another layout is stale.
-pub const LAYOUT: u32 = (section::VERSION as u32) << 16 | config::PREPARED_WORLD_LAYOUT as u32;
+/// The layout of a prepared world's file, as text: the versions of everything in it (the rules
+/// section, the package file format it is and embeds, and `config::PREPARED_WORLD_LAYOUT` for
+/// which sections it holds). Part of what a stored world is found under, with the build that
+/// made it: the file does not carry it.
+#[must_use]
+pub fn layout() -> String {
+    format!("{}.{}.{}", section::VERSION, package::VERSION, config::PREPARED_WORLD_LAYOUT)
+}
 
-/// Most bytes the game's names and ids may inflate to: a seed's own cap, since a seed names
-/// them.
-const GAME_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
+/// The design cap of a seed file, where no configured one is at hand: the default of a fill
+/// request, and the most the game's names and ids may inflate to (a seed names them).
+pub const SEED_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
 
 /// A loaded prepared world: the compiled world, and the tables every seed of it shares.
 #[derive(Debug)]
@@ -64,11 +69,11 @@ impl Prepared {
     /// Load a prepared world's `file`, checked as [`World::from_package`] checks a package.
     ///
     /// # Errors
-    /// A file that is not a prepared world of this layout.
+    /// A file whose sections are missing, damaged or of another version than this engine reads.
     pub fn open(file: &[u8]) -> Result<Self, String> {
         let world = World::from_package(file)?;
         let seed_game = seed_game(file)?;
-        let content = package::section_of(seed_game, SECTION_GAME, GAME_MAX_BYTES)
+        let content = package::section_of(seed_game, SECTION_GAME, SEED_MAX_BYTES)
             .map_err(|e| e.to_string())?
             .ok_or("prepared world: no game section in the seed game")?;
         let (game, data) = GamePackage::parse(&content).map_err(|e| e.to_string())?;
@@ -91,17 +96,6 @@ impl Prepared {
     #[must_use]
     pub fn game(&self) -> &str {
         &self.game
-    }
-
-    /// Bytes this prepared world holds in memory: the loaded world, the game's name and both
-    /// tables. What a cache of prepared worlds counts against its cap.
-    #[must_use]
-    pub fn held_bytes(&self) -> usize {
-        self.world.held_bytes()
-            + self.game.capacity()
-            + self.data.held_bytes()
-            + self.table.held_bytes()
-            + self.games_json.capacity()
     }
 
     /// The game's names, ids and checksum.

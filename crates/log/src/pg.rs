@@ -813,22 +813,22 @@ impl crate::ManifestStore for PgLogStore {
         }
     }
 
-    /// In the `prepared_worlds` table (migration 0010).
+    /// In the `prepared_worlds` table (migration 0011).
     async fn prepared_put(
         &self,
         id: &BlobKey,
-        layout: u32,
+        engine: &str,
         package: &BlobKey,
     ) -> Result<(), StoreError> {
-        let (id, package) = (id.to_vec(), package.to_vec());
+        let (id, engine, package) = (id.to_vec(), engine.to_owned(), package.to_vec());
         self.isolated(move |c| {
             Box::pin(async move {
                 sqlx::query(
-                    "INSERT INTO prepared_worlds (manifest, layout, package) VALUES ($1, $2, $3) \
-                     ON CONFLICT (manifest, layout) DO UPDATE SET package = EXCLUDED.package",
+                    "INSERT INTO prepared_worlds (manifest, engine, package) VALUES ($1, $2, $3) \
+                     ON CONFLICT (manifest, engine) DO UPDATE SET package = EXCLUDED.package",
                 )
                 .bind(&id)
-                .bind(i64::from(layout))
+                .bind(&engine)
                 .bind(&package)
                 .execute(&mut *c)
                 .await
@@ -839,16 +839,20 @@ impl crate::ManifestStore for PgLogStore {
         .await
     }
 
-    async fn prepared_key(&self, id: &BlobKey, layout: u32) -> Result<Option<BlobKey>, StoreError> {
-        let id = id.to_vec();
+    async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        let (id, engine) = (id.to_vec(), engine.to_owned());
         let found: Option<Vec<u8>> = self
             .isolated(move |c| {
                 Box::pin(async move {
                     sqlx::query_scalar(
-                        "SELECT package FROM prepared_worlds WHERE manifest = $1 AND layout = $2",
+                        "SELECT package FROM prepared_worlds WHERE manifest = $1 AND engine = $2",
                     )
                     .bind(&id)
-                    .bind(i64::from(layout))
+                    .bind(&engine)
                     .fetch_optional(&mut *c)
                     .await
                     .map_err(|e| db::<StoreError>(&e))

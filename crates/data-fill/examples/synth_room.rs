@@ -18,8 +18,10 @@
 //! one` is a room as the server generates it, every player on one world, loaded once. Only
 //! then is a seed assembled: `assemble_ms` builds the bundle on the prepared tables
 //! ([`data_fill::seed::assemble_on`]), `encode_ms` checks, hashes and encodes it as the seed
-//! file ([`data_fill::seed::encode_on`]), and `import_v1_ms` is what the path before did in
-//! its place (the bundle as JSON text, then `seed_bundle::import_v1`); medians of `reps`. Two
+//! file ([`data_fill::seed::encode_on`]), `open_ms` opens that file on the world's package as
+//! the server does (`seed_bundle::Seed::read`), and `import_v1_ms` is what the path before did
+//! in place of both (the bundle as JSON text, then `seed_bundle::import_v1`, which encodes and
+//! opens); medians of `reps`. Two
 //! parts of the encode are also timed alone: `validate_ms` (the check), and `hash_whole_ms`,
 //! the hash with the game's names and ids written again, which the encode does not pay.
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
@@ -37,7 +39,7 @@
 
 use std::time::Instant;
 
-use data_fill::prepared::{Prepared, build};
+use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Shape, world};
@@ -100,9 +102,6 @@ fn fine(ms: f64) -> f64 {
     (ms * 100.0).round() / 100.0
 }
 
-/// The seed cap of the encodes here.
-const SEED_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
-
 fn one(
     shape: &Shape,
     seed: u64,
@@ -159,6 +158,13 @@ fn one(
         let seed_file = encode_on(on, &mut bundle, SEED_MAX_BYTES)?;
         let (assemble_ms, _) = median(reps, || assemble().map(drop))?;
         let (encode_ms, _) = median(reps, || encode_on(on, &mut bundle, SEED_MAX_BYTES).map(drop))?;
+        // What the server then does with the seed file: open it on the world's package.
+        let game = seed_game(&files[0])?.to_vec();
+        let (open_ms, _) = median(reps, || {
+            seed_bundle::Seed::read(seed_file.clone(), |_| Ok(game.clone()), SEED_MAX_BYTES)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })?;
         let rss_after_encode = peak_rss();
         let (validate_ms, _) = median(reps, || bundle.validate().map_err(|e| e.to_string()))?;
         let (hash_whole_ms, _) = median(reps, || bundle.hash().map(drop))?;
@@ -170,7 +176,7 @@ fn one(
             }
             Ok(())
         })?;
-        seed_row = json!({"assemble_ms": fine(assemble_ms), "encode_ms": fine(encode_ms),
+        seed_row = json!({"assemble_ms": fine(assemble_ms), "encode_ms": fine(encode_ms), "open_ms": fine(open_ms),
                           "validate_ms": fine(validate_ms), "hash_whole_ms": fine(hash_whole_ms),
                           "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len(),
                           "peak_rss_after_encode_bytes": rss_after_encode});
@@ -196,7 +202,6 @@ fn one(
         "prepare_ms": fine(prepare_ms),
         "load_ms": fine(load_ms),
         "prepared_bytes": files.iter().map(Vec::len).sum::<usize>(),
-        "loaded_bytes": loaded.iter().map(Prepared::held_bytes).sum::<usize>(),
         "seed": seed_row,
         "setup_ms": (setup_ms * 10.0).round() / 10.0,
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
