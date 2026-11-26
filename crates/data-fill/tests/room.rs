@@ -2,7 +2,9 @@
 //! plays it as is, player 2 with a harder hall door, player 3 with a goal that stops at the
 //! hall and one location fewer.
 
-use data_fill::room::{self, Given, Seat, fill_room_spheres, locked_placed, validate_room};
+use data_fill::room::{
+    self, Compiled, Given, Seat, fill_room_spheres, locked_placed, validate_room,
+};
 use data_fill::spheres::room_spheres;
 use data_fill::{Instance, Plan, World, fill};
 use serde_json::Value;
@@ -18,33 +20,10 @@ fn load() -> (Value, Vec<Instance>) {
 }
 
 /// Compiled worlds, plans and progression flags for `n` players (the fixture's three, repeated).
-struct Room {
-    worlds: Vec<World>,
-    plans: Vec<Plan>,
-    progression: Vec<Vec<bool>>,
-}
-
-impl Room {
-    fn new(n: usize, workers: usize) -> Self {
-        let (m, insts) = load();
-        let insts: Vec<&Instance> = (0..n).map(|p| &insts[p % insts.len()]).collect();
-        let manifests: Vec<&Value> = vec![&m; n];
-        let worlds = room::worlds(&manifests, workers).unwrap();
-        let pairs: Vec<(&World, &Instance)> = worlds.iter().zip(insts.iter().copied()).collect();
-        let plans = room::plans(&pairs, workers).unwrap();
-        let progression = worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
-        Room { worlds, plans, progression }
-    }
-
-    fn seats(&self) -> Vec<Seat<'_>> {
-        (0..self.plans.len())
-            .map(|p| Seat {
-                w: &self.worlds[p],
-                plan: &self.plans[p],
-                progression: &self.progression[p],
-            })
-            .collect()
-    }
+fn players(n: usize, workers: usize) -> Compiled {
+    let (m, insts) = load();
+    let insts: Vec<&Instance> = (0..n).map(|p| &insts[p % insts.len()]).collect();
+    Compiled::new(&vec![&m; n], &insts, workers).unwrap()
 }
 
 fn rng(seed: u64) -> SpecRng {
@@ -109,7 +88,7 @@ const CHAIN: &[(u16, &str, u16, &str)] = &[
 
 #[test]
 fn an_item_in_another_world_opens_the_door_for_a_third_player() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
     let (beatable, reached) = validate_room(&seats, &placed).unwrap();
@@ -149,7 +128,7 @@ fn an_item_in_another_world_opens_the_door_for_a_third_player() {
 
 #[test]
 fn an_item_behind_its_own_door_strands_only_its_owner() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     // Player 1's key moves into player 1's vault (behind the door it opens) and the lamp that
     // was there goes to player 3's first room: player 1 is stuck, the others do not need it.
@@ -163,7 +142,7 @@ fn an_item_behind_its_own_door_strands_only_its_owner() {
 
 #[test]
 fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     // crossed[a][b]: a progression item of player a seen in player b's world.
     let mut crossed = [[false; 3]; 3];
@@ -213,7 +192,7 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
 
 #[test]
 fn the_same_seed_gives_the_same_bytes_and_other_seeds_differ() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     let run = |seed| {
         let f = room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
@@ -229,7 +208,7 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
     let outputs: Vec<Vec<String>> = [1usize, 2, 3, 7, 16]
         .iter()
         .map(|workers| {
-            let r = Room::new(7, *workers);
+            let r = players(7, *workers);
             let seats = r.seats();
             (1u64..=5)
                 .map(|seed| {
@@ -244,9 +223,48 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
     assert!(outputs.windows(2).all(|p| p[0] == p[1]));
 }
 
+/// The fixture world on both ways of placing rounds: carried, forward on one thread and on
+/// three, and the path a room of that size takes by itself (forward from
+/// `config::ROOM_FORWARD_MIN_PLAYERS` players). Placements, spheres, attempts and rounds are
+/// the same, or the error is.
+#[test]
+fn the_fixture_fills_the_same_carried_and_forward() {
+    use data_fill::room::{Path, fill_room_on};
+    let mut forward = 0;
+    for n in [1usize, 2, 3, 7, 8, 9, 12] {
+        let r = players(n, 1);
+        let seats = r.seats();
+        for seed in 1u64..=12 {
+            let shown = |x: Result<(room::RoomFilled, _), data_fill::FillError>| match x {
+                Ok((f, sp)) => {
+                    let solves = f.solves;
+                    (Ok((lines(&seats, &f.placed), sp, f.attempts, f.rounds, f.beatable)), solves)
+                }
+                Err(e) => (Err(format!("{e:?}")), 0),
+            };
+            let on =
+                |path| shown(fill_room_on(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, path));
+            let (carried, _) = on(Path::Carry);
+            for workers in [1, 3] {
+                assert_eq!(carried, on(Path::Forward { workers }).0, "{n} players, seed {seed}");
+            }
+            let (auto, solves) =
+                shown(fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
+            assert_eq!(carried, auto, "{n} players, seed {seed}: the room's own path");
+            // A fill that worked solved once when carried, once per round when forward.
+            let took_forward = solves > 1;
+            if carried.is_ok() {
+                assert_eq!(took_forward, n >= config::ROOM_FORWARD_MIN_PLAYERS, "{n} players");
+            }
+            forward += u32::from(took_forward);
+        }
+    }
+    assert!(forward > 0, "rooms at and above the threshold filled forward");
+}
+
 #[test]
 fn a_room_of_one_fills_exactly_like_a_single_player() {
-    let r = Room::new(1, 1);
+    let r = players(1, 1);
     let seats = r.seats();
     for seed in 1u64..=40 {
         let one =
@@ -259,7 +277,7 @@ fn a_room_of_one_fills_exactly_like_a_single_player() {
 
 #[test]
 fn a_room_needs_players_and_matching_counts() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     let e = room::fill_room(&[], &mut rng(1), 1).unwrap_err();
     assert!(matches!(e, data_fill::FillError::Instance(_)), "{e:?}");
@@ -302,7 +320,7 @@ fn shared_data_is_send_and_sync_and_a_state_can_move_to_a_task() {
 
 #[test]
 fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
     let sp = room_spheres(&seats, &placed).unwrap();
@@ -332,7 +350,7 @@ fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
 
 #[test]
 fn placements_that_do_not_fit_the_room_are_refused_not_indexed() {
-    let r = Room::new(3, 1);
+    let r = players(3, 1);
     let seats = r.seats();
     let good = hand(&seats, CHAIN);
     let bad = |placed: &[Vec<Option<Given>>]| {

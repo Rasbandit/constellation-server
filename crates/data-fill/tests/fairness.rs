@@ -118,16 +118,13 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
 #[test]
 fn a_room_is_measured_against_the_same_baseline() {
     use data_fill::fairness::{Flat, report_named, sample_room};
-    use data_fill::room::{self, Seat};
+    use data_fill::room;
     let v: Value =
         serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
     let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let worlds = room::worlds(&vec![&v["manifest"]; insts.len()], 1).expect("worlds");
-    let pairs: Vec<_> = worlds.iter().zip(&insts).collect();
-    let plans = room::plans(&pairs, 1).expect("plans");
-    let prog: Vec<Vec<bool>> = worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
-    let seats: Vec<Seat<'_>> =
-        (0..3).map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &prog[p] }).collect();
+    let insts: Vec<&Instance> = insts.iter().collect();
+    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+    let (worlds, seats) = (&c.worlds, c.seats());
     let flat = Flat::new(&seats).expect("flat");
     let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
     assert_eq!((s.fill.samples, s.failed, s.baseline.samples), (400, 0, 400));

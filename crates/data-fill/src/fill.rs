@@ -8,6 +8,7 @@ use serde::Deserialize;
 use spec_rng::SpecRng;
 
 use crate::fold::{Folded, fold};
+use crate::live::Live;
 use crate::reach::{Reach, Stats, eval_static, saturation};
 use crate::spheres::{Spheres, from_state};
 use crate::world::World;
@@ -87,7 +88,8 @@ pub struct Plan {
     self_grants: Vec<(u32, u16)>,
     pub(crate) progression: Vec<u16>,
     pub(crate) rest: Vec<u16>,
-    pub(crate) item_group: HashMap<u16, u32>,
+    /// Per world item: its placement group, if it has one.
+    item_group: Vec<Option<u32>>,
     loc_group: Vec<Option<u32>>,
     /// Per item: held count past which no rule reads more copies (see [`Plan::saturated_at`]).
     saturated: Vec<i64>,
@@ -202,9 +204,9 @@ impl Plan {
         let gid = |g: &String| {
             u32::try_from(groups.iter().position(|x| *x == g).unwrap_or(0)).unwrap_or(0)
         };
-        let mut item_group = HashMap::new();
+        let mut item_group = vec![None; w.items()];
         for (k, g) in by_key(&inst.item_groups) {
-            item_group.insert(item(k)?, gid(g));
+            item_group[usize::from(item(k)?)] = Some(gid(g));
         }
         let mut loc_group = vec![None; w.locations()];
         for (k, g) in by_key(&inst.location_groups) {
@@ -341,7 +343,16 @@ impl Plan {
     }
 
     pub(crate) fn allowed(&self, item: u16, loc: u32) -> bool {
-        self.item_group.get(&item).is_none_or(|g| self.loc_group[loc as usize] == Some(*g))
+        self.group(item).is_none_or(|g| self.loc_group[loc as usize] == Some(g))
+    }
+
+    /// Whether `item` has a placement group (it may go only to locations of that group).
+    pub(crate) fn confined(&self, item: u16) -> bool {
+        self.group(item).is_some()
+    }
+
+    fn group(&self, item: u16) -> Option<u32> {
+        self.item_group.get(usize::from(item)).copied().flatten()
     }
 }
 
@@ -466,15 +477,16 @@ impl Steps<'_> {
         }
         // Confined items first, as the world's pre_fill does, each into its own group.
         let (mut confined, mut prog): (Vec<u16>, Vec<u16>) =
-            plan.progression.iter().partition(|i| plan.item_group.contains_key(i));
+            plan.progression.iter().partition(|i| plan.confined(**i));
         rng.shuffle(&mut confined);
         rng.shuffle(&mut prog);
         let mut locs = free.clone();
         rng.shuffle(&mut locs);
+        let mut locs = Live::new(locs);
         // The state carries over from one phase to the next: one full solve per fill.
         let mut prev = None;
         self.restrictive(&mut confined, &prog, &mut locs, &mut placed, &mut prev)?;
-        locs.retain(|l| !plan.excluded[*l as usize]);
+        locs.retain(|l| !plan.excluded[l as usize]);
         self.restrictive(&mut prog, &[], &mut locs, &mut placed, &mut prev)?;
         // Everything else goes anywhere left, excluded locations included.
         let mut rest = plan.rest.clone();
@@ -506,7 +518,7 @@ impl Steps<'_> {
         &mut self,
         items: &mut Vec<u16>,
         also_held: &[u16],
-        locs: &mut Vec<u32>,
+        locs: &mut Live<u32>,
         placed: &mut [Option<u16>],
         prev: &mut Option<(u32, u16)>,
     ) -> Result<(), FillError> {
@@ -535,15 +547,13 @@ impl Steps<'_> {
                 self.solves += 1;
                 self.stats.absorb(&self.r.stats);
             }
-            let r = &self.r;
-            let pos = locs.iter().position(|l| r.reached(*l) && self.plan.allowed(item, *l));
-            let Some(pos) = pos else {
+            let (r, plan) = (&self.r, self.plan);
+            let Some(l) = locs.take_first(|l| r.reached(l) && plan.allowed(item, l)) else {
                 return Err(FillError::Stuck {
                     item: self.w.item_key(item).to_owned(),
                     attempts: 1,
                 });
             };
-            let l = locs.remove(pos);
             placed[l as usize] = Some(item);
             *prev = Some((l, item));
         }

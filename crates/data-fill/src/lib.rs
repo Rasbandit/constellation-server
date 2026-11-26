@@ -7,6 +7,7 @@ pub mod fairness;
 pub mod fill;
 mod fold;
 pub mod job;
+mod live;
 pub mod par;
 pub mod parity_rng;
 pub mod reach;
@@ -14,6 +15,7 @@ pub mod room;
 pub mod section;
 pub mod seed;
 pub mod spheres;
+pub mod synth;
 pub mod world;
 
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};

@@ -298,9 +298,26 @@ pub const RULES_MAX_DEPTH: u32 = 256;
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
 
 /// Worker threads that compile worlds and resolve instances of a room's players in parallel
-/// before a multiworld fill (a design value; the fill itself is sequential, and results never
-/// depend on this number).
+/// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
+
+/// Players from which a room's fill places its rounds against a fresh forward solve of the
+/// room instead of taking the round's items back by truth maintenance (`data_fill::room::Path`;
+/// both give the same placements). The forward solve is slower for one player and faster at
+/// ten on the synthetic rooms of the `bench-room` CI job; where the two cross in between is not
+/// measured (see `docs/port-check.md`, "Scaling with players").
+pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
+
+/// Most threads the players' states of a room run on while a round is solved forward: a fill
+/// takes the worker count of its request, at most this many and at most the cores the process
+/// may use (a design value; results never depend on the number).
+pub const ROOM_FORWARD_WORKERS: usize = 4;
+
+/// Rule evaluations ahead of one step of a forward solve (queued regions and sites over the
+/// room's states; every rule site of the room for the first step of a solve) from which the
+/// step starts threads; below it the states run on the caller's thread, since starting threads
+/// would cost more than the step (a design value, not measured).
+pub const ROOM_FORWARD_MIN_PENDING: usize = 2048;
 
 /// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
 /// value).
