@@ -48,6 +48,30 @@ jobs:
               --players "$PLAYERS" --checks "$CHECKS" \
               | tee -a bench-room.jsonl
           done; done
+          # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
+          # exact fill's rows above: with and without skipping the checks of empty locations.
+          for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
+            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
+              --profile "$profile" --path forward --workers 1 --mode "$mode" \
+              --players "$PLAYERS" --checks "$CHECKS" \
+              | tee -a bench-room.jsonl
+          done; done
+      # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
+      # on the two small fixture worlds against uniform beatable placements.
+      - name: quality
+        env:
+          CHECKS: ${{ inputs.checks || '1000' }}
+          MODES: exact level level,depth=100 level,depth=300 level,depth=-100 level,goal shuffle shuffle,depth=100 shuffle,depth=300 shuffle,depth=-100 shuffle,goal
+        run: |
+          set -o pipefail
+          fair() { cargo run --release --locked -p data-fill --bin fill-fairness -- "$@" > /dev/null; }
+          for profile in light heavy; do
+            fair --synth "$profile" --players 1 --checks "$CHECKS" --seeds 200 --required 5 --modes "$MODES" --out "quality-$profile-1.json"
+            fair --synth "$profile" --players 10 --checks "$CHECKS" --seeds 20 --modes "$MODES" --out "quality-$profile-10.json"
+          done
+          for world in fairness_world room_world; do
+            fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds 10000 --baseline 10000 --required 200 --modes "$MODES" --out "quality-$world.json"
+          done
       - name: summary
         run: |
           {
@@ -62,10 +86,38 @@ jobs:
               echo
               echo "| players | checks | clocks | setup ms | fill ms (median) | rule evals | ns/eval | threads | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes (calling thread) | beatable |"
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("players") and .profile == $p and .path == $t and .workers == $w) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.workers) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
+              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("players") and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "| \(.players) | \(.checks) | \(.clocks) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.workers) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
               echo
-              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("fitted_exponent") and .profile == $p and .path == $t and .workers == $w) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
+              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("fitted_exponent") and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
             done; done
+            echo
+            echo "### Fill modes on one thread (same runner, same rooms and seed; exact is the forward path on 1 thread)"
+            echo
+            echo "Peak RSS is the whole process's high-water mark when the row was printed (setup and every smaller room included). Mode evals are the mode's own solves; the rest of the rule evals are the final solve that checks and reports the seed."
+            for profile in light heavy; do
+              echo
+              echo "#### Profile: $profile"
+              echo
+              echo "| mode | players | fill ms (median) | fill ms (worst of 5) | rule evals | mode evals | solves | placed by the mode | repairs | swaps | fallbacks | attempts | spheres | peak heap bytes | peak RSS bytes |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" 'select(has("players") and .profile == $p and .path == "forward" and .workers == 1) | "| \(.mode) | \(.players) | \(.fill_ms) | \(.fill_ms_runs | max) | \(.rule_evals) | \(.mode_rule_evals) | \(.solves) | \(.placed_by_the_mode) | \(.repairs) | \(.swaps) | \(.fallbacks) | \(.attempts) | \(.spheres) | \(.peak_heap_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
+            done
+            echo
+            echo "### Seed shape per mode (counted over fill seeds 1 to N of one room; distances are from the exact fill on the same seeds)"
+            echo
+            echo "Required spheres: spheres holding an item no goal can be reached without (first seeds only, see the n in brackets). Stuck: share of a player's rounds in which no location of theirs opens. Uniform columns exist only for the small fixture worlds (rejection sampling of beatable uniform placements)."
+            for q in quality-*.json; do
+              echo
+              echo "#### $q: $(jq -r '"\(.players) players, \(.seeds) seeds"' "$q")"
+              echo
+              echo "| mode | failed | placed by the mode | untouched share | swaps/seed | repairs | fallbacks | spheres mean | progression in sphere 0 | in first two | locations in first two | relative depth | required spheres (n) | location entropy | stuck mean | stuck worst 5% | sphere distance from exact | location chi2/dof vs exact | max gap vs uniform | coverage gaps vs uniform | fill ms median | worst 1% |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r 'def r(n): if . == null then "n/a" else (. * n | round) / n end; .modes[] | "| \(.mode) | \(.failed) | \(.placed_by_the_mode) | \(.untouched_share | r(1000)) | \(.swaps_per_seed | r(100)) | \(.repairs) | \(.fallbacks) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.location_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.progression_location_entropy_normalized | r(1000)) | \(.stuck_share_mean | r(1000)) | \(.stuck_share_worst_5_percent | r(1000)) | \(.against_exact.sphere_distribution_distance | r(1000)) | \(.against_exact.location_chi2_per_dof | r(100)) | \(.against_uniform.max_deviation.value | r(1000)) | \(.against_uniform.coverage_gaps | if . == null then "n/a" else length end) | \(.fill_ms_median | r(100)) | \(.fill_ms_worst_1_percent | r(100)) |"' "$q"
+            done
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
-        with: { name: bench-room, path: bench-room.jsonl }
+        with:
+          name: bench-room
+          path: |
+            bench-room.jsonl
+            quality-*.json

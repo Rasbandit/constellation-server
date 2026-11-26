@@ -173,3 +173,37 @@ fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     assert!(room::check_placed(&seats, &[vec![None]]).is_err());
     assert!(sample_room(&seats, &flat, 1, 0, 0).is_err());
 }
+
+/// The mode comparison on the small room: every mode is measured on the same seeds, the exact
+/// fill is at distance 0 from itself, and a deeper depth dial moves progression later.
+#[test]
+fn modes_are_compared_on_the_same_room_and_the_depth_dial_moves_progression() {
+    use data_fill::fairness::{shape, shape_report};
+    use data_fill::room::{self, Algorithm};
+    let v: Value =
+        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
+    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
+    let insts: Vec<&Instance> = insts.iter().collect();
+    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+    let seats = c.seats();
+    let exact = shape(&seats, 300, Algorithm::Exact, 20).expect("exact");
+    let own = shape_report(&exact, Some(&exact));
+    assert_eq!(own["against_exact"]["sphere_distribution_distance"], 0.0);
+    assert_eq!(own["against_exact"]["location_chi2"], 0.0);
+    assert_eq!((exact.failed, exact.own, exact.required.len()), (0, 300, 20));
+    assert!(own["required_spheres_mean"].as_f64().is_some_and(|x| x >= 1.0), "{own}");
+    let depth = |mode: &str| {
+        let s = shape(&seats, 300, mode.parse().expect("mode"), 0).expect("shape");
+        assert_eq!(s.failed, 0, "{mode}");
+        let r = shape_report(&s, Some(&exact));
+        assert!(r["against_exact"]["sphere_distribution_distance"].as_f64().is_some(), "{r}");
+        (r["progression_relative_depth_mean"].as_f64().expect("depth"), s.own)
+    };
+    for mode in ["level", "shuffle"] {
+        let (shallow, _) = depth(&format!("{mode},depth=-300"));
+        let (flat, own) = depth(mode);
+        let (deep, _) = depth(&format!("{mode},depth=300"));
+        assert!(own > 150, "{mode} placed {own} of 300 rooms itself");
+        assert!(shallow < flat && flat < deep, "{mode}: {shallow} {flat} {deep}");
+    }
+}

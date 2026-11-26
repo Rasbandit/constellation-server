@@ -206,6 +206,37 @@ Fitted exponent of fill time over players: carried 1.52 (light) and 1.59 (heavy)
 - **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
 - The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
 
+## Opt-in fill modes: level fill and shuffle fill
+
+The fill described above (the exact fill, `room::Algorithm::Exact`) stays the default and the reference; nothing in it changed (the pinned placements test still holds). Two further modes place the progression items that have no placement group, each with about one forward solve instead of one per item or round. They are asked for by name (`fill_room_by`, or `"algorithm"` in a fill request: `"exact"`, `{"level": {}}`, `{"shuffle": {}}`); confined items before them and everything else after them are placed as always. Neither idea is new: both follow fills other randomizers use. The paragraph that credits them by name is written and waits for the review and sign-off `CONTRIBUTING.md` asks for.
+
+**Level fill** (`Algorithm::Level`, `level.rs`). The shuffled progression list is read as the order a player finds the items. One forward solve adds them one at a time and labels every location with its level: the number of order items held when it is first reached. Item `k` may sit only at a level below `k`, so the seed is beatable by construction. Placing all items is possible exactly when, for every `k`, at least `k` free locations have a level below `k`; items are placed last first, each among the levels that keep that true for the items before it. An order that fails the count is reordered without drawing (the first later item that opened a location in the last solve moves forward) and solved again, at most `config::LEVEL_FILL_MAX_REPAIRS` times; then the attempt is the exact fill's, on the same draws, so a fallback seed is byte for byte the exact fill's seed.
+
+**Shuffle fill** (`Algorithm::Shuffle`, shuffle then unstick). Every item goes to a uniformly random permitted location. One forward solve holds progression only. While progression is out of reach, each player with an unreached item that a rule on their frontier reads (an exit, event or check of a reached region that does not hold yet; any unreached item when no frontier names one) has one such item change places with a non-progression item at a reached location, and the same solve goes on: rules are monotone and what moves out is not held, so nothing reached is lost, and nothing is retracted or restarted. A first shuffle that is beatable is the seed as drawn (test `a_shuffle_that_is_beatable_as_drawn_is_kept_as_drawn`). With no reached location left to move to, the attempt is the exact fill's, on the same draws. It runs on one thread.
+
+Both end with a fresh solve of the finished room, which is what `validate_room` answers; a seed whose progression that solve does not reach is `FillError::Invalid` (a bug, asserted in tests).
+
+**Dials** (`room::Dials`; the defaults in `crates/config` change nothing): `depth` (`FILL_DEPTH_PERCENT`, 0 uniform; above 0 more draws per pick and the location opened latest wins, below 0 the earliest), `goal_only` (`FILL_GOAL_ONLY`: only every goal has to be reachable; the engine had no accessibility setting before, see #92), and `skip_empty` (`FILL_SKIP_EMPTY_CHECKS`, a work switch, not a feel dial).
+
+**Checks of empty locations.** Before this, a solve evaluated every check of a reached region when the region was first visited and again whenever an item or counter its rule reads changed, until it held (the dependency index, `World::item_sites`); a check that holds is never evaluated again. So an empty location cost at least one evaluation per solve. With `skip_empty`, the opt-in modes' solves leave the check of a location that holds no progression asleep: it is evaluated when a shuffle fill needs it as a place to move an item to, in level fill's labelling solve when an item may take it (the level is the product there, so those stay awake), and otherwise in one pass at the end. Under `goal_only` the last pass is skipped only for a caller that asks for no spheres; the product always asks, since a seed records a sphere per location. Placements, reports and spheres are the same with and without (test `skipping_empty_checks_gives_the_same_seed_with_fewer_evaluations`).
+
+**What the small worlds show** (counted, 4,000 fill seeds and 4,000 uniform beatable placements per row, this branch, 2026-11-25; "max gap" is the largest difference between how often the mode and the uniform baseline put an item at a location):
+
+| World | Mode | Spheres, mean | Progression in sphere 0 | Max gap from uniform | Coverage gaps | Seeds placed by the mode |
+|---|---|---|---|---|---|---|
+| single player fixture | exact | 3.47 | 0.471 | 0.055 | 0 | all |
+| | level | 3.05 | 0.634 | 0.230 | 0 | 4,000 |
+| | level, depth 100 | 3.15 | 0.588 | 0.169 | 0 | 4,000 |
+| | shuffle | 3.28 | 0.536 | 0.079 | 0 | 4,000 (26 percent untouched) |
+| room, three players | exact (rounds) | 4.16 | 0.489 | 0.147 | 6 | all |
+| | level | 3.65 | 0.626 | 0.128 | 0 | 4,000 |
+| | level, depth 100 | 3.95 | 0.545 | 0.085 | 0 | 4,000 |
+| | shuffle | 4.36 | 0.494 | 0.063 | 0 | 3,985 (18 percent untouched) |
+
+Level fill pulls progression early, as order-first fills are known to: shorter seeds and the largest gap on the single player world; the depth dial takes back part of it. Shuffle fill is the closest of the three to the uniform baseline on the room and second to the exact fill for one player. These worlds have three to six progression items; the large synthetic rooms are measured by the `bench-room` job (below) and have no uniform baseline.
+
+`fill-fairness --modes "exact level level,depth=100 shuffle" (--world w.json | --synth light|heavy --players N)` prints, per mode on the same room and seeds: spheres, progression per sphere against locations per sphere, how often each location holds progression (normalized entropy, and a chi-square against the exact fill), the share of rounds a player waits with nothing new, spheres that hold a required item (`--required N` seeds: one solve per progression item, so keep N small), repairs, swaps, fallbacks, and fill time (median and worst 1 percent); with `--baseline N` on a small world also the comparison with uniform beatable placements.
+
 ## Fairness
 
 ### Tier 1: port sanity (part of `port-check`)
