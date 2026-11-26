@@ -227,6 +227,16 @@ pub struct Limits {
     pub fill_cpu_secs: u64,
     /// Wall-clock limit of one fill child process, after which it is killed (design value).
     pub fill_timeout_ms: u64,
+    /// Fill worker processes that stay up and take one fill job after another
+    /// (`server::pool`); 0 runs each fill in a process of its own, as before the pool. One
+    /// worker is one core ([`GENERATION_WORKERS`] thread per fill), and never more are busy
+    /// than `gen_concurrency`, so more than that would only sit idle (design value;
+    /// `CONSTELLATION_FILL_POOL_WORKERS`). Each worker runs under the same caps as a fill
+    /// child process, and a job past `fill_timeout_ms` ends its worker.
+    pub fill_pool_workers: usize,
+    /// Fill jobs a pooled worker takes before it is replaced by a fresh process, which bounds
+    /// what memory its fills leave fragmented (design value, not measured).
+    pub fill_worker_jobs: usize,
     /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
     pub gen_concurrency: usize,
     /// Most generations queued or running at once; a new one past it is refused as busy
@@ -321,6 +331,13 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// also prepared again by every new server build, so this guards builds that share a version
 /// text (local and test builds).
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
+
+/// Most bytes of prepared world files whose loaded worlds one pooled fill worker keeps between
+/// jobs (`server::pool`), the least recently used going first. Counted by the file a world
+/// was loaded from, not by what the loaded world holds in memory: the `bench` CI job measures
+/// a worker's resident memory with the cache full. The worker's address-space cap
+/// (`fill_memory_bytes`) is the hard bound either way (design value, from issue 200).
+pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. A room's fill runs on one thread on
@@ -492,6 +509,8 @@ impl Limits {
         fill_cpu_secs: 120,
         fill_max_processes: 8192,
         fill_timeout_ms: 60_000,
+        fill_pool_workers: 1,
+        fill_worker_jobs: 256,
         gen_concurrency: 1,
         gen_queue_max: 64,
         admin_write_burst: 30,
@@ -543,6 +562,9 @@ impl Limits {
         if self.catalogue_check_seeds == 0 {
             return Err("catalogue_check_seeds must be at least 1");
         }
+        if self.fill_worker_jobs == 0 {
+            return Err("fill_worker_jobs must be at least 1");
+        }
         if self.password_hash_parallel == 0 {
             return Err("password_hash_parallel must be at least 1");
         }
@@ -583,6 +605,7 @@ pub fn load() -> Result<Limits, String> {
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
         ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
         ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
+        ("CONSTELLATION_FILL_POOL_WORKERS", &mut l.fill_pool_workers),
         ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
         ("CONSTELLATION_CATALOGUE_CHECK_SEEDS", &mut l.catalogue_check_seeds),
         ("CONSTELLATION_CATALOGUE_CHECK_CONCURRENCY", &mut l.catalogue_check_concurrency),
@@ -1096,6 +1119,20 @@ mod tests {
             (262_144, 4_096_000)
         );
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
+    }
+
+    /// The fill worker pool: on by default with one worker (one core, as one generation runs
+    /// at a time), each recycled after a fixed number of jobs, holding loaded worlds under the
+    /// cap issue 200 names. Zero workers is the one-process-per-job path.
+    #[test]
+    fn the_fill_pool_is_one_worker_recycled_after_a_fixed_number_of_jobs() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (1, 256));
+        assert_eq!(l.fill_pool_workers, l.gen_concurrency, "never more workers than busy jobs");
+        assert_eq!(PREPARED_CACHE_BYTES, 32 << 20);
+        assert!(Limits { fill_pool_workers: 0, ..l }.check().is_ok(), "zero turns the pool off");
+        let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
+        assert!(e.contains("fill_worker_jobs"), "{e}");
     }
 
     #[test]
