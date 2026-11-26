@@ -247,7 +247,7 @@ pub fn job_argv(exe: &Path, job: &str, l: &Limits) -> Vec<OsString> {
     a
 }
 
-/// Run a data-only job (`generate` or `inspect`) in a capped child process: `input` on its
+/// Run a data-only job (one of `data_fill::job::run`'s) in a capped child process: `input` on its
 /// stdin, its stdout back. A child past `timeout` is killed and reaped before this returns.
 ///
 /// # Errors
@@ -289,11 +289,7 @@ pub fn fill_job(job: &str) -> Result<(), String> {
     use std::io::{Read, Write};
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
-    let out = match job {
-        "generate" => data_fill::job::generate(&input)?,
-        "inspect" => data_fill::job::inspect(&input)?,
-        other => return Err(format!("unknown job {other:?}")),
-    };
+    let out = data_fill::job::run(job, &input)?;
     std::io::stdout().write_all(&out).map_err(|e| e.to_string())
 }
 

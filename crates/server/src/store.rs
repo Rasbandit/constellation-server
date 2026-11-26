@@ -2,9 +2,9 @@
 //! generation statuses, over Postgres or memory. The one place that chooses between the two.
 
 use log::{
-    AccountStore, BlobKey, CatalogueStore, Game, GameVersion, JobState, JobStore, ManifestRecord,
-    ManifestStore, MemLogStore, NewVersion, OwnedRoom, OwnerRemoved, PgLogStore, StoreError,
-    UploadKind, UploadRecord, UploadStore, VersionAdded, VersionState,
+    AccountStore, BlobKey, BlobStore, CatalogueStore, Game, GameVersion, JobState, JobStore,
+    ManifestRecord, ManifestStore, MemLogStore, NewVersion, OwnedRoom, OwnerRemoved, PgLogStore,
+    StoreError, UploadKind, UploadRecord, UploadStore, VersionAdded, VersionState,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,6 +136,33 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<ManifestRecord>, StoreError> {
         on!(self, s => s.manifest_list(game, after, limit).await)
+    }
+
+    pub(crate) async fn prepared_put(
+        &self,
+        id: &BlobKey,
+        layout: u32,
+        package: &BlobKey,
+    ) -> Result<(), StoreError> {
+        on!(self, s => s.prepared_put(id, layout, package).await)
+    }
+
+    pub(crate) async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        layout: u32,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        on!(self, s => s.prepared_key(id, layout).await)
+    }
+
+    /// Store a blob under its content hash (`log::BlobStore`).
+    pub(crate) async fn blob_put(&self, key: &BlobKey, bytes: &[u8]) -> Result<(), StoreError> {
+        on!(self, s => s.put(key, bytes).await)
+    }
+
+    /// A blob, checked against its key.
+    pub(crate) async fn blob_get(&self, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        on!(self, s => s.get(key).await)
     }
 
     pub(crate) async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {

@@ -1,7 +1,8 @@
 //! Uploaded data-only world manifests: stored in the database once per content hash (never as
 //! files, so every server instance sees them), with the listing columns beside them so a listing
-//! never reads a manifest, and a size-bounded in-memory cache in front of the bytes a generation
-//! reads.
+//! never reads a manifest, and each one's prepared world (`data_fill::prepared`) as a blob found
+//! by manifest and engine layout. A size-bounded in-memory cache is in front of the bytes a
+//! generation reads.
 
 use crate::store::Db;
 use log::{BlobKey, ManifestRecord, StoreError};
@@ -59,6 +60,8 @@ pub(crate) struct Manifests {
     db: Db,
     cache: Mutex<Cache>,
     page_max: usize,
+    /// The engine layout prepared worlds are stored and found under.
+    pub(crate) layout: u32,
 }
 
 /// The id as the 32 bytes it is the hex of. `id` must be 64 lowercase hex digits.
@@ -89,6 +92,7 @@ impl Manifests {
             db,
             cache: Mutex::new(Cache::new(limits.manifest_cache_bytes)),
             page_max: limits.list_page_max,
+            layout: data_fill::prepared::LAYOUT,
         }
     }
 
@@ -101,14 +105,54 @@ impl Manifests {
     /// The manifest's bytes: from the cache, else from the database (and then cached).
     pub(crate) async fn bytes(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
         let Some(key) = key_of(id) else { return Ok(None) };
-        let hit = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key);
-        if hit.is_some() {
-            return Ok(hit);
+        if let Some(hit) = self.cached(&key) {
+            return Ok(Some(hit));
         }
         let Some(bytes) = self.db.manifest_bytes(&key).await? else { return Ok(None) };
+        Ok(Some(self.cache(key, bytes)))
+    }
+
+    fn cached(&self, key: &BlobKey) -> Option<Arc<Vec<u8>>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(key)
+    }
+
+    fn cache(&self, key: BlobKey, bytes: Vec<u8>) -> Arc<Vec<u8>> {
         let bytes = Arc::new(bytes);
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).put(key, Arc::clone(&bytes));
-        Ok(Some(bytes))
+        bytes
+    }
+
+    /// Manifest `id`'s prepared world, from the cache or the blob store. `None` when it must be
+    /// prepared (again): never prepared at this engine layout, or its blob is missing or torn.
+    pub(crate) async fn prepared(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
+        let Some(key) = key_of(id) else { return Ok(None) };
+        let Some(package) = self.db.prepared_key(&key, self.layout).await? else {
+            return Ok(None);
+        };
+        if let Some(hit) = self.cached(&package) {
+            return Ok(Some(hit));
+        }
+        match self.db.blob_get(&package).await {
+            Ok(Some(file)) => Ok(Some(self.cache(package, file))),
+            Ok(None) | Err(StoreError::Corrupt(_)) => {
+                tracing::warn!(id, "a prepared world's blob is missing or torn");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Store manifest `id`'s prepared world `file` as a blob, found under this engine layout.
+    pub(crate) async fn put_prepared(
+        &self,
+        id: &str,
+        file: Vec<u8>,
+    ) -> Result<Arc<Vec<u8>>, StoreError> {
+        let key = key_of(id).ok_or_else(|| StoreError::Corrupt("not a manifest id".into()))?;
+        let package = log::blob_key(&file);
+        self.db.blob_put(&package, &file).await?;
+        self.db.prepared_put(&key, self.layout, &package).await?;
+        Ok(self.cache(package, file))
     }
 
     /// Store a checked manifest (`found` is what the check printed: game, version, items,
