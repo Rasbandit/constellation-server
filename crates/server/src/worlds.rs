@@ -44,7 +44,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// The API's shared state.
@@ -1500,6 +1500,7 @@ async fn player_files(w: &Worlds, yamls: &[String]) -> Result<Vec<(String, Vec<u
 /// CPU time, wall clock; a child past its time is killed), under the same `gen_concurrency`
 /// permit, status file and publish path as a legacy world.
 async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value), String> {
+    let mut laps = Laps::start();
     let id = status["id"].as_str().unwrap_or("");
     let manifest = status["manifest"].as_str().unwrap_or("");
     let mut prepared = prepared_world(w, manifest).await?;
@@ -1514,6 +1515,7 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
         u64::from_le_bytes(Sha256::digest(id.as_bytes())[..8].try_into().unwrap_or([0; 8]));
     let seed_name = format!("data-only-{}", id.get(..12).unwrap_or(id));
     let files = player_files(w, &yamls).await?;
+    laps.lap("store");
     let players = yamls.len();
     // Building the request is blocking work.
     let limits = w.limits;
@@ -1522,6 +1524,7 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
+    laps.lap("request");
     let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
     // The child prints the seed file itself; it names the game's package of the prepared world.
     let mut first = true;
@@ -1538,15 +1541,41 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
             done => break done.map_err(|e| e.to_string())?,
         }
     };
+    laps.lap("job");
     let loaded = tokio::task::spawn_blocking(move || {
         let game = data_fill::prepared::seed_game(&prepared)?.to_vec();
         crate::parse_seed(seed, vec![game], &limits)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
+    laps.lap("open");
     publish_loaded(w, loaded.clone()).await?;
-    let report = json!({"engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players});
+    laps.lap("publish");
+    let report = json!({
+        "engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players, "ms": laps.ms,
+    });
     Ok((loaded, report))
+}
+
+/// Where a generation's wall time went: the milliseconds of each phase, for its report.
+struct Laps {
+    at: Instant,
+    ms: serde_json::Map<String, Value>,
+}
+
+impl Laps {
+    fn start() -> Self {
+        Self { at: Instant::now(), ms: serde_json::Map::new() }
+    }
+
+    /// The phase since the last lap (or the start) ends now.
+    fn lap(&mut self, phase: &str) {
+        let now = Instant::now();
+        // To a thousandth of a millisecond.
+        let ms = ((now - self.at).as_secs_f64() * 1e6).round() / 1e3;
+        self.ms.insert(phase.to_owned(), json!(ms));
+        self.at = now;
+    }
 }
 
 /// Import the sidecar's v1 bundle (encoded to v2 off the runtime) into the host's store: its
@@ -2701,6 +2730,20 @@ mod tests {
         let file = w.manifests.prepared(&content_id(&manifest(|_| {}))).await.unwrap().unwrap();
         let world = data_fill::prepared::Prepared::open(&file).unwrap();
         assert_eq!(world.game(), "Fixture Game");
+    }
+
+    /// A finished generation's status says where its wall time went, phase by phase, so the
+    /// cost of the job's process can be read off any real generation. Fails without the laps.
+    #[tokio::test]
+    async fn a_data_only_generation_reports_where_its_time_went() {
+        let root = temp("laps");
+        let w = hosting(&root).await;
+        let id = finished_world(&w, &me()).await;
+        let status = read_status(&w, &id).await.unwrap();
+        let ms = status["generation"]["ms"].as_object().expect("the report times its phases");
+        let phases: Vec<&str> = ms.keys().map(String::as_str).collect();
+        assert_eq!(phases, ["job", "open", "publish", "request", "store"], "{status}");
+        assert!(ms.values().all(|v| v.as_f64().is_some_and(|ms| ms >= 0.0)), "{status}");
     }
 
     /// The seed a generation stores is, byte for byte, the seed the path before stored for the
