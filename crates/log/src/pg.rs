@@ -1727,6 +1727,7 @@ struct VersionRow {
     generator: String,
     state: String,
     error: Option<String>,
+    scan: Option<String>,
 }
 
 impl VersionRow {
@@ -1740,6 +1741,7 @@ impl VersionRow {
             generator: self.generator,
             state: crate::VersionState::parse(&self.state).ok_or_else(|| bad("state"))?,
             error: self.error,
+            scan: self.scan,
         })
     }
 }
@@ -1988,7 +1990,7 @@ impl crate::CatalogueStore for PgLogStore {
                 Box::pin(async move {
                     sqlx::query_as(
                         "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
-                         v.error FROM catalogue_versions v \
+                         v.error, v.scan FROM catalogue_versions v \
                          JOIN catalogue_games g ON g.key = v.game \
                          WHERE v.game = $1 ORDER BY v.seq DESC",
                     )
@@ -2013,7 +2015,7 @@ impl crate::CatalogueStore for PgLogStore {
                 Box::pin(async move {
                     sqlx::query_as(
                         "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
-                         v.error FROM catalogue_versions v \
+                         v.error, v.scan FROM catalogue_versions v \
                          JOIN catalogue_games g ON g.key = v.game \
                          WHERE v.game = $1 AND v.generator = $2 AND v.state = 'live' \
                          ORDER BY v.seq DESC LIMIT 1",
@@ -2027,5 +2029,49 @@ impl crate::CatalogueStore for PgLogStore {
             })
             .await?;
         row.map(VersionRow::version).transpose()
+    }
+
+    async fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, version, scan) = (crate::game_key(game), version.to_owned(), scan.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE catalogue_versions SET scan = $3, updated_at = now() \
+                     WHERE game = $1 AND version = $2",
+                )
+                .bind(&key)
+                .bind(&version)
+                .bind(&scan)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn versions_checking(&self) -> Result<Vec<crate::GameVersion>, StoreError> {
+        let rows: Vec<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.state = 'checking' ORDER BY v.seq",
+                    )
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(VersionRow::version).collect()
     }
 }

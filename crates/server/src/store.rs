@@ -301,4 +301,27 @@ impl Db {
     pub(crate) async fn versions(&self, game: &str) -> Result<Vec<GameVersion>, StoreError> {
         on!(self, s => s.versions(game).await)
     }
+
+    pub(crate) async fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.version_scan_set(game, version, scan).await)
+    }
+
+    /// What a new room of `game` uses (making a room from a game is #190).
+    #[cfg(test)]
+    pub(crate) async fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> Result<Option<GameVersion>, StoreError> {
+        on!(self, s => s.version_latest_live(game, generator).await)
+    }
+
+    pub(crate) async fn versions_checking(&self) -> Result<Vec<GameVersion>, StoreError> {
+        on!(self, s => s.versions_checking().await)
+    }
 }

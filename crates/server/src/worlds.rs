@@ -85,6 +85,11 @@ pub(crate) struct Worlds {
     /// Behind a reverse proxy: the header carrying the client address (`--trusted-proxy-header`).
     /// Off by default, because any client could send it.
     proxy_header: Option<HeaderName>,
+    /// The generator checkout's version (`__version__` in its `Utils.py`): what a
+    /// catalogue version is checked with. None when it cannot be read.
+    generator: Option<String>,
+    /// The catalogue's version checks running in this process.
+    catalogue_checks: crate::checks::Checks,
 }
 
 /// `status.engine` of a world the data-fill engine generates (a legacy world has none).
@@ -241,6 +246,13 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         std::fs::create_dir_all(dir.join(sub)).map_err(io)?;
     }
     let mem = Arc::new(log::MemLogStore::new());
+    let generator = generator_version(&paths.ap_dir);
+    if generator.is_none() {
+        tracing::warn!(
+            ap = %paths.ap_dir.display(),
+            "no __version__ in the checkout's Utils.py: catalogue versions will fail their checks"
+        );
+    }
     Ok(Worlds {
         dir: dir.to_owned(),
         sandbox: Sandbox::new(paths, limits, dir)?,
@@ -266,6 +278,20 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         importer: None,
         accounts: None,
         proxy_header: None,
+        generator,
+        catalogue_checks: crate::checks::Checks::new(&limits),
+    })
+}
+
+/// The checkout's version: `__version__ = "<v>"` in its `Utils.py`.
+fn generator_version(ap: &Path) -> Option<String> {
+    let utils = std::fs::read_to_string(ap.join("Utils.py")).ok()?;
+    utils.lines().find_map(|line| {
+        let rest = line.strip_prefix("__version__")?.trim_start().strip_prefix('=')?.trim();
+        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let inner = rest.strip_prefix(quote)?;
+        let v = &inner[..inner.find(quote)?];
+        (!v.is_empty()).then(|| v.to_owned())
     })
 }
 
@@ -284,6 +310,87 @@ impl Worlds {
     /// The server's limits.
     pub(crate) const fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The generator version catalogue checks run with.
+    pub(crate) fn generator(&self) -> Option<&str> {
+        self.generator.as_deref()
+    }
+
+    pub(crate) const fn checks(&self) -> &crate::checks::Checks {
+        &self.catalogue_checks
+    }
+
+    /// Wait for a generation slot (`gen_concurrency`), in the one line players' worlds wait in.
+    pub(crate) async fn generation_turn(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.one_gen.acquire().await.ok()
+    }
+
+    /// Run one step of a catalogue check in the sandbox on `apworld` (see [`crate::checks`]),
+    /// in a folder of its own under `tmp/` (cleared at startup) that goes when it ends.
+    pub(crate) async fn sandboxed_check(
+        &self,
+        step: &crate::checks::Step,
+        apworld: &[u8],
+    ) -> Result<Vec<u8>, Failure> {
+        use crate::checks::Step;
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.dir.join("tmp").join(format!("check-{}-{n}", std::process::id()));
+        let broken = |e: std::io::Error| Failure::Broken(format!("check folder: {e}"));
+        let ran = async {
+            let inside = format!("{JOB}/upload.apworld");
+            let (unpacked, entries) = (
+                self.limits.apworld_max_unpacked_bytes.to_string(),
+                self.limits.apworld_max_entries.to_string(),
+            );
+            let inspect = Duration::from_millis(self.limits.inspect_timeout_ms);
+            match step {
+                Step::Inspect | Step::Scan => {
+                    tokio::fs::create_dir_all(&tmp).await.map_err(broken)?;
+                    tokio::fs::write(tmp.join("upload.apworld"), apworld).await.map_err(broken)?;
+                    let cmd =
+                        if *step == Step::Inspect { "inspect-apworld" } else { "scan-apworld" };
+                    let args =
+                        [cmd, &inside, "--max-unpacked", &unpacked, "--max-entries", &entries];
+                    let mounts = [Mount::Ro(tmp.clone(), JOB.to_owned())];
+                    self.sandbox.run(false, &mounts, &args, inspect).await
+                }
+                Step::Seed { module, seed } => {
+                    if !valid_module(module) {
+                        return Err(Failure::Refused(format!("bad module name {module:?}")));
+                    }
+                    let worlds = tmp.join("apworlds");
+                    tokio::fs::create_dir_all(&worlds).await.map_err(broken)?;
+                    let file = worlds.join(format!("{module}.apworld"));
+                    tokio::fs::write(file, apworld).await.map_err(broken)?;
+                    let (custom, out) = (format!("{AP}/custom_worlds"), format!("{JOB}/out"));
+                    let seed = seed.to_string();
+                    let args = [
+                        "check",
+                        "--ap",
+                        AP,
+                        "--apworlds",
+                        &custom,
+                        "--module",
+                        module,
+                        "--seed",
+                        &seed,
+                        "--out",
+                        &out,
+                    ];
+                    let mounts = [Mount::Ro(worlds, custom.clone()), Mount::Scratch(out.clone())];
+                    let timeout = Duration::from_millis(self.limits.gen_timeout_ms);
+                    self.sandbox.run(true, &mounts, &args, timeout).await
+                }
+            }
+        };
+        let result = ran.await;
+        if let Err(e) = tokio::fs::remove_dir_all(&tmp).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, dir = %tmp.display(), "check folder left behind");
+        }
+        result
     }
 
     /// Count a generation against `gen_queue_max`, or `None` when that many are already queued
@@ -352,6 +459,7 @@ impl Worlds {
         self.proxy_header = proxy_header;
         let state = Arc::new(self);
         tokio::spawn(sweep(Arc::downgrade(&state)));
+        tokio::spawn(crate::checks::resume(Arc::clone(&state)));
         routes(state)
     }
 }
@@ -1052,7 +1160,7 @@ async fn inspect_in_sandbox(
 
 /// What Archipelago imports as `worlds.<module>`; also the file name in `custom_worlds`, so it
 /// must never hold a path separator (the sidecar checks the same).
-fn valid_module(m: &str) -> bool {
+pub(crate) fn valid_module(m: &str) -> bool {
     let mut c = m.chars();
     c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
         && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
@@ -1884,6 +1992,22 @@ mod tests {
         }
         for bad in ["", "1a", "a-b", "a/b", "..", "a.b", "é"] {
             assert!(!valid_module(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_generator_version_is_read_from_the_checkouts_utils() {
+        let dir = temp("generator-version");
+        assert_eq!(generator_version(&dir), None, "no Utils.py");
+        for (text, want) in [
+            ("import x\n__version__ = \"0.6.8\"\n", Some("0.6.8")),
+            ("__version__='0.7.0'  # comment\n", Some("0.7.0")),
+            ("__version__ = \"\"\n", None),
+            ("__version__ = version_of(x)\n", None),
+            ("my__version__ = \"1\"\n", None),
+        ] {
+            std::fs::write(dir.join("Utils.py"), text).unwrap();
+            assert_eq!(generator_version(&dir).as_deref(), want, "{text}");
         }
     }
 
@@ -3119,7 +3243,190 @@ mod tests {
         assert_eq!(json_of_call(&app, "/api/games/annsgame", &ann).await, a_game);
     }
 
-    /// Ann's game `annsgame` with version 1 (checking), from a stored `.apworld`; its page.
+    /// A router whose catalogue checks run `fake` in place of the sandbox, with generator
+    /// `gen-1` and `seeds` test seeds; ann is signed up and owns the game `ww`.
+    async fn checking(
+        name: &str,
+        seeds: usize,
+        fake: crate::checks::FakeRunner,
+    ) -> (Arc<Worlds>, Router, String) {
+        checking_with(name, seeds, fake, Some("gen-1")).await
+    }
+
+    async fn checking_with(
+        name: &str,
+        seeds: usize,
+        fake: crate::checks::FakeRunner,
+        generator: Option<&str>,
+    ) -> (Arc<Worlds>, Router, String) {
+        let limits = Limits { signup_burst: 10, catalogue_check_seeds: seeds, ..Limits::DESIGN };
+        let mut w = worlds(&temp(name), limits);
+        w.generator = generator.map(str::to_owned);
+        w.catalogue_checks.fake = Some(fake);
+        let w = Arc::new(w);
+        let app = routes(Arc::clone(&w));
+        let ann = signed_up(&app, "ann").await;
+        let r = call(&app, "POST", "/api/games", &ann, r#"{"name":"ww"}"#).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        (w, app, ann)
+    }
+
+    /// Post version `v` of `ww` from a stored `.apworld` of `body`.
+    async fn post_version(w: &Worlds, app: &Router, ann: &str, v: &str, body: &[u8]) {
+        let up = stored(w, Kind::Apworld, body, json!({"name": "ww.apworld"})).await;
+        let req = json!({"version": v, "apworld": up["id"]}).to_string();
+        let r = call(app, "POST", "/api/games/ww/versions", ann, &req).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
+    /// Version `v` of `ww` once its check has ended (or after five seconds).
+    async fn checked(w: &Worlds, v: &str) -> log::GameVersion {
+        for _ in 0..500 {
+            let all = w.store.versions("ww").await.unwrap();
+            let found = all.into_iter().find(|x| x.version == v).unwrap();
+            if found.state != log::VersionState::Checking {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("version {v} is still checking");
+    }
+
+    /// A stand-in sandbox: the module is `ww`, the scan flags one line, and a test seed of an
+    /// `.apworld` whose bytes start with `bad` fails. Every step it ran is in the list.
+    fn fake_sandbox() -> (crate::checks::FakeRunner, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::checks::Step;
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&ran);
+        let fake: crate::checks::FakeRunner = Arc::new(move |step: &Step, apworld: &[u8]| {
+            seen.lock().unwrap().push(match step {
+                Step::Inspect => "inspect".to_owned(),
+                Step::Scan => "scan".to_owned(),
+                Step::Seed { module, .. } => format!("seed {module}"),
+            });
+            match step {
+                Step::Inspect if apworld.starts_with(b"not a zip") => {
+                    Err(Failure::Refused("not a zip file".to_owned()))
+                }
+                Step::Inspect => Ok(br#"{"module":"ww","game":"Wind Waker"}"#.to_vec()),
+                Step::Scan => Ok(
+                    br#"[{"file":"ww/__init__.py","line":1,"reason":"connects to the network"}]"#
+                        .to_vec(),
+                ),
+                Step::Seed { .. } if apworld.starts_with(b"bad") => {
+                    Err(Failure::Refused("KeyError: 'Master Sword'".to_owned()))
+                }
+                Step::Seed { .. } => Ok(br#"{"report":{"slots":1}}"#.to_vec()),
+            }
+        });
+        (fake, ran)
+    }
+
+    /// A version that passes every check goes live, checked with the server's generator and
+    /// its scan saved; one whose test seed fails is failed with which check and the error, and
+    /// the game's live version stays live. The scan runs before the seeds.
+    #[tokio::test]
+    async fn a_version_goes_live_only_when_every_check_passes() {
+        let (fake, ran) = fake_sandbox();
+        let (w, app, ann) = checking("checks-pass", 3, fake).await;
+        post_version(&w, &app, &ann, "1", b"good world").await;
+        let one = checked(&w, "1").await;
+        assert_eq!(
+            (one.state, one.generator.as_str(), one.error),
+            (log::VersionState::Live, "gen-1", None)
+        );
+        assert_eq!(*ran.lock().unwrap(), ["inspect", "scan", "seed ww", "seed ww", "seed ww"]);
+        let page = json_of_call(&app, "/api/games/ww", &ann).await;
+        assert_eq!(page["versions"][0]["scan"][0]["reason"], json!("connects to the network"));
+
+        ran.lock().unwrap().clear();
+        post_version(&w, &app, &ann, "2", b"bad world").await;
+        let two = checked(&w, "2").await;
+        assert_eq!(two.state, log::VersionState::Failed);
+        let error = two.error.unwrap();
+        assert!(error.starts_with("check 3 (test seed 1 of 3, seed "), "{error}");
+        assert!(error.ends_with("KeyError: 'Master Sword'"), "{error}");
+        assert!(two.scan.is_some(), "the scan ran before the seeds");
+        assert_eq!(*ran.lock().unwrap(), ["inspect", "scan", "seed ww"], "stops at the first");
+        let live = w.store.version_latest_live("ww", "gen-1").await.unwrap();
+        assert_eq!(live.map(|v| v.version).as_deref(), Some("1"), "the previous one stays live");
+    }
+
+    /// Check 1 refuses an `.apworld` over today's cap, check 2 one the sandbox refuses, and a
+    /// server that cannot tell its generator version fails every version (none goes live with
+    /// an unknown one). None of them gets to the test seeds.
+    #[tokio::test]
+    async fn size_inspection_and_an_unknown_generator_fail_before_any_seed() {
+        let (fake, ran) = fake_sandbox();
+        let (w, app, ann) = checking("checks-early", 3, Arc::clone(&fake)).await;
+        post_version(&w, &app, &ann, "1", b"not a zip").await;
+        let one = checked(&w, "1").await;
+        assert_eq!(one.error.as_deref(), Some("check 2 (inspect): not a zip file"));
+
+        let big = vec![b'x'; Limits::DESIGN.apworld_max_bytes + 1];
+        post_version(&w, &app, &ann, "2", &big).await;
+        let two = checked(&w, "2").await;
+        let cap = Limits::DESIGN.apworld_max_bytes;
+        let want = format!("check 1 (size): the .apworld is larger than {cap} bytes");
+        assert_eq!(two.error.as_deref(), Some(want.as_str()));
+        assert!(!ran.lock().unwrap().iter().any(|s| s.starts_with("seed")));
+
+        let (w, app, ann) = checking_with("checks-no-gen", 3, fake, None).await;
+        post_version(&w, &app, &ann, "1", b"good world").await;
+        let one = checked(&w, "1").await;
+        assert_eq!(one.state, log::VersionState::Failed);
+        assert!(one.error.unwrap().contains("generator version is unknown"));
+        assert!(!ran.lock().unwrap().iter().any(|s| s.starts_with("seed")));
+    }
+
+    /// A version a stopped process left checking is checked again at the next start; one that
+    /// is withdrawn meanwhile is not.
+    #[tokio::test]
+    async fn a_restart_runs_the_checks_a_stopped_process_left() {
+        let (fake, ran) = fake_sandbox();
+        let (w, _app, _ann) = checking("checks-resume", 2, fake).await;
+        let up = stored(&w, Kind::Apworld, b"good world", json!({"name": "ww.apworld"})).await;
+        for v in ["1", "2"] {
+            // As a process that stopped before its checks ended left them.
+            let new = log::NewVersion {
+                game: "ww".to_owned(),
+                version: v.to_owned(),
+                note: String::new(),
+                apworld: manifests::key_of(up["id"].as_str().unwrap()).unwrap(),
+                generator: String::new(),
+            };
+            assert_eq!(w.store.version_add(&new).await.unwrap(), log::VersionAdded::Added);
+        }
+        let withdrawn = log::VersionState::Withdrawn;
+        assert!(w.store.version_set("ww", "2", withdrawn, "", None).await.unwrap());
+        crate::checks::resume(Arc::clone(&w)).await;
+        assert_eq!(checked(&w, "1").await.state, log::VersionState::Live);
+        assert_eq!(checked(&w, "2").await.state, withdrawn);
+        assert_eq!(ran.lock().unwrap().len(), 4, "only version 1: inspect, scan, two seeds");
+    }
+
+    /// A test seed waits for a generation slot like a player's world: while the only slot is
+    /// taken, the version's inspection and scan run but no seed does.
+    #[tokio::test]
+    async fn a_test_seed_takes_its_turn_for_a_generation_slot() {
+        let (fake, ran) = fake_sandbox();
+        let (w, app, ann) = checking("checks-turn", 1, fake).await;
+        let player = w.generation_turn().await.unwrap();
+        post_version(&w, &app, &ann, "1", b"good world").await;
+        for _ in 0..500 {
+            if ran.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*ran.lock().unwrap(), ["inspect", "scan"], "no seed while the slot is held");
+        drop(player);
+        assert_eq!(checked(&w, "1").await.state, log::VersionState::Live);
+    }
+
+    /// Ann's game `annsgame` with version 1 from a stored `.apworld`, once its check ended;
+    /// its page.
     async fn ann_game(w: &Worlds, app: &Router, ann: &str) -> Value {
         let up = stored(w, Kind::Apworld, b"ann's world", json!({"name": "a.apworld"})).await;
         let r = call(app, "POST", "/api/games", ann, r#"{"name":"annsgame"}"#).await;
@@ -3127,7 +3434,15 @@ mod tests {
         let v = json!({"version": "1", "apworld": up["id"]}).to_string();
         let r = call(app, "POST", "/api/games/annsgame/versions", ann, &v).await;
         assert_eq!(r.status(), StatusCode::CREATED);
-        json_of(r).await
+        // Its check ends at once here (no generator), so the page stays as it is from now on.
+        for _ in 0..500 {
+            let all = w.store.versions("annsgame").await.unwrap();
+            if all.iter().all(|v| v.state != log::VersionState::Checking) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        json_of_call(app, "/api/games/annsgame", ann).await
     }
 
     /// The catalogue routes: make a game (its maker is its owner, a name taken ignoring case
