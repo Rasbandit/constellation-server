@@ -126,6 +126,84 @@ class InspectYaml(unittest.TestCase):
             inspect_yaml(self.yaml("name: !!python/object/apply:os.system ['true']\ngame: A\n"))
 
 
+class ScanApworld(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def scan(self, entries):
+        return ap_gen.scan_apworld(build_zip(self.dir / "w.apworld", entries), UNPACKED, ENTRIES)
+
+    def reasons(self, source):
+        return [(f["line"], f["reason"]) for f in self.scan({"w/__init__.py": source.encode()})]
+
+    def test_ordinary_world_code_is_not_flagged(self):
+        source = """
+import os
+import random
+from worlds.AutoWorld import World
+from .items import item_table
+here = os.path.dirname(__file__)
+with open(os.path.join(here, "data.json")) as f:
+    data = f.read()
+exec("x = 1")
+class W(World):
+    game = "W"
+"""
+        self.assertEqual(self.reasons(source), [])
+
+    def test_network_programs_files_and_hidden_code_are_flagged_by_line(self):
+        source = """import socket
+import subprocess as sp
+from os import system
+import os.path as osp
+import os, shutil, base64
+sp.run(["ls"])
+system("rm -rf /")
+os.execv("/bin/sh", [])
+shutil.rmtree("x")
+open("/etc/passwd")
+open("../../x", "w")
+osp.expanduser("~")
+exec(base64.b64decode(blob))
+eval(code)
+__import__(name)
+"""
+        got = self.reasons(source)
+        self.assertEqual(got, sorted(got))
+        self.assertEqual(got, [
+            (1, ap_gen.NETWORK), (2, ap_gen.PROGRAMS), (7, ap_gen.PROGRAMS),
+            (8, ap_gen.PROGRAMS), (9, ap_gen.FILES), (10, ap_gen.FILES), (11, ap_gen.FILES),
+            (12, ap_gen.FILES), (13, ap_gen.HIDDEN), (14, ap_gen.HIDDEN), (15, ap_gen.HIDDEN),
+        ])
+
+    def test_a_long_encoded_text_native_and_compiled_files_are_flagged(self):
+        blob = "QUJD" * 600
+        got = self.scan({
+            "w/__init__.py": f"X = {blob!r}\nY = {'words and spaces. ' * 200!r}\n".encode(),
+            "w/lib/fast.so": b"\x7fELF",
+            "w/__pycache__/x.cpython-312.pyc": b"\x00",
+        })
+        self.assertEqual([(f["file"], f["line"], f["reason"]) for f in got], [
+            ("w/__init__.py", 1, ap_gen.BLOB),
+            ("w/__pycache__/x.cpython-312.pyc", 0, f"{ap_gen.UNREADABLE}: compiled Python"),
+            ("w/lib/fast.so", 0, ap_gen.NATIVE),
+        ])
+
+    def test_a_file_that_is_not_python_is_flagged_not_refused(self):
+        got = self.scan({"w/__init__.py": b"def (:\n"})
+        self.assertEqual([f["reason"] for f in got], [f"{ap_gen.UNREADABLE}: SyntaxError"])
+
+    def test_flags_are_capped_and_an_unsafe_zip_is_refused_as_inspect_refuses_it(self):
+        many = "".join(f"eval(x{i})\n" for i in range(ap_gen.MAX_FLAGS + 50))
+        self.assertEqual(len(self.scan({"w/__init__.py": many.encode()})), ap_gen.MAX_FLAGS)
+        with self.assertRaisesRegex(Refused, "unsafe path"):
+            self.scan({"w/../../x.py": b""})
+
+    def test_the_test_player_has_the_worlds_game_and_default_options(self):
+        self.assertEqual(ap_gen.test_player("A: Game"),
+                         {"name": "Tester", "game": "A: Game", "A: Game": {}})
+
+
 class Cli(unittest.TestCase):
     def test_a_refusal_exits_1(self):
         self.assertEqual(ap_gen.main(["inspect-apworld", "/nonexistent/x.apworld",

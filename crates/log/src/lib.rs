@@ -701,6 +701,9 @@ pub struct GameVersion {
     pub state: VersionState,
     /// Why its check failed, when it did.
     pub error: Option<String>,
+    /// What the code scan flagged, as JSON text (an array of `{file, line, reason}`); None
+    /// until the scan has run.
+    pub scan: Option<String>,
 }
 
 /// What adding a version did.
@@ -836,6 +839,27 @@ pub trait CatalogueStore: Send + Sync + 'static {
         game: &str,
         generator: &str,
     ) -> impl Future<Output = Result<Option<GameVersion>, StoreError>> + Send;
+
+    /// Record what the code scan of `game`'s `version` found (JSON text). False when there is
+    /// no such version.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Every version whose checks have not ended, oldest upload first: what a restart runs
+    /// again.
+    ///
+    /// # Errors
+    /// The store failing.
+    fn versions_checking(
+        &self,
+    ) -> impl Future<Output = Result<Vec<GameVersion>, StoreError>> + Send;
 }
 
 /// Whether an upload's `bytes` no longer hash to its `id` (a torn row).

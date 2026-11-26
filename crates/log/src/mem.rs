@@ -745,6 +745,7 @@ impl crate::CatalogueStore for MemLogStore {
                     generator: version.generator.clone(),
                     state: crate::VersionState::Checking,
                     error: None,
+                    scan: None,
                 };
                 versions.push((key, new));
                 Added
@@ -795,6 +796,27 @@ impl crate::CatalogueStore for MemLogStore {
             *g == key && v.state == crate::VersionState::Live && v.generator == generator
         });
         ready(Ok(latest.map(|(_, v)| v.clone())))
+    }
+
+    fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter_mut().find(|(g, v)| *g == key && v.version == version);
+        let set = found.map(|(_, v)| v.scan = Some(scan.to_owned()));
+        ready(Ok(set.is_some()))
+    }
+
+    fn versions_checking(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::GameVersion>, StoreError>> + Send {
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let checking = versions.iter().filter(|(_, v)| v.state == crate::VersionState::Checking);
+        ready(Ok(checking.map(|(_, v)| v.clone()).collect()))
     }
 }
 
