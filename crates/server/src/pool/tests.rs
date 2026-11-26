@@ -27,21 +27,24 @@ fn scripted(
     worlds: &mut Cache<Loaded>,
 ) -> (Result<(), String>, Vec<(Kind, Vec<u8>)>) {
     let mut out = Vec::new();
-    let ended = serve_keeping(input, &mut out, worlds);
+    let ended = serve_keeping(input, &mut out, worlds, MESSAGE_MAX);
     let (mut answers, mut rest) = (Vec::new(), &out[..]);
-    while let Some(m) = read(&mut rest).unwrap() {
+    while let Some(m) = read(&mut rest, usize::MAX).unwrap() {
         answers.push(m);
     }
     (ended, answers)
 }
 
+/// The longest message the scripted workers read.
+const MESSAGE_MAX: usize = 1 << 26;
+
 fn roomy() -> Cache<Loaded> {
     Cache::new(config::PREPARED_CACHE_BYTES)
 }
 
-/// What a kept world loaded from `file` counts against the cap.
+/// What a kept world loaded from `file` counts against the cap: the bytes it holds.
 fn held(file: &[u8]) -> usize {
-    file.len() * config::PREPARED_HELD_PER_FILE_BYTE
+    Prepared::open(file).unwrap().held_bytes()
 }
 
 fn kept(worlds: &Cache<Loaded>) -> Vec<BlobKey> {
@@ -174,6 +177,19 @@ fn a_world_that_does_not_load_is_refused_as_the_job_child_refuses_it_and_not_kep
     assert_eq!(answers[1].0, Kind::Done);
 }
 
+/// A bad request is refused as a job child refuses it, before the worker asks for a world it
+/// does not hold: the server is not made to send a world for a job that cannot run.
+#[test]
+fn a_bad_request_is_refused_before_its_world_is_asked_for() {
+    let x = prepared(&small(), 1);
+    let mut worlds = roomy();
+    let (ended, answers) = scripted(&job_message(b"{", &x.0), &mut worlds);
+    assert_eq!(ended, Ok(()));
+    let refused = (Kind::Refused, alone(b"{", &x.1).unwrap_err().into_bytes());
+    assert_eq!(answers, [refused], "no miss: the world was never asked for");
+    assert!(worlds.held.is_empty());
+}
+
 /// The kept worlds stay under the cap, the least recently used going first; a cap of nothing
 /// keeps nothing and every job still fills.
 #[test]
@@ -207,13 +223,14 @@ fn a_worker_stops_on_anything_but_a_whole_message_in_turn() {
     let job = job_message(&head(&["Ann"], &x.2, 1, Algorithm::Exact), &x.0);
     let world = message(Kind::World, &x.1);
     let short_key = job_message(b"{}", &[7; 31]);
-    let bad: [(&str, Vec<u8>); 9] = [
+    let bad: [(&str, Vec<u8>); 10] = [
         ("an unknown kind", vec![9, 0, 0, 0, 0]),
         ("a world before any job", world.clone()),
         ("an answer kind", message(Kind::Done, b"seed")),
         ("a header cut short", job[..3].to_vec()),
         ("a body cut short", job[..job.len() - 1].to_vec()),
-        ("a length that lies", [&header(Kind::Job, 1 << 30).unwrap()[..], b"x"].concat()),
+        ("a length over the cap", header(Kind::Job, MESSAGE_MAX + 1).unwrap().to_vec()),
+        ("a length that lies", [&header(Kind::Job, MESSAGE_MAX).unwrap()[..], b"x"].concat()),
         ("a key of 31 bytes", short_key),
         ("no world after a miss", job.clone()),
         ("a job in place of the world", [&job[..], &job[..]].concat()),
@@ -278,7 +295,8 @@ async fn the_server_side_takes_a_seed_or_a_refusal_and_nothing_else() {
 async fn the_world_is_sent_on_a_miss_only_and_the_seed_is_the_same_cold_and_warm() {
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let reader = theirs.try_clone().unwrap();
-    let worker = std::thread::spawn(move || serve(reader, theirs, config::PREPARED_CACHE_BYTES));
+    let caps = caps_of(&worker_job(&Limits::DESIGN)).unwrap().unwrap();
+    let worker = std::thread::spawn(move || serve(reader, theirs, caps));
     ours.set_nonblocking(true).unwrap();
     let (mut from, mut to) = tokio::net::UnixStream::from_std(ours).unwrap().into_split();
     let (key, file, instance) = prepared(&small(), 1);
@@ -294,28 +312,42 @@ async fn the_world_is_sent_on_a_miss_only_and_the_seed_is_the_same_cold_and_warm
     assert_eq!(worker.join().unwrap(), Ok(()));
 }
 
-/// A worker's CPU cap counts its whole life, so it is replaced while a whole job still fits:
-/// with the design limits (120 CPU seconds, jobs of at most 60 s on one thread) that is up to
-/// 60 s of jobs. Where no whole job fits even in a fresh worker, none is kept for a second.
+/// A worker's CPU cap counts its whole life, so it is replaced while a whole job and a margin
+/// still fit: with the design limits (120 CPU seconds, jobs of at most 60 s, a second in
+/// hand) that is up to 59 s of jobs on one thread. A job on more threads may use that many
+/// times its wall time. Where no whole job fits even in a fresh worker, none is kept.
 #[test]
 fn a_worker_is_replaced_before_its_cpu_cap_could_end_a_job_that_did_nothing_wrong() {
     let l = Limits::DESIGN;
-    assert_eq!((l.fill_cpu_secs, l.fill_timeout_ms, config::GENERATION_WORKERS), (120, 60_000, 1));
-    assert!(has_cpu_left(Duration::ZERO, &l));
-    assert!(has_cpu_left(Duration::from_millis(59_999), &l));
-    assert!(!has_cpu_left(Duration::from_secs(60), &l));
-    assert!(!has_cpu_left(Duration::ZERO, &Limits { fill_cpu_secs: 60, ..l }));
-    assert!(!has_cpu_left(Duration::MAX, &l));
+    assert_eq!((l.fill_cpu_secs, l.fill_timeout_ms), (120, 60_000));
+    assert_eq!(config::FILL_WORKER_CPU_MARGIN_MS, 1000);
+    assert!(has_cpu_left(0, 1, &l));
+    assert!(has_cpu_left(58_999, 1, &l));
+    assert!(!has_cpu_left(59_000, 1, &l), "a second is kept in hand");
+    assert!(!has_cpu_left(0, 2, &l), "two threads for 60 s may use the whole cap");
+    assert!(!has_cpu_left(0, 1, &Limits { fill_cpu_secs: 61, ..l }));
+    assert!(!has_cpu_left(u128::MAX / 4, 1, &l));
 }
 
-/// A worker is started as a job child is: the same program under the same caps, in job mode.
+/// A worker is started as a job child is: the same program under the same caps, in job mode,
+/// its own limits in the job's name (it gets no environment to read them from).
 #[test]
 fn a_worker_runs_under_the_caps_of_a_job_child() {
-    let l = Limits { fill_memory_bytes: 7, fill_cpu_secs: 3, ..Limits::DESIGN };
+    let l = Limits {
+        fill_memory_bytes: 7,
+        fill_cpu_secs: 3,
+        fill_worker_cache_bytes: 99,
+        ..Limits::DESIGN
+    };
     let (worker, child) = (
-        job_argv(std::path::Path::new("/x/server"), WORKER, &l),
+        worker_argv(std::path::Path::new("/x/server"), &l),
         job_argv(std::path::Path::new("/x/server"), "fill", &l),
     );
-    assert_eq!(worker.last().unwrap(), "worker");
+    assert_eq!(worker.last().unwrap(), "worker=99,7");
     assert_eq!(worker[..worker.len() - 1], child[..child.len() - 1]);
+    assert_eq!(caps_of("worker=99,7"), Some(Ok(Caps { cache_bytes: 99, message_max: 7 })));
+    assert_eq!(caps_of("fill"), None, "a job child's job is no worker");
+    for bad in ["worker=", "worker=1", "worker=a,2", "worker=1,-2"] {
+        assert!(caps_of(bad).unwrap().is_err(), "{bad}");
+    }
 }

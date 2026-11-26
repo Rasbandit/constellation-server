@@ -281,17 +281,22 @@ fn without_deleted(exe: PathBuf) -> PathBuf {
     }
 }
 
-/// The child side of [`run_job`]: read stdin, run the job, print the result. Job
-/// [`crate::pool::WORKER`] is the child side of the pool instead: fill after fill on the same
-/// two pipes, until stdin closes.
+/// How a job child that refused its job exited, as its refusal is worded
+/// ([`exec`]: `<its last words> (<status>)`): `main` ends it with a failure, status 1. A pooled
+/// worker's refusal is worded the same, so an error reads alike with and without the pool.
+pub(crate) const REFUSED_STATUS: &str = "exit status: 1";
+
+/// The child side of [`run_job`]: read stdin, run the job, print the result. A job name a
+/// pool made ([`crate::pool::caps_of`]) is the child side of the pool instead: fill after fill
+/// on the same two pipes, until stdin closes.
 ///
 /// # Errors
 /// What the job refused, or an IO error on the pipes.
 pub fn fill_job(job: &str) -> Result<(), String> {
     use std::io::{Read, Write};
-    if job == crate::pool::WORKER {
+    if let Some(caps) = crate::pool::caps_of(job) {
         let (stdin, stdout) = (std::io::stdin().lock(), std::io::stdout().lock());
-        return crate::pool::serve(stdin, stdout, config::PREPARED_CACHE_BYTES);
+        return crate::pool::serve(stdin, stdout, caps?);
     }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
