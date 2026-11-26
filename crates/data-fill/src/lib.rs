@@ -11,6 +11,7 @@ mod level;
 mod live;
 pub mod par;
 pub mod parity_rng;
+pub mod prepared;
 pub mod reach;
 pub mod room;
 pub mod section;

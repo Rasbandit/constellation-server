@@ -1,7 +1,10 @@
 //! The seed a generation stores, byte for byte: seeds 1 to 20 of one world at 1 and at 10
 //! players, through `seed::generate` on the manifest and the v1 import, pinned by one digest.
-//! Every faster way to the same seed must give these bytes.
+//! Every faster way to the same seed must give these bytes: here the prepared path, which
+//! compiles the world once (`job::prepare`) and fills from the stored form (`job::fill`).
 
+use data_fill::job;
+use data_fill::prepared::Prepared;
 use data_fill::seed::{Player, generate};
 use data_fill::synth::{Shape, world};
 use seed_bundle::package::key_of;
@@ -30,6 +33,39 @@ fn by_manifest(manifest: &Value, players: &[Player], rng: u64) -> (Vec<u8>, Vec<
     (seed.bytes().to_vec(), packages)
 }
 
+/// The found record and the prepared world of `manifest`, as an upload stores them.
+fn prepared(manifest: &Value) -> (Value, Vec<u8>) {
+    let out = job::prepare(manifest.to_string().as_bytes()).unwrap();
+    let (found, file) = job::unframe(&out).unwrap();
+    (serde_json::from_slice(found).unwrap(), file.to_vec())
+}
+
+/// The fill request of `players` on a prepared world, as the server sends it.
+fn request(file: &[u8], players: &[Player], rng: u64, workers: usize) -> Vec<u8> {
+    let players: Vec<Value> = players
+        .iter()
+        .map(|p| {
+            let i = &p.instance;
+            json!({"name": p.name, "instance": {
+                "options": i.options, "rolls": i.rolls, "locations": i.locations,
+                "excluded": i.excluded, "locked": i.locked, "pool": i.pool,
+                "pool_class": i.pool_class, "start_inventory": i.start_inventory,
+                "logic_start": i.logic_start, "item_groups": i.item_groups,
+                "location_groups": i.location_groups,
+            }})
+        })
+        .collect();
+    let head = json!({"seed_name": format!("s{rng}"), "players": players, "rng_seed": rng, "workers": workers});
+    job::frame(head.to_string().as_bytes(), file)
+}
+
+/// The seed file and package files the prepared path stores.
+fn by_prepared(file: &[u8], players: &[Player], rng: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let out = job::fill(&request(file, players, rng, 1)).unwrap();
+    let (seed, packages) = seed_bundle::import_v1(&out, MAX).unwrap();
+    (seed.bytes().to_vec(), packages)
+}
+
 /// Seeds 1 to 20 at 1 and at 10 players.
 fn rooms() -> impl Iterator<Item = (Value, Vec<Player>, u64)> {
     [1, 10].into_iter().flat_map(|n| {
@@ -51,4 +87,49 @@ fn the_stored_seeds_of_seeds_1_to_20_at_1_and_10_players_are_pinned() {
         all.extend(packages.concat());
     }
     assert_eq!(hex(&key_of(&all)), PINNED);
+}
+
+/// Fails without `job::prepare` and `job::fill`: the world is compiled once, and every seed
+/// filled from that stored form is the seed the manifest path makes.
+#[test]
+fn the_prepared_path_stores_the_bytes_the_manifest_path_does() {
+    let mut all = Vec::new();
+    for n in [1, 10] {
+        let (m, p) = room(n);
+        let (_, file) = prepared(&m);
+        for rng in 1..=20 {
+            let (seed, packages) = by_prepared(&file, &p, rng);
+            assert_eq!(
+                (&seed, &packages),
+                (&by_manifest(&m, &p, rng).0, &by_manifest(&m, &p, rng).1)
+            );
+            all.extend(seed);
+            all.extend(packages.concat());
+        }
+    }
+    assert_eq!(hex(&key_of(&all)), PINNED);
+}
+
+#[test]
+fn preparing_checks_a_manifest_as_inspect_does_and_the_file_opens_as_its_world() {
+    let (m, p) = room(1);
+    let (found, file) = prepared(&m);
+    let inspected: Value =
+        serde_json::from_slice(&job::inspect(m.to_string().as_bytes()).unwrap()).unwrap();
+    assert_eq!(found, inspected);
+    let world = Prepared::open(&file).unwrap();
+    assert_eq!((world.game(), world.world().locations()), ("Synth", 200));
+    // The same manifest prepares to the same bytes: the stored form is found by content.
+    assert_eq!(prepared(&m).1, file);
+    // More workers when the request asks: the same seed.
+    let four = job::fill(&request(&file, &p, 3, 4)).unwrap();
+    assert_eq!(four, job::fill(&request(&file, &p, 3, 1)).unwrap());
+    // What prepare refuses is what inspect refuses, and a cut file is refused, not filled.
+    let mut bad = m.clone();
+    bad.as_object_mut().unwrap().remove("version");
+    assert!(job::prepare(bad.to_string().as_bytes()).unwrap_err().contains("version"));
+    assert!(job::prepare(b"{").unwrap_err().contains("JSON"));
+    assert!(job::fill(&request(&file[..file.len() / 2], &p, 1, 1)).is_err());
+    assert!(job::fill(b"\x02").is_err());
+    assert!(job::run("nope", b"").unwrap_err().contains("unknown job"));
 }

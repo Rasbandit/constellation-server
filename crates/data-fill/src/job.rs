@@ -5,13 +5,13 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::seed::{Player, checked_name, generate_by as fill, manifest_game};
+use crate::prepared::{self, Prepared};
+use crate::seed::{Player, checked_name, generate_by, generate_on, manifest_game};
 use crate::world::World;
 
-/// A fill request: the manifest, who plays it, and the seed's name and random stream.
+/// A fill request less its world: who plays, and the seed's name and random stream.
 #[derive(Debug, Deserialize)]
-struct Request {
-    manifest: Value,
+struct Fill {
     seed_name: String,
     players: Vec<Player>,
     rng_seed: u64,
@@ -21,14 +21,92 @@ struct Request {
     algorithm: crate::room::Algorithm,
 }
 
+/// A fill request that carries the manifest to compile.
+#[derive(Debug, Deserialize)]
+struct Request {
+    manifest: Value,
+    #[serde(flatten)]
+    fill: Fill,
+}
+
+/// Run job `job` on `input`: the one list of the jobs a child process takes.
+///
+/// # Errors
+/// What the job refuses, or a job that is not one.
+pub fn run(job: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+    match job {
+        "prepare" => prepare(input),
+        "fill" => fill(input),
+        "generate" => generate(input),
+        "inspect" => inspect(input),
+        other => Err(format!("unknown job {other:?}")),
+    }
+}
+
+/// A job's two-part input or output as one byte string: `head`'s length (4 bytes, little
+/// endian), `head` (JSON), then `body` (a prepared world file) to the end.
+#[must_use]
+pub fn frame(head: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + head.len() + body.len());
+    out.extend_from_slice(&u32::try_from(head.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(head);
+    out.extend_from_slice(body);
+    out
+}
+
+/// The head and body of a [`frame`].
+///
+/// # Errors
+/// When the bytes are shorter than the head they announce.
+pub fn unframe(framed: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let cut = || "a job frame is cut short".to_owned();
+    let (len, rest) = framed.split_first_chunk::<4>().ok_or_else(cut)?;
+    rest.split_at_checked(u32::from_le_bytes(*len) as usize).ok_or_else(cut)
+}
+
 /// Fill the room a request describes; the seed bundle as JSON text.
 ///
 /// # Errors
 /// A message for a request that does not parse, or for what [`crate::seed::generate`] refuses.
 pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
     let r: Request = serde_json::from_slice(input).map_err(|e| format!("bad fill request: {e}"))?;
-    let bundle = fill(&r.manifest, &r.seed_name, &r.players, r.rng_seed, r.workers, r.algorithm)?;
+    let f = r.fill;
+    let bundle =
+        generate_by(&r.manifest, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
     serde_json::to_vec(&bundle).map_err(|e| e.to_string())
+}
+
+/// Fill a room on a prepared world: the input is a [`frame`] of the request (JSON:
+/// `seed_name`, `players`, `rng_seed`, `workers`, and `algorithm` if not the exact fill) and
+/// the prepared world's file ([`prepare`]). Nothing is compiled. The seed bundle as JSON text.
+///
+/// # Errors
+/// A message for a frame or request that does not parse, a file that is not a prepared world
+/// of this layout, or what [`crate::seed::generate`] refuses.
+pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (head, file) = unframe(input)?;
+    let f: Fill = serde_json::from_slice(head).map_err(|e| format!("bad fill request: {e}"))?;
+    let world = Prepared::open(file)?;
+    let bundle = generate_on(&world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
+    serde_json::to_vec(&bundle).map_err(|e| e.to_string())
+}
+
+/// A manifest's game and version, checked.
+fn named(m: &Value) -> Result<(&str, String), String> {
+    let game = manifest_game(m)?;
+    let version = match &m["version"] {
+        Value::String(v) => checked_name("version", v)?.to_owned(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err("the manifest needs a \"version\"".to_owned()),
+    };
+    Ok((game, version))
+}
+
+/// What a check answers with: `{"game", "version", "items", "locations"}` as JSON text.
+fn found((game, version): (&str, String), w: &World) -> Result<Vec<u8>, String> {
+    let found =
+        json!({"game": game, "version": version, "items": w.items(), "locations": w.locations()});
+    serde_json::to_vec(&found).map_err(|e| e.to_string())
 }
 
 /// Check a manifest (JSON bytes) the way an upload needs: a `game`, a `version`, and it compiles.
@@ -38,14 +116,18 @@ pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
 /// A message naming what is wrong with it.
 pub fn inspect(input: &[u8]) -> Result<Vec<u8>, String> {
     let m: Value = serde_json::from_slice(input).map_err(|e| format!("not valid JSON: {e}"))?;
-    let game = manifest_game(&m)?;
-    let version = match &m["version"] {
-        Value::String(v) => checked_name("version", v)?.to_owned(),
-        Value::Number(n) => n.to_string(),
-        _ => return Err("the manifest needs a \"version\"".to_owned()),
-    };
-    let w = World::load(&m)?;
-    let found =
-        json!({"game": game, "version": version, "items": w.items(), "locations": w.locations()});
-    serde_json::to_vec(&found).map_err(|e| e.to_string())
+    found(named(&m)?, &World::load(&m)?)
+}
+
+/// Check a manifest as [`inspect`] does and keep what the check compiled: a [`frame`] of
+/// [`inspect`]'s answer and the prepared world's file ([`crate::prepared`]), for the caller to
+/// store and hand to [`fill`].
+///
+/// # Errors
+/// As [`inspect`].
+pub fn prepare(input: &[u8]) -> Result<Vec<u8>, String> {
+    let m: Value = serde_json::from_slice(input).map_err(|e| format!("not valid JSON: {e}"))?;
+    let name = named(&m)?;
+    let (file, world) = prepared::build(&m)?;
+    Ok(frame(&found(name, &world)?, &file))
 }

@@ -27,6 +27,9 @@ pub const VERSION: u16 = 1;
 pub const SECTION_GAME: u16 = 1;
 /// Section, reserved: the game's rules and regions (not written yet).
 pub const SECTION_RULES: u16 = 2;
+/// Section of a prepared world (`data_fill::prepared`): the whole package file of the game as
+/// seeds of that world name it ([`GamePackage::file`]), stored as is.
+pub const SECTION_SEED_GAME: u16 = 3;
 /// Bytes of one table of contents entry.
 const ENTRY: usize = 48;
 /// Section flag: the bytes are raw deflate.

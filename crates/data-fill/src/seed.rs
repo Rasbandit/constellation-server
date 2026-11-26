@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
 use crate::fill::Instance;
+use crate::prepared::Prepared;
 use crate::room::{self, Seat};
 use crate::spheres::RoomSpheres;
 use crate::world::World;
@@ -87,6 +88,30 @@ pub fn generate_by(
     algorithm: room::Algorithm,
 ) -> Result<SeedBundle, String> {
     let game = manifest_game(manifest)?;
+    named(players)?;
+    fill_on(&World::load(manifest)?, game, seed_name, players, rng_seed, workers, algorithm)
+}
+
+/// [`generate_by`] on a prepared world: nothing is compiled, the fill starts from the stored
+/// form. The same bundle as the manifest gives.
+///
+/// # Errors
+/// As [`generate`], less what only a manifest can get wrong.
+pub fn generate_on(
+    prepared: &Prepared,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+    algorithm: room::Algorithm,
+) -> Result<SeedBundle, String> {
+    named(players)?;
+    let (w, game) = (prepared.world(), prepared.game());
+    fill_on(w, game, seed_name, players, rng_seed, workers, algorithm)
+}
+
+/// Every player has a name, and no two share one.
+fn named(players: &[Player]) -> Result<(), String> {
     for (k, p) in players.iter().enumerate() {
         if p.name.trim().is_empty() {
             return Err(format!("player {} has no name", k + 1));
@@ -95,9 +120,23 @@ pub fn generate_by(
             return Err(format!("player name {:?} repeats", p.name));
         }
     }
+    Ok(())
+}
+
+/// Fill a room of `players` on the loaded world `w` of `game` and assemble its seed.
+fn fill_on(
+    w: &World,
+    game: &str,
+    seed_name: &str,
+    players: &[Player],
+    rng_seed: u64,
+    workers: usize,
+    algorithm: room::Algorithm,
+) -> Result<SeedBundle, String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
-    let room = room::Compiled::shared(World::load(manifest)?, &insts, workers)?;
-    let (w, seats) = (room.world(0), room.seats());
+    // The room owns its world: a copy of the loaded bytes, small beside a fill.
+    let room = room::Compiled::shared(w.clone(), &insts, workers)?;
+    let seats = room.seats();
     let (filled, spheres) = room::fill_room_by(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
@@ -175,7 +214,7 @@ fn assemble(
 
 /// The world's names and ids as the game's data package; the checksum is the hash of both
 /// tables, so it changes with them.
-fn game_data(w: &World) -> Result<GameData, String> {
+pub(crate) fn game_data(w: &World) -> Result<GameData, String> {
     let items: BTreeMap<String, i64> = (0..u16::try_from(w.items()).map_err(|e| e.to_string())?)
         .map(|i| (w.item_key(i).to_owned(), w.item_id(i)))
         .collect();
