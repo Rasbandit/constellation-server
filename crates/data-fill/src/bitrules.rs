@@ -128,6 +128,8 @@ struct Builder<'a> {
     times: Vec<u64>,
     /// Per def: not compiled yet, or its terms (`None`: stays bytecode).
     defs: Vec<Option<Option<Vec<And>>>>,
+    /// Tests the defs' terms kept in `defs` may still hold: a def past it stays bytecode.
+    room: usize,
 }
 
 impl Bits {
@@ -137,7 +139,8 @@ impl Bits {
     }
 
     /// [`Bits::of`] holding at most `budget` tests in all: a rule that would pass it stays
-    /// bytecode.
+    /// bytecode, and once it is spent no further rule is compiled. The defs' terms kept while
+    /// building have the same budget of their own.
     fn within(w: &World, budget: usize) -> Self {
         let mut b = Builder {
             w,
@@ -147,6 +150,7 @@ impl Bits {
             fixed: HashMap::new(),
             times: Vec::new(),
             defs: vec![None; w.defs()],
+            room: budget,
         };
         let mut out = Bits::clone(&NONE);
         let mut memo: HashMap<u32, ((u32, u32), usize)> = HashMap::new();
@@ -158,7 +162,10 @@ impl Bits {
                 let fits = |t: &[And]| {
                     out.tests.len() + t.iter().map(|t| t.atoms.len()).sum::<usize>() <= budget
                 };
-                match b.dnf(at as usize).filter(|(terms, _)| fits(terms)) {
+                // Once the budget is spent no rule is compiled at all.
+                let spent = out.tests.len() >= budget;
+                let rule = if spent { None } else { b.dnf(at as usize) };
+                match rule.filter(|(terms, _)| fits(terms)) {
                     Some((terms, _)) => (out.push(&terms), b.class(&terms)),
                     None => (BYTECODE, 4),
                 }
@@ -382,6 +389,10 @@ impl Builder<'_> {
                 let d = usize::from(d);
                 if self.defs.get(d)?.is_none() {
                     let terms = self.dnf(w.def(d) as usize).map(|x| x.0);
+                    // Kept until the build ends: within the budget, or the def stays bytecode.
+                    let held = |t: &Vec<And>| t.iter().map(|t| t.atoms.len()).sum::<usize>();
+                    let terms = terms.filter(|t| held(t) <= self.room);
+                    self.room -= terms.as_ref().map_or(0, held);
                     self.defs[d] = Some(terms);
                 }
                 (self.defs[d].clone()??, at)
@@ -484,6 +495,35 @@ mod tests {
     /// The check sites of a world, in order.
     fn checks(w: &crate::World) -> impl Iterator<Item = usize> + '_ {
         (0..w.site_count()).filter(|s| w.site_place(*s).1 == crate::section::CHECKS)
+    }
+
+    /// A spent budget ends the work, not only the storing: no rule after it is compiled (its
+    /// atoms are never made), and the defs' terms a build keeps are budgeted too, so a def past
+    /// that budget stays bytecode with every site that refers to it.
+    #[test]
+    fn a_spent_budget_compiles_no_more_rules_and_keeps_no_more_def_terms() {
+        let keys: Vec<String> =
+            (0..150).map(|k| format!("x{k}")).chain(["c", "d"].map(String::from)).collect();
+        // Five defs of 30 tests each; the first four are referred to only from rules of a
+        // shape that stays bytecode, the fifth from a rule that is the def alone.
+        let def = |d: usize| json!({"all": keys[d * 30..(d + 1) * 30].iter().map(|k| json!({"has": k})).collect::<Vec<_>>()});
+        let defs: serde_json::Map<String, Value> =
+            (0..5).map(|d| (format!("d{d}"), def(d))).collect();
+        let odd = json!({"ge": [{"int": ["*", {"count": "c"}, 2]}, 2]});
+        let mut rules: Vec<Value> =
+            (0..4).map(|d| json!({"all": [{"ref": format!("d{d}")}, odd]})).collect();
+        rules.push(json!({"ref": "d4"}));
+        let (w, _) = world_of(&keys, &Value::Object(defs), &rules);
+        assert_eq!(bytecode(&w), 4, "with the world's own budget the fifth rule is a bit rule");
+        // 100 tests: three defs of 30 are kept, the fourth and fifth are not, though the fifth
+        // rule alone (30 tests) would fit what is stored.
+        let small = Bits::within(&w, 100);
+        assert_eq!(small.classes[4], 5);
+        assert!(small.tests.len() <= 3, "{} tests: the events and the goal", small.tests.len());
+        // Two tests: after the first two rules that fit, nothing is compiled, so no atom is made.
+        let (w, _) = world(&["a", "b", "e", "f", "g"].map(|i| json!({"has": i})));
+        assert!(w.bits().atoms.len() >= 7);
+        assert_eq!(Bits::within(&w, 2).atoms.len(), 2);
     }
 
     /// The term cap at its edge: an OR of 16 distinct atoms is a bit rule, of 17 it is not.
