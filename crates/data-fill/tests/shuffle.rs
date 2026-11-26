@@ -5,10 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use data_fill::seed::{Player, generate};
-use data_fill::shuffle::{Staged, stage};
+use data_fill::shuffle::{Staged, order, room, stage};
 use data_fill::synth::{Shape, world as synth_world};
 use data_fill::{Instance, World, decode};
 use serde_json::{Value, json};
+use spec_rng::SpecRng;
 
 fn t() -> Value {
     json!({"true": {}})
@@ -263,19 +264,93 @@ fn dead_ends_are_placed_after_branches_so_no_attempt_is_wasted() {
     }
 }
 
+/// Doors `d1` to region `a`, `d2` to the shrine and one more per name in `more`, all out of
+/// the village. `d2` opens on a bell that rings in `a`, so a layout that puts `a` behind `d2`
+/// closes both.
+fn bell(more: &[&str], rows: Value) -> (Value, Instance) {
+    let mut a = region("a", &["c_a"], json!([back("d1", "village")]));
+    a["events"] = json!([{"event": "bell", "rule": t()}]);
+    let rung = json!({"ge": [{"counter": "bell"}, 1]});
+    let mut out = vec![door("d1", "a", "g", t()), door("d2", "shrine", "g", rung)];
+    let mut names = vec!["d1".to_owned(), "d2".to_owned()];
+    let mut regions = vec![a, region("shrine", &["c_shrine"], json!([back("d2", "village")]))];
+    for (k, r) in more.iter().enumerate() {
+        let key = format!("d{}", k + 3);
+        out.push(door(&key, r, "g", t()));
+        regions.push(region(r, &[], json!([back(&key, "village")])));
+        names.push(key);
+    }
+    regions.insert(0, region("village", &["c1", "c2", "c3"], json!(out)));
+    let shuffle =
+        json!({"coupled": true, "slots": {"type": "exit", "names": names}, "allow": rows});
+    manifest(regions, json!({"entrances": shuffle}))
+}
+
 #[test]
 fn a_world_that_can_never_pass_the_check_errors_at_the_cap() {
-    let mut regions = doors_regions();
-    regions.push(region("island", &["c_island"], json!([])));
-    let (m, inst) = manifest(regions, entrances());
+    // The table lets the two doors only trade places, which puts the bell behind its own door.
+    let swap = json!([{"slots": {"names": ["d1"]}, "only": {"names": ["d2"]}},
+                      {"slots": {"names": ["d2"]}, "only": {"names": ["d1"]}}]);
+    let (m, inst) = bell(&[], swap);
     let w = World::load(&m).unwrap();
     let e = stage(&w, &inst, 1, 0).unwrap_err();
     let cap = format!("{} attempts", config::SHUFFLE_MAX_ATTEMPTS);
-    assert!(e.contains(&cap) && e.contains("entrances") && e.contains("island"), "{e}");
+    assert!(e.contains(&cap) && e.contains("entrances") && e.contains("region \"a\""), "{e}");
     // Through the seed path the error also names the player and the world.
     let p = [Player { name: "Ann".into(), instance: inst }];
     let e = generate(&m, "s", &p, 1, 1).unwrap_err();
     assert!(e.contains("player 1") && e.contains("Doors") && e.contains("entrances"), "{e}");
+}
+
+#[test]
+fn a_failed_layout_starts_again_and_the_next_attempt_can_pass() {
+    // Four doors, free to trade: one layout in four puts the bell behind its own door.
+    let (m, inst) = bell(&["b", "c"], json!([]));
+    let w = World::load(&m).unwrap();
+    let mut restarted = 0;
+    for seed in 1..=60 {
+        let s = staged(&w, &inst, seed);
+        assert_ne!(s.table["entrances"]["d2"], "d1", "seed {seed}: the layout that cannot pass");
+        assert_whole_world(&s, &inst, &format!("seed {seed}"));
+        restarted += u32::from(s.attempts > 1);
+        // Another attempt is another stream, and the same one every time.
+        assert_eq!(s.attempts, staged(&w, &inst, seed).attempts, "seed {seed}");
+    }
+    assert!(restarted > 5, "{restarted} of 60 seeds restarted");
+}
+
+#[test]
+fn a_none_shuffle_restarts_too_when_its_draw_closes_a_check() {
+    // The ghost cannot be beaten (one sword exists); the prize is behind the spire's guardian.
+    let mut shuffles = guardians();
+    shuffles["guardians"]["allow"] = json!([]);
+    shuffles["guardians"]["things"]["hydra"] = json!({"rule": {"has": "sword", "n": 2}});
+    let (m, inst) = halls(shuffles);
+    let w = World::load(&m).unwrap();
+    let mut restarted = 0;
+    for seed in 1..=60 {
+        let s = staged(&w, &inst, seed);
+        assert_ne!(s.table["guardians"]["spire_hall"], "hydra", "seed {seed}");
+        restarted += u32::from(s.attempts > 1);
+    }
+    assert!(restarted > 5, "{restarted} of 60 seeds restarted");
+}
+
+#[test]
+fn a_region_no_layout_can_open_is_an_error_at_once_not_at_the_cap() {
+    // An island behind an option: closed by default, whatever the doors do.
+    let mut regions = doors_regions();
+    regions.push(region("island", &["c_island"], json!([])));
+    let open = json!({"eq": [{"opt": "ferry"}, 1]});
+    regions[0]["exits"].as_array_mut().unwrap().push(json!({"to": "island", "rule": open}));
+    let (mut m, mut inst) = manifest(regions, entrances());
+    m["options"] = json!([{"key": "ferry", "default": 0}]);
+    let w = World::load(&m).unwrap();
+    let e = stage(&w, &inst, 1, 0).unwrap_err();
+    assert!(e.contains("island") && e.contains("unshuffled layout"), "{e}");
+    assert!(!e.contains("attempts"), "no attempt can change it: {e}");
+    inst.options.insert("ferry".into(), 1);
+    assert_whole_world(&staged(&w, &inst, 1), &inst, "the ferry runs");
 }
 
 /// Three halls, three guardians; the large one may not stand in the spire.
@@ -349,7 +424,18 @@ fn a_shuffle_runs_after_the_shuffles_its_rules_read_and_a_cycle_is_a_load_error(
     shuffles["aaa"] = relics(json!({"at": ["guardians", "marsh_hall"]}));
     let (m, inst) = halls(shuffles.clone());
     let w = World::load(&m).unwrap();
+    assert_eq!(order(&w), ["guardians", "aaa"]);
     assert_eq!(staged(&w, &inst, 1).table["aaa"]["altar"], "cup");
+    // The layout is one node after every shuffle a rule can read (design doc 17 section 4.3:
+    // its check inspects every rule). The worked cycle of that section needs a `when` that
+    // reads the entrances, which is refused by name until write edges exist.
+    let mut both = guardians();
+    both["entrances"] = entrances()["entrances"].clone();
+    let w = World::load(&manifest(doors_regions(), both.clone()).0).unwrap();
+    assert_eq!(order(&w), ["guardians", "layout"]);
+    both["guardians"]["when"] = json!({"eq": [{"at": ["entrances", "chute"]}, "chute"]});
+    let e = World::load(&manifest(doors_regions(), both).0).unwrap_err();
+    assert!(e.contains("shuffles.guardians") && e.contains("`when`"), "{e}");
     // The guardians now read `aaa` back.
     shuffles["guardians"]["things"]["golem"]["rule"] = json!({"at": ["aaa", "altar"]});
     let e = World::load(&halls(shuffles).0).unwrap_err();
@@ -432,7 +518,42 @@ fn a_fill_on_a_world_whose_shuffles_did_not_run_is_refused() {
 #[test]
 fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
     type Change = fn(&mut Value);
-    let entrance: [(&str, Change); 16] = [
+    let entrance: [(&str, Change); 30] = [
+        ("shuffles.entrances.slots.type", |s| s["entrances"]["slots"] = json!({})),
+        ("shuffles.entrances.slots.names", |s| {
+            s["entrances"]["slots"].as_object_mut().unwrap().remove("names");
+        }),
+        ("shuffles.entrances.slots", |s| {
+            s["entrances"].as_object_mut().unwrap().remove("slots");
+        }),
+        ("`scope`", |s| s["entrances"]["scope"] = json!("cosmetic")),
+        ("`vanilla`", |s| s["entrances"]["vanilla"] = json!({"chute": "chute"})),
+        ("without a dot", |s| *s = json!({"a.b": s["entrances"].take()})),
+        ("48 bytes", |s| *s = json!({"n".repeat(49): s["entrances"].take()})),
+        ("at most 64", |s| {
+            let one = s["entrances"].take();
+            *s = (0..65)
+                .map(|k| (format!("s{k}"), one.clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+        }),
+        ("rows", |s| {
+            let row = s["entrances"]["allow"][0].clone();
+            s["entrances"]["allow"] = json!(vec![row; config::SHUFFLE_MAX_ROWS + 1]);
+        }),
+        ("names and groups", |s| {
+            let many = vec!["cave"; config::SHUFFLE_MAX_SLOTS + 1];
+            s["entrances"]["allow"][0]["only"] = json!({"groups": many});
+        }),
+        ("only a shuffle that moves exits", |s| {
+            *s = guardians();
+            s["guardians"]["coupled"] = json!(true);
+        }),
+        ("is not supported yet", |s| s["entrances"]["coupled"] = json!({"opt": "x"})),
+        ("the things of an exit shuffle", |s| {
+            s["entrances"]["things"] = json!({"type": "exit", "names": ["chute"]});
+        }),
+        ("a row is", |s| s["entrances"]["allow"][0] = json!({"slots": {"groups": ["cave"]}})),
         ("`when`", |s| s["entrances"]["when"] = json!({"opt": "x"})),
         ("`pin`", |s| s["entrances"]["pin"] = json!([{"slot": "chute", "thing": "chute"}])),
         ("`pool`", |s| s["entrances"]["pool"] = json!({"file": "layouts.bin"})),
@@ -462,7 +583,23 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
         let e = World::load(&manifest(doors_regions(), s).0).unwrap_err();
         assert!(e.contains(want) && e.contains("shuffles"), "{want}: {e}");
     }
-    let hall: [(&str, Change); 9] = [
+    let hall: [(&str, Change); 16] = [
+        ("`min`", |s| s["guardians"]["things"]["wisp"]["min"] = json!(1)),
+        ("`weight`", |s| s["guardians"]["things"]["wisp"]["weight"] = json!(5)),
+        ("`fill`", |s| s["guardians"]["things"]["wisp"]["fill"] = json!(true)),
+        ("`grants`", |s| s["guardians"]["things"]["wisp"]["grants"] = json!(["bell"])),
+        ("`item`", |s| s["guardians"]["things"]["wisp"]["item"] = json!("sword")),
+        ("things", |s| {
+            let many: Vec<String> =
+                (0..=config::SHUFFLE_MAX_SLOTS).map(|i| format!("g{i}")).collect();
+            s["guardians"]["things"] = json!(many);
+        }),
+        ("read as a rule", |s| {
+            // More candidates than one rule can list.
+            for k in 0..config::SHUFFLE_MAX_READ_THINGS {
+                s["guardians"]["things"][format!("g{k}")] = json!({"rule": {"true": {}}});
+            }
+        }),
         ("`to`", |s| s["guardians"]["things"]["wisp"]["to"] = json!("village")),
         ("`count`", |s| s["guardians"]["things"]["wisp"]["count"] = json!(2)),
         ("`value`", |s| s["guardians"]["things"]["wisp"]["value"] = json!(3)),
@@ -506,6 +643,52 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
         let e = World::load(&manifest(regions, shuffles).0).unwrap_err();
         assert!(e.contains(want), "{want}: {e}");
     }
+    // The world's own fields this slice does not build are refused in every manifest, and the
+    // exit fields of a shuffle in a manifest without one.
+    for (field, value) in [("require", json!(["returnable"])), ("kinds", json!({}))] {
+        for shuffles in [entrances(), json!({})] {
+            let mut m = manifest(doors_regions(), shuffles.clone()).0;
+            m[field] = value.clone();
+            if shuffles == json!({}) {
+                m["regions"] = json!([
+                    region("village", &["c_village"], json!([])),
+                    region("shrine", &[], json!([]))
+                ]);
+            }
+            let e = World::load(&m).unwrap_err();
+            assert!(e.contains(&format!("`{field}`")) && e.contains("not supported"), "{e}");
+        }
+    }
+    let mut m = doors().0;
+    m.as_object_mut().unwrap().remove("shuffles");
+    let e = World::load(&m).unwrap_err();
+    assert!(e.contains("cave_mouth") && e.contains("no shuffle"), "{e}");
+    // Names the compiler keeps for shuffle results, and the cap on what rules can read.
+    let mut m = halls(guardians()).0;
+    m["options"] = json!([{"key": "at.guardians.spire_hall", "default": 0}]);
+    assert!(World::load(&m).unwrap_err().contains("`at.` names"), "an option");
+    let mut m = halls(guardians()).0;
+    m["defs"] = json!({"at.guardians.spire_hall": t()});
+    assert!(World::load(&m).unwrap_err().contains("`at.` names"), "a def");
+    let mut s = guardians();
+    let many: Vec<String> = (0..300).map(|i| format!("h{i}")).collect();
+    s["guardians"]["slots"]["names"] = json!(many);
+    s["guardians"]["things"] = json!(many);
+    s["guardians"]["allow"] = json!([]);
+    let mut m = halls(s).0;
+    m["regions"][1]["checks"] = json!([]);
+    let e = World::load(&m).unwrap_err();
+    assert!(e.contains("at most 256"), "{e}");
+    // Rules compiled with shuffle results and loaded without the shuffles would read every
+    // slot as its first thing.
+    let (rules, game) = data_fill::section::sections(&halls(guardians()).0).unwrap();
+    let e = World::from_sections(rules, game).unwrap_err();
+    assert!(e.contains("shuffle section"), "{e}");
+    // An error does not carry a name of any length back.
+    let mut s = entrances();
+    s["entrances"]["slots"]["names"][0] = json!("x".repeat(1 << 20));
+    let e = World::load(&manifest(doors_regions(), s).0).unwrap_err();
+    assert!(e.len() <= config::SHUFFLE_ERROR_MAX_BYTES + 8, "{} bytes", e.len());
     // A door with three sides, a side that is not the other's way back, a group without a key.
     let mut regions = doors_regions();
     regions[4]["exits"][1] = json!({"to": "attic", "rule": t(), "key": "x", "door": "cave_mouth"});
@@ -521,56 +704,335 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
     assert!(e.contains("needs a key"), "{e}");
 }
 
-/// Synthetic worlds with shuffled two-way doors (in the first shape a door is the only way
-/// into a region): every room that fills is beatable on layouts that pass the whole-world
-/// check. The restarts, the worlds out of attempts and the rooms the exact fill could not fill
-/// are counted and printed.
+/// Synthetic worlds with shuffled two-way doors: light with a door as the only way into a
+/// region, light with a second fixed way in, and heavy without a time context. Every room
+/// stages and fills beatable, and each table says what the staged world's exits do. The
+/// restarts are counted and printed. (Heavy worlds without `doors` can be unfillable before
+/// any shuffle, issue 209; `doors` keeps the start region's checks open.)
 #[test]
-fn synthetic_worlds_with_shuffled_doors_fill_beatable() {
-    let (mut staged_worlds, mut restarts, mut capped, mut stuck, mut plain_stuck) = (0, 0, 0, 0, 0);
+fn synthetic_worlds_with_shuffled_doors_all_fill_beatable() {
+    let (mut staged_worlds, mut restarts) = (0, 0);
+    let light = Shape { checks: 60, layers: 3, doors: true, timeless: true, ..Shape::default() };
     for (shape, players) in [
-        (Shape { checks: 60, layers: 3, branching: 1, doors: true, ..Shape::default() }, 3),
-        (Shape { checks: 60, layers: 3, doors: true, ..Shape::heavy() }, 2),
+        (Shape { branching: 1, ..light }, 3u32),
+        (light, 2),
+        (Shape { checks: 60, layers: 3, doors: true, timeless: true, ..Shape::heavy() }, 2),
     ] {
         for seed in 1..=40u64 {
             let (mut m, inst) = synth_world(&shape, seed, 0);
             m["game"] = json!("Synth");
-            assert!(m["shuffles"]["entrances"]["slots"]["names"].as_array().unwrap().len() > 5);
+            let names = m["shuffles"]["entrances"]["slots"]["names"].as_array().unwrap();
+            assert!(names.len() > 5);
             let p: Vec<Player> = (0..players)
                 .map(|k| Player { name: format!("P{k}"), instance: inst.clone() })
                 .collect();
-            // The same world with its doors left where they are, for the fill's own failures.
-            let (mut plain, _) = synth_world(&Shape { doors: false, ..shape }, seed, 0);
-            plain["game"] = json!("Synth");
-            plain_stuck += u32::from(generate(&plain, "s", &p, seed, 1).is_err());
-            match generate(&m, "s", &p, seed, 1) {
-                Ok(b) => {
-                    let w = World::load(&m).unwrap();
-                    for k in 0..players {
-                        let s = stage(&w, &inst, seed, k).unwrap().unwrap();
-                        assert_whole_world(&s, &inst, &format!("seed {seed}"));
-                        restarts += s.attempts - 1;
-                        staged_worlds += 1;
-                    }
-                    assert!(b.slots.iter().all(|s| s.slot_data["shuffles"].is_object()));
+            let b = generate(&m, "s", &p, seed, 1).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let w = World::load(&m).unwrap();
+            let vanilla = graph(&m, &w);
+            for (k, slot) in b.slots.iter().enumerate() {
+                let s = stage(&w, &inst, seed, k as u32).unwrap().unwrap();
+                assert_eq!(slot.slot_data, json!({"shuffles": s.table}), "seed {seed}");
+                assert_whole_world(&s, &inst, &format!("seed {seed}"));
+                // The table against the exits the fill walked: `e<r>` leads where its thing
+                // led, and that region's way back `b<r>` leads here.
+                let (real, table) = (graph(&m, &s.world), &s.table["entrances"]);
+                for name in names.iter().map(|n| n.as_str().unwrap()) {
+                    let thing = &table[name];
+                    assert_eq!(real[name].1, vanilla[thing].1, "seed {seed}, {name}");
+                    let back = &real[&thing.replacen('e', "b", 1)];
+                    assert_eq!(*back, (real[name].1.clone(), real[name].0.clone()), "seed {seed}");
                 }
-                // A layout that passes the check and that the fill cannot fill fails the room
-                // (doc 17 section 4.8); the fill's error names the item.
-                Err(e) if e.contains("Stuck") => stuck += 1,
-                // The only other refusal allowed: a world out of attempts, named.
-                Err(e) => {
-                    assert!(e.contains("attempts") && e.contains("entrances"), "seed {seed}: {e}");
-                    capped += 1;
-                }
+                restarts += s.attempts - 1;
+                staged_worlds += 1;
             }
         }
     }
-    println!(
-        "80 rooms: {staged_worlds} worlds staged, {restarts} restarts, {capped} rooms at the cap, \
-         {stuck} rooms the fill could not fill ({plain_stuck} with the doors not shuffled) (counted)"
-    );
-    assert!(staged_worlds > 150 && capped <= 4, "{staged_worlds} staged, {capped} capped");
+    println!("120 rooms, {staged_worlds} worlds staged, {restarts} restarts (counted)");
+    assert_eq!(staged_worlds, 40 * (3 + 2 + 2));
     // Off, the shape draws the world it always drew.
     let off = Shape { checks: 60, layers: 3, ..Shape::default() };
     assert!(synth_world(&off, 1, 0).0.get("shuffles").is_none());
+}
+
+#[test]
+fn a_synthetic_none_shuffle_fills_beatable_and_a_time_context_refuses_a_layout_shuffle() {
+    let shape = Shape { checks: 60, layers: 3, guards: true, ..Shape::default() };
+    for seed in 1..=20u64 {
+        let (mut m, inst) = synth_world(&shape, seed, 0);
+        m["game"] = json!("Synth");
+        let p = [Player { name: "P".into(), instance: inst }];
+        let b = generate(&m, "s", &p, seed, 1).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(b.slots[0].slot_data["shuffles"]["guards"].as_object().unwrap().len(), 8);
+    }
+    // More than one time slice, or clocks: an exit shuffle is refused until exits that narrow
+    // time are settled (design doc 17 section 9). A `none` shuffle is not.
+    for shape in [
+        Shape { checks: 60, layers: 3, doors: true, ..Shape::default() },
+        Shape { checks: 60, layers: 3, doors: true, ..Shape::heavy() },
+    ] {
+        let e = World::load(&synth_world(&shape, 1, 0).0).unwrap_err();
+        assert!(e.contains("shuffles.entrances") && e.contains("time"), "{e}");
+    }
+    let (mut m, _) = doors();
+    m["x.time"] = json!({"slices": 2, "start_mask": 1});
+    assert!(World::load(&m).unwrap_err().contains("time"));
+}
+
+/// The tables of fixed seeds, pinned: a change to a draw, a stream or the layout solve
+/// changes every shuffled seed and has to show here.
+#[test]
+fn the_results_of_fixed_seeds_are_pinned() {
+    let pin = |(m, inst): (Value, Instance)| {
+        let w = World::load(&m).unwrap();
+        let out: String =
+            (1..=8).map(|seed| format!("{:?}\n", staged(&w, &inst, seed).table)).collect();
+        format!("{:016x}", data_fill::check::fnv1a(out.as_bytes()))
+    };
+    assert_eq!(pin(doors()), "?", "the entrance shuffle");
+    assert_eq!(pin(halls(guardians())), "?", "the guardian shuffle");
+    assert_eq!(pin(bell(&["b", "c"], json!([]))), "?", "with restarts");
+}
+
+/// Both sides of each door listed in a shuffle that is not coupled: every side is its own
+/// slot, and a door need not lead back.
+#[test]
+fn decoupled_doors_are_four_slots_and_need_not_lead_back() {
+    let regions = vec![
+        region(
+            "village",
+            &["c1", "c2", "c3"],
+            json!([door("cave_in", "cave", "g", t()), door("shrine_in", "shrine", "g", t())]),
+        ),
+        region("cave", &["c_cave"], json!([back("cave_in", "village")])),
+        region("shrine", &["c_shrine"], json!([back("shrine_in", "village")])),
+    ];
+    let names = ["cave_in", "cave_in_back", "shrine_in", "shrine_in_back"];
+    let shuffles =
+        json!({"entrances": {"coupled": false, "slots": {"type": "exit", "names": names}}});
+    let (m, inst) = manifest(regions, shuffles);
+    let w = World::load(&m).unwrap();
+    let vanilla = graph(&m, &w);
+    let mut one_way = 0;
+    for seed in 1..=100 {
+        let s = staged(&w, &inst, seed);
+        let (real, table) = (graph(&m, &s.world), &s.table["entrances"]);
+        assert_eq!(table.len(), 4, "seed {seed}: no side follows another");
+        for name in names {
+            assert_eq!(real[name].1, vanilla[&table[name]].1, "seed {seed}, {name}");
+        }
+        assert_whole_world(&s, &inst, &format!("seed {seed}"));
+        let back = |door: &str| real[&format!("{door}_back")].1 == "village";
+        one_way += u32::from(!back("cave_in") || !back("shrine_in"));
+    }
+    assert!(one_way > 0, "some door leads somewhere else than back");
+}
+
+/// Three shuffles over the doors of one world: one joint solve, each exit in its own table.
+#[test]
+fn several_layout_shuffles_of_a_world_are_solved_together() {
+    let slots =
+        |names: &[&str]| json!({"coupled": true, "slots": {"type": "exit", "names": names}});
+    let shuffles = json!({
+        "caves": slots(&["cave_mouth", "mill_door", "deep_door"]),
+        "drops": slots(&["well_drop", "chute"]),
+        "dungeons": slots(&["tower_gate", "crypt_gate"]),
+    });
+    let (m, inst) = manifest(doors_regions(), shuffles);
+    let w = World::load(&m).unwrap();
+    assert_eq!(order(&w), ["layout"]);
+    let mut seen = BTreeSet::new();
+    for seed in 1..=100 {
+        let s = staged(&w, &inst, seed);
+        let own = |shuffle: &str, names: &[&str]| {
+            let t = &s.table[shuffle];
+            names.iter().all(|n| names.contains(&t[*n].as_str()))
+        };
+        assert!(own("caves", &["cave_mouth", "mill_door", "deep_door"]), "seed {seed}");
+        assert!(
+            own("drops", &["well_drop", "chute"]) && own("dungeons", &["tower_gate", "crypt_gate"])
+        );
+        assert_whole_world(&s, &inst, &format!("seed {seed}"));
+        seen.insert(format!("{:?}", s.table));
+    }
+    assert!(seen.len() > 5, "{} layouts", seen.len());
+}
+
+#[test]
+fn a_coupled_door_listed_from_its_far_side_is_a_load_error_that_names_it() {
+    let (mut m, _) = tree();
+    m["shuffles"]["entrances"]["slots"]["names"][0] = json!("to_hub_back");
+    let e = World::load(&m).unwrap_err();
+    assert!(e.contains("shuffles.entrances") && e.contains("to_hub_back"), "{e}");
+    assert!(e.contains("region \"hub\"") && e.contains("far side"), "{e}");
+}
+
+#[test]
+fn a_room_stages_the_same_on_one_thread_and_on_several() {
+    let (m, inst) = doors();
+    let w = World::load(&m).unwrap();
+    let insts = vec![&inst; 9];
+    let (one, tables) = room(&[&w], &insts, 5, 1).unwrap();
+    let (many, same) = room(&[&w], &insts, 5, 4).unwrap();
+    assert_eq!(tables, same);
+    let exits = |c: &data_fill::room::Compiled| {
+        c.worlds.iter().map(|w| decode::manifest(w)["regions"].clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(exits(&one), exits(&many));
+    assert!(tables.iter().any(|t| *t != tables[0]), "players differ");
+    // A staged world shares what the seed did not change with the world it came from.
+    assert!(one.worlds.iter().all(|s| s.shares_with(&w)));
+}
+
+/// More fixed regions behind the shuffled exits than the layout index may hold.
+#[test]
+fn a_world_whose_fixed_regions_around_its_doors_are_too_many_is_refused() {
+    let mut regions = vec![region(
+        "village",
+        &["c1", "c2"],
+        json!([{"to": "r1", "rule": t()},
+                                                                   {"to": "shrine", "rule": t()}]),
+    )];
+    regions.push(region("shrine", &[], json!([])));
+    let mut names = Vec::new();
+    for k in 1..=1100 {
+        let mut exits = vec![json!({"to": format!("r{}", k + 1), "rule": t()})];
+        if k > 76 {
+            exits.push(door(&format!("e{k}"), &format!("x{k}"), "g", t()));
+            regions.push(region(
+                &format!("x{k}"),
+                &[],
+                json!([back(&format!("e{k}"), &format!("r{k}"))]),
+            ));
+            names.push(format!("e{k}"));
+        }
+        regions.push(region(&format!("r{k}"), &[], json!(exits)));
+    }
+    regions.push(region("r1101", &[], json!([])));
+    assert_eq!(names.len(), config::SHUFFLE_MAX_SLOTS);
+    let shuffles =
+        json!({"entrances": {"coupled": true, "slots": {"type": "exit", "names": names}}});
+    let e = World::load(&manifest(regions, shuffles).0).unwrap_err();
+    assert!(e.contains("not shuffled") && e.contains("shuffles"), "{e}");
+}
+
+fn below(rng: &mut SpecRng, n: usize) -> usize {
+    usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0)
+}
+
+/// One random change to a JSON value: a member dropped, repeated or replaced by something of
+/// another shape.
+fn mutate(v: &mut Value, rng: &mut SpecRng, depth: u32) {
+    let children = match v {
+        Value::Object(o) => o.len(),
+        Value::Array(a) => a.len(),
+        _ => 0,
+    };
+    if children > 0 && depth < 12 && below(rng, 4) != 0 {
+        let (k, what) = (below(rng, children), below(rng, 8));
+        match v {
+            Value::Object(o) => {
+                let key = o.keys().nth(k).cloned().unwrap_or_default();
+                match (what, o.get_mut(&key)) {
+                    (0, _) | (_, None) => drop(o.remove(&key)),
+                    (_, Some(child)) => mutate(child, rng, depth + 1),
+                }
+            }
+            Value::Array(a) => match what {
+                0 => drop(a.remove(k)),
+                1 => a.push(a[k].clone()),
+                _ => mutate(&mut a[k], rng, depth + 1),
+            },
+            _ => {}
+        }
+        return;
+    }
+    *v = match below(rng, 12) {
+        0 => Value::Null,
+        1 => json!(true),
+        2 => json!(-1),
+        3 => json!(u64::MAX),
+        4 => json!(""),
+        5 => json!("layout"),
+        6 => json!([]),
+        7 => json!({}),
+        8 => json!("x".repeat(300)),
+        9 => json!({"at": ["guardians", "spire_hall"]}),
+        10 => json!(["cave_mouth", "cave_mouth_back", 7]),
+        _ => json!({"names": ["chute"], "groups": ["cave"], "type": "exit"}),
+    };
+}
+
+/// Malformed input is an error, never a panic: thousands of random changes to the shuffles
+/// and regions of manifests, and to the stored shuffle section of a compiled world.
+#[test]
+fn random_damage_to_a_manifest_or_a_stored_section_is_an_error_never_a_panic() {
+    let mut both = guardians();
+    both["entrances"] = entrances()["entrances"].clone();
+    let bases =
+        [doors(), halls(guardians()), manifest(doors_regions(), both), bell(&["b"], json!([]))];
+    let mut rng = SpecRng::from_u64(7);
+    let (mut loaded, mut refused) = (0, 0);
+    for case in 0..4000u64 {
+        let (mut m, inst) = bases[(case % 4) as usize].clone();
+        for _ in 0..=case % 3 {
+            let part = ["shuffles", "shuffles", "regions"][(case / 4 % 3) as usize];
+            mutate(&mut m[part], &mut rng, 0);
+        }
+        match World::load(&m) {
+            // Whatever loads also stages or says why not.
+            Ok(w) => loaded += u32::from(stage(&w, &inst, case, 0).is_ok()),
+            Err(e) => {
+                assert!(!e.is_empty());
+                refused += 1;
+            }
+        }
+    }
+    assert!(loaded > 100 && refused > 1000, "{loaded} staged, {refused} refused");
+    // The stored form of a compiled world, as a prepared world file carries it.
+    let (mut opened, mut refused) = (0, 0);
+    for case in 0..2000u64 {
+        let (m, inst) = &bases[(case % 4) as usize];
+        let (rules, game) = data_fill::section::sections(m).unwrap();
+        let stored = data_fill::shuffle::section(m).unwrap().unwrap();
+        let mut v: Value = serde_json::from_slice(&stored).unwrap();
+        mutate(&mut v, &mut rng, 0);
+        match World::from_parts(rules, game, Some(v.to_string().as_bytes())) {
+            Ok(w) => opened += u32::from(stage(&w, inst, case, 0).is_ok()),
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(opened > 0 && refused > 500, "{opened} staged, {refused} refused");
+}
+
+/// The tools that resolve a plan themselves say that a world with shuffles has to be staged.
+#[test]
+fn the_tools_refuse_a_world_with_shuffles_by_name() {
+    let (m, inst) = doors();
+    let dir = std::env::temp_dir().join(format!("shuffle-tools-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &str, v: &Value| {
+        let p = dir.join(name);
+        std::fs::write(&p, v.to_string()).unwrap();
+        p.to_str().unwrap().to_owned()
+    };
+    let (mp, ip) = (path("m.json", &m), path("i.json", &serde_json::to_value(&inst).unwrap()));
+    let out = dir.join("out.json").to_str().unwrap().to_owned();
+    let runs: [(&str, Vec<&str>); 3] = [
+        (env!("CARGO_BIN_EXE_data-fill"), vec![&mp, &ip]),
+        (env!("CARGO_BIN_EXE_fill-fairness"), vec!["--manifest", &mp, "--instance", &ip]),
+        (
+            env!("CARGO_BIN_EXE_port-check"),
+            vec!["--manifest", &mp, "--legacy", "true", "--out", &out],
+        ),
+    ];
+    for (bin, args) in runs {
+        let o = std::process::Command::new(bin).args(&args).output().unwrap();
+        let said =
+            String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
+        assert!(
+            !o.status.success() && said.contains("shuffles") && said.contains("stage"),
+            "{bin}: {said}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
