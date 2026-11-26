@@ -289,6 +289,12 @@ pub const RULES_MAX_DEPTH: u32 = 256;
 /// the next draws of the seed's random stream; a design value).
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
 
+/// Threads one generation asks its fill for (`workers` of the fill request): one, so a
+/// generation costs one core and many run side by side. The parallel path stays for a caller of
+/// the fill that asks for more, up to [`ROOM_FORWARD_WORKERS`] (results never depend on the
+/// number).
+pub const GENERATION_WORKERS: usize = 1;
+
 /// Worker threads that compile worlds and resolve instances of a room's players in parallel
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;

@@ -1332,6 +1332,26 @@ fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String
         .collect()
 }
 
+/// The fill request of a generation, as the child reads it: on `config::GENERATION_WORKERS`
+/// threads.
+fn fill_request(
+    manifest: &[u8],
+    seed_name: &str,
+    files: &[(String, Vec<u8>)],
+    rng_seed: u64,
+) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8(manifest.to_vec()).map_err(|e| e.to_string())?;
+    let raw = serde_json::value::RawValue::from_string(text).map_err(|e| e.to_string())?;
+    let req = FillReq {
+        manifest: &raw,
+        seed_name,
+        players: player_requests(files)?,
+        rng_seed,
+        workers: config::GENERATION_WORKERS,
+    };
+    serde_json::to_vec(&req).map_err(|e| e.to_string())
+}
+
 /// Each chosen player file from the store, with the name it was uploaded under (for errors).
 async fn player_files(w: &Worlds, yamls: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::with_capacity(yamls.len());
@@ -1363,20 +1383,10 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     let files = player_files(w, &yamls).await?;
     let players = yamls.len();
     // Building the request is blocking work.
-    let input = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let text = String::from_utf8(manifest.to_vec()).map_err(|e| e.to_string())?;
-        let raw = serde_json::value::RawValue::from_string(text).map_err(|e| e.to_string())?;
-        let req = FillReq {
-            manifest: &raw,
-            seed_name: &seed_name,
-            players: player_requests(&files)?,
-            rng_seed,
-            workers: config::FILL_SETUP_WORKERS,
-        };
-        serde_json::to_vec(&req).map_err(|e| e.to_string())
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))?;
+    let input =
+        tokio::task::spawn_blocking(move || fill_request(&manifest, &seed_name, &files, rng_seed))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))?;
     let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
     let bundle = w.run_job("generate", &input, timeout).await.map_err(|e| e.to_string())?;
     let limits = w.limits;
@@ -2455,6 +2465,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the world never finished and listed");
+    }
+
+    /// A generation asks for one thread: the product's default (a caller of the fill job may
+    /// still ask for more). Fails with the old four.
+    #[test]
+    fn a_generation_asks_the_fill_for_one_worker() {
+        let req = fill_request(b"{}", "s", &[], 1).unwrap();
+        let req: Value = serde_json::from_slice(&req).unwrap();
+        assert_eq!(req["workers"], 1);
+        assert_eq!(config::GENERATION_WORKERS, 1);
     }
 
     /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
