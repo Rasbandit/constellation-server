@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use data_fill::fairness::{Flat, report, report_named, sample, sample_room};
-use data_fill::room::{self, Seat};
+use data_fill::room;
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 
@@ -69,16 +69,10 @@ fn room_report(
     (seeds, baseline, max_attempts): (u64, u64, u64),
     m: &HashMap<&str, &str>,
 ) -> Result<(Value, bool), String> {
-    let workers = config::FILL_SETUP_WORKERS;
-    let worlds = room::worlds(&vec![manifest; list.len()], workers)?;
     let insts = room::instances(list)?;
-    let pairs: Vec<_> = worlds.iter().zip(&insts).collect();
-    let plans = room::plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
-    let progression: Vec<Vec<bool>> =
-        worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
-    let seats: Vec<Seat<'_>> = (0..plans.len())
-        .map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &progression[p] })
-        .collect();
+    let insts: Vec<&Instance> = insts.iter().collect();
+    let room = room::Compiled::shared(World::load(manifest)?, &insts, config::FILL_SETUP_WORKERS)?;
+    let seats = room.seats();
     let flat = Flat::new(&seats)?;
     let t = Instant::now();
     let s =

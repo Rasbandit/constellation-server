@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use allocation_counter::{AllocationInfo, measure};
-use data_fill::room::{Seat, fill_room_spheres};
+use data_fill::room::{Compiled, fill_room_spheres};
 use data_fill::{Instance, Plan, World, section};
 use serde_json::Value;
 use spec_rng::SpecRng;
@@ -86,8 +86,9 @@ fn main() -> Result<(), String> {
         Ok::<_, String>((plans, progression))
     });
     let (plans, progression) = setup?;
-    let seats: Vec<Seat<'_>> =
-        (0..n).map(|p| Seat { w: &w, plan: &plans[p], progression: &progression[p] }).collect();
+    // One world for every seat; the players were resolved one by one above (see the top).
+    let room = Compiled { worlds: vec![w], plans, progression };
+    let seats = room.seats();
     let (filled, fill_ms) = run.phase("fill room", || {
         fill_room_spheres(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
     });

@@ -79,15 +79,9 @@ pub fn generate(
             return Err(format!("player name {:?} repeats", p.name));
         }
     }
-    let w = World::load(manifest)?;
-    let pairs: Vec<(&World, &Instance)> = players.iter().map(|p| (&w, &p.instance)).collect();
-    let plans = room::plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
-    let progression: Vec<Vec<bool>> = players.iter().map(|p| p.instance.progression(&w)).collect();
-    let seats: Vec<Seat<'_>> = plans
-        .iter()
-        .zip(&progression)
-        .map(|(plan, progression)| Seat { w: &w, plan, progression })
-        .collect();
+    let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
+    let room = room::Compiled::shared(World::load(manifest)?, &insts, workers)?;
+    let (w, seats) = (room.world(0), room.seats());
     let (filled, spheres) = room::fill_room_on(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
@@ -98,7 +92,7 @@ pub fn generate(
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
-    assemble(&w, game, seed_name, players, &seats, &filled.placed, &spheres)
+    assemble(w, game, seed_name, players, &seats, &filled.placed, &spheres)
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.

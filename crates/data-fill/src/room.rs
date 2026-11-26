@@ -106,7 +106,7 @@ pub fn instances(raw: &[serde_json::Value]) -> Result<Vec<Instance>, String> {
 /// [`Seat`]s borrow.
 #[derive(Debug)]
 pub struct Compiled {
-    /// Per player: the world.
+    /// Per player: the world. Or one world that every player plays ([`Compiled::shared`]).
     pub worlds: Vec<World>,
     /// Per player: the resolved instance.
     pub plans: Vec<Plan>,
@@ -128,11 +128,32 @@ impl Compiled {
         if manifests.len() != insts.len() {
             return Err(format!("{} manifests, {} instances", manifests.len(), insts.len()));
         }
-        let worlds = worlds(manifests, workers)?;
-        let pairs: Vec<(&World, &Instance)> = worlds.iter().zip(insts.iter().copied()).collect();
+        Self::resolve(worlds(manifests, workers)?, insts, workers)
+    }
+
+    /// One compiled `world` that every player plays, each with their own instance: the world
+    /// is held once however many players there are.
+    ///
+    /// # Errors
+    /// As [`plans`].
+    pub fn shared(world: World, insts: &[&Instance], workers: usize) -> Result<Self, String> {
+        Self::resolve(vec![world], insts, workers)
+    }
+
+    /// Resolve each player's instance against their world (`worlds`: one each, or one for all).
+    fn resolve(worlds: Vec<World>, insts: &[&Instance], workers: usize) -> Result<Self, String> {
+        let world = |p: usize| &worlds[p % worlds.len().max(1)];
+        let pairs: Vec<(&World, &Instance)> =
+            insts.iter().enumerate().map(|(p, i)| (world(p), *i)).collect();
         let plans = plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
-        let progression = worlds.iter().zip(insts).map(|(w, i)| i.progression(w)).collect();
+        let progression = pairs.iter().map(|(w, i)| i.progression(w)).collect();
         Ok(Compiled { worlds, plans, progression })
+    }
+
+    /// Player `p`'s world.
+    #[must_use]
+    pub fn world(&self, p: usize) -> &World {
+        &self.worlds[p % self.worlds.len().max(1)]
     }
 
     /// One seat per player.
@@ -140,7 +161,7 @@ impl Compiled {
     pub fn seats(&self) -> Vec<Seat<'_>> {
         (0..self.plans.len())
             .map(|p| Seat {
-                w: &self.worlds[p],
+                w: self.world(p),
                 plan: &self.plans[p],
                 progression: &self.progression[p],
             })
