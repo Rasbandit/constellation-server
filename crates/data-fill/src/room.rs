@@ -40,7 +40,7 @@ use crate::fill::{FillError, Instance, Plan};
 use crate::level;
 use crate::live::Live;
 use crate::par::{for_each_mut, map_ordered};
-use crate::reach::{Msg, Reach, Stats};
+use crate::reach::{Mark, Msg, Reach, Stats};
 use crate::section::CHECKS;
 use crate::spheres::{RoomSpheres, room_from_states};
 use crate::world::World;
@@ -912,9 +912,7 @@ impl<'a, 'w> Linked<'a, 'w> {
             marks.push(self.seq);
             // What only the last item opens is of no use to any item.
             if k + 1 < order.len() {
-                let o = usize::from(g.to);
-                self.with(o, |m| m.add(g.item, 1));
-                self.mark(o);
+                self.add_held(*g);
                 self.settle();
             }
         }
@@ -1110,18 +1108,28 @@ impl<'a, 'w> Linked<'a, 'w> {
         true
     }
 
-    /// Where every state's journal stands ([`Reach::mark`]), at a fixed point of the room.
-    fn marks(&self) -> Vec<usize> {
-        self.models.iter().map(Reach::mark).collect()
+    /// Where every state's journal stands ([`Reach::mark`]) and the room's next rank, at a
+    /// fixed point of the room.
+    fn marks(&self) -> (Vec<Mark>, u32) {
+        (self.models.iter().map(Reach::mark).collect(), self.seq)
     }
 
-    /// Take back everything added to the room since `marks` ([`Reach::undo_to`]).
-    fn undo(&mut self, marks: &[usize]) {
-        let held: usize = self.models.iter().map(Reach::mark).sum();
+    /// Take back everything added to the room since `marks` ([`Reach::undo_to`]); the room's
+    /// ranks go on from where they stood then.
+    fn undo(&mut self, (marks, seq): &(Vec<Mark>, u32)) {
+        let held: usize = self.models.iter().map(|m| m.mark().steps()).sum();
         self.journal_peak = self.journal_peak.max(held);
         for (m, mark) in self.models.iter_mut().zip(marks) {
             self.undone += m.undo_to(*mark) as u64;
         }
+        self.seq = *seq;
+    }
+
+    /// One more copy of `g`'s item held by its owner, to run on the next settle.
+    fn add_held(&mut self, g: Given) {
+        let o = usize::from(g.to);
+        self.with(o, |m| m.add(g.item, 1));
+        self.mark(o);
     }
 
     fn reset_stats(&mut self) {
@@ -1672,11 +1680,11 @@ impl Steps<'_, '_> {
         if groups.is_empty() {
             return Ok(());
         }
-        let start = std::time::Instant::now();
-        let picked = self.profile.nanos[2];
         self.held.iter_mut().for_each(Vec::clear);
         self.room.solve(&self.held, placed);
         self.solves += 1;
+        let start = std::time::Instant::now();
+        let picked = self.profile.nanos[2];
         self.room.models.iter_mut().for_each(Reach::keep_journal);
         let mut put = vec![Vec::new(); groups.len()];
         let done = self.halve(groups, (0, groups.len() - 1), locs, placed, &mut put);
@@ -1711,9 +1719,7 @@ impl Steps<'_, '_> {
         let mid = a + (b - a) / 2;
         let marks = self.room.marks();
         for g in groups[mid + 1..=b].iter().flatten() {
-            let o = usize::from(g.to);
-            self.room.with(o, |m| m.add(g.item, 1));
-            self.room.mark(o);
+            self.room.add_held(*g);
         }
         self.room.settle();
         self.halve(groups, (a, mid), locs, placed, put)?;
@@ -2371,13 +2377,42 @@ mod tests {
     /// in any amount, over many seeds, with and without clocks, items crossing worlds.
     #[test]
     fn adding_to_a_room_and_taking_it_back_matches_a_fresh_forward_solve() {
-        use crate::synth::{Shape, room};
+        use crate::synth::{Hostile, Shape, world};
         let small = Shape { checks: 60, layers: 3, ..Shape::default() };
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let hostile = |how| Shape { checks: 60, ..Shape::hostile(how) };
+        let rooms = [
+            (small, 1),
+            (small, 3),
+            (heavy, 2),
+            (heavy, 5),
+            (hostile(Hostile::Chain), 3),
+            (hostile(Hostile::Keys), 2),
+            (hostile(Hostile::Brink), 3),
+            (hostile(Hostile::Tight), 2),
+            (Shape::wide(), 2),
+        ];
         let (mut steps, mut undone, mut lost, mut crossed) = (0, 0u64, 0, 0);
-        for (shape, players) in [(small, 1), (small, 3), (heavy, 2), (heavy, 5)] {
-            for seed in 1u64..=25 {
-                let c = room(&shape, seed, players, 1).unwrap();
+        for (shape, players) in rooms {
+            for seed in 1u64..=12 {
+                // Every other room of the layered worlds has excluded and locked locations and
+                // start items too (placement groups are the fill's business, not the states').
+                let built: Vec<_> = (0..players as u64)
+                    .map(|p| {
+                        let (m, mut inst) = world(&shape, seed, p);
+                        if seed % 2 == 0 && shape.hostile.is_none() && !shape.wide {
+                            inst.excluded = (0..60).step_by(6).map(|l| format!("l{l}")).collect();
+                            let at = inst.pool.iter().position(|k| k == "p1").unwrap();
+                            inst.locked.insert("l3".to_owned(), inst.pool.remove(at));
+                            inst.start_inventory.push("p1".to_owned());
+                            inst.logic_start.insert("p0".to_owned(), 1);
+                        }
+                        (m, inst)
+                    })
+                    .collect();
+                let manifests: Vec<_> = built.iter().map(|b| &b.0).collect();
+                let insts: Vec<_> = built.iter().map(|b| &b.1).collect();
+                let c = Compiled::new(&manifests, &insts, 1).unwrap();
                 let seats = c.seats();
                 let mut r = rng(seed);
                 let mut pick = |n: usize| usize::try_from(r.below(n as u64).unwrap()).unwrap();
@@ -2419,8 +2454,14 @@ mod tests {
                     let back = !stack.is_empty() && (items.len() < 6 || pick(5) < 2);
                     if back {
                         let keep = pick(stack.len());
-                        let (marks, was, h, pl, it, lo): (Vec<usize>, Vec<Reach<'_>>, _, _, _, _) =
-                            stack.swap_remove(keep);
+                        let (marks, was, h, pl, it, lo): (
+                            (Vec<Mark>, u32),
+                            Vec<Reach<'_>>,
+                            _,
+                            _,
+                            _,
+                            _,
+                        ) = stack.swap_remove(keep);
                         stack.truncate(keep);
                         let before = (room.undone, reached(&room));
                         room.undo(&marks);
@@ -2444,8 +2485,7 @@ mod tests {
                             let o = usize::from(g.to);
                             if pick(2) == 0 {
                                 held[o].push(g.item);
-                                room.with(o, |m| m.add(g.item, 1));
-                                room.mark(o);
+                                room.add_held(g);
                             } else {
                                 let (p, l) = locs.swap_remove(pick(locs.len()));
                                 placed[usize::from(p)][l as usize] = Some(g);
@@ -2468,10 +2508,41 @@ mod tests {
                 }
             }
         }
-        assert!(steps == 4000 && undone > 10_000, "{steps} steps, {undone} journal steps undone");
+        assert!(steps == 4320 && undone > 10_000, "{steps} steps, {undone} journal steps undone");
         assert!(
             lost > 500 && crossed > 1000,
             "{lost} undos lost a location, {crossed} items crossed"
         );
+    }
+
+    /// An opt-in mode that gives up hands the attempt to the exact fill, on whatever path the
+    /// room takes: on the split path the seed is the one the carried path gives, fallen back
+    /// or not.
+    #[test]
+    fn a_mode_that_falls_back_places_the_same_on_the_split_path() {
+        let (w, mut inst) = world_with(false);
+        // Only progression in the pool: a shuffle can never move an item out of the way.
+        inst.pool.retain(|k| k != "junk");
+        inst.locations.truncate(inst.pool.len());
+        let plan = Plan::new(&w, &inst).unwrap();
+        let prog = inst.progression(&w);
+        let seats = [Seat { w: &w, plan: &plan, progression: &prog }];
+        let (mut fell, mut filled) = (0, 0);
+        for seed in 1u64..=40 {
+            for mode in [Algorithm::Shuffle(Dials::default()), Algorithm::Level(Dials::default())] {
+                let on = |path| {
+                    fill_room_by(&seats, &mut rng(seed), 20, path, mode)
+                        .map(|(f, sp)| (f.placed, f.fast, f.fallbacks, f.attempts, sp))
+                        .map_err(|e| format!("{e:?}"))
+                };
+                let split = on(Path::Split);
+                assert_eq!(split, on(Path::Carry), "seed {seed}, {mode:?}");
+                if let Ok(f) = split {
+                    fell += f.2;
+                    filled += 1;
+                }
+            }
+        }
+        assert!(fell > 0 && filled > 0, "{fell} fallbacks, {filled} filled");
     }
 }

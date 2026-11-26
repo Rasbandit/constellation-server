@@ -595,6 +595,22 @@ pub struct Reach<'w> {
     journaling: bool,
 }
 
+/// A fixed point of a journaled state to come back to ([`Reach::mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mark {
+    /// Journal steps then.
+    steps: usize,
+    /// The next rank then.
+    seq: u32,
+}
+
+impl Mark {
+    /// Journal steps the state held at the mark.
+    pub(crate) fn steps(self) -> usize {
+        self.steps
+    }
+}
+
 /// One change a forward run or its caller made to a state, as the journal keeps it: enough to
 /// take it back when everything after it was taken back first.
 #[derive(Debug, Clone, Copy)]
@@ -788,6 +804,9 @@ impl<'w> Reach<'w> {
 
     fn next(&mut self) -> u32 {
         let k = self.seq;
+        // The two ranks above stand for supports (`BY_WAIT`, `BY_START`) and for "none": a
+        // rank must never reach them, whatever the build.
+        assert!(k < BY_WAIT, "the ranks of a solve ran out");
         self.seq += 1;
         k
     }
@@ -940,7 +959,8 @@ impl<'w> Reach<'w> {
             return;
         }
         let before = self.holds[l].replace(item);
-        debug_assert!(before.is_none() || !self.journaling, "a journaled location held an item");
+        // The journal keeps no old item: undoing would leave the location empty.
+        assert!(before.is_none() || !self.journaling, "a journaled location held an item");
         self.log(Step::Hold(loc));
         if self.reached.contains(l) {
             self.collect(item, self.loc_rank[l]);
@@ -1020,6 +1040,12 @@ impl<'w> Reach<'w> {
     pub(crate) fn keep_journal(&mut self) {
         debug_assert!(self.ran && self.idle(), "a journal starts at a fixed point");
         self.journaling = true;
+        // Room for one state's worth of steps, once: every site and half-day, a first visit
+        // and a few growths per region, something held per location, every copy of the seed.
+        let (w, plan) = (self.w, self.plan);
+        let copies: usize = (0..w.items()).map(|i| plan.copies(i)).sum();
+        let steps = w.site_count() + self.half_rank.len() + w.regions() * (1 + GROWS);
+        self.journal.reserve_exact(steps + w.locations() + copies);
     }
 
     /// Stop keeping the journal and forget it: nothing more is taken back.
@@ -1028,19 +1054,25 @@ impl<'w> Reach<'w> {
         self.journal.clear();
     }
 
-    /// Where the journal stands: a fixed point to come back to.
-    pub(crate) fn mark(&self) -> usize {
-        self.journal.len()
+    /// Where the journal and the ranks stand: a fixed point to come back to.
+    pub(crate) fn mark(&self) -> Mark {
+        Mark { steps: self.journal.len(), seq: self.seq }
     }
 
     /// Take back every step after `mark` ([`Reach::mark`], taken at a fixed point), last
     /// first: the state is again the fixed point it was then, value for value. Only additions
     /// followed the mark (rules are monotone, a forward run retracts nothing), so each step is
-    /// undone by removing what it added. Returns the steps taken back.
-    pub(crate) fn undo_to(&mut self, mark: usize) -> usize {
+    /// undone by removing what it added, and the ranks handed out since are handed out again.
+    /// Returns the steps taken back.
+    pub(crate) fn undo_to(&mut self, mark: Mark) -> usize {
         debug_assert!(self.idle(), "undo from a fixed point");
+        debug_assert!(mark.steps <= self.journal.len(), "a mark of another state, or a later one");
         let w = self.w;
-        let undone = self.journal.len().saturating_sub(mark);
+        let undone = self.journal.len().saturating_sub(mark.steps);
+        // No fact with a rank handed out since the mark is left: the ranks go on from there,
+        // so a state's ranks stay within one state's facts however often it is added to.
+        self.seq = mark.seq;
+        let mark = mark.steps;
         while self.journal.len() > mark {
             let Some(step) = self.journal.pop() else { break };
             match step {
@@ -1938,6 +1970,7 @@ impl Reach<'_> {
             (self.lit != o.lit, "lit"),
             (self.adjust != o.adjust, "adjust"),
             (self.owned != o.owned, "owned"),
+            (self.seq != o.seq, "seq"),
             (grows(self) != grows(o), "grows"),
             (!self.idle() || !o.idle(), "queues"),
         ]
@@ -1965,6 +1998,18 @@ mod tests {
     use super::*;
     use crate::fill::Instance;
     use serde_json::json;
+
+    /// A rank never reaches the values that stand for a support or for "none": a state that
+    /// would hand one out stops, in every build, instead of wrapping.
+    #[test]
+    #[should_panic(expected = "the ranks of a solve ran out")]
+    fn running_out_of_ranks_stops_the_solve() {
+        let (w, inst) = clock_world(&[]);
+        let plan = Plan::new(&w, &inst).unwrap();
+        let mut r = Reach::new(&w, &plan);
+        r.set_seq(BY_WAIT);
+        r.run();
+    }
 
     /// A clock world of two slices where `dawn` owns the first and `dusk` the second (none
     /// owned: the first, as the solver starts).
