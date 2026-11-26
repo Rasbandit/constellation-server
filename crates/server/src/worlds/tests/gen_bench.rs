@@ -242,22 +242,28 @@ async fn by_pool(exe: &Path, profile: &str, shape: &Shape, players: usize, seed:
 }
 
 /// A worker's resident memory as its cache fills: one worker (never replaced here, so this is
-/// the most a worker can come to hold) fills one player on world after world, each a different
-/// heavy world, until the files of the worlds it was sent pass `config::PREPARED_CACHE_BYTES`
-/// and the cache has begun to drop the oldest. A debug build stops after a few worlds.
+/// the most a worker can come to hold) fills one player on world after world until the files
+/// of the worlds it was sent pass `config::PREPARED_CACHE_BYTES` and the cache has begun to
+/// drop the oldest. Every world is the heavy world of the rows above under another game name:
+/// another file and key, loaded apart, and a fill that is known to succeed (a refusal would
+/// end the worker). A debug build stops after a few worlds.
 async fn memory(exe: &Path) -> Value {
     let l = Limits { fill_worker_jobs: usize::MAX, ..Limits::DESIGN };
     let pool = Pool::new(exe.to_owned(), l);
     let shape = Shape { checks: CHECKS, ..Shape::heavy() };
+    let (mut manifest, instance) = world(&shape, 1, 0);
+    manifest["version"] = json!("1");
+    let head = fills::head(&["P0"], &instance, 7, data_fill::room::Algorithm::Exact);
     let most = if cfg!(debug_assertions) { 3 } else { usize::MAX };
     let full = config::PREPARED_CACHE_BYTES;
     let (mut worlds, mut sent, mut file_bytes) = (0_usize, 0_usize, 0);
     let (mut pid, mut rss_one_world) = (0, 0);
     // A tenth past the cap, so the cache is full and has dropped worlds.
     while sent <= full + full / 10 && worlds < most {
-        let (key, file, instance) = fills::prepared(&shape, 100 + worlds as u64);
-        let head = fills::head(&["P0"], &instance, 1, data_fill::room::Algorithm::Exact);
-        pool.fill(&head, &key, &file).await.unwrap();
+        manifest["game"] = json!(format!("Synth {worlds}"));
+        let out = data_fill::job::prepare(manifest.to_string().as_bytes()).unwrap();
+        let (_, file) = data_fill::job::unframe(&out).unwrap();
+        pool.fill(&head, &log::blob_key(file), file).await.unwrap();
         let pids = pool.idle_pids();
         if worlds == 0 {
             (pid, rss_one_world) = (pids[0], rss(pids[0]));
