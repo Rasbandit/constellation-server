@@ -1,5 +1,6 @@
 name: bench
-# Room fill scaling on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build.
+# Where a generation's time goes through the server, and room fill scaling on synthetic worlds
+# (crates/data-fill/examples/synth_room.rs), release build.
 # Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints a table to
 # the job summary and uploads the JSON lines as an artifact; nothing here gates a merge yet.
 # A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
@@ -31,6 +32,16 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
+      # Where a generation's time goes through the server (crates/server/src/worlds/tests/
+      # gen_bench.rs): the job's process, its pipes, load, fill and encode, and a whole request,
+      # for a room of 1 and of 10 players. First, so the fills below do not share its runner time.
+      - name: gen_bench
+        run: |
+          set -o pipefail
+          cargo build --release --locked -p server --bin constellation-server
+          cargo test --release --locked -p server --lib --features gen-bench gen_bench -- --nocapture \
+            | tee gen-bench.log
+          grep '^{"bench":"gen"' gen-bench.log > gen-bench.jsonl
       # Inputs go through the environment, never into the script text. Both profiles of
       # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), each
       # on both ways of placing rounds (`data_fill::room::Path`), the forward one on 1 thread and
@@ -96,6 +107,14 @@ jobs:
       - name: summary
         run: |
           {
+            echo "### Where a generation's time goes through the server (measured on this runner, release build, median of the reps)"
+            echo
+            echo "One synthetic world per room, every player on it, one fill thread. Start: a job process that does nothing, from start to exit. Pipe in: the fill's input on its stdin, by difference. Load, fill and encode: the job's own steps, timed in the bench process. Job: the fill job as the server runs it; rest is what the parts leave of it (inferred by subtraction). Request: from the world being asked for to its status reading done, in-memory store, no HTTP; its laps are the generation's own report."
+            echo
+            echo "| runner | profile | players | start ms | pipe in ms | load ms | fill ms | encode ms | rest ms | job ms | start plus load, share of job | request ms | laps: store | request | job | open | publish | prepared bytes | request bytes | seed bytes | reps |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r '"| \(.runner) | \(.profile) | \(.players) | \(.start_ms) | \(.pipe_in_ms) | \(.load_ms) | \(.fill_ms) | \(.encode_ms) | \(.rest_ms) | \(.job_ms) | \(((.start_ms + .load_ms) / .job_ms * 1000 | round) / 10)% | \(.request_ms) | \(.phase_ms.store) | \(.phase_ms.request) | \(.phase_ms.job) | \(.phase_ms.open) | \(.phase_ms.publish) | \(.prepared_bytes) | \(.request_bytes) | \(.seed_bytes) | \(.reps) |"' gen-bench.jsonl
+            echo
             echo "### One game per room, one thread: what is done once per world and what each seed pays (measured on a GitHub-hosted ubuntu-latest runner, release build)"
             echo
             echo "Every player plays one world, as the server generates a room. Prepare (compile to the stored ready form) is paid once per world and server build. Load (open the stored form) is paid by every generation while each runs in its own process. Per seed: setup (resolve the players), fill, assemble (the bundle, on the prepared tables), encode (check, hash, seed file, in the child) and open (the server opens the seed file on the world's package). v1 import is what the path before did in place of encode and open together (JSON text, parsed, encoded, the package deflated, opened). Peak RSS is the whole process's high-water mark when the row was printed, drawing the synthetic manifest and every smaller room included."
@@ -153,5 +172,6 @@ jobs:
         with:
           name: bench-room
           path: |
+            gen-bench.jsonl
             bench-room.jsonl
             quality-*.json

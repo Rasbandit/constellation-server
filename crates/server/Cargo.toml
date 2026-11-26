@@ -40,6 +40,9 @@ pg-tests = ["log/pg-tests"]
 sandbox-tests = []
 # The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
 memory-harness = ["dep:allocation-counter"]
+# The generation bench (`src/worlds/tests/gen_bench.rs`): timings of a data-only generation,
+# through the real server binary of the same profile (build it first). CI's `bench` job runs it.
+gen-bench = []
 
 [dependencies]
 # Counts allocations per thread for the memory harness only (feature `memory-harness`).

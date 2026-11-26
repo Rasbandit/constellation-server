@@ -1789,6 +1789,10 @@ async fn access_lost(w: Arc<Worlds>, headers: HeaderMap, id: String) {
 mod tests {
     use super::*;
 
+    /// Where a generation's time goes, on a release build (CI's `bench` job).
+    #[cfg(feature = "gen-bench")]
+    mod gen_bench;
+
     #[test]
     fn only_64_lowercase_hex_digits_are_an_id() {
         let good = "a".repeat(64);
@@ -2628,6 +2632,11 @@ mod tests {
     }
 
     async fn hosting_with(root: &Path, limits: Limits) -> Arc<Worlds> {
+        hosting_on(root, limits, JobRunner::InProcess).await
+    }
+
+    /// [`hosting_with`], its data-only jobs run by `jobs`.
+    async fn hosting_on(root: &Path, limits: Limits, jobs: JobRunner) -> Arc<Worlds> {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
@@ -2635,6 +2644,7 @@ mod tests {
         let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.db());
         tokio::spawn(async move { host.supervise().await });
         let mut w = worlds(root, limits);
+        w.jobs = jobs;
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
         w.store = db.clone();
