@@ -321,10 +321,24 @@ pub const SHUFFLE_MAX_SLOTS: usize = 1024;
 /// (`spec_rng::derive`).
 pub const SHUFFLE_NAME_MAX_BYTES: usize = 48;
 
-/// Most (region, shuffled exit) pairs of "this region reaches that exit's region by exits
-/// that are not shuffled" a world's layout may have: the index the layout solve tells a branch
-/// from a dead end by, about 2 bytes a pair (a design value).
+/// Most steps the load of a world's layout index may take: per shuffled exit, the regions
+/// that reach its region by exits that are not shuffled (what the layout solve tells a branch
+/// from a dead end by, about 2 bytes each), and the exits walked to find them (a design
+/// value).
 pub const SHUFFLE_MAX_BEHIND: usize = 1 << 20;
+
+/// Most permission rows one shuffle may carry: a row is applied to the whole table of its
+/// shuffle when the world is compiled (a design value).
+pub const SHUFFLE_MAX_ROWS: usize = 64;
+
+/// Most things a shuffle may have when a rule reads its result as a rule: such a read is one
+/// shared rule listing every candidate, and a rule lists at most this many parts (the
+/// engine's limit, one byte).
+pub const SHUFFLE_MAX_READ_THINGS: usize = 255;
+
+/// Longest error text the shuffle checks give back, bytes: a message may quote names from the
+/// manifest, and a name's length is not known to be small when it is quoted (a design value).
+pub const SHUFFLE_ERROR_MAX_BYTES: usize = 4096;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. The price is wall time for rooms on the

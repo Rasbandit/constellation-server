@@ -65,18 +65,25 @@ jobs:
               --players "$PLAYERS" --checks "$CHECKS" \
               | tee -a bench-room.jsonl
           done; done
-      # Entrance shuffle (`data_fill::shuffle`) against the same fill without it: heavy worlds
-      # with and without shuffled two-way doors, one thread, the path a room of that size takes.
+      # Shuffles (`data_fill::shuffle`) against the same fill without them, heavy worlds, one
+      # thread, the path a room of that size takes: an entrance shuffle of two-way doors (on
+      # the heavy shape without a time context, which an exit shuffle needs) and a `none`
+      # shuffle that rules read. Then the entrance rows again as the server generates a room,
+      # every player on one loaded world, for what a player costs in memory.
       # Its own file, so the tables below keep the rows they select.
-      - name: entrance shuffle
+      - name: shuffles
         env:
           CHECKS: ${{ inputs.checks || '1000' }}
         run: |
           set -o pipefail
-          for entrances in off on; do
+          run() {
             cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile heavy --path auto --workers 1 --players 1,100 --checks "$CHECKS" \
-              --entrances "$entrances" | tee -a bench-shuffle.jsonl
+              --profile heavy --path auto --workers 1 --checks "$CHECKS" "$@" | tee -a bench-shuffle.jsonl
+          }
+          for entrances in off on; do run --players 1,100 --timeless on --entrances "$entrances"; done
+          for guards in off on; do run --players 1,100 --guards "$guards"; done
+          for entrances in off on; do
+            run --players 100 --worlds one --timeless on --entrances "$entrances"
           done
       # Skipping the checks of empty locations must not change a seed: every `noskip` row has to
       # carry the placements hash of its skipping row.
@@ -109,15 +116,15 @@ jobs:
       - name: summary
         run: |
           {
-            echo "### Entrance shuffle against the exact fill (heavy profile, one thread, a world per player; measured on this runner, release build)"
+            echo "### Shuffles against the exact fill (heavy profile, one thread; measured on this runner, release build)"
             echo
-            echo "Shuffle ms is what staging adds per seed over resolving the instances: the layout solve, the fold and the whole-world check of every player. The shuffled room fills on other layouts, so its fill time differs from the plain room's for that reason too. Both shares are of the plain room's fill."
+            echo "Each row is a room with a shuffle against the same shape without it. entrances: two-way doors on the heavy shape without a time context. guards: a \`none\` shuffle of 8 things that one check in eight reads as a rule. Shuffle ms is what staging adds per seed over resolving the instances: the draws, the layout solve, the fold and the whole-world check of every player. The room with a shuffle fills other worlds (other layouts, or rules that read the shuffle), so its fill time differs for that reason too. Both shares are of the plain room's fill. Load ms is per room and covers its worlds' shuffle sections. Room bytes per player is the heap the room keeps per player after setup (plan, and a staged world's own exits); world bytes is one loaded world, which a room shares."
             echo
-            echo "| players | path | fill ms plain (median) | fill ms shuffled (median) | shuffle ms (median) | shuffle ms per world | shuffle, share of the plain fill % | shuffle plus the change in fill, share of the plain fill % | restarts | shuffled exits per world |"
-            echo "|---|---|---|---|---|---|---|---|---|---|"
-            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances) as $on
-              | ($r[] | select((.entrances | not) and .players == $on.players)) as $off
-              | "| \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \(($on.shuffle.shuffle_ms / $off.fill_ms * 1000 | round) / 10) | \((($on.shuffle.shuffle_ms + $on.fill_ms - $off.fill_ms) / $off.fill_ms * 1000 | round) / 10) | \($on.shuffle.restarts) | \($on.shuffle.exits) |"' bench-shuffle.jsonl
+            echo "| shuffle | worlds | players | path | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | shuffle ms per world | shuffle, share of the plain fill % | shuffle plus the change in fill, share of the plain fill % | restarts | shuffled exits per world | load ms plain | load ms with | room bytes per player plain | with | world bytes | peak RSS plain | with |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
+              | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
+              | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \(($on.shuffle.shuffle_ms / $off.fill_ms * 1000 | round) / 10) | \((($on.shuffle.shuffle_ms + $on.fill_ms - $off.fill_ms) / $off.fill_ms * 1000 | round) / 10) | \($on.shuffle.restarts) | \($on.shuffle.exits) | \($off.load_ms) | \($on.load_ms) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl
             echo
             echo "### One game per room, one thread: what is done once per world and what each seed pays (measured on a GitHub-hosted ubuntu-latest runner, release build)"
             echo

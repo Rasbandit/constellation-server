@@ -203,7 +203,7 @@ fn fill_on(
     // A world that declares shuffles is staged per player first: each gets their own layout,
     // and the fill below sees ordinary worlds.
     let (room, tables) = if on.0.has_shuffles() {
-        crate::shuffle::room(&[on.0], &insts, rng_seed)
+        crate::shuffle::room(&[on.0], &insts, rng_seed, workers)
             .map_err(|e| format!("world {:?}: {e}", on.1))?
     } else {
         // The room owns its world: a copy of the loaded bytes, small beside a fill.
@@ -232,7 +232,7 @@ fn fill_on(
     // Each world's shuffle results, slot to thing by name: `slot_data` reaches the game client
     // and needs no change to the seed format.
     for (slot, table) in bundle.slots.iter_mut().zip(tables) {
-        slot.slot_data = json!({"shuffles": table});
+        slot.slot_data["shuffles"] = json!(table);
     }
     Ok((bundle, report))
 }

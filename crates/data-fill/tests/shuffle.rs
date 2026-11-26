@@ -451,8 +451,20 @@ fn a_shuffle_runs_after_the_shuffles_its_rules_read_and_a_cycle_is_a_load_error(
 fn a_world_without_shuffles_is_not_staged_and_its_seed_says_nothing_new() {
     let (mut m, inst) = doors();
     m.as_object_mut().unwrap().remove("shuffles");
+    for exit in m["regions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .flat_map(|r| r["exits"].as_array_mut().unwrap().iter_mut())
+    {
+        let exit = exit.as_object_mut().unwrap();
+        for field in ["key", "door", "group"] {
+            exit.remove(field);
+        }
+    }
     let w = World::load(&m).unwrap();
     assert!(stage(&w, &inst, 1, 0).unwrap().is_none());
+    assert!(order(&w).is_empty());
     let p = [Player { name: "Ann".into(), instance: inst }];
     let b = generate(&m, "s", &p, 1, 1).unwrap();
     assert_eq!(b.slots[0].slot_data, json!({}));
@@ -788,9 +800,9 @@ fn the_results_of_fixed_seeds_are_pinned() {
             (1..=8).map(|seed| format!("{:?}\n", staged(&w, &inst, seed).table)).collect();
         format!("{:016x}", data_fill::check::fnv1a(out.as_bytes()))
     };
-    assert_eq!(pin(doors()), "?", "the entrance shuffle");
-    assert_eq!(pin(halls(guardians())), "?", "the guardian shuffle");
-    assert_eq!(pin(bell(&["b", "c"], json!([]))), "?", "with restarts");
+    // The entrance shuffle, the guardian shuffle, and a layout that restarts.
+    let got = [pin(doors()), pin(halls(guardians())), pin(bell(&["b", "c"], json!([])))];
+    assert_eq!(got, ["a4521a4a03bded05", "7e7645c7fd61def5", "7b5053b20fdcc435"]);
 }
 
 /// Both sides of each door listed in a shuffle that is not coupled: every side is its own
