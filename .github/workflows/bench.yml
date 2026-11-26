@@ -56,6 +56,18 @@ jobs:
               --players "$PLAYERS" --checks "$CHECKS" \
               | tee -a bench-room.jsonl
           done; done
+      # Skipping the checks of empty locations must not change a seed: every `noskip` row has to
+      # carry the placements hash of its skipping row.
+      - name: skipping changes no placement
+        run: |
+          jq -s -e '
+            [.[] | select(has("players") and .path == "forward" and .workers == 1)] as $rows
+            | [$rows[] | select(.mode | endswith(",noskip")) as $n
+               | ($rows[] | select(.profile == $n.profile and .players == $n.players
+                                   and .mode == ($n.mode | rtrimstr(",noskip")))) as $y
+               | select($y.placements_hash != $n.placements_hash)
+               | "\($n.profile) \($n.players) \($n.mode)"]
+            | if length == 0 then true else error("placements differ: \(.)") end' bench-room.jsonl
       # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
       # on the two small fixture worlds against uniform beatable placements.
       - name: quality
@@ -98,21 +110,21 @@ jobs:
               echo
               echo "#### Profile: $profile"
               echo
-              echo "| mode | players | fill ms (median) | fill ms (worst of 5) | rule evals | mode evals | solves | placed by the mode | repairs | swaps | fallbacks | attempts | spheres | peak heap bytes | peak RSS bytes |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .profile == $p and .path == "forward" and .workers == 1) | "| \(.mode) | \(.players) | \(.fill_ms) | \(.fill_ms_runs | max) | \(.rule_evals) | \(.mode_rule_evals) | \(.solves) | \(.placed_by_the_mode) | \(.repairs) | \(.swaps) | \(.fallbacks) | \(.attempts) | \(.spheres) | \(.peak_heap_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
+              echo "| mode | players | fill ms (median) | fill ms (worst of 5) | rule evals | mode evals | solves | placed by the mode | repairs | swaps | fallbacks | attempts | spheres | peak heap bytes | peak RSS bytes | placements hash |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" 'select(has("players") and .profile == $p and .path == "forward" and .workers == 1) | "| \(.mode) | \(.players) | \(.fill_ms) | \(.fill_ms_runs | max) | \(.rule_evals) | \(.mode_rule_evals) | \(.solves) | \(.placed_by_the_mode) | \(.repairs) | \(.swaps) | \(.fallbacks) | \(.attempts) | \(.spheres) | \(.peak_heap_bytes) | \(.peak_rss_bytes) | \(.placements_hash) |"' bench-room.jsonl
             done
             echo
-            echo "### Seed shape per mode (counted over fill seeds 1 to N of one room; distances are from the exact fill on the same seeds)"
+            echo "### Seed shape per mode (counted over fill seeds 1 to N of one room, over the seeds the mode placed itself; distances are from the exact fill on another stream of seeds, so the exact row is the noise floor)"
             echo
             echo "Required spheres: spheres holding an item no goal can be reached without (first seeds only, see the n in brackets). Stuck: share of a player's rounds in which no location of theirs opens. Uniform columns exist only for the small fixture worlds (rejection sampling of beatable uniform placements)."
             for q in quality-*.json; do
               echo
               echo "#### $q: $(jq -r '"\(.players) players, \(.seeds) seeds"' "$q")"
               echo
-              echo "| mode | failed | placed by the mode | untouched share | swaps/seed | repairs | fallbacks | spheres mean | progression in sphere 0 | in first two | locations in first two | relative depth | required spheres (n) | location entropy | stuck mean | stuck worst 5% | sphere distance from exact | location chi2/dof vs exact | max gap vs uniform | coverage gaps vs uniform | fill ms median | worst 1% |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r 'def r(n): if . == null then "n/a" else (. * n | round) / n end; .modes[] | "| \(.mode) | \(.failed) | \(.placed_by_the_mode) | \(.untouched_share | r(1000)) | \(.swaps_per_seed | r(100)) | \(.repairs) | \(.fallbacks) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.location_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.progression_location_entropy_normalized | r(1000)) | \(.stuck_share_mean | r(1000)) | \(.stuck_share_worst_5_percent | r(1000)) | \(.against_exact.sphere_distribution_distance | r(1000)) | \(.against_exact.location_chi2_per_dof | r(100)) | \(.against_uniform.max_deviation.value | r(1000)) | \(.against_uniform.coverage_gaps | if . == null then "n/a" else length end) | \(.fill_ms_median | r(100)) | \(.fill_ms_worst_1_percent | r(100)) |"' "$q"
+              echo "| mode | failed | placed by the mode | fell back (seeds) | untouched share | swaps/seed | repairs | fallback attempts | spheres mean | progression in sphere 0 | in first two | locations in first two | relative depth | required spheres (n) | location entropy | stuck mean | stuck worst 5% | sphere distance from exact | location chi2/dof vs exact | max gap vs uniform | chi2 vs uniform (dof) | coverage gaps vs uniform | fill ms median | worst 1% |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r 'def r(n): if . == null then "n/a" else (. * n | round) / n end; .modes[] | "| \(.mode) | \(.failed) | \(.placed_by_the_mode) | \(.fell_back_seeds) | \(.untouched_share | r(1000)) | \(.swaps_per_seed | r(100)) | \(.repairs) | \(.fallback_attempts) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.location_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.progression_location_entropy_normalized | r(1000)) | \(.stuck_share_mean | r(1000)) | \(.stuck_share_worst_5_percent | r(1000)) | \(.against_exact.sphere_distribution_distance | r(1000)) | \(.against_exact.location_chi2_per_dof | r(100)) | \(.against_uniform.max_deviation.value | r(1000)) | \(.against_uniform.chi2 | r(1)) (\(.against_uniform.dof)) | \(.against_uniform.coverage_gaps | if . == null then "n/a" else length end) | \(.fill_ms_median | r(100)) | \(.fill_ms_worst_1_percent | r(100)) |"' "$q"
             done
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

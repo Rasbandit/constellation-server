@@ -122,6 +122,8 @@ fn one(
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
         "placed_by_the_mode": mode == Algorithm::Exact || f.fast,
+        // The same hash in two rows means the same placements (the `noskip` rows against theirs).
+        "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
         "repairs": f.repairs,
         "swaps": f.swaps,
         "fallbacks": f.fallbacks,

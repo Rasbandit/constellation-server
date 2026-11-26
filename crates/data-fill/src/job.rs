@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::seed::{Player, checked_name, generate_by as fill, manifest_game};
+use crate::seed::{FillReport, Player, checked_name, generate_by as fill, manifest_game};
 use crate::world::World;
 
 /// A fill request: the manifest, who plays it, and the seed's name and random stream.
@@ -21,14 +21,28 @@ struct Request {
     algorithm: crate::room::Algorithm,
 }
 
-/// Fill the room a request describes; the seed bundle as JSON text.
+/// Fill the room a request describes; the seed bundle as JSON text. When the asked mode fell
+/// back to the exact fill, one line on stderr says so (stdout is the bundle and nothing else).
 ///
 /// # Errors
 /// A message for a request that does not parse, or for what [`crate::seed::generate`] refuses.
 pub fn generate(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (bundle, report) = generate_reported(input)?;
+    if report.fallbacks > 0 {
+        eprintln!("fill: the asked mode fell back to the exact fill: {report:?}");
+    }
+    Ok(bundle)
+}
+
+/// [`generate`], and how the progression was placed (whether the asked mode fell back).
+///
+/// # Errors
+/// As [`generate`].
+pub fn generate_reported(input: &[u8]) -> Result<(Vec<u8>, FillReport), String> {
     let r: Request = serde_json::from_slice(input).map_err(|e| format!("bad fill request: {e}"))?;
-    let bundle = fill(&r.manifest, &r.seed_name, &r.players, r.rng_seed, r.workers, r.algorithm)?;
-    serde_json::to_vec(&bundle).map_err(|e| e.to_string())
+    let (bundle, report) =
+        fill(&r.manifest, &r.seed_name, &r.players, r.rng_seed, r.workers, r.algorithm)?;
+    Ok((serde_json::to_vec(&bundle).map_err(|e| e.to_string())?, report))
 }
 
 /// Check a manifest (JSON bytes) the way an upload needs: a `game`, a `version`, and it compiles.

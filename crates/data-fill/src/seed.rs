@@ -71,10 +71,29 @@ pub fn generate(
     workers: usize,
 ) -> Result<SeedBundle, String> {
     generate_by(manifest, seed_name, players, rng_seed, workers, room::Algorithm::Exact)
+        .map(|x| x.0)
+}
+
+/// How a seed's progression was placed, for a caller that asked for an opt-in mode: the
+/// bundle itself cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillReport {
+    /// The asked mode placed the seed itself (always for the exact fill); `false`: it fell
+    /// back and the seed is the exact fill's.
+    pub placed_by_the_mode: bool,
+    /// Attempts the mode gave up on.
+    pub fallbacks: u32,
+    /// Full fills started.
+    pub attempts: u32,
+    /// Items a shuffle fill moved, and orders a level fill repaired, in the seed.
+    pub swaps: u32,
+    /// See `swaps`.
+    pub repairs: u32,
 }
 
 /// [`generate`] with the mode that places the progression items ([`room::Algorithm`]). The
-/// bundle has no field that names the mode: the same bundle shape whichever made it.
+/// bundle has no field that names the mode: the same bundle shape whichever made it, so what
+/// happened comes back beside it.
 ///
 /// # Errors
 /// As [`generate`].
@@ -85,7 +104,7 @@ pub fn generate_by(
     rng_seed: u64,
     workers: usize,
     algorithm: room::Algorithm,
-) -> Result<SeedBundle, String> {
+) -> Result<(SeedBundle, FillReport), String> {
     let game = manifest_game(manifest)?;
     for (k, p) in players.iter().enumerate() {
         if p.name.trim().is_empty() {
@@ -109,7 +128,14 @@ pub fn generate_by(
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
-    assemble(w, game, seed_name, players, &seats, &filled.placed, &spheres)
+    let report = FillReport {
+        placed_by_the_mode: algorithm == room::Algorithm::Exact || filled.fast,
+        fallbacks: filled.fallbacks,
+        attempts: filled.attempts,
+        swaps: filled.swaps,
+        repairs: filled.repairs,
+    };
+    Ok((assemble(w, game, seed_name, players, &seats, &filled.placed, &spheres)?, report))
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.
