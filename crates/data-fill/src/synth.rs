@@ -573,6 +573,65 @@ mod tests {
         assert!(bits * 2 > evals, "bit rules answered {bits} of {evals} evaluations");
     }
 
+    /// A fill's states never evaluate the checks of locations that do not exist this seed and
+    /// grant nothing. Against the same plans with those checks evaluated
+    /// (`Plan::with_absent_checks`): everything a fill decides is the same, on both paths and
+    /// in the level mode, with fewer rule evaluations on the heavy profile (about every second
+    /// location of it is absent) and the same count on the light one (none is).
+    #[test]
+    fn skipping_absent_checks_decides_the_same_with_fewer_evaluations() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        for (shape, what) in
+            [(small(true), "confined+locked+start"), (heavy, ""), (heavy, "locked")]
+        {
+            for players in [1u64, 3, 9] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                let whole = Compiled {
+                    plans: c.plans.iter().cloned().map(crate::Plan::with_absent_checks).collect(),
+                    worlds: c.worlds.clone(),
+                    progression: c.progression.clone(),
+                };
+                let absent = c.plans[0].rules_report(&c.worlds[0])["absent_check_sites"].clone();
+                assert_eq!(absent != 0, shape.absent > 0.0, "{absent} absent check sites");
+                for seed in 1..=2 {
+                    let at = format!("{shape:?}, {what:?}, {players} players, seed {seed}");
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        let (a, sa, solves) = outcome(&c, seed, path);
+                        let (b, sb, wholly) = outcome(&whole, seed, path);
+                        assert_eq!((&a, solves), (&b, wholly), "{at}, {path:?}");
+                        assert!(a.is_ok(), "{at}");
+                        if shape.absent > 0.0 {
+                            assert!(sa.evals < sb.evals, "{at}: {} of {}", sa.evals, sb.evals);
+                        } else {
+                            assert_eq!(sa, sb, "{at}");
+                        }
+                    }
+                    let level = |c: &Compiled| {
+                        let (path, mode) =
+                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.1))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    assert_eq!(level(&c), level(&whole), "{at}, level fill");
+                }
+            }
+        }
+        // One state, lean and whole: the same regions, counters and existing locations.
+        let c = room(&heavy, 23, 1, 1).unwrap();
+        let (w, plan) = (&c.worlds[0], &c.plans[0]);
+        let whole = plan.state(w, &plan.progression, &[]);
+        let mut lean = crate::Reach::new(w, plan).lean();
+        plan.solve_into(&mut lean, &plan.progression, &[]);
+        assert_eq!((&lean.masks, &lean.counters), (&whole.masks, &whole.counters));
+        assert!(plan.included.iter().all(|l| lean.reached(*l) == whole.reached(*l)));
+        let reached =
+            |r: &crate::Reach<'_>| (0..w.locations()).filter(|l| r.reached(*l as u32)).count();
+        assert!(reached(&lean) < reached(&whole), "the absent locations are not asked");
+    }
+
     /// The forward path's states run on several threads: the placements, the spheres and every
     /// work counter are the same with one worker and with many (the steps are the same ones;
     /// only who runs a state differs). The last room is large enough for threads to start.

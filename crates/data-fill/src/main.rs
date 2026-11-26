@@ -170,6 +170,7 @@ fn run(args: &[String]) -> Result<Value, String> {
         "world": {"items": w.items(), "locations": w.locations(), "regions": w.regions(),
                   "defs": w.defs(), "rules_bytes": w.rules_bytes(),
                   "existing_locations": plan.included.len()},
+        "rules": plan.rules_report(&w),
         "oracle": oracle,
         "fill": {"placed": placed.len(), "attempts": filled.attempts, "solves": filled.solves,
                  "rule_evals": filled.stats.evals,

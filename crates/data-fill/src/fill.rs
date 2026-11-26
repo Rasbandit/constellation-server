@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use spec_rng::SpecRng;
 
-use crate::fold::{Folded, fold};
+use crate::fold::{CLASSES, Folded, fold};
 use crate::live::Live;
 use crate::reach::{Reach, Stats, eval_static, saturation};
+use crate::section::{CHECKS, EXITS};
 use crate::spheres::{Spheres, from_state};
 use crate::world::World;
 
@@ -86,6 +87,9 @@ pub struct Plan {
     pub(crate) locked: Vec<(u32, u16)>,
     /// Option-disabled locations with a vanilla item: reaching them grants it.
     self_grants: Vec<(u32, u16)>,
+    /// Check sites, ascending, of the locations that do not exist this seed and grant nothing:
+    /// nothing is ever placed there, so a fill's states never evaluate them ([`Reach::lean`]).
+    pub(crate) absent: Vec<u32>,
     pub(crate) progression: Vec<u16>,
     pub(crate) rest: Vec<u16>,
     /// Per world item: its placement group, if it has one.
@@ -214,7 +218,16 @@ impl Plan {
         for (k, g) in by_key(&inst.location_groups) {
             loc_group[loc(k)? as usize] = Some(gid(g));
         }
-        let folded = fold(w, &opts, &rolls);
+        let mut held = vec![0i64; w.items()];
+        start.iter().for_each(|(i, n)| held[usize::from(*i)] += n);
+        let folded = fold(w, &opts, &rolls, &held);
+        let mut holds = is_included;
+        locked.iter().chain(&self_grants).for_each(|(l, _)| holds[*l as usize] = true);
+        let mut absent: Vec<u32> = (0..w.locations())
+            .filter(|l| !holds[*l])
+            .flat_map(|l| w.sites_into(CHECKS, l).iter().copied())
+            .collect();
+        absent.sort_unstable();
         let mut plan = Plan {
             opts,
             rolls,
@@ -225,6 +238,7 @@ impl Plan {
             excluded,
             locked,
             self_grants,
+            absent,
             progression,
             rest,
             item_group,
@@ -277,6 +291,64 @@ impl Plan {
     #[must_use]
     pub fn bit_rules(&self) -> ([u32; 5], usize) {
         (self.folded.bits.classes, self.folded.bits.bytes())
+    }
+
+    /// The same plan whose fills also evaluate the checks of absent locations: what skipping
+    /// them is tested and measured against.
+    #[must_use]
+    pub fn with_absent_checks(mut self) -> Self {
+        self.absent.clear();
+        self
+    }
+
+    /// What this seed's fold leaves of the world's rules, all counted: rule sites per class and
+    /// the bit rules' bytes ([`Plan::bit_rules`]); sites whose rule is constant with the options
+    /// and rolls alone and with the start items too; the absent locations' check sites a fill
+    /// skips; regions no exit that can open leads to, and their sites; exits that are always
+    /// open, and the regions whose only entrance that can open is one of those (what merging
+    /// chains of open exits could remove).
+    #[must_use]
+    pub fn rules_report(&self, w: &World) -> serde_json::Value {
+        let constant = |sites: &[u32]| sites.iter().filter(|at| **at <= 1).count();
+        let sites = &self.folded.sites;
+        let options_only = fold(w, &self.opts, &self.rolls, &[]);
+        let live = |r: usize| w.group(r, EXITS).filter(|e| sites[*e] != 1);
+        let mut seen = vec![false; w.regions()];
+        let mut queue = vec![w.start as usize];
+        seen[w.start as usize] = true;
+        // Per region: entrances that can open, from regions that can be reached, and how many
+        // of them are always open.
+        let mut ways = vec![(0u32, 0u32); w.regions()];
+        while let Some(r) = queue.pop() {
+            for e in live(r) {
+                let to = w.site_target(e) as usize;
+                ways[to].0 += 1;
+                ways[to].1 += u32::from(sites[e] == 0);
+                if !std::mem::replace(&mut seen[to], true) {
+                    queue.push(to);
+                }
+            }
+        }
+        let dead = (0..w.regions()).filter(|r| !seen[*r]);
+        let (classes, bytes) = self.bit_rules();
+        serde_json::json!({
+            "rule_sites": sites.len(),
+            "classes": CLASSES.iter().zip(classes).collect::<HashMap<_, _>>(),
+            "bit_rule_bytes": bytes,
+            "constant_sites_by_options": constant(&options_only.sites),
+            "constant_sites_with_start_items": constant(sites),
+            "absent_check_sites": self.absent.len(),
+            "regions": w.regions(),
+            "unreachable_regions": dead.clone().count(),
+            "sites_in_unreachable_regions": dead
+                .map(|r| w.group(r, EXITS).start..w.stays(r).end)
+                .map(|x| x.len())
+                .sum::<usize>(),
+            "always_open_exits": (0..w.regions()).filter(|r| seen[*r]).flat_map(live)
+                .filter(|e| sites[*e] == 0).count(),
+            "regions_entered_only_by_one_open_exit": (0..w.regions())
+                .filter(|r| *r != w.start as usize && ways[*r] == (1, 1)).count(),
+        })
     }
 
     /// Copies of `item` that exist this seed.
@@ -437,7 +509,7 @@ fn fill_with(
     let mut s = Steps {
         w,
         plan,
-        r: Reach::new(w, plan),
+        r: Reach::new(w, plan).lean(),
         held: Vec::new(),
         solves: 0,
         rederived: 0,

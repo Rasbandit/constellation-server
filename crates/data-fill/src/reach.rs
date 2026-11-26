@@ -546,6 +546,8 @@ pub struct Reach<'w> {
     owned: u64,
     /// Owned clocks with nothing held (the solver's first clock evaluation).
     owned0: u64,
+    /// This state serves a fill ([`Reach::lean`]).
+    lean: bool,
     /// A run has started. Before it, adding an item needs no recheck: the first visit of a
     /// region evaluates every one of its sites.
     ran: bool,
@@ -639,6 +641,7 @@ impl<'w> Reach<'w> {
             sites_q: Vec::with_capacity(sites + halves),
             owned: w.time.all,
             owned0: w.time.all,
+            lean: false,
             ran: false,
             stats: Stats::default(),
             def_cache: (0..w.defs()).map(|_| Cell::new(0)).collect(),
@@ -668,6 +671,24 @@ impl<'w> Reach<'w> {
         };
         r.start();
         r
+    }
+
+    /// This state as a fill's: the checks of the locations that do not exist this seed and
+    /// grant nothing (`Plan::absent`) are never evaluated, here and after every reset. Nothing
+    /// is ever placed there and a fill asks only about locations that exist, so everything else
+    /// the state derives is the same; [`Reach::reached`] says `false` for those locations.
+    #[must_use]
+    pub fn lean(mut self) -> Self {
+        self.lean = true;
+        self.skip_absent();
+        self
+    }
+
+    /// Mark the absent locations' checks done: done without a rank, as a sleeping check is.
+    fn skip_absent(&mut self) {
+        for &s in &self.plan.absent {
+            self.done.insert(s as usize);
+        }
     }
 
     /// Back to the empty state, keeping every buffer.
@@ -708,6 +729,9 @@ impl<'w> Reach<'w> {
         self.lit.iter_mut().for_each(Vec::clear);
         self.adjust.fill(0);
         self.start();
+        if self.lean {
+            self.skip_absent();
+        }
     }
 
     fn start(&mut self) {
@@ -788,8 +812,10 @@ impl<'w> Reach<'w> {
     /// Wake every sleeping check: those of a reached region are queued for the next run.
     pub(crate) fn wake(&mut self) {
         let w = self.w;
+        let skipped =
+            |s: usize| self.plan.absent.binary_search(&u32::try_from(s).unwrap_or(0)).is_ok();
         for s in 0..w.site_count() {
-            if self.done.contains(s) && self.fired[s] == NONE {
+            if self.done.contains(s) && self.fired[s] == NONE && !(self.lean && skipped(s)) {
                 self.done.remove(s);
                 if self.masks[w.site_place(s).0] != 0 {
                     self.push_site(u32::try_from(s).unwrap_or(0));

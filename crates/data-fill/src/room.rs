@@ -760,7 +760,7 @@ impl<'a, 'w> Linked<'a, 'w> {
     fn new(seats: &'a [Seat<'w>]) -> Self {
         Linked {
             seats,
-            models: seats.iter().map(|s| Reach::new(s.w, s.plan)).collect(),
+            models: seats.iter().map(|s| Reach::new(s.w, s.plan).lean()).collect(),
             seq: 1,
             touched: vec![false; seats.len()],
             touched_list: Vec::new(),
