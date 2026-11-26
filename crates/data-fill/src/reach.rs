@@ -110,7 +110,7 @@ struct DefMemo {
     stamp: Cell<u64>,
     /// Def bodies evaluated (memo misses), for the complexity tests.
     bodies: Cell<u64>,
-    /// Bytecode nodes read, for [`Reach::replay`].
+    /// Bytecode nodes read, for [`Reach::replay`] (counted only where `crate::COUNTED`).
     nodes: Cell<u64>,
 }
 
@@ -146,7 +146,9 @@ impl<V: View> Env<'_, V> {
     /// The boolean node at `pc` against region mask `t`, and the offset after it.
     fn b(&self, pc: usize, t: u64) -> (bool, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (false, pc + 1) };
-        self.memo.nodes.set(self.memo.nodes.get() + 1);
+        if crate::COUNTED {
+            self.memo.nodes.set(self.memo.nodes.get() + 1);
+        }
         match n {
             Node::Const(v) => (v, at),
             Node::All(k, len) | Node::Any(k, len) => {
@@ -214,7 +216,9 @@ impl<V: View> Env<'_, V> {
     // Upgrade when the validator rejects manifests whose expressions can overflow.
     fn i(&self, pc: usize) -> (i64, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (0, pc + 1) };
-        self.memo.nodes.set(self.memo.nodes.get() + 1);
+        if crate::COUNTED {
+            self.memo.nodes.set(self.memo.nodes.get() + 1);
+        }
         match n {
             Node::Int(v) => (i64::from(v), at),
             Node::Count(i) => (self.count(i), at),
@@ -1573,6 +1577,7 @@ impl<'w> Reach<'w> {
     }
 
     /// The folded bytecode of fact `f`: a site, a half-day past the sites, then the goal.
+    /// (The same layout is spelled in `Bits::of`, `Reach::goal` and `Reach::clocks`: see #208.)
     fn rule(&self, f: usize) -> u32 {
         let (folded, sc) = (&self.plan.folded, self.w.site_count());
         if f < sc {

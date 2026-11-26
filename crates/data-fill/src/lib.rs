@@ -21,6 +21,11 @@ pub mod spheres;
 pub mod synth;
 pub mod world;
 
+/// Whether this build keeps the measurements only the bench and the tests read (bytecode nodes
+/// read, wall time and reached sets of a fill's rounds): with feature `memory-harness`, and in
+/// this crate's own tests. A fill in the product pays for none of them.
+pub(crate) const COUNTED: bool = cfg!(any(test, feature = "memory-harness"));
+
 pub use bitrules::CLASSES as RULE_CLASSES;
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};
 pub use reach::{Reach, Stats};
