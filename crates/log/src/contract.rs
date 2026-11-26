@@ -275,6 +275,23 @@ async fn blobs_are_stored_once_by_key_and_checked_on_write<S: Store>(s: Arc<S>) 
     assert_eq!(s.get(&kb).await.unwrap(), None, "the refused put wrote nothing");
 }
 
+/// A prepared world is found by its manifest and the engine layout it was prepared at: another
+/// layout or another manifest reads as none, and a later put replaces the key.
+async fn a_prepared_world_is_found_by_manifest_and_layout<S: Store>(s: Arc<S>) {
+    let (m, other) = (blob_key(b"manifest"), blob_key(b"another manifest"));
+    let (a, b) = (blob_key(b"prepared a"), blob_key(b"prepared b"));
+    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), None);
+    s.prepared_put(&m, 1, &a).await.unwrap();
+    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), Some(a));
+    assert_eq!(s.prepared_key(&m, 2).await.unwrap(), None, "an older layout's is stale");
+    assert_eq!(s.prepared_key(&other, 1).await.unwrap(), None);
+    s.prepared_put(&m, 2, &b).await.unwrap();
+    s.prepared_put(&m, 1, &b).await.unwrap();
+    assert_eq!(s.prepared_key(&m, 1).await.unwrap(), Some(b), "rebuilt: the key is replaced");
+    assert_eq!(s.prepared_key(&m, 2).await.unwrap(), Some(b));
+    assert_eq!(s.prepared_key(&m, u32::MAX).await.unwrap(), None);
+}
+
 fn manifest(name: &str, game: &str, body: &[u8]) -> ManifestRecord {
     ManifestRecord {
         id: blob_key(body),
@@ -819,6 +836,7 @@ macro_rules! contract {
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
                 manifests_are_deduplicated_checked_and_listed_in_pages,
+                a_prepared_world_is_found_by_manifest_and_layout,
                 uploads_are_deduplicated_by_kind_checked_and_listed,
                 jobs_are_read_back_and_only_stale_unfinished_ones_fail,
                 a_job_put_if_absent_never_replaces_a_stored_status,

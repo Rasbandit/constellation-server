@@ -35,6 +35,8 @@ pub struct MemLogStore {
     packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
     manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
+    /// (manifest id, engine layout) to the blob key of the prepared world.
+    prepared: Mutex<BTreeMap<(BlobKey, u32), BlobKey>>,
     uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
     jobs: Mutex<BTreeMap<String, Job>>,
     users: Mutex<BTreeMap<String, String>>,
@@ -79,7 +81,7 @@ pub(crate) fn same_or_refused(stored: &[u8], seed: &[u8]) -> Result<(), StoreErr
     }
 }
 
-fn get<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: &K) -> Option<Vec<u8>> {
+fn get<K: Ord, V: Clone>(m: &Mutex<BTreeMap<K, V>>, k: &K) -> Option<V> {
     m.lock().unwrap_or_else(PoisonError::into_inner).get(k).cloned()
 }
 
@@ -306,6 +308,25 @@ impl crate::ManifestStore for MemLogStore {
             }
             found => Ok(found.map(|(_, b)| b.clone())),
         })
+    }
+
+    fn prepared_put(
+        &self,
+        id: &BlobKey,
+        layout: u32,
+        package: &BlobKey,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut m = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
+        m.insert((*id, layout), *package);
+        ready(Ok(()))
+    }
+
+    fn prepared_key(
+        &self,
+        id: &BlobKey,
+        layout: u32,
+    ) -> impl Future<Output = Result<Option<BlobKey>, StoreError>> + Send {
+        ready(Ok(get(&self.prepared, &(*id, layout))))
     }
 
     fn manifest_list(
