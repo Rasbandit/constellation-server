@@ -102,6 +102,15 @@ jobs:
             target/release/examples/synth_room --profile "$profile" --path "$path" --workers 1 \
               --players 100 --checks "$CHECKS" --seed "$seed" --reps 1 | tee -a bench-seeds.jsonl
           done; done; done
+          # The forward path on four threads at 100 players, to hold against split on one thread:
+          # every player on one world here, a world each below (at every size with `full`).
+          for profile in light heavy; do
+            bench --profile "$profile" --path forward --workers 4 --worlds one \
+              --players 100 --checks "$CHECKS"
+            if [ "$FULL" != on ]; then
+              bench --profile "$profile" --path forward --workers 4 --players 100 --checks "$CHECKS"
+            fi
+          done
           if [ "$FULL" = on ]; then
             for profile in light heavy; do for run in "forward 4"; do
               read -r path workers <<< "$run"
@@ -109,6 +118,22 @@ jobs:
                 --profile "$profile" --path "$path" --workers "$workers" \
                 --players "$PLAYERS" --checks "$CHECKS"
             done; done
+            # Measurements for issue 212 (rooms the round rule cannot fill), in a file of their
+            # own: the chain and keys worlds on the split path over room sizes, the same two at
+            # 100 players with rounds of one item (`--rounds single`, not the product's rule),
+            # and what such rounds cost on the heavy and light profiles at 100 players.
+            for profile in chain keys; do
+              target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
+                --players 16,18,20,22,24,26,28,32,40,50,64,80,100 --reps 1 --failed-row | tee -a bench-212.jsonl
+              timeout 600 target/release/examples/synth_room --profile "$profile" --path split \
+                --workers 1 --players 20,100 --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
+                || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within ten minutes\"}" | tee -a bench-212.jsonl
+            done
+            for profile in light heavy; do
+              timeout 900 target/release/examples/synth_room --profile "$profile" --path split \
+                --workers 1 --players 10,100 --checks "$CHECKS" --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
+                || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within fifteen minutes\"}" | tee -a bench-212.jsonl
+            done
             # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
             # exact fill's rows above: with and without skipping the checks of empty locations.
             for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
@@ -267,6 +292,25 @@ jobs:
             echo
             jq -r 'select(.failed != null) | "- \(.profile), \(.room) players, \(.path): failed: \(.failed)"' bench-room.jsonl
             echo
+            echo "#### Forward on four threads against split on one thread, 100 players (same run, measured)"
+            echo
+            echo "| profile | world | forward ms, 1 thread | forward ms, 4 threads | split ms, 1 thread | forward on 4 / split |"
+            echo "|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players == 100 and .mode == "exact" and .rules == "bits" and .absent == "skip" and (.profile == "light" or .profile == "heavy"))] as $rows
+              | $rows[] | select(.path == "forward" and .workers == 4) as $four
+              | ($rows[] | select(.path == "forward" and .workers == 1 and .profile == $four.profile and .world == $four.world)) as $one
+              | ($rows[] | select(.path == "split" and .profile == $four.profile and .world == $four.world)) as $s
+              | "| \($four.profile) | \($four.world) | \($one.fill_ms) | \($four.fill_ms) | \($s.fill_ms) | \(($four.fill_ms / $s.fill_ms * 100 | round) / 100) |"' bench-room.jsonl
+            if [ -s bench-212.jsonl ]; then
+              echo
+              echo "#### Issue 212: room sizes and rounds of one item (split path, one fill each; a measurement, not the product's rule)"
+              echo
+              echo "| profile | round | players | result | attempts | fill ms | rounds |"
+              echo "|---|---|---|---|---|---|---|"
+              jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.round) | \(.players // .room) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.fill_ms // "") | \(.rounds // "") |"' bench-212.jsonl
+            fi
+            echo
             echo "#### Other seeds, 100 players, a world per player (one timed fill per row)"
             echo
             echo "| profile | seed | fill ms forward | split | forward / split | rule evals forward | split |"
@@ -357,4 +401,5 @@ jobs:
           path: |
             bench-room.jsonl
             bench-seeds.jsonl
+            bench-212.jsonl
             quality-*.json

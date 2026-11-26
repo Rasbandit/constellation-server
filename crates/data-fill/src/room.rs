@@ -468,7 +468,24 @@ pub fn fill_room_by(
     path: Path,
     algorithm: Algorithm,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    let (f, s) = fill_by(seats, rng, max_attempts, (true, path, algorithm), true)?;
+    let (f, s) = fill_by(seats, rng, max_attempts, (true, path, algorithm, true), true)?;
+    Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
+}
+
+/// For measurements only (feature `memory-harness`): the exact fill on the split path with
+/// rounds of one item instead of one item per player, the rule issue 212 weighs. Its seeds are
+/// not the product's.
+///
+/// # Errors
+/// As [`fill_room`].
+#[cfg(feature = "memory-harness")]
+pub fn fill_room_one_item_rounds(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    max_attempts: u32,
+) -> Result<(RoomFilled, RoomSpheres), FillError> {
+    let how = (true, Path::Split, Algorithm::Exact, false);
+    let (f, s) = fill_by(seats, rng, max_attempts, how, true)?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -690,14 +707,14 @@ fn fill_on(
     path: Path,
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
-    fill_by(seats, rng, max_attempts, (extend, path, Algorithm::Exact), want_spheres)
+    fill_by(seats, rng, max_attempts, (extend, path, Algorithm::Exact, true), want_spheres)
 }
 
 fn fill_by(
     seats: &[Seat<'_>],
     rng: &mut SpecRng,
     max_attempts: u32,
-    (extend, path, algorithm): (bool, Path, Algorithm),
+    (extend, path, algorithm, per_player): (bool, Path, Algorithm, bool),
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
     check(seats)?;
@@ -713,6 +730,7 @@ fn fill_by(
         stats: Stats::default(),
         extend,
         path,
+        per_player,
         algorithm,
         spheres: want_spheres,
         fast: false,
@@ -1171,6 +1189,9 @@ struct Steps<'a, 'w> {
     stats: Stats,
     extend: bool,
     path: Path,
+    /// A round takes one item from every player (the rule); `false` only for measurements:
+    /// rounds of one item.
+    per_player: bool,
     algorithm: Algorithm,
     /// The caller wants the spheres: every check has to be evaluated by the end.
     spheres: bool,
@@ -1292,7 +1313,7 @@ impl Steps<'_, '_> {
         }
         self.fast = proof.is_some();
         if proof.is_none() && self.path == Path::Split {
-            self.split(&groups(prog, true), &mut locs, &mut placed, &mut prev)?;
+            self.split(&groups(prog, self.per_player), &mut locs, &mut placed, &mut prev)?;
         } else if proof.is_none() {
             self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
         }

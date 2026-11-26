@@ -2,7 +2,7 @@
 //! [--path auto|carry|forward|split] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--rounds players|single]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
@@ -63,7 +63,9 @@
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by};
+use data_fill::room::{
+    Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by, fill_room_one_item_rounds,
+};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
@@ -147,7 +149,7 @@ fn one(
     players: usize,
     reps: usize,
     (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
-    (bits, skip): (bool, bool),
+    (bits, skip, single): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
     let path = path.unwrap_or(Path::of(players, workers));
@@ -184,6 +186,9 @@ fn one(
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
+        if single {
+            return fill_room_one_item_rounds(&seats, &mut rng, config::FILL_MAX_ATTEMPTS);
+        }
         fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
     };
     let t = Instant::now();
@@ -310,6 +315,7 @@ fn one(
     });
     out["bit_rules_ms"] = json!(fine(bit_rules_ms));
     out["seed"] = json!(seed);
+    out["round"] = json!(if single { "one item" } else { "one item per player" });
     out["fill_reps"] = json!(reps);
     out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     Ok(out)
@@ -381,7 +387,9 @@ fn main() -> Result<(), String> {
         x if x == off => Ok(false),
         x => Err(format!("{name}: {on} or {off}, got {x}")),
     };
-    let engine = (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?);
+    // `--rounds single`: for measurements, rounds of one item on the split path (issue 212).
+    let single = pick("--rounds", "players", "single").map(|per_player| !per_player)?;
+    let engine = (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?, single);
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -398,6 +406,7 @@ fn main() -> Result<(), String> {
                 println!(
                     "{}",
                     json!({"room": n, "profile": profile, "path": path_arg, "seed": seed,
+                           "round": if single { "one item" } else { "one item per player" },
                            "failed": e})
                 );
                 continue;
