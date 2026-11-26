@@ -299,6 +299,19 @@ pub const RULES_MAX_DEPTH: u32 = 256;
 /// test world's rules are counted in the PR that added this).
 pub const RULE_BITS_MAX_TERMS: usize = 16;
 
+/// Most tests (atom bits and time windows) one term of a bit rule may hold. A def's terms are
+/// copied into every rule that refers to it and AND joins the lists, so without this a long
+/// def referred to from many sites grows the bit rules by sites times its length; a rule with a
+/// longer term, at any step of the way, stays bytecode (a design value).
+pub const RULE_BITS_MAX_TERM_TESTS: usize = 32;
+
+/// Most tests a loaded world's bit rules may hold in all (two bytes each), def terms copied
+/// into sites counted: once reached, the rules not yet compiled stay bytecode. A site's rule
+/// is at most [`RULE_BITS_MAX_TERMS`] terms of [`RULE_BITS_MAX_TERM_TESTS`] tests, so this
+/// bounds a load whatever the manifest (a design value: the heavy synthetic world of 1,000
+/// checks holds under a tenth of it).
+pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
+
 /// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
 /// the next draws of the seed's random stream; a design value).
 pub const FILL_MAX_ATTEMPTS: u32 = 20;

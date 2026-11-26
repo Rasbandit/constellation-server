@@ -260,6 +260,11 @@ pub(crate) mod tests {
     /// by two events, and a group sum.
     pub(crate) fn world(rules: &[Value]) -> (World, Instance) {
         let keys: Vec<String> = ('a'..='j').map(String::from).collect();
+        world_of(&keys, &json!({"d": {"any": [{"has": "a"}, {"has": "b", "n": 2}]}}), rules)
+    }
+
+    /// [`world`] over the items `keys` (the events read `c` and `d`) and the defs `defs`.
+    pub(crate) fn world_of(keys: &[String], defs: &Value, rules: &[Value]) -> (World, Instance) {
         let checks: Vec<Value> = rules
             .iter()
             .enumerate()
@@ -273,7 +278,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             "start": "s",
             "x.time": {"slices": 2, "start_mask": 1},
-            "defs": {"d": {"any": [{"has": "a"}, {"has": "b", "n": 2}]}},
+            "defs": defs,
             "regions": [{"key": "s", "can_stay": false, "stays": [], "exits": [],
                          "events": [{"event": "lit", "rule": {"has": "c"}},
                                     {"event": "lit", "rule": {"has": "d"}}],
