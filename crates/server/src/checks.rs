@@ -2,11 +2,11 @@
 //!
 //! 1. Size: the `.apworld` is within `apworld_max_bytes` (its type is checked by 2).
 //! 2. It is inspected in the sandbox as an upload is, under today's limits.
-//! 4. The code scan (`ap_gen.py scan-apworld`) lists code a person should look at. A flag never
-//!    fails a version: the list is saved with it for the admin who reviews it (#192).
 //! 3. It generates `catalogue_check_seeds` test seeds, each with a random seed and a default
 //!    player, within the generation limits. The sandbox has no network, so a world that needs
 //!    it fails here.
+//! 4. The code scan (`ap_gen.py scan-apworld`) lists code a person should look at. A flag never
+//!    fails a version: the list is saved with it for the admin who reviews it (#192).
 //!
 //! The scan runs before the seeds, so its flags are saved even for a version that fails.
 //! A version passes all of them to be `live`; the first that fails makes it `failed`, with
