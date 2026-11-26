@@ -35,16 +35,20 @@ struct Names {
     sorted: Vec<u16>,
 }
 
-/// Unpacked copies of the indexes a solve reads per step.
+/// A list shared by every copy of a world: read like a `Vec`, never changed once loaded.
+type Shared<T> = Arc<[T]>;
+
+/// Unpacked copies of the indexes a solve reads per step. Shared between the copies of a world
+/// ([`Shared`]), so a copy costs pointers and a seed's staged world owns only what it moves.
 #[derive(Debug, Clone, Default)]
 struct Hot {
-    target: Vec<u32>,
-    place: Vec<(u16, u8)>,
-    starts: Vec<u32>,
-    item_sites: (Vec<u32>, Vec<u32>),
-    counter_sites: (Vec<u32>, Vec<u32>),
+    target: Shared<u32>,
+    place: Shared<(u16, u8)>,
+    starts: Shared<u32>,
+    item_sites: (Shared<u32>, Shared<u32>),
+    counter_sites: (Shared<u32>, Shared<u32>),
     /// Per group (exits, events, checks): sites by target, the reverse of `target`.
-    into: [(Vec<u32>, Vec<u32>); 3],
+    into: [(Shared<u32>, Shared<u32>); 3],
     time_dep: BitSet,
     def_time: BitSet,
     def_items: BitSet,
@@ -107,36 +111,11 @@ pub struct Time {
     pub owned: Option<Owned>,
 }
 
-/// One world version: what its package's sections load as, shared by every copy of the world
-/// ([`Core`]), and what a seed can move, where the exits lead. A copy costs a few pointers,
-/// and a seed's staged world ([`crate::shuffle::stage`]) holds only its own exit targets.
+/// One world version, loaded from its package sections.
 #[derive(Debug, Clone)]
 pub struct World {
-    core: Arc<Core>,
-    /// Target of every site (region, counter, location or slice by group): the loaded ones,
-    /// or a seed's, whose shuffled exits lead elsewhere.
-    target: Arc<[u32]>,
-    /// Exit sites by the region they lead to, the reverse of `target` for exits.
-    into_exits: Arc<(Vec<u32>, Vec<u32>)>,
-    /// The shuffles the world declares, still to run for a seed; `None` for a world that
-    /// declares none, and for a seed's staged world.
-    shuffles: Option<Arc<Bound>>,
-}
-
-impl std::ops::Deref for World {
-    type Target = Core;
-
-    fn deref(&self) -> &Core {
-        &self.core
-    }
-}
-
-/// The loaded form of one world version, checked once and never changed: a [`World`] reads
-/// through to it.
-#[derive(Debug, Clone)]
-pub struct Core {
-    rules: Vec<u8>,
-    game: Vec<u8>,
+    rules: Shared<u8>,
+    game: Shared<u8>,
     pub(crate) widths: Widths,
     counts: [usize; 6],
     /// Start region.
@@ -161,12 +140,15 @@ pub struct Core {
     vanilla: List,
     roll_ids: List,
     roll_locs: List,
-    names: [Names; 7],
+    names: Arc<[Names; 7]>,
     loc_ids: usize,
     /// Members of every item group (starts, items, caps + 1 with 0 for none).
     groups: (List, List, List),
     /// Per item, the groups it is a member of and its cap there (computed at load).
-    item_groups: (Vec<u32>, Vec<(u16, u16)>),
+    item_groups: (Shared<u32>, Shared<(u16, u16)>),
+    /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
+    /// `None` for a world that declares none, and for a seed's staged world.
+    shuffles: Option<Arc<Bound>>,
 }
 
 const ITEMS: usize = 0;
@@ -260,14 +242,6 @@ impl World {
         Self::from_parts(rules.to_vec(), game.to_vec(), section(SECTION_SHUFFLES)?)
     }
 
-    /// Load from the two sections' bytes: a world that declares no shuffle.
-    ///
-    /// # Errors
-    /// As [`World::from_package`].
-    pub fn from_sections(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
-        Self::from_parts(rules, game, None)
-    }
-
     /// Load from the sections' bytes, with the shuffle section the world was compiled with
     /// ([`crate::shuffle::section`]) when it declares shuffles: checked against the world's
     /// regions, exits and options.
@@ -276,13 +250,7 @@ impl World {
     /// As [`World::from_package`]; a shuffle section that does not parse or names what the
     /// world lacks; rules that read shuffle results without their shuffle section.
     pub fn from_parts(rules: Vec<u8>, game: Vec<u8>, shuffles: Option<&[u8]>) -> R<Self> {
-        let core = Core::from_sections(rules, game)?;
-        let mut w = World {
-            target: core.hot.target.as_slice().into(),
-            into_exits: Arc::new(core.hot.into[EXITS].clone()),
-            core: Arc::new(core),
-            shuffles: None,
-        };
+        let mut w = Self::loaded(rules, game)?;
         match shuffles {
             Some(bytes) => w.shuffles = Some(Arc::new(Bound::bind(&w, bytes)?)),
             // Filled as it is, every slot a rule reads would hold its first thing.
@@ -309,7 +277,7 @@ impl World {
     /// and the world it was staged from).
     #[must_use]
     pub fn shares_with(&self, other: &World) -> bool {
-        Arc::ptr_eq(&self.core, &other.core)
+        Arc::ptr_eq(&self.rules, &other.rules)
     }
 
     /// One seed's world: this one with every exit site of `exits` leading to its new region,
@@ -318,42 +286,20 @@ impl World {
     pub(crate) fn staged(&self, exits: &[(usize, u32)]) -> World {
         let mut w = World { shuffles: None, ..self.clone() };
         if !exits.is_empty() {
-            let mut target = self.target.to_vec();
+            let mut target = self.hot.target.to_vec();
             for (site, to) in exits {
                 if let Some(t) = target.get_mut(*site) {
                     *t = *to;
                 }
             }
-            w.into_exits = Arc::new(self.sites_by_target(&target, EXITS, self.counts[REGIONS]));
-            w.target = target.into();
+            w.hot.into[EXITS] = self.sites_by_target(&target, EXITS, self.counts[REGIONS]);
+            w.hot.target = target.into();
         }
         w
     }
 
-    /// Target of site `s` (region, counter, location or slice by group).
-    #[inline]
-    pub(crate) fn site_target(&self, s: usize) -> u32 {
-        self.target[s]
-    }
-
-    /// Site count (half-day dependency sites come after these).
-    #[must_use]
-    pub fn site_count(&self) -> usize {
-        self.target.len()
-    }
-
-    /// Sites of group `g` (exits, events or checks) whose target is `t`: the exits into a
-    /// region, the events of a counter, the checks of a location.
-    #[inline]
-    pub(crate) fn sites_into(&self, g: usize, t: usize) -> &[u32] {
-        let (at, v) = if g == EXITS { &*self.into_exits } else { &self.core.hot.into[g] };
-        &v[at[t] as usize..at[t + 1] as usize]
-    }
-}
-
-impl Core {
     /// Sites of group `g` by target (`n` targets), the reverse of `target`.
-    fn sites_by_target(&self, target: &[u32], g: usize, n: usize) -> (Vec<u32>, Vec<u32>) {
+    fn sites_by_target(&self, target: &[u32], g: usize, n: usize) -> (Shared<u32>, Shared<u32>) {
         let mut at = vec![0u32; n + 1];
         let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
         let sites = || (0..target.len()).filter(of_g);
@@ -366,12 +312,22 @@ impl Core {
             v[fill[t] as usize] = u32::try_from(s).unwrap_or(0);
             fill[t] += 1;
         }
-        (at, v)
+        (at.into(), v.into())
     }
 
-    /// The loaded form of the two sections' bytes.
+    /// Load from the two sections' bytes: a world that declares no shuffle. Rules that read
+    /// shuffle results are refused here: without their shuffle section every slot would read
+    /// as its first thing ([`World::from_parts`] loads them).
+    ///
+    /// # Errors
+    /// As [`World::from_package`].
+    pub fn from_sections(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
+        Self::from_parts(rules, game, None)
+    }
+
+    /// The two sections' bytes, checked.
     #[allow(clippy::too_many_lines)] // one pass in section order
-    fn from_sections(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
+    fn loaded(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
         let b = &rules;
         if u16_at(b, 0)? != VERSION {
             return Err(bad("unknown layout version"));
@@ -466,7 +422,7 @@ impl Core {
             Some(0) => None,
             _ => return Err(bad("time model flag")),
         };
-        let mut w = Core {
+        let mut w = World {
             widths,
             counts,
             start,
@@ -487,14 +443,15 @@ impl Core {
             vanilla,
             roll_ids,
             roll_locs,
-            names,
+            names: Arc::new(names),
             loc_ids,
             groups: (g_starts, g_items, g_caps),
-            item_groups: (Vec::new(), Vec::new()),
-            game,
-            rules: Vec::new(),
+            item_groups: Default::default(),
+            shuffles: None,
+            game: game.into(),
+            rules: Shared::default(),
         };
-        w.rules = rules;
+        w.rules = rules.into();
         w.check_groups()?;
         w.hot.starts = (0..w.region_starts.len).map(|k| w.at(w.region_starts, k)).collect();
         let mut memo = w.check()?;
@@ -517,7 +474,7 @@ impl Core {
                     usize::from(*y),
                 ))
             });
-            w.names[k].sorted = v;
+            Arc::make_mut(&mut w.names)[k].sorted = v;
         }
         Ok(w)
     }
@@ -551,7 +508,7 @@ impl Core {
         }
         let mut at = vec![0u32];
         per.iter().for_each(|p| at.push(at[at.len() - 1] + u32::try_from(p.len()).unwrap_or(0)));
-        self.item_groups = (at, per.concat());
+        self.item_groups = (at.into(), per.concat().into());
         Ok(())
     }
 
@@ -591,6 +548,7 @@ impl Core {
             return Err(bad("region site ranges"));
         }
         let halves = self.time.owned.map_or(0, |o| o.halves);
+        let (mut targets, mut places) = (Vec::new(), Vec::new());
         for r in 0..c[REGIONS] {
             for g in 0..GROUPS {
                 let span = self.group(r, g);
@@ -605,13 +563,12 @@ impl Core {
                         return Err(bad("site target out of range"));
                     }
                     self.rule_ok(rule, &mut memo)?;
-                    self.hot.target.push(target);
-                    self.hot
-                        .place
-                        .push((u16::try_from(r).unwrap_or(0), u8::try_from(g).unwrap_or(0)));
+                    targets.push(target);
+                    places.push((u16::try_from(r).unwrap_or(0), u8::try_from(g).unwrap_or(0)));
                 }
             }
         }
+        (self.hot.target, self.hot.place) = (targets.into(), places.into());
         for (g, n) in [c[REGIONS], c[COUNTERS], c[LOCS]].into_iter().enumerate() {
             self.hot.into[g] = self.sites_by_target(&self.hot.target, g, n);
         }
@@ -745,7 +702,7 @@ impl Core {
             lists.iter().for_each(|l| {
                 at.push(at[at.len() - 1] + u32::try_from(l.len()).unwrap_or(u32::MAX))
             });
-            (at, lists.concat())
+            (Shared::from(at), Shared::from(lists.concat()))
         };
         if csr(items) != self.hot.item_sites
             || csr(counters) != self.hot.counter_sites
@@ -974,6 +931,12 @@ impl Core {
         (usize::from(r), usize::from(g))
     }
 
+    /// Target of site `s` (region, counter, location or slice by group).
+    #[inline]
+    pub(crate) fn site_target(&self, s: usize) -> u32 {
+        self.hot.target[s]
+    }
+
     /// Sites of region `r`, group `g` (exits, events, checks, stays).
     #[inline]
     pub(crate) fn group(&self, r: usize, g: usize) -> Range<usize> {
@@ -1001,7 +964,7 @@ impl Core {
         (u64_at(&self.rules, at).unwrap_or(0), u32_at(&self.rules, at + 8).unwrap_or(1))
     }
 
-    fn csr(&self, (starts, list): (List, List)) -> (Vec<u32>, Vec<u32>) {
+    fn csr(&self, (starts, list): (List, List)) -> (Shared<u32>, Shared<u32>) {
         (
             (0..starts.len).map(|k| self.at(starts, k)).collect(),
             (0..list.len).map(|k| self.at(list, k)).collect(),
@@ -1013,6 +976,14 @@ impl Core {
     pub(crate) fn item_sites(&self, i: usize) -> &[u32] {
         let (at, v) = &self.hot.item_sites;
         &v[at[i] as usize..at[i + 1] as usize]
+    }
+
+    /// Sites of group `g` (exits, events or checks) whose target is `t`: the exits into a
+    /// region, the events of a counter, the checks of a location.
+    #[inline]
+    pub(crate) fn sites_into(&self, g: usize, t: usize) -> &[u32] {
+        let (at, v) = &self.hot.into[g];
+        &v[at[t] as usize..at[t + 1] as usize]
     }
 
     /// Sites whose rule reads counter `c`.
@@ -1083,6 +1054,12 @@ impl Core {
     #[must_use]
     pub fn counters(&self) -> usize {
         self.counts[COUNTERS]
+    }
+
+    /// Site count (half-day dependency sites come after these).
+    #[must_use]
+    pub fn site_count(&self) -> usize {
+        self.counts[SITES]
     }
 
     /// Def count.
