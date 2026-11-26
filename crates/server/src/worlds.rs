@@ -23,7 +23,8 @@
 
 use crate::accounts::{self, Authenticator, Identity, PasswordAuth};
 use crate::host::{RoomsFolder, Waker};
-use crate::manifests::{self, Manifests};
+use crate::manifests::{self, Manifests, PreparedWorld};
+use crate::pool::Pool;
 use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox, run_job};
 use crate::store;
@@ -64,6 +65,9 @@ pub(crate) struct Worlds {
     store: store::Db,
     /// How a manifest fill or check runs.
     jobs: JobRunner,
+    /// The fill workers that stay up (`fill_pool_workers`); without them each fill is a job of
+    /// its own through `jobs`.
+    pool: Option<Pool>,
     /// The jobs run so far, in order.
     #[cfg(test)]
     ran: std::sync::Mutex<Vec<String>>,
@@ -253,6 +257,7 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
             "no __version__ in the checkout's Utils.py: catalogue versions will fail their checks"
         );
     }
+    let exe = crate::sandbox::exe_path()?;
     Ok(Worlds {
         dir: dir.to_owned(),
         sandbox: Sandbox::new(paths, limits, dir)?,
@@ -263,7 +268,8 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         // Until [`Worlds::router`] gives it the host's store.
         manifests: Manifests::new(store::Db::Mem(Arc::clone(&mem)), &limits),
         store: store::Db::Mem(mem),
-        jobs: JobRunner::Child(crate::sandbox::exe_path()?),
+        pool: (limits.fill_pool_workers > 0).then(|| Pool::new(exe.clone(), limits)),
+        jobs: JobRunner::Child(exe),
         #[cfg(test)]
         ran: std::sync::Mutex::default(),
         write_rate: edge_compat::RateTable::new(
@@ -399,6 +405,17 @@ impl Worlds {
         let before = self.queued.fetch_add(1, Ordering::AcqRel);
         let slot = JobSlot(Arc::clone(&self.queued));
         (before < self.limits.gen_queue_max).then_some(slot)
+    }
+
+    /// Fill the request `head` on the prepared world: on a pooled worker that stays up and may
+    /// hold the world loaded, or without a pool as a `fill` job in a process of its own. The
+    /// same seed either way, under the same caps and the same `fill_timeout_ms` kill.
+    async fn fill(&self, head: &[u8], world: &PreparedWorld) -> Result<Vec<u8>, Failure> {
+        if let Some(pool) = &self.pool {
+            return pool.fill(head, &world.key, &world.file).await;
+        }
+        let input = data_fill::job::frame(head, &world.file).map_err(Failure::Broken)?;
+        self.run_job("fill", &input, Duration::from_millis(self.limits.fill_timeout_ms)).await
     }
 
     /// Run a data-only job (`prepare` or `fill`) on `input`; see [`JobRunner`].
@@ -993,7 +1010,7 @@ async fn prepare_manifest(w: &Worlds, manifest: &[u8]) -> Result<(Value, Vec<u8>
 /// Manifest `id`'s prepared world: the stored one, or, when that is stale or lost (prepared by
 /// another build or layout, or its blob is missing or torn), prepared again from the stored
 /// manifest and stored.
-async fn prepared_world(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+async fn prepared_world(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
     match w.manifests.prepared(id).await.map_err(|e| format!("{e:?}"))? {
         Some(stored) => Ok(stored),
         None => prepare_again(w, id).await,
@@ -1002,7 +1019,7 @@ async fn prepared_world(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
 
 /// Prepare manifest `id`'s world from the stored manifest and store it in place of what was
 /// stored for this engine.
-async fn prepare_again(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
     let manifest = w.manifests.bytes(id).await.map_err(|e| format!("{e:?}"))?;
     let manifest = manifest.ok_or("the manifest is gone")?;
     tracing::info!(id, engine = w.manifests.engine, "preparing a world again");
@@ -1525,12 +1542,11 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
     laps.lap("request");
-    let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
-    // The child prints the seed file itself; it names the game's package of the prepared world.
+    // The job answers with the seed file itself; it names the game's package of the prepared
+    // world.
     let mut first = true;
     let seed = loop {
-        let input = data_fill::job::frame(&head, &prepared)?;
-        match w.run_job("fill", &input, timeout).await {
+        match w.fill(&head, &prepared).await {
             // A stored world this engine cannot load (it hashes to its key, so the store gave
             // it back) would fail every generation of its manifest: prepare it again, once.
             Err(Failure::Refused(why)) if first && why.contains(data_fill::job::UNLOADABLE) => {
@@ -1868,6 +1884,7 @@ mod tests {
         let mut w = open(&root.join("data"), paths, limits).unwrap();
         // The unit tests are not the server's executable: the jobs run in this process.
         w.jobs = JobRunner::InProcess;
+        w.pool = None;
         w.accounts = Some(Arc::new(PasswordAuth::new(w.store.clone(), limits, None)));
         w
     }
@@ -2740,6 +2757,18 @@ mod tests {
         let file = w.manifests.prepared(&content_id(&manifest(|_| {}))).await.unwrap().unwrap();
         let world = data_fill::prepared::Prepared::open(&file).unwrap();
         assert_eq!(world.game(), "Fixture Game");
+    }
+
+    /// The pool is the default and config turns it off: with `fill_pool_workers` at zero a
+    /// generation's fill is a job in a process of its own, as before the pool.
+    #[tokio::test]
+    async fn fills_go_to_the_pool_unless_config_asks_for_no_workers() {
+        let root = temp("pool-choice");
+        let paths = || crate::sandbox::tests::layout(&root);
+        assert_eq!(Limits::DESIGN.fill_pool_workers, 1);
+        assert!(open(&root.join("data"), paths(), Limits::DESIGN).unwrap().pool.is_some());
+        let off = Limits { fill_pool_workers: 0, ..Limits::DESIGN };
+        assert!(open(&root.join("data"), paths(), off).unwrap().pool.is_none());
     }
 
     /// A finished generation's status says where its wall time went, phase by phase, so the

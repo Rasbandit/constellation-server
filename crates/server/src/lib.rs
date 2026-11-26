@@ -24,8 +24,9 @@ mod store;
 mod web;
 mod worlds;
 
-pub use sandbox::fill_job;
+pub use sandbox::{Failure, fill_job, run_job};
 pub mod host;
+pub mod pool;
 pub mod rooms;
 
 use axum::Router;

@@ -20,6 +20,23 @@ pub(crate) struct Manifests {
     pub(crate) engine: String,
 }
 
+/// A prepared world's file and the key it is stored under (the hash of the file), which names
+/// the world to a fill worker that may already hold it loaded ([`crate::pool`]). Reads as the
+/// file's bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedWorld {
+    pub(crate) key: BlobKey,
+    pub(crate) file: Arc<Vec<u8>>,
+}
+
+impl core::ops::Deref for PreparedWorld {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.file
+    }
+}
+
 /// What a prepared world is stored and found under beside its manifest: the layout of the file
 /// (`data_fill::prepared::layout`) and the server build that made it (`build`,
 /// [`crate::build_version`]). The compiled form is kept between generations, so a fix to the
@@ -89,16 +106,18 @@ impl Manifests {
 
     /// Manifest `id`'s prepared world, from the cache or the blob store. `None` when it must be
     /// prepared (again): never prepared by this engine, or its blob is missing or torn.
-    pub(crate) async fn prepared(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, StoreError> {
+    pub(crate) async fn prepared(&self, id: &str) -> Result<Option<PreparedWorld>, StoreError> {
         let Some(key) = key_of(id) else { return Ok(None) };
         let Some(package) = self.db.prepared_key(&key, &self.engine).await? else {
             return Ok(None);
         };
-        if let Some(hit) = self.cached(&package) {
-            return Ok(Some(hit));
+        if let Some(file) = self.cached(&package) {
+            return Ok(Some(PreparedWorld { key: package, file }));
         }
         match self.db.blob_get(&package).await {
-            Ok(Some(file)) => Ok(Some(self.cache(package, file))),
+            Ok(Some(file)) => {
+                Ok(Some(PreparedWorld { key: package, file: self.cache(package, file) }))
+            }
             Ok(None) | Err(StoreError::Corrupt(_)) => {
                 tracing::warn!(id, "a prepared world's blob is missing or torn");
                 Ok(None)
@@ -112,12 +131,12 @@ impl Manifests {
         &self,
         id: &str,
         file: Vec<u8>,
-    ) -> Result<Arc<Vec<u8>>, StoreError> {
+    ) -> Result<PreparedWorld, StoreError> {
         let key = key_of(id).ok_or_else(|| StoreError::Corrupt("not a manifest id".into()))?;
         let package = log::blob_key(&file);
         self.db.blob_put(&package, &file).await?;
         self.db.prepared_put(&key, &self.engine, &package).await?;
-        Ok(self.cache(package, file))
+        Ok(PreparedWorld { key: package, file: self.cache(package, file) })
     }
 
     /// Store a checked manifest (`found` is what the check printed: game, version, items,
