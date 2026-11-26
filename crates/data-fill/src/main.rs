@@ -145,7 +145,8 @@ fn run(args: &[String]) -> Result<Value, String> {
             }
         }
         oracle = json!({
-            "no_items": compare(&w, &plan, &o["no_items"], &inst.start_inventory)?,
+            // Nothing extra: the plan already holds the start inventory on every solve.
+            "no_items": compare(&w, &plan, &o["no_items"], &[])?,
             "all_items": compare(&w, &plan, &o["all_items"], &inv("all_inventory"))?,
             "samples": {"total": sampled.0, "identical": sampled.1, "mismatches": sampled.2},
         });
@@ -170,6 +171,7 @@ fn run(args: &[String]) -> Result<Value, String> {
         "world": {"items": w.items(), "locations": w.locations(), "regions": w.regions(),
                   "defs": w.defs(), "rules_bytes": w.rules_bytes(),
                   "existing_locations": plan.included.len()},
+        "rules": plan.rules_summary(&w),
         "oracle": oracle,
         "fill": {"placed": placed.len(), "attempts": filled.attempts, "solves": filled.solves,
                  "rule_evals": filled.stats.evals,
@@ -190,5 +192,51 @@ fn main() -> ExitCode {
             eprintln!("data-fill: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use serde_json::json;
+
+    /// The "no items" oracle solve holds the start items once, as the legacy side does: a rule
+    /// that needs two copies of a start item is not met by the one copy the player starts with.
+    #[test]
+    fn the_no_items_comparison_holds_the_start_items_once() {
+        let manifest = json!({
+            "options": [],
+            "items": [{"key": "a", "id": 1}, {"key": "junk", "id": 2}],
+            "locations": [{"key": "l0", "id": 1}, {"key": "l1", "id": 2}],
+            "start": "s",
+            "x.time": {"slices": 1, "start_mask": 1},
+            "defs": {},
+            "regions": [{"key": "s", "can_stay": false, "stays": [], "exits": [], "events": [],
+                         "checks": [{"loc": "l0", "rule": {"true": {}}},
+                                    {"loc": "l1", "rule": {"has": "a", "n": 2}}]}],
+            "goal": {"reach": "region:s"}
+        });
+        let solve = |checks: &[&str]| json!({"checks": checks, "regions": {"s": 1}, "events": {}});
+        let instance = json!({
+            "locations": ["l0", "l1"],
+            "pool": ["a", "junk"],
+            "pool_class": {"a": "progression", "junk": "filler"},
+            "start_inventory": ["a"],
+            "oracle": {"no_items": solve(&["l0"]), "all_items": solve(&["l0", "l1"]),
+                       "all_inventory": ["a"], "samples": []}
+        });
+        let dir = std::env::temp_dir();
+        let path = |name: &str| dir.join(format!("data-fill-{}-{name}.json", std::process::id()));
+        let (m, i) = (path("manifest"), path("instance"));
+        std::fs::write(&m, manifest.to_string()).unwrap();
+        std::fs::write(&i, instance.to_string()).unwrap();
+        let args = ["data-fill", m.to_str().unwrap(), i.to_str().unwrap()].map(str::to_owned);
+        let out = run(&args);
+        std::fs::remove_file(&m).unwrap();
+        std::fs::remove_file(&i).unwrap();
+        let oracle = &out.unwrap()["oracle"];
+        assert_eq!(oracle["no_items"]["only_engine"], json!([]), "{oracle}");
+        assert_eq!(oracle["no_items"]["checks_engine"], json!(1));
+        assert_eq!(oracle["all_items"]["only_python"], json!([]), "{oracle}");
     }
 }

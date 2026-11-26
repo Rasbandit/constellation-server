@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use spec_rng::SpecRng;
 
+use crate::bitrules::{CLASSES, NONE};
 use crate::fold::{Folded, fold};
 use crate::live::Live;
-use crate::reach::{Reach, Stats, eval_static, saturation};
+use crate::reach::{Reach, Stats, eval_static, eval_statics, saturation};
+use crate::section::{CHECKS, EXITS};
 use crate::spheres::{Spheres, from_state};
 use crate::world::World;
 
@@ -79,6 +81,11 @@ pub struct Plan {
     pub(crate) clocks: bool,
     /// The rules with this seed's options and rolls folded in.
     pub(crate) folded: Folded,
+    /// The atom set a state starts from: the world's option atoms as this seed decides them.
+    /// Empty when the plan leaves every rule as bytecode ([`Plan::interpreted`]).
+    pub(crate) atoms: Vec<u64>,
+    /// The plan's states answer rules by the world's bit rules.
+    pub(crate) bits: bool,
     start: Vec<(u16, i64)>,
     /// Locations that exist (index into the world).
     pub included: Vec<u32>,
@@ -86,6 +93,9 @@ pub struct Plan {
     pub(crate) locked: Vec<(u32, u16)>,
     /// Option-disabled locations with a vanilla item: reaching them grants it.
     self_grants: Vec<(u32, u16)>,
+    /// Check sites, ascending, of the locations that do not exist this seed and grant nothing:
+    /// nothing is ever placed there, so a fill's states never evaluate them ([`Reach::lean`]).
+    pub(crate) absent: Vec<u32>,
     pub(crate) progression: Vec<u16>,
     pub(crate) rest: Vec<u16>,
     /// Per world item: its placement group, if it has one.
@@ -130,6 +140,11 @@ pub enum FillError {
         /// Free locations.
         locations: usize,
     },
+}
+
+/// Folded rule offsets that are a constant (0 true, 1 false).
+fn constant(sites: &[u32]) -> usize {
+    sites.iter().filter(|at| **at <= 1).count()
 }
 
 impl Plan {
@@ -214,17 +229,60 @@ impl Plan {
         for (k, g) in by_key(&inst.location_groups) {
             loc_group[loc(k)? as usize] = Some(gid(g));
         }
-        let folded = fold(w, &opts, &rolls);
+        // A confined progression item takes only the locations of its group that are not
+        // excluded (`permits`). A group that has room for its copies only with the excluded
+        // ones counted can never be filled: say so here, by name. (A group too small either
+        // way is left to the fill, which reports it stuck.)
+        let mut confined: Vec<u16> =
+            progression.iter().copied().filter(|i| item_group[usize::from(*i)].is_some()).collect();
+        confined.sort_unstable();
+        for kind in confined.chunk_by(|a, b| a == b) {
+            let group = item_group[usize::from(kind[0])];
+            let open = |l: &&u32| {
+                loc_group[**l as usize] == group
+                    && locked.binary_search_by_key(*l, |x| x.0).is_err()
+            };
+            let all = included.iter().filter(open).count();
+            let free = included.iter().filter(open).filter(|l| !excluded[**l as usize]).count();
+            if free < kind.len() && all >= kind.len() {
+                return Err(e(format!(
+                    "item {:?}: {} progression copies are confined to a group with {free} \
+                     locations that take progression ({} more are excluded)",
+                    w.item_key(kind[0]),
+                    kind.len(),
+                    all - free
+                )));
+            }
+        }
+        let mut held = vec![0i64; w.items()];
+        start.iter().for_each(|(i, n)| held[usize::from(*i)] += n);
+        let folded = fold(w, &opts, &rolls, &held);
+        let rules = w.bits();
+        let mut atoms = vec![0u64; rules.words()];
+        let decided = eval_statics(w, &opts, &rolls, rules.statics.iter().map(|s| s.1));
+        for ((bit, _), _) in rules.statics.iter().zip(decided).filter(|x| x.1) {
+            crate::bitrules::put(&mut atoms, *bit, true);
+        }
+        let mut holds = is_included;
+        locked.iter().chain(&self_grants).for_each(|(l, _)| holds[*l as usize] = true);
+        let mut absent: Vec<u32> = (0..w.locations())
+            .filter(|l| !holds[*l])
+            .flat_map(|l| w.sites_into(CHECKS, l).iter().copied())
+            .collect();
+        absent.sort_unstable();
         let mut plan = Plan {
             opts,
             rolls,
             clocks,
             folded,
+            atoms,
+            bits: true,
             start,
             included,
             excluded,
             locked,
             self_grants,
+            absent,
             progression,
             rest,
             item_group,
@@ -262,6 +320,120 @@ impl Plan {
         }
         plan.copies = copies;
         Ok(plan)
+    }
+
+    /// The same plan with every rule left as bytecode: what the bit rules are tested and
+    /// measured against. Every solve of it gives what a solve of `self` gives.
+    #[must_use]
+    pub fn interpreted(mut self) -> Self {
+        self.bits = false;
+        self.atoms = Vec::new();
+        self
+    }
+
+    /// The bit rules this plan's states read: the world's, or none.
+    pub(crate) fn rules<'w>(&self, w: &'w World) -> &'w crate::bitrules::Bits {
+        if self.bits { w.bits() } else { &NONE }
+    }
+
+    /// Rule sites per class of [`crate::RULE_CLASSES`] (counted), and the bytes the world's bit
+    /// rules take (counted from their lists' lengths; held once per loaded world).
+    #[must_use]
+    pub fn bit_rules(&self, w: &World) -> ([u32; 5], usize) {
+        (self.rules(w).classes, self.rules(w).bytes())
+    }
+
+    /// The same plan whose fills also evaluate the checks of absent locations: what skipping
+    /// them is tested and measured against.
+    #[must_use]
+    pub fn with_absent_checks(mut self) -> Self {
+        self.absent.clear();
+        self
+    }
+
+    /// What this seed's fold leaves of the world's rules, all counted: rule sites per class and
+    /// the bit rules' bytes ([`Plan::bit_rules`]), the atom sets a player holds, the sites whose
+    /// rule is constant with the options, rolls and start items, and the absent locations'
+    /// check sites a fill skips. Reads what the plan already holds: no rule is folded again.
+    #[must_use]
+    pub fn rules_summary(&self, w: &World) -> serde_json::Value {
+        let (classes, bytes) = self.bit_rules(w);
+        serde_json::json!({
+            "rule_sites": self.folded.sites.len(),
+            "classes": CLASSES.iter().zip(classes).collect::<HashMap<_, _>>(),
+            "bit_rule_bytes_per_world": bytes,
+            // Two sets of 8-byte words: the plan's (the option atoms) and one state's.
+            "atom_set_bytes_per_player": self.atoms.len() * 2 * size_of::<u64>(),
+            "constant_sites_with_start_items": constant(&self.folded.sites),
+            "absent_check_sites": self.absent.len(),
+        })
+    }
+
+    /// For measurements only (it folds every rule again and walks the regions):
+    /// [`Plan::rules_summary`], and what the shrinking steps that were not built could remove,
+    /// all counted. Sites constant with the
+    /// options and rolls alone; regions no exit that can open leads to, and their sites; exits
+    /// that are always open, and the regions whose only entrance that can open is one of those
+    /// (what merging chains of open exits could remove).
+    #[must_use]
+    pub fn rules_report(&self, w: &World) -> serde_json::Value {
+        let mut all = self.rules_summary(w);
+        if let (Some(all), serde_json::Value::Object(more)) =
+            (all.as_object_mut(), self.shrink_report(w))
+        {
+            all.extend(more);
+        }
+        all
+    }
+
+    /// The part of [`Plan::rules_report`] that folds and walks.
+    fn shrink_report(&self, w: &World) -> serde_json::Value {
+        let sites = &self.folded.sites;
+        let options_only = fold(w, &self.opts, &self.rolls, &[]);
+        let live = |r: usize| w.group(r, EXITS).filter(|e| sites[*e] != 1);
+        let mut seen = vec![false; w.regions()];
+        let mut queue = vec![w.start as usize];
+        seen[w.start as usize] = true;
+        // Per region: entrances that can open, from regions that can be reached, and how many
+        // of them are always open.
+        let mut ways = vec![(0u32, 0u32); w.regions()];
+        while let Some(r) = queue.pop() {
+            for e in live(r) {
+                let to = w.site_target(e) as usize;
+                ways[to].0 += 1;
+                ways[to].1 += u32::from(sites[e] == 0);
+                if !std::mem::replace(&mut seen[to], true) {
+                    queue.push(to);
+                }
+            }
+        }
+        let dead = (0..w.regions()).filter(|r| !seen[*r]);
+        serde_json::json!({
+            "constant_sites_by_options": constant(&options_only.sites),
+            "regions": w.regions(),
+            "unreachable_regions": dead.clone().count(),
+            "sites_in_unreachable_regions": dead
+                .map(|r| w.group(r, EXITS).start..w.stays(r).end)
+                .map(|x| x.len())
+                .sum::<usize>(),
+            "always_open_exits": (0..w.regions()).filter(|r| seen[*r]).flat_map(live)
+                .filter(|e| sites[*e] == 0).count(),
+            "regions_entered_only_by_one_open_exit": (0..w.regions())
+                .filter(|r| *r != w.start as usize && ways[*r] == (1, 1)).count(),
+        })
+    }
+
+    /// The same plan with the start items' `has` tests left in its rules (folded for the
+    /// options and rolls alone): what folding them is tested against.
+    #[cfg(test)]
+    pub(crate) fn without_start_fold(mut self, w: &World) -> Self {
+        self.folded = fold(w, &self.opts, &self.rolls, &[]);
+        self
+    }
+
+    /// Start copies of `item` (the start inventory's and the logic start's).
+    pub(crate) fn start_copies(&self, item: u16) -> i64 {
+        self.start.iter().filter(|(i, _)| *i == item).map(|(_, n)| *n).sum()
     }
 
     /// Copies of `item` that exist this seed.
@@ -422,7 +594,7 @@ fn fill_with(
     let mut s = Steps {
         w,
         plan,
-        r: Reach::new(w, plan),
+        r: Reach::new(w, plan).lean(),
         held: Vec::new(),
         solves: 0,
         rederived: 0,
@@ -550,7 +722,8 @@ impl Steps<'_> {
                 self.stats.absorb(&self.r.stats);
             }
             let (r, plan) = (&self.r, self.plan);
-            let Some(l) = locs.take_first(|l| r.reached(l) && plan.allowed(item, l)) else {
+            // Every item placed here is progression: none takes an excluded location.
+            let Some(l) = locs.take_first(|l| r.reached(l) && plan.permits(item, l, true)) else {
                 return Err(FillError::Stuck {
                     item: self.w.item_key(item).to_owned(),
                     attempts: 1,

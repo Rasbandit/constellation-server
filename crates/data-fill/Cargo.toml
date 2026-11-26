@@ -23,6 +23,11 @@ required-features = ["memory-harness"]
 name = "measure_room"
 required-features = ["memory-harness"]
 
+# The room bench: it reads counters only this feature keeps.
+[[example]]
+name = "synth_room"
+required-features = ["memory-harness"]
+
 [features]
 # The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
 memory-harness = ["dep:allocation-counter"]

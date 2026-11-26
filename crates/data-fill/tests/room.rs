@@ -224,13 +224,13 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
 }
 
 /// The fixture world on both ways of placing rounds: carried, forward on one thread and on
-/// three, and the path a room of that size takes by itself (forward from
+/// three, and the path a room of that size takes by itself (the split path from
 /// `config::ROOM_FORWARD_MIN_PLAYERS` players). Placements, spheres, attempts and rounds are
 /// the same, or the error is.
 #[test]
 fn the_fixture_fills_the_same_carried_and_forward() {
     use data_fill::room::{Path, fill_room_on};
-    let mut forward = 0;
+    let mut split = 0;
     for n in [1usize, 2, 3, 7, 8, 9, 12] {
         let r = players(n, 1);
         let seats = r.seats();
@@ -251,15 +251,15 @@ fn the_fixture_fills_the_same_carried_and_forward() {
             let (auto, solves) =
                 shown(fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
             assert_eq!(carried, auto, "{n} players, seed {seed}: the room's own path");
-            // A fill that worked solved once when carried, once per round when forward.
-            let took_forward = solves > 1;
+            // A fill that worked solved once, carried or split: never once per round.
             if carried.is_ok() {
-                assert_eq!(took_forward, n >= config::ROOM_FORWARD_MIN_PLAYERS, "{n} players");
+                assert_eq!(solves, 1, "{n} players");
             }
-            forward += u32::from(took_forward);
+            assert_eq!(carried, on(Path::Split).0, "{n} players, seed {seed}");
+            split += u32::from(n >= config::ROOM_FORWARD_MIN_PLAYERS && carried.is_ok());
         }
     }
-    assert!(forward > 0, "rooms at and above the threshold filled forward");
+    assert!(split > 0, "rooms at and above the threshold filled on the split path");
 }
 
 #[test]
