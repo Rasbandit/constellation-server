@@ -12,6 +12,10 @@
 //! [`Shape::heavy`], whose counts per check follow the experiment's test world as counted in
 //! `docs/data-only-world-experiment.md` (1516 checks, 318 regions, 3685 rule sites, 107 defs,
 //! 45 time slices, clocks as items).
+//!
+//! A third, [`Shape::wide`], is another kind of world: one region that holds every check, each
+//! behind a deep OR-of-AND tree over counts of items and sums of counts, so every rule reads
+//! many items and every item is read by many rules.
 
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -46,6 +50,8 @@ pub struct Shape {
     /// Longer rules: three checks in eight are gated like exits, half the gates carry a second
     /// condition, defs read other defs and time, and time leaves test a window of slices.
     pub rich: bool,
+    /// One region only ([`Shape::wide`]); the fields about regions, time and defs are not read.
+    pub wide: bool,
 }
 
 impl Default for Shape {
@@ -62,6 +68,7 @@ impl Default for Shape {
             defs: 0.125,
             absent: 0.0,
             rich: false,
+            wide: false,
         }
     }
 }
@@ -82,6 +89,81 @@ impl Shape {
             ..Shape::default()
         }
     }
+
+    /// The wide profile: 131 checks in one region, three in five items progression, three
+    /// checks in four behind a tree of `any` over `all` over `any` (now and then one level
+    /// more) whose leaves are `has` with and without a count and sums of three counts.
+    #[must_use]
+    pub fn wide() -> Self {
+        Shape { checks: 131, progression: 0.6, wide: true, ..Shape::default() }
+    }
+}
+
+/// The one-region world of [`Shape::wide`].
+fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance) {
+    let checks = shape.checks.max(8);
+    let copies_total = ((checks as f64 * shape.progression).round() as usize).clamp(3, checks);
+    let (kinds, copies) = (copies_total / 3, 3);
+    let p = |k: usize| format!("p{k}");
+    fn tree(
+        depth: usize,
+        any: bool,
+        leaf: &dyn Fn(&mut dyn FnMut(usize) -> usize) -> Value,
+        pick: &mut dyn FnMut(usize) -> usize,
+    ) -> Value {
+        if depth == 0 {
+            return leaf(pick);
+        }
+        let parts: Vec<Value> =
+            (0..2 + pick(2)).map(|_| tree(depth - 1, !any, leaf, pick)).collect();
+        json!({if any { "any" } else { "all" }: parts})
+    }
+    let leaf = |pick: &mut dyn FnMut(usize) -> usize| match pick(10) {
+        0..=4 => json!({"has": p(pick(kinds)), "n": 1 + pick(copies)}),
+        5..=7 => json!({"has": p(pick(kinds))}),
+        _ => {
+            let sum: Vec<Value> = (0..3).map(|_| json!({"count": p(pick(kinds))})).collect();
+            json!({"ge": [{"int": ["+", sum[0], sum[1], sum[2]]}, 1 + pick(copies)]})
+        }
+    };
+    let rules: Vec<Value> = (0..checks)
+        .map(|l| {
+            let rule = if pick(4) == 0 {
+                json!({"true": {}})
+            } else {
+                tree(3 + pick(4) / 3, true, &leaf, pick)
+            };
+            json!({"loc": format!("l{l}"), "rule": rule})
+        })
+        .collect();
+    let events: Vec<Value> =
+        (0..6).map(|_| json!({"event": "lit", "rule": tree(2, true, &leaf, pick)})).collect();
+    let mut items: Vec<Value> = (0..kinds).map(|k| json!({"key": p(k), "id": k + 1})).collect();
+    items.push(json!({"key": "filler", "id": kinds + 1}));
+    let manifest = json!({
+        "options": [],
+        "items": items,
+        "locations": (0..checks).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
+            .collect::<Vec<_>>(),
+        "start": "r0",
+        "x.time": {"slices": 1, "start_mask": 1},
+        "defs": {},
+        "regions": [{"key": "r0", "can_stay": false, "checks": rules, "exits": [],
+                     "events": events, "stays": []}],
+        "goal": {"ge": [{"counter": "lit"}, 6]},
+    });
+    let mut pool: Vec<String> = (0..kinds).flat_map(|k| vec![p(k); copies]).collect();
+    pool.resize(checks, "filler".to_owned());
+    let mut pool_class: std::collections::HashMap<String, String> =
+        (0..kinds).map(|k| (p(k), "progression".to_owned())).collect();
+    pool_class.insert("filler".to_owned(), "filler".to_owned());
+    let inst = Instance {
+        locations: (0..checks).map(|l| format!("l{l}")).collect(),
+        pool,
+        pool_class,
+        ..Instance::default()
+    };
+    (manifest, inst)
 }
 
 /// One player's world and instance. The same `seed` and `player` give the same bytes.
@@ -89,6 +171,9 @@ impl Shape {
 pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut rng = SpecRng::from_u64_tagged(seed, b"synthrm\0", player);
     let mut pick = |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
+    if shape.wide {
+        return wide(shape, &mut pick);
+    }
     let checks = shape.checks.max(1);
     let regions = ((checks as f64 * shape.regions) as usize).max(2);
     let slices = shape.slices.clamp(2, 64);
@@ -404,6 +489,38 @@ mod tests {
                     .enumerate()
                     .any(|(p, r)| r.iter().flatten().any(|g| usize::from(g.to) != p));
             assert!(crossed && x.1.removals > 0, "seed {seed}: items cross, removals ran");
+        }
+    }
+
+    /// The wide profile is one region of deep rules: 131 checks and 6 events, over 15 rule
+    /// nodes a site, some rules past the bit rules' term cap. It fills beatable, alone and in a
+    /// room, the same with bit rules and with bytecode only.
+    #[test]
+    fn the_wide_profile_is_one_region_of_deep_rules_and_fills() {
+        let shape = Shape::wide();
+        let (m, inst) = world(&shape, 1, 0);
+        let region = &m["regions"].as_array().unwrap()[0];
+        let sites = || ["checks", "events"].into_iter().flat_map(|g| region[g].as_array().unwrap());
+        let size: usize = sites().map(|s| nodes(&s["rule"])).sum();
+        assert_eq!((m["regions"].as_array().unwrap().len(), inst.locations.len()), (1, 131));
+        assert_eq!(sites().count(), 137);
+        assert!(size / 137 >= 15, "{} nodes per rule site", size / 137);
+        for players in [1, 3] {
+            let c = room(&shape, 1, players, 1).unwrap();
+            let classes = c.plans[0].bit_rules().0;
+            assert!(classes[2] > 15 && classes[4] > 30, "counted and bytecode rules: {classes:?}");
+            let plain = Compiled {
+                plans: c.plans.iter().cloned().map(crate::Plan::interpreted).collect(),
+                worlds: c.worlds.clone(),
+                progression: c.progression.clone(),
+            };
+            for seed in 1..=3 {
+                let (a, sa, _) = outcome(&c, seed, Path::Carry);
+                let (b, sb, _) = outcome(&plain, seed, Path::Carry);
+                assert!(a.as_ref().is_ok_and(|f| f.4.iter().all(|b| *b)), "seed {seed}: {a:?}");
+                assert_eq!((a, crate::Stats { bits: 0, ..sa }), (b, sb), "seed {seed}");
+                assert!(sa.bits > 0 && sa.bits < sa.evals, "{sa:?}");
+            }
         }
     }
 
