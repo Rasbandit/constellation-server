@@ -186,3 +186,99 @@ jobs:
             bench-room.jsonl
             bench-shuffle.jsonl
             quality-*.json
+  # The base branch against this one on one runner: both builds of the bench, run in turns
+  # (which side goes first alternates), on the plain rows. Runners differ too much between jobs
+  # to compare two jobs' numbers.
+  bench-ab:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - name: build both
+        env: { BASE: "${{ github.base_ref || 'main' }}" }
+        run: |
+          git worktree add ../base "origin/$BASE"
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+          (cd ../base && cargo build --release --locked -p data-fill --features memory-harness --example synth_room)
+      - name: in turns
+        run: |
+          set -o pipefail
+          for pair in 1 2 3 4; do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --path auto --workers 1 --players 1,10,100 --checks 1000 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab.jsonl
+            done
+          done; done
+      - name: summary
+        run: |
+          {
+            echo "### Base against head, plain worlds, exact fill, one thread (measured on this runner, release build, 4 runs a side in turns; each run's fill ms is its median of 5)"
+            echo
+            echo "| profile | players | path | base fill ms median | base range | head fill ms median | head range | head / base |"
+            echo "|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[]
+              | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
+              | "| \(.[0].profile) | \(.[0].players) | \(.[0].path) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) |"' bench-ab.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-ab
+          path: bench-ab.jsonl
+  # The same doors-shaped worlds filled with their doors shuffled and with every door where
+  # the manifest has it, seed by seed: what a shuffled layout costs the fill, apart from what
+  # the shape costs. A seed whose room does not fill is recorded and skipped.
+  bench-layout:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - run: cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+      - name: shuffled against vanilla
+        run: |
+          for seed in 1 2 3 4 5 6 7 8 9 10; do for layout in vanilla on; do
+            if out=$(target/release/examples/synth_room --profile heavy --timeless on --entrances "$layout" \
+                --seed "$seed" --path auto --workers 1 --players 1,100 --checks 1000 --reps 3 2>&1); then
+              jq -c --argjson seed "$seed" 'select(has("players")) | . + {seed_n: $seed}' <<< "$out" | tee -a bench-layout.jsonl
+            else
+              jq -c -n --argjson seed "$seed" --arg layout "$layout" --arg e "$out" '{failed: $e, seed_n: $seed, layout: $layout}' | tee -a bench-layout.jsonl
+            fi
+          done; done
+      - name: summary
+        run: |
+          {
+            echo "### Shuffled doors against the same worlds with every door in place (heavy profile without a time context, 1,000 checks, 209 doors per world, one thread, seeds 1 to 10; measured on this runner, release build, each fill ms a median of 3)"
+            echo
+            echo "Ratio is shuffled over vanilla, seed by seed. Staging ms is what the shuffles add before the fill, whole room."
+            echo
+            echo "| players | seeds | vanilla fill ms median | range | shuffled fill ms median | range | ratio median | ratio range | rule evals ratio median | spheres vanilla median | spheres shuffled median | rounds vanilla | rounds shuffled | staging ms median |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              def r3: (. * 1000 | round) / 1000;
+              [.[] | select(has("players"))] | group_by(.players) | .[]
+              | (map(select(.layout == "vanilla")) | map({key: (.seed_n | tostring), value: .}) | from_entries) as $v
+              | [.[] | select(.layout == "shuffled" and $v[.seed_n | tostring] != null) | {s: ., v: $v[.seed_n | tostring]}] as $p
+              | "| \(.[0].players) | \($p | length) | \($p | map(.v.fill_ms) | med) | \($p | map(.v.fill_ms) | min) to \($p | map(.v.fill_ms) | max) | \($p | map(.s.fill_ms) | med) | \($p | map(.s.fill_ms) | min) to \($p | map(.s.fill_ms) | max) | \($p | map(.s.fill_ms / .v.fill_ms) | med | r3) | \($p | map(.s.fill_ms / .v.fill_ms) | min | r3) to \($p | map(.s.fill_ms / .v.fill_ms) | max | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | med | r3) | \($p | map(.v.spheres) | med) | \($p | map(.s.spheres) | med) | \($p | map(.v.rounds) | med) | \($p | map(.s.rounds) | med) | \($p | map(.s.shuffle.shuffle_ms) | med) |"' bench-layout.jsonl
+            echo
+            echo "Rooms that did not fill: $(jq -s '[.[] | select(has("failed"))] | length' bench-layout.jsonl)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-layout
+          path: bench-layout.jsonl

@@ -97,10 +97,10 @@ impl Bound {
     /// Check a stored shuffle section against the world it came with.
     pub(crate) fn bind(w: &World, section: &[u8]) -> R<Bound> {
         // A stored name is quoted in an error at whatever length the section gives it.
-        Self::bound(w, section).map_err(decl::clip)
+        Self::checked(w, section).map_err(decl::clip)
     }
 
-    fn bound(w: &World, section: &[u8]) -> R<Bound> {
+    fn checked(w: &World, section: &[u8]) -> R<Bound> {
         let decl = Decl::load(section)?;
         for option in decl.option_keys() {
             if !(0..w.options()).any(|k| w.option_key(k) == option) {
@@ -282,6 +282,26 @@ pub fn stage(w: &World, inst: &Instance, seed: u64, player: u32) -> R<Option<Sta
         }
     }
     Err(format!("shuffle {}: no valid result in {cap} attempts (the last: {})", last.0, last.1))
+}
+
+/// The world of `w` with every exit where the manifest has it, resolved for `inst`: what a
+/// seed's staged world is measured against (the same fill, on the layout nothing moved).
+/// `None` for a world that declares no shuffle.
+///
+/// # Errors
+/// A world with a `none` shuffle, whose rules read a draw and have no unshuffled form, or an
+/// instance the world lacks keys for.
+pub fn unshuffled(w: &World, inst: &Instance) -> R<Option<Staged>> {
+    let Some(bound) = w.shuffles() else { return Ok(None) };
+    if !bound.decl.order.is_empty() {
+        return Err(format!(
+            "shuffle {}: rules read its draw, so it has no unshuffled form",
+            bound.names(false)
+        ));
+    }
+    let world = w.staged(&[]);
+    let plan = Plan::new(&world, inst).map_err(|e| format!("{e:?}"))?;
+    Ok(Some(Staged { world, plan, table: Table::new(), attempts: 0 }))
 }
 
 /// A room staged, on up to `workers` threads: per player their world (player `p` plays

@@ -1,7 +1,7 @@
 //! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--entrances on|off] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
@@ -33,6 +33,9 @@
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
+//! `--entrances vanilla` draws the same worlds as `--entrances on` and fills them with every
+//! door where the manifest has it ([`data_fill::shuffle::unshuffled`]), so the two rows differ
+//! in the layout alone; the row's `layout` says which.
 //! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`), `--guards
 //! on` with a `none` shuffle that rules read (`Shape::guards`), and `--timeless on` without a
 //! time context (`Shape::timeless`, which an exit shuffle needs). With a shuffle, every
@@ -134,7 +137,7 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
+    (path, workers, mode, one_world, vanilla): (Option<Path>, usize, Algorithm, bool, bool),
 ) -> Result<Value, String> {
     let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
@@ -160,7 +163,18 @@ fn one(
     // A room owns its worlds, as in `seed::generate_on`: staged per player when the world
     // declares shuffles, copies of the loaded world otherwise.
     let setup = || {
-        if shape.doors || shape.guards {
+        if vanilla {
+            // The doors-shaped worlds with every door where the manifest has it.
+            let mut c = Compiled { worlds: Vec::new(), plans: Vec::new(), progression: Vec::new() };
+            for (p, inst) in insts.iter().enumerate() {
+                let s = data_fill::shuffle::unshuffled(base[p % count], inst)?
+                    .ok_or("--entrances vanilla: the world declares no shuffle")?;
+                c.progression.push(inst.progression(&s.world));
+                c.worlds.push(s.world);
+                c.plans.push(s.plan);
+            }
+            Ok(c)
+        } else if shape.doors || shape.guards {
             data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
         } else {
             Compiled::resolve(base.iter().map(|w| (*w).clone()).collect(), &insts, workers)
@@ -169,7 +183,7 @@ fn one(
     let (c, room_bytes) = kept(setup);
     let c = c?;
     let setup_ms = ms(t);
-    if shape.doors || shape.guards {
+    if !vanilla && (shape.doors || shape.guards) {
         let (stage_ms, _) = median(reps, || setup().map(drop))?;
         let pairs: Vec<(&World, &Instance)> =
             (0..players).map(|p| (c.world(p), insts[p])).collect();
@@ -286,6 +300,11 @@ fn one(
         "peak_rss_bytes": peak_rss(),
     });
     row["entrances"] = json!(shape.doors);
+    row["layout"] = json!(match (shape.doors, vanilla) {
+        (false, _) => None,
+        (true, true) => Some("vanilla"),
+        (true, false) => Some("shuffled"),
+    });
     row["guards"] = json!(shape.guards);
     row["timeless"] = json!(shape.timeless);
     row["shuffle"] = shuffle_row;
@@ -319,6 +338,8 @@ fn main() -> Result<(), String> {
         x => return Err(format!("--profile: light or heavy, got {x}")),
     };
     let on = |b: bool| if b { "on" } else { "off" }.to_owned();
+    // `--entrances vanilla`: the doors-shaped world, filled with no door moved.
+    let vanilla = arg(&args, "--entrances", String::new())? == "vanilla";
     let flag = |name: &str, default: bool| match arg(&args, name, on(default))?.as_str() {
         "on" => Ok(true),
         "off" => Ok(false),
@@ -334,7 +355,7 @@ fn main() -> Result<(), String> {
             "off" => false,
             x => return Err(format!("--clocks: on or off, got {x}")),
         },
-        doors: flag("--entrances", d.doors)?,
+        doors: vanilla || flag("--entrances", d.doors)?,
         guards: flag("--guards", d.guards)?,
         timeless: flag("--timeless", d.timeless)?,
         ..d
@@ -362,7 +383,7 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world))?;
+        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world, vanilla))?;
         row["profile"] = json!(profile);
         row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));

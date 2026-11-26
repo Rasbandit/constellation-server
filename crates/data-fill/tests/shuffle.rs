@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use data_fill::seed::{Player, generate};
-use data_fill::shuffle::{Staged, order, room, stage};
+use data_fill::shuffle::{Staged, order, room, stage, unshuffled};
 use data_fill::synth::{Shape, world as synth_world};
 use data_fill::{Instance, World, decode};
 use serde_json::{Value, json};
@@ -803,6 +803,20 @@ fn the_results_of_fixed_seeds_are_pinned() {
     // The entrance shuffle, the guardian shuffle, and a layout that restarts.
     let got = [pin(doors()), pin(halls(guardians())), pin(bell(&["b", "c"], json!([])))];
     assert_eq!(got, ["a4521a4a03bded05", "7e7645c7fd61def5", "7b5053b20fdcc435"]);
+}
+
+/// The comparison form: the same world with every exit where the manifest has it.
+#[test]
+fn the_unshuffled_form_of_a_world_keeps_every_exit_and_passes_the_same_check() {
+    let (m, inst) = doors();
+    let w = World::load(&m).unwrap();
+    let plain = unshuffled(&w, &inst).unwrap().unwrap();
+    assert_eq!(graph(&m, &plain.world), graph(&m, &w));
+    assert!(plain.table.is_empty() && plain.world.shares_with(&w));
+    assert_whole_world(&plain, &inst, "unshuffled");
+    let (m, inst) = halls(guardians());
+    let e = unshuffled(&World::load(&m).unwrap(), &inst).unwrap_err();
+    assert!(e.contains("guardians") && e.contains("no unshuffled form"), "{e}");
 }
 
 /// Both sides of each door listed in a shuffle that is not coupled: every side is its own
