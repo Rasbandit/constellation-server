@@ -237,6 +237,25 @@ pub struct RoomFilled {
     /// Rule evaluations of the opt-in mode's own solves, out of `stats.evals` (the rest are
     /// the confined items' steps and the final solve that checks and reports the seed).
     pub mode_evals: u64,
+    /// What the rounds of fresh solves did, for measurements.
+    pub profile: Rounds,
+}
+
+/// The fresh solves of a fill's rounds (a round solves every player's world, then places one
+/// item per player against what is reached), counted, and where the wall time went, measured.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rounds {
+    /// Worlds solved, over all rounds.
+    pub solved: u64,
+    /// Of them: worlds that reached another set of locations than in the round before (the
+    /// first round's all count).
+    pub changed: u64,
+    /// Of them: worlds something changed for since the round before (an item of the player
+    /// was taken out of the held ones or placed, or an item was placed in the world).
+    pub touched: u64,
+    /// Nanoseconds: setting the states up for a solve (reset, start items, what locations
+    /// hold), running them to the fixed point, and picking the round's locations.
+    pub nanos: [u64; 3],
 }
 
 impl RoomFilled {
@@ -693,6 +712,8 @@ fn fill_by(
         fallbacks: 0,
         swaps: 0,
         mode_evals: 0,
+        profile: Rounds::default(),
+        last: vec![Vec::new(); seats.len()],
     };
     for attempt in 1..=max_attempts {
         match s.try_fill(rng) {
@@ -713,6 +734,10 @@ fn fill_by(
                     fallbacks: s.fallbacks,
                     swaps: s.swaps,
                     mode_evals: s.mode_evals,
+                    profile: Rounds {
+                        nanos: [s.room.nanos[0], s.room.nanos[1], s.profile.nanos[2]],
+                        ..s.profile
+                    },
                 };
                 return Ok((filled, sp));
             }
@@ -754,6 +779,8 @@ struct Linked<'a, 'w> {
     /// The ranks order every derivation of the room: no superstep has run since the last
     /// solve in rank order. Truth maintenance needs it.
     ranked: bool,
+    /// Nanoseconds of the fresh solves: set up, and settled ([`Rounds::nanos`]).
+    nanos: [u64; 2],
 }
 
 impl<'a, 'w> Linked<'a, 'w> {
@@ -775,6 +802,7 @@ impl<'a, 'w> Linked<'a, 'w> {
             forward: None,
             fresh: false,
             ranked: true,
+            nanos: [0; 2],
         }
     }
 
@@ -802,6 +830,7 @@ impl<'a, 'w> Linked<'a, 'w> {
         awake: Option<&dyn Fn(usize, u32) -> bool>,
     ) {
         let seats = self.seats;
+        let start = std::time::Instant::now();
         let held = |g: &Given| awake.is_none() || is_progression(seats, *g);
         // Rank 1 is the first fact of the first state: the room's sequence starts over.
         self.seq = 1;
@@ -829,7 +858,11 @@ impl<'a, 'w> Linked<'a, 'w> {
         self.fresh = true;
         // Every state starts over, so the ranks are the room's again unless supersteps follow.
         self.ranked = true;
+        let set_up = start.elapsed();
         self.settle();
+        let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos[0] += nanos(set_up);
+        self.nanos[1] += nanos(start.elapsed() - set_up);
     }
 
     /// Level fill's solve. The room is solved with nothing of `order` held (`none`: no extra
@@ -1103,6 +1136,9 @@ struct Steps<'a, 'w> {
     fallbacks: u32,
     swaps: u32,
     mode_evals: u64,
+    profile: Rounds,
+    /// Per player: the reached set of the round before ([`Rounds::changed`]).
+    last: Vec<Vec<u64>>,
 }
 
 /// A location of a room: the player whose world it is in, and its index there.
@@ -1535,8 +1571,24 @@ impl Steps<'_, '_> {
                 self.room.solve(&self.held, placed);
                 self.solves += 1;
                 self.room.absorb(&mut self.stats);
+                let mut touched = vec![false; seats.len()];
+                group.iter().for_each(|g| touched[usize::from(g.to)] = true);
+                for ((p, _), g) in prev.iter() {
+                    touched[usize::from(*p)] = true;
+                    touched[usize::from(g.to)] = true;
+                }
+                self.profile.touched += touched.iter().filter(|t| **t).count() as u64;
+                for (m, last) in self.room.models.iter().zip(&mut self.last) {
+                    self.profile.solved += 1;
+                    if last.as_slice() != m.reached_words() {
+                        self.profile.changed += 1;
+                        last.clear();
+                        last.extend_from_slice(m.reached_words());
+                    }
+                }
             }
             prev.clear();
+            let picking = std::time::Instant::now();
             for item in group {
                 let models = &self.room.models;
                 let free = locs.take_first(|(p, l)| {
@@ -1552,6 +1604,8 @@ impl Steps<'_, '_> {
                 placed[usize::from(p)][l as usize] = Some(*item);
                 prev.push(((p, l), *item));
             }
+            self.profile.nanos[2] +=
+                u64::try_from(picking.elapsed().as_nanos()).unwrap_or(u64::MAX);
         }
         Ok(())
     }

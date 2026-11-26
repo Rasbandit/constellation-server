@@ -771,6 +771,11 @@ impl<'w> Reach<'w> {
         self.reached.contains(l as usize)
     }
 
+    /// The reached locations as set words: for telling whether two solves reached the same.
+    pub(crate) fn reached_words(&self) -> &[u64] {
+        self.reached.words()
+    }
+
     /// The rank location `l` was reached at (`u32::MAX`: not reached). Ranks grow with every
     /// fact a forward run derives, so they tell what was reached before what.
     pub(crate) fn loc_rank(&self, l: u32) -> u32 {

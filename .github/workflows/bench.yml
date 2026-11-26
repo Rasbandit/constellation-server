@@ -189,6 +189,14 @@ jobs:
                 | "| \($b.mode) | \($b.path) | \($b.players) | \($b.fill_ms) | \($m.fill_ms) | \($a.fill_ms) | \(if $a.fill_ms > 0 then ($b.fill_ms / $a.fill_ms * 100 | round) / 100 else "n/a" end) | \($b.rule_evals) | \($a.rule_evals) | \($a.rule_evals_ranked) | \($a.rule_evals_bits) | \($b.ns_per_eval) | \($m.ns_per_eval) | \($a.ns_per_eval) | \($b.eval_only.nothing_held.ns_per_eval) / \($b.eval_only.all_held.ns_per_eval) | \($a.eval_only.nothing_held.ns_per_eval) / \($a.eval_only.all_held.ns_per_eval) | \($b.peak_heap_bytes) | \($a.peak_heap_bytes) |"' bench-room.jsonl
             done
             echo
+            echo "#### The rounds of the forward path (the engine as it is; one fill)"
+            echo
+            echo "A round solves every world afresh, then places one item per player. World solves, and the shares of them that were touched (an item of the player left the held ones or was placed, or an item was placed in the world) and that reached another set of locations than the round before, are counted. Set up (reset, start items, what locations hold), settle (run to the fixed point) and pick are measured wall time of one fill. Evaluation is estimated: counted evaluations times the measured eval-only ns with all held."
+            echo
+            echo "| profile | players | rounds | world solves | touched share | reached set changed share | set up ms | settle ms | pick ms | of settle: rule evaluation ms (estimated) |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null and .world == "each" and .mode == "exact" and .path == "forward" and .workers == 1 and .rules == "bits" and .absent == "skip") | .rounds_profile as $r | "| \(.profile) | \(.players) | \(.rounds) | \($r.world_solves) | \($r.touched_share) | \($r.changed_share) | \($r.set_up_ms) | \($r.settle_ms) | \($r.pick_ms) | \(.rule_evals * .eval_only.all_held.ns_per_eval / 1e6 | round) |"' bench-room.jsonl
+            echo
             echo "#### Rule sites per class, first player's world (counted when the world is loaded)"
             echo
             echo "Constant: no atom a solve can change (a constant, or options only). Plain: an AND/OR of has-item, event-fired and region-reached. Counted: the same with a count above one or a sum of counts. Timed: either with a time window. Bytecode: any other shape, or more than \`config::RULE_BITS_MAX_TERMS\` terms."

@@ -285,6 +285,15 @@ fn one(
         "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
     });
+    let r = f.profile;
+    let share = |x: u64| (x as f64 / r.solved.max(1) as f64 * 1e3).round() / 1e3;
+    let ms = |ns: u64| (ns as f64 / 1e6 * 10.0).round() / 10.0;
+    // One fill's rounds (the first, untimed fill's): counted, and its wall time by phase.
+    out["rounds_profile"] = json!({
+        "world_solves": r.solved, "changed_share": share(r.changed),
+        "touched_share": share(r.touched),
+        "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
+    });
     out["fill_reps"] = json!(reps);
     out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     Ok(out)
