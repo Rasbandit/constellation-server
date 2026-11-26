@@ -22,11 +22,26 @@ pub const LAYOUT: u32 = (section::VERSION as u32) << 16 | config::PREPARED_WORLD
 /// them.
 const GAME_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
 
-/// A loaded prepared world.
+/// A loaded prepared world: the compiled world, and the tables every seed of it shares.
 #[derive(Debug)]
 pub struct Prepared {
     world: World,
     game: String,
+    /// The game's names, ids and checksum, as a seed bundle carries them.
+    data: GameData,
+    /// The game's package as a seed file is encoded on it (ids to indexes), under its key.
+    table: GamePackage,
+}
+
+/// The game's package file in a prepared world's `file`: what a seed of that world names by
+/// key, for the store that keeps seeds' packages.
+///
+/// # Errors
+/// A file without that section.
+pub fn seed_game(file: &[u8]) -> Result<&[u8], String> {
+    package::stored(file, SECTION_SEED_GAME)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "prepared world: no seed game section".to_owned())
 }
 
 /// Prepare the world `manifest` describes: the file to store, and the world it loads as.
@@ -48,12 +63,11 @@ impl Prepared {
     /// A file that is not a prepared world of this layout.
     pub fn open(file: &[u8]) -> Result<Self, String> {
         let world = World::from_package(file)?;
-        let seed_game = package::stored(file, SECTION_SEED_GAME)
-            .map_err(|e| e.to_string())?
-            .ok_or("prepared world: no seed game section")?;
-        let (game, _): (String, GameData) =
+        let seed_game = seed_game(file)?;
+        let (game, data) =
             package::game_of(seed_game, GAME_MAX_BYTES).map_err(|e| e.to_string())?;
-        Ok(Self { world, game })
+        let table = GamePackage::new(package::key_of(seed_game), &game, &data);
+        Ok(Self { world, game, data, table })
     }
 
     /// The compiled world.
@@ -66,5 +80,17 @@ impl Prepared {
     #[must_use]
     pub fn game(&self) -> &str {
         &self.game
+    }
+
+    /// The game's names, ids and checksum.
+    #[must_use]
+    pub const fn data(&self) -> &GameData {
+        &self.data
+    }
+
+    /// The game's package, keyed as seeds of this world name it.
+    #[must_use]
+    pub const fn table(&self) -> &GamePackage {
+        &self.table
     }
 }

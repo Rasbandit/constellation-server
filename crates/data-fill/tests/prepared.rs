@@ -4,7 +4,7 @@
 //! compiles the world once (`job::prepare`) and fills from the stored form (`job::fill`).
 
 use data_fill::job;
-use data_fill::prepared::Prepared;
+use data_fill::prepared::{self, Prepared};
 use data_fill::seed::{Player, generate};
 use data_fill::synth::{Shape, world};
 use seed_bundle::package::key_of;
@@ -132,4 +132,20 @@ fn preparing_checks_a_manifest_as_inspect_does_and_the_file_opens_as_its_world()
     assert!(job::fill(&request(&file[..file.len() / 2], &p, 1, 1)).is_err());
     assert!(job::fill(b"\x02").is_err());
     assert!(job::run("nope", b"").unwrap_err().contains("unknown job"));
+}
+
+/// Fails without the tables kept in the prepared world: the names, ids and checksum every
+/// seed of a world carries, and the package file every seed of it names, are made when the
+/// world is prepared and are the ones the manifest path makes for each seed.
+#[test]
+fn the_prepared_world_holds_the_tables_every_seed_of_it_shares() {
+    let (m, p) = room(1);
+    let (_, file) = prepared(&m);
+    let world = Prepared::open(&file).unwrap();
+    let bundle = generate(&m, "s1", &p, 1, 1).unwrap();
+    assert_eq!(world.data(), &bundle.games["Synth"]);
+    let (_, packages) = by_manifest(&m, &p, 1);
+    assert_eq!(packages, [prepared::seed_game(&file).unwrap().to_vec()]);
+    assert_eq!(world.table().key(), &key_of(&packages[0]));
+    assert_eq!(world.table().name(), "Synth");
 }

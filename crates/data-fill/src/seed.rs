@@ -89,11 +89,13 @@ pub fn generate_by(
 ) -> Result<SeedBundle, String> {
     let game = manifest_game(manifest)?;
     named(players)?;
-    fill_on(&World::load(manifest)?, game, seed_name, players, rng_seed, workers, algorithm)
+    let w = World::load(manifest)?;
+    let data = game_data(&w)?;
+    fill_on((&w, game, data), seed_name, players, rng_seed, workers, algorithm)
 }
 
-/// [`generate_by`] on a prepared world: nothing is compiled, the fill starts from the stored
-/// form. The same bundle as the manifest gives.
+/// [`generate_by`] on a prepared world: nothing is compiled and the game's tables are not
+/// built again, the fill starts from the stored form. The same bundle as the manifest gives.
 ///
 /// # Errors
 /// As [`generate`], less what only a manifest can get wrong.
@@ -106,8 +108,26 @@ pub fn generate_on(
     algorithm: room::Algorithm,
 ) -> Result<SeedBundle, String> {
     named(players)?;
-    let (w, game) = (prepared.world(), prepared.game());
-    fill_on(w, game, seed_name, players, rng_seed, workers, algorithm)
+    let on = (prepared.world(), prepared.game(), prepared.data().clone());
+    fill_on(on, seed_name, players, rng_seed, workers, algorithm)
+}
+
+/// The bundle of a room filled on a prepared world: `placed` (one row per seat) and the
+/// `spheres` that reached them. The step of [`generate_on`] after the fill, for callers that
+/// time the steps apart.
+///
+/// # Errors
+/// An instance naming an item the world lacks, or more slots than a seed takes.
+pub fn assemble_on(
+    prepared: &Prepared,
+    seed_name: &str,
+    players: &[Player],
+    seats: &[Seat<'_>],
+    placed: &[Vec<Option<room::Given>>],
+    spheres: &RoomSpheres,
+) -> Result<SeedBundle, String> {
+    let on = (prepared.world(), prepared.game(), prepared.data().clone());
+    assemble(on, seed_name, players, seats, placed, spheres)
 }
 
 /// Every player has a name, and no two share one.
@@ -123,10 +143,13 @@ fn named(players: &[Player]) -> Result<(), String> {
     Ok(())
 }
 
-/// Fill a room of `players` on the loaded world `w` of `game` and assemble its seed.
+/// A loaded world, its game's name and the game's tables ([`game_data`], which depend only on
+/// the world).
+type On<'a> = (&'a World, &'a str, GameData);
+
+/// Fill a room of `players` on a loaded world and assemble its seed.
 fn fill_on(
-    w: &World,
-    game: &str,
+    on: On<'_>,
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
@@ -135,7 +158,7 @@ fn fill_on(
 ) -> Result<SeedBundle, String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
     // The room owns its world: a copy of the loaded bytes, small beside a fill.
-    let room = room::Compiled::shared(w.clone(), &insts, workers)?;
+    let room = room::Compiled::shared(on.0.clone(), &insts, workers)?;
     let seats = room.seats();
     let (filled, spheres) = room::fill_room_by(
         &seats,
@@ -148,13 +171,12 @@ fn fill_on(
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
-    assemble(w, game, seed_name, players, &seats, &filled.placed, &spheres)
+    assemble(on, seed_name, players, &seats, &filled.placed, &spheres)
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.
 fn assemble(
-    w: &World,
-    game: &str,
+    (w, game, data): On<'_>,
     seed_name: &str,
     players: &[Player],
     seats: &[Seat<'_>],
@@ -206,7 +228,7 @@ fn assemble(
         },
         slots,
         connect_names,
-        games: BTreeMap::from([(game.to_owned(), game_data(w)?)]),
+        games: BTreeMap::from([(game.to_owned(), data)]),
         race_mode: 0,
         start_hints: Vec::new(),
     })
