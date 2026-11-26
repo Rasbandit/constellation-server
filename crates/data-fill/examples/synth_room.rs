@@ -1,4 +1,4 @@
-//! `synth_room [--profile light|heavy|wide] [--rules bits|bytecode] [--absent skip|check]
+//! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight] [--rules bits|bytecode] [--absent skip|check]
 //! [--path auto|carry|forward|split] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
@@ -62,7 +62,7 @@ use std::time::Instant;
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by};
 use data_fill::seed::{Player, assemble_on, encode_on};
-use data_fill::synth::{Shape, world};
+use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -306,6 +306,7 @@ fn one(
         "undone": r.undone, "journal_peak": r.journaled,
     });
     out["bit_rules_ms"] = json!(fine(bit_rules_ms));
+    out["seed"] = json!(seed);
     out["fill_reps"] = json!(reps);
     out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     Ok(out)
@@ -332,7 +333,16 @@ fn main() -> Result<(), String> {
         "light" => Shape::default(),
         "heavy" => Shape::heavy(),
         "wide" => Shape::wide(),
-        x => return Err(format!("--profile: light, heavy or wide, got {x}")),
+        "chain" => Shape::hostile(Hostile::Chain),
+        "gated" => Shape::hostile(Hostile::Gated),
+        "keys" => Shape::hostile(Hostile::Keys),
+        "brink" => Shape::hostile(Hostile::Brink),
+        "tight" => Shape::hostile(Hostile::Tight),
+        x => {
+            return Err(format!(
+                "--profile: light, heavy, wide, chain, gated, keys, brink or tight, got {x}"
+            ));
+        }
     };
     let on = |b: bool| if b { "on" } else { "off" }.to_owned();
     let shape = Shape {
