@@ -12,6 +12,10 @@
 //! [`Shape::heavy`], whose counts per check follow the experiment's test world as counted in
 //! `docs/data-only-world-experiment.md` (1516 checks, 318 regions, 3685 rule sites, 107 defs,
 //! 45 time slices, clocks as items).
+//!
+//! A third, [`Shape::wide`], is another kind of world: one region that holds every check, each
+//! behind a deep OR-of-AND tree over counts of items and sums of counts, so every rule reads
+//! many items and every item is read by many rules.
 
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -46,6 +50,8 @@ pub struct Shape {
     /// Longer rules: three checks in eight are gated like exits, half the gates carry a second
     /// condition, defs read other defs and time, and time leaves test a window of slices.
     pub rich: bool,
+    /// One region only ([`Shape::wide`]); the fields about regions, time and defs are not read.
+    pub wide: bool,
 }
 
 impl Default for Shape {
@@ -62,6 +68,7 @@ impl Default for Shape {
             defs: 0.125,
             absent: 0.0,
             rich: false,
+            wide: false,
         }
     }
 }
@@ -82,6 +89,81 @@ impl Shape {
             ..Shape::default()
         }
     }
+
+    /// The wide profile: 131 checks in one region, three in five items progression, three
+    /// checks in four behind a tree of `any` over `all` over `any` (now and then one level
+    /// more) whose leaves are `has` with and without a count and sums of three counts.
+    #[must_use]
+    pub fn wide() -> Self {
+        Shape { checks: 131, progression: 0.6, wide: true, ..Shape::default() }
+    }
+}
+
+/// The one-region world of [`Shape::wide`].
+fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance) {
+    let checks = shape.checks.max(8);
+    let copies_total = ((checks as f64 * shape.progression).round() as usize).clamp(3, checks);
+    let (kinds, copies) = (copies_total / 3, 3);
+    let p = |k: usize| format!("p{k}");
+    fn tree(
+        depth: usize,
+        any: bool,
+        leaf: &dyn Fn(&mut dyn FnMut(usize) -> usize) -> Value,
+        pick: &mut dyn FnMut(usize) -> usize,
+    ) -> Value {
+        if depth == 0 {
+            return leaf(pick);
+        }
+        let parts: Vec<Value> =
+            (0..2 + pick(2)).map(|_| tree(depth - 1, !any, leaf, pick)).collect();
+        json!({if any { "any" } else { "all" }: parts})
+    }
+    let leaf = |pick: &mut dyn FnMut(usize) -> usize| match pick(10) {
+        0..=4 => json!({"has": p(pick(kinds)), "n": 1 + pick(copies)}),
+        5..=7 => json!({"has": p(pick(kinds))}),
+        _ => {
+            let sum: Vec<Value> = (0..3).map(|_| json!({"count": p(pick(kinds))})).collect();
+            json!({"ge": [{"int": ["+", sum[0], sum[1], sum[2]]}, 1 + pick(copies)]})
+        }
+    };
+    let rules: Vec<Value> = (0..checks)
+        .map(|l| {
+            let rule = if pick(4) == 0 {
+                json!({"true": {}})
+            } else {
+                tree(3 + pick(4) / 3, true, &leaf, pick)
+            };
+            json!({"loc": format!("l{l}"), "rule": rule})
+        })
+        .collect();
+    let events: Vec<Value> =
+        (0..6).map(|_| json!({"event": "lit", "rule": tree(2, true, &leaf, pick)})).collect();
+    let mut items: Vec<Value> = (0..kinds).map(|k| json!({"key": p(k), "id": k + 1})).collect();
+    items.push(json!({"key": "filler", "id": kinds + 1}));
+    let manifest = json!({
+        "options": [],
+        "items": items,
+        "locations": (0..checks).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
+            .collect::<Vec<_>>(),
+        "start": "r0",
+        "x.time": {"slices": 1, "start_mask": 1},
+        "defs": {},
+        "regions": [{"key": "r0", "can_stay": false, "checks": rules, "exits": [],
+                     "events": events, "stays": []}],
+        "goal": {"ge": [{"counter": "lit"}, 6]},
+    });
+    let mut pool: Vec<String> = (0..kinds).flat_map(|k| vec![p(k); copies]).collect();
+    pool.resize(checks, "filler".to_owned());
+    let mut pool_class: std::collections::HashMap<String, String> =
+        (0..kinds).map(|k| (p(k), "progression".to_owned())).collect();
+    pool_class.insert("filler".to_owned(), "filler".to_owned());
+    let inst = Instance {
+        locations: (0..checks).map(|l| format!("l{l}")).collect(),
+        pool,
+        pool_class,
+        ..Instance::default()
+    };
+    (manifest, inst)
 }
 
 /// One player's world and instance. The same `seed` and `player` give the same bytes.
@@ -89,6 +171,9 @@ impl Shape {
 pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut rng = SpecRng::from_u64_tagged(seed, b"synthrm\0", player);
     let mut pick = |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
+    if shape.wide {
+        return wide(shape, &mut pick);
+    }
     let checks = shape.checks.max(1);
     let regions = ((checks as f64 * shape.regions) as usize).max(2);
     let slices = shape.slices.clamp(2, 64);
@@ -407,6 +492,38 @@ mod tests {
         }
     }
 
+    /// The wide profile is one region of deep rules: 131 checks and 6 events, over 15 rule
+    /// nodes a site, some rules past the bit rules' term cap. It fills beatable, alone and in a
+    /// room, the same with bit rules and with bytecode only.
+    #[test]
+    fn the_wide_profile_is_one_region_of_deep_rules_and_fills() {
+        let shape = Shape::wide();
+        let (m, inst) = world(&shape, 1, 0);
+        let region = &m["regions"].as_array().unwrap()[0];
+        let sites = || ["checks", "events"].into_iter().flat_map(|g| region[g].as_array().unwrap());
+        let size: usize = sites().map(|s| nodes(&s["rule"])).sum();
+        assert_eq!((m["regions"].as_array().unwrap().len(), inst.locations.len()), (1, 131));
+        assert_eq!(sites().count(), 137);
+        assert!(size / 137 >= 15, "{} nodes per rule site", size / 137);
+        for players in [1, 3] {
+            let c = room(&shape, 1, players, 1).unwrap();
+            let classes = c.plans[0].bit_rules(&c.worlds[0]).0;
+            assert!(classes[2] > 15 && classes[4] > 30, "counted and bytecode rules: {classes:?}");
+            let plain = Compiled {
+                plans: c.plans.iter().cloned().map(crate::Plan::interpreted).collect(),
+                worlds: c.worlds.clone(),
+                progression: c.progression.clone(),
+            };
+            for seed in 1..=3 {
+                let (a, sa, _) = outcome(&c, seed, Path::Carry);
+                let (b, sb, _) = outcome(&plain, seed, Path::Carry);
+                assert!(a.as_ref().is_ok_and(|f| f.4.iter().all(|b| *b)), "seed {seed}: {a:?}");
+                assert_eq!((a, crate::Stats { bits: 0, ..sa }), (b, sb), "seed {seed}");
+                assert!(sa.bits > 0 && sa.bits < sa.evals, "{sa:?}");
+            }
+        }
+    }
+
     /// Everything a fill decides, or the error it ends with as text.
     type Outcome =
         Result<(Vec<Vec<Option<Given>>>, RoomSpheres, u32, u32, Vec<bool>, Vec<usize>), String>;
@@ -453,6 +570,40 @@ mod tests {
             // More copies of `p0` than its group has locations: every attempt is stuck.
             confine(inst, inst.locations.len(), 1);
         }
+    }
+
+    /// Folding the `has` tests the start items meet changes nothing a fill decides: the same
+    /// plans with those tests left in the rules (`Plan::without_start_fold`) give the same
+    /// outcome, by bit rules and by bytecode, carried and forward.
+    #[test]
+    fn folding_the_start_items_changes_nothing_a_fill_decides() {
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let cases = [(small(false), "excluded+locked+start"), (heavy, "confined+locked+start")];
+        let mut removals = 0;
+        for (shape, what) in cases {
+            for players in [1u64, 3, 9] {
+                for bits in [true, false] {
+                    let plain = |p: crate::Plan| if bits { p } else { p.interpreted() };
+                    let room =
+                        || room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                    let (mut folded, mut unfolded) = (room(), room());
+                    folded.plans = folded.plans.into_iter().map(plain).collect();
+                    unfolded.plans = (unfolded.plans.into_iter().zip(&unfolded.worlds))
+                        .map(|(p, w)| plain(p.without_start_fold(w)))
+                        .collect();
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        for seed in 1..=3 {
+                            let (a, stats, _) = outcome(&folded, seed, path);
+                            let (b, _, _) = outcome(&unfolded, seed, path);
+                            let at = format!("{what}, {players} players, bits {bits}, {path:?}");
+                            assert_eq!(a, b, "{at}, seed {seed}");
+                            removals += stats.removals;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(removals > 0, "no item was taken back");
     }
 
     /// A round's state is the unique least fixed point for what is held and placed, and
@@ -519,6 +670,117 @@ mod tests {
                 assert_eq!(a, b, "{players} players, seed {seed}, {workers} workers");
             }
         }
+    }
+
+    /// A plan's bit rules answer what its bytecode does: fills with them, and with every rule
+    /// left as bytecode (`Plan::interpreted`), agree in everything they decide and in every work
+    /// counter but the one that says who answered. Both profiles, clocks on and off, start
+    /// items, locked, excluded and confined locations; one player and rooms; both paths and the
+    /// level mode.
+    #[test]
+    fn bit_rules_decide_what_the_bytecode_does() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut bits, mut evals) = (0, 0);
+        for (shape, what) in [
+            (small(false), ""),
+            (small(true), "confined+excluded+locked+start"),
+            (heavy, ""),
+            (heavy, "confined+locked+start"),
+        ] {
+            for players in [1u64, 3, 9] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                let plain = Compiled {
+                    plans: c.plans.iter().cloned().map(crate::Plan::interpreted).collect(),
+                    worlds: c.worlds.clone(),
+                    progression: c.progression.clone(),
+                };
+                for seed in 1..=2 {
+                    let at = format!("{shape:?}, {what:?}, {players} players, seed {seed}");
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        let (a, sa, solves) = outcome(&c, seed, path);
+                        let (b, sb, plainly) = outcome(&plain, seed, path);
+                        assert_eq!(sb.bits, 0, "{at}: bytecode only");
+                        assert_eq!(
+                            (a, crate::Stats { bits: 0, ..sa }, solves),
+                            (b, sb, plainly),
+                            "{at}, {path:?}"
+                        );
+                        bits += sa.bits;
+                        evals += sa.evals;
+                    }
+                    let level = |c: &Compiled| {
+                        let (path, mode) =
+                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.0.stats.evals, x.1))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    assert_eq!(level(&c), level(&plain), "{at}, level fill");
+                }
+            }
+        }
+        assert!(bits * 2 > evals, "bit rules answered {bits} of {evals} evaluations");
+    }
+
+    /// A fill's states never evaluate the checks of locations that do not exist this seed and
+    /// grant nothing. Against the same plans with those checks evaluated
+    /// (`Plan::with_absent_checks`): everything a fill decides is the same, on both paths and
+    /// in the level mode, with fewer rule evaluations on the heavy profile (about every second
+    /// location of it is absent) and the same count on the light one (none is).
+    #[test]
+    fn skipping_absent_checks_decides_the_same_with_fewer_evaluations() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        for (shape, what) in
+            [(small(true), "confined+locked+start"), (heavy, ""), (heavy, "locked")]
+        {
+            for players in [1u64, 3, 9] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                let whole = Compiled {
+                    plans: c.plans.iter().cloned().map(crate::Plan::with_absent_checks).collect(),
+                    worlds: c.worlds.clone(),
+                    progression: c.progression.clone(),
+                };
+                let absent = c.plans[0].rules_report(&c.worlds[0])["absent_check_sites"].clone();
+                assert_eq!(absent != 0, shape.absent > 0.0, "{absent} absent check sites");
+                for seed in 1..=2 {
+                    let at = format!("{shape:?}, {what:?}, {players} players, seed {seed}");
+                    for path in [Path::Carry, Path::Forward { workers: 1 }] {
+                        let (a, sa, solves) = outcome(&c, seed, path);
+                        let (b, sb, wholly) = outcome(&whole, seed, path);
+                        assert_eq!((&a, solves), (&b, wholly), "{at}, {path:?}");
+                        assert!(a.is_ok(), "{at}");
+                        if shape.absent > 0.0 {
+                            assert!(sa.evals < sb.evals, "{at}: {} of {}", sa.evals, sb.evals);
+                        } else {
+                            assert_eq!(sa, sb, "{at}");
+                        }
+                    }
+                    let level = |c: &Compiled| {
+                        let (path, mode) =
+                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
+                        let mut rng = SpecRng::from_u64(seed);
+                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.1))
+                            .map_err(|e| format!("{e:?}"))
+                    };
+                    assert_eq!(level(&c), level(&whole), "{at}, level fill");
+                }
+            }
+        }
+        // One state, lean and whole: the same regions, counters and existing locations.
+        let c = room(&heavy, 23, 1, 1).unwrap();
+        let (w, plan) = (&c.worlds[0], &c.plans[0]);
+        let whole = plan.state(w, &plan.progression, &[]);
+        let mut lean = crate::Reach::new(w, plan).lean();
+        plan.solve_into(&mut lean, &plan.progression, &[]);
+        assert_eq!((&lean.masks, &lean.counters), (&whole.masks, &whole.counters));
+        assert!(plan.included.iter().all(|l| lean.reached(*l) == whole.reached(*l)));
+        let reached =
+            |r: &crate::Reach<'_>| (0..w.locations()).filter(|l| r.reached(*l as u32)).count();
+        assert!(reached(&lean) < reached(&whole), "the absent locations are not asked");
     }
 
     /// The forward path's states run on several threads: the placements, the spheres and every

@@ -18,6 +18,7 @@ use std::collections::BinaryHeap;
 
 use bits::BitSet;
 
+use crate::bitrules::{Bits, COUNTER, GROUP, ITEM, REGION, STATIC};
 use crate::fill::Plan;
 use crate::section::{CHECKS, EVENTS, EXITS, Node, STAYS, compare, node, operand};
 use crate::world::World;
@@ -109,6 +110,8 @@ struct DefMemo {
     stamp: Cell<u64>,
     /// Def bodies evaluated (memo misses), for the complexity tests.
     bodies: Cell<u64>,
+    /// Bytecode nodes read, for [`Reach::replay`] (counted only where `crate::COUNTED`).
+    nodes: Cell<u64>,
 }
 
 impl DefMemo {
@@ -143,6 +146,9 @@ impl<V: View> Env<'_, V> {
     /// The boolean node at `pc` against region mask `t`, and the offset after it.
     fn b(&self, pc: usize, t: u64) -> (bool, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (false, pc + 1) };
+        if crate::COUNTED {
+            self.memo.nodes.set(self.memo.nodes.get() + 1);
+        }
         match n {
             Node::Const(v) => (v, at),
             Node::All(k, len) | Node::Any(k, len) => {
@@ -210,6 +216,9 @@ impl<V: View> Env<'_, V> {
     // Upgrade when the validator rejects manifests whose expressions can overflow.
     fn i(&self, pc: usize) -> (i64, usize) {
         let Some((n, at)) = node(self.code, pc, self.w.widths) else { return (0, pc + 1) };
+        if crate::COUNTED {
+            self.memo.nodes.set(self.memo.nodes.get() + 1);
+        }
         match n {
             Node::Int(v) => (i64::from(v), at),
             Node::Count(i) => (self.count(i), at),
@@ -249,6 +258,16 @@ impl<V: View> Env<'_, V> {
 
 /// Evaluate an option-only rule (no state) for a seed's option and roll values.
 pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> bool {
+    eval_statics(w, opts, rolls, [rule])[0]
+}
+
+/// [`eval_static`] for several rules.
+pub(crate) fn eval_statics(
+    w: &World,
+    opts: &[i32],
+    rolls: &[i16],
+    rules: impl IntoIterator<Item = u32>,
+) -> Vec<bool> {
     let defs: Vec<u32> = (0..w.defs()).map(|d| w.def(d)).collect();
     let env = Env {
         w,
@@ -261,7 +280,7 @@ pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> 
         epoch: 1,
         memo: &DefMemo::new(w.defs()),
     };
-    env.eval(rule as usize, 0)
+    rules.into_iter().map(|rule| env.eval(rule as usize, 0)).collect()
 }
 
 /// The held count of `item` from which no rule this seed reads more copies: with at least that
@@ -416,6 +435,10 @@ impl Sat<'_> {
 pub struct Stats {
     /// Rule evaluations (sites whose rule was run; stay and clock rules not counted).
     pub evals: u64,
+    /// Of `evals`: a removal's support checks, against the state as of a rank.
+    pub ranked: u64,
+    /// Of `evals`: answered by a bit rule, not by the bytecode.
+    pub bits: u64,
     /// Worklist pushes: regions queued plus sites queued.
     pub pushes: u64,
     /// Items collected during a run (each walks its dependency list once).
@@ -461,6 +484,8 @@ impl Stats {
     /// Add another run's counters.
     pub fn absorb(&mut self, o: &Stats) {
         self.evals += o.evals;
+        self.ranked += o.ranked;
+        self.bits += o.bits;
         self.pushes += o.pushes;
         self.collected += o.collected;
         self.rechecks += o.rechecks;
@@ -512,6 +537,11 @@ pub struct Reach<'w> {
     pub counters: Vec<i64>,
     /// Item group sums (capped copies), kept up to date as items are added.
     groups: Vec<i64>,
+    /// The bit rules this state answers by ([`Plan::rules`]).
+    rules: &'w Bits,
+    /// One bit per atom of the bit rules: whether it holds now. Kept up to date with `counts`,
+    /// `counters`, `groups` and `masks`; the option atoms are the plan's.
+    atoms: Vec<u64>,
     /// Time mask per region; 0 means not reached.
     pub masks: Vec<u64>,
     reached: BitSet,
@@ -532,6 +562,8 @@ pub struct Reach<'w> {
     owned: u64,
     /// Owned clocks with nothing held (the solver's first clock evaluation).
     owned0: u64,
+    /// This state serves a fill ([`Reach::lean`]).
+    lean: bool,
     /// A run has started. Before it, adding an item needs no recheck: the first visit of a
     /// region evaluates every one of its sites.
     ran: bool,
@@ -608,6 +640,8 @@ impl<'w> Reach<'w> {
                 .map(|c| Vec::with_capacity(w.sites_into(EVENTS, c).len()))
                 .collect(),
             groups: vec![0; w.groups()],
+            rules: plan.rules(w),
+            atoms: plan.atoms.clone(),
             masks: vec![0; n],
             reached: BitSet::new(w.locations()),
             holds: vec![None; w.locations()],
@@ -624,6 +658,7 @@ impl<'w> Reach<'w> {
             sites_q: Vec::with_capacity(sites + halves),
             owned: w.time.all,
             owned0: w.time.all,
+            lean: false,
             ran: false,
             stats: Stats::default(),
             def_cache: (0..w.defs()).map(|_| Cell::new(0)).collect(),
@@ -655,6 +690,24 @@ impl<'w> Reach<'w> {
         r
     }
 
+    /// This state as a fill's: the checks of the locations that do not exist this seed and
+    /// grant nothing (`Plan::absent`) are never evaluated, here and after every reset. Nothing
+    /// is ever placed there and a fill asks only about locations that exist, so everything else
+    /// the state derives is the same; [`Reach::reached`] says `false` for those locations.
+    #[must_use]
+    pub fn lean(mut self) -> Self {
+        self.lean = true;
+        self.skip_absent();
+        self
+    }
+
+    /// Mark the absent locations' checks done: done without a rank, as a sleeping check is.
+    fn skip_absent(&mut self) {
+        for &s in &self.plan.absent {
+            self.done.insert(s as usize);
+        }
+    }
+
     /// Back to the empty state, keeping every buffer.
     pub fn reset(&mut self) {
         self.reset_from(1);
@@ -662,9 +715,11 @@ impl<'w> Reach<'w> {
 
     /// [`Reach::reset`], handing out ranks from `seq` on.
     pub(crate) fn reset_from(&mut self, seq: u32) {
+        debug_assert!(self.atoms_agree(), "an atom bit went stale");
         self.counts.fill(0);
         self.counters.fill(0);
         self.groups.fill(0);
+        self.atoms.copy_from_slice(&self.plan.atoms);
         self.masks.fill(0);
         self.reached.clear();
         self.holds.fill(None);
@@ -691,6 +746,9 @@ impl<'w> Reach<'w> {
         self.lit.iter_mut().for_each(Vec::clear);
         self.adjust.fill(0);
         self.start();
+        if self.lean {
+            self.skip_absent();
+        }
     }
 
     fn start(&mut self) {
@@ -715,6 +773,11 @@ impl<'w> Reach<'w> {
     #[must_use]
     pub fn reached(&self, l: u32) -> bool {
         self.reached.contains(l as usize)
+    }
+
+    /// The reached locations as set words: for telling whether two solves reached the same.
+    pub(crate) fn reached_words(&self) -> &[u64] {
+        self.reached.words()
     }
 
     /// The rank location `l` was reached at (`u32::MAX`: not reached). Ranks grow with every
@@ -771,8 +834,10 @@ impl<'w> Reach<'w> {
     /// Wake every sleeping check: those of a reached region are queued for the next run.
     pub(crate) fn wake(&mut self) {
         let w = self.w;
+        let skipped =
+            |s: usize| self.plan.absent.binary_search(&u32::try_from(s).unwrap_or(0)).is_ok();
         for s in 0..w.site_count() {
-            if self.done.contains(s) && self.fired[s] == NONE {
+            if self.done.contains(s) && self.fired[s] == NONE && !(self.lean && skipped(s)) {
                 self.done.remove(s);
                 if self.masks[w.site_place(s).0] != 0 {
                     self.push_site(u32::try_from(s).unwrap_or(0));
@@ -826,10 +891,8 @@ impl<'w> Reach<'w> {
         let hit = w.item_sites(usize::from(item)).iter().any(|s| {
             let s = *s as usize;
             if s >= sc {
-                return (0..self.half_rank.len()).any(|h| {
-                    self.half_rank[h] == NONE
-                        && self.env().eval(self.plan.folded.halves[h] as usize, 0)
-                });
+                return (0..self.half_rank.len())
+                    .any(|h| self.half_rank[h] == NONE && self.now(sc + h, 0));
             }
             let (r, g) = w.site_place(s);
             let l = w.site_target(s) as usize;
@@ -838,7 +901,7 @@ impl<'w> Reach<'w> {
                 return false;
             }
             evals += 1;
-            self.env().eval(self.plan.folded.sites[s] as usize, self.masks[r])
+            self.now(s, self.masks[r])
         });
         self.count_change(item, -1);
         self.def_cache.iter().zip(defs).for_each(|(c, was)| c.set(was));
@@ -941,10 +1004,30 @@ impl<'w> Reach<'w> {
         let before = self.counts[i];
         let after = before + n;
         self.counts[i] = after;
+        let bits = self.rules;
+        bits.set(&mut self.atoms, ITEM, i, after);
         for &(g, cap) in self.w.item_groups(i) {
-            let cap = i64::from(cap);
-            self.groups[usize::from(g)] += after.min(cap) - before.min(cap);
+            let (g, cap) = (usize::from(g), i64::from(cap));
+            self.groups[g] += after.min(cap) - before.min(cap);
+            bits.set(&mut self.atoms, GROUP, g, self.groups[g]);
         }
+    }
+
+    /// Whether every atom bit says what the values it is kept from say.
+    fn atoms_agree(&self) -> bool {
+        self.rules.atoms.iter().enumerate().all(|(bit, a)| {
+            let i = usize::from(a.idx);
+            let v = match usize::from(a.kind) {
+                ITEM => self.counts[i],
+                COUNTER => self.counters[i],
+                GROUP => self.groups[i],
+                REGION => i64::from(self.masks[i] != 0),
+                // An option atom: the seed decided it, no value of the state moves it.
+                _ => return usize::from(a.kind) == STATIC,
+            };
+            let bit = u16::try_from(bit).unwrap_or(u16::MAX);
+            crate::bitrules::bit(&self.atoms, bit) == (v >= i64::from(a.n))
+        })
     }
 
     /// A copy of `item` collected at rank `k`; after the first run the rules reading it are
@@ -1030,6 +1113,8 @@ impl<'w> Reach<'w> {
     pub(crate) fn start_removal(&mut self, item: u16) -> bool {
         let i = usize::from(item);
         self.adjust[i] -= 1;
+        // The fold answered every `has` the start items meet for good: they are never taken back.
+        debug_assert!(self.adjust[i] >= self.plan.start_copies(item), "a start item taken back");
         self.count_change(item, -1);
         if self.adjust[i] >= self.plan.saturated_at(item) {
             return false;
@@ -1160,6 +1245,7 @@ impl<'w> Reach<'w> {
             let (r, _) = self.w.site_place(f);
             let t = self.mask_at(r, k);
             self.stats.evals += 1;
+            self.stats.ranked += 1;
             return t != 0 && self.eval_at(self.plan.folded.sites[f], t, k);
         }
         debug_assert!(f < hb, "a growth is checked by `check_grow`");
@@ -1260,6 +1346,7 @@ impl<'w> Reach<'w> {
             }
             EVENTS => {
                 self.counters[t] -= 1;
+                self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
                 if let Ok(at) = self.lit[t].binary_search(&was) {
                     self.lit[t].remove(at);
                 }
@@ -1323,6 +1410,7 @@ impl<'w> Reach<'w> {
     fn retract_bits(&mut self, r: usize, lost: u64, k: u32) {
         let w = self.w;
         self.masks[r] &= !lost;
+        self.rules.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
         if !self.tm.lost_flag.contains(r) {
             self.tm.lost_flag.insert(r);
             self.tm.lost.push(u32::try_from(r).unwrap_or(0));
@@ -1439,7 +1527,25 @@ impl<'w> Reach<'w> {
     /// Whether the goal rule holds now.
     #[must_use]
     pub fn goal(&self) -> bool {
-        self.env().eval(self.plan.folded.goal as usize, 0)
+        self.now(self.w.site_count() + self.half_rank.len(), 0)
+    }
+
+    /// For measurements: evaluate the rule of every exit, event and check of every reached
+    /// region against the state as it is (by its bit rule where it has one), changing nothing.
+    /// Returns the rules evaluated, how many hold, and the bytecode nodes and def bodies read
+    /// for them (all counted).
+    #[must_use]
+    pub fn replay(&self) -> [u64; 4] {
+        let (w, memo) = (self.w, &self.def_memo);
+        let (nodes, bodies) = (memo.nodes.get(), memo.bodies.get());
+        let (mut evals, mut held) = (0, 0);
+        for (r, m) in self.masks.iter().enumerate().filter(|(_, m)| **m != 0) {
+            for s in [EXITS, EVENTS, CHECKS].into_iter().flat_map(|g| w.group(r, g)) {
+                evals += 1;
+                held += u64::from(self.now(s, *m));
+            }
+        }
+        [evals, held, memo.nodes.get() - nodes, memo.bodies.get() - bodies]
     }
 
     /// Reached regions with their masks.
@@ -1470,9 +1576,37 @@ impl<'w> Reach<'w> {
         }
     }
 
-    fn eval(&mut self, rule: u32, t: u64) -> bool {
+    /// The folded bytecode of fact `f`: a site, a half-day past the sites, then the goal.
+    /// (The same layout is spelled in `Bits::of`, `Reach::goal` and `Reach::clocks`: see #208.)
+    fn rule(&self, f: usize) -> u32 {
+        let (folded, sc) = (&self.plan.folded, self.w.site_count());
+        if f < sc {
+            folded.sites[f]
+        } else {
+            folded.halves.get(f - sc).copied().unwrap_or(folded.goal)
+        }
+    }
+
+    /// Whether fact `f` holds now, in a region of mask `t`, and whether its bit rule said so
+    /// (not its bytecode).
+    fn answer(&self, f: usize, t: u64) -> (bool, bool) {
+        match self.rules.holds(&self.atoms, f, t) {
+            Some(v) => (v, true),
+            None => (self.env().eval(self.rule(f) as usize, t), false),
+        }
+    }
+
+    /// Whether fact `f` holds now, in a region of mask `t`.
+    fn now(&self, f: usize, t: u64) -> bool {
+        self.answer(f, t).0
+    }
+
+    /// [`Reach::now`] for site `s`, counted as a rule evaluation.
+    fn eval(&mut self, s: usize, t: u64) -> bool {
+        let (v, by_bits) = self.answer(s, t);
         self.stats.evals += 1;
-        self.env().eval(rule as usize, t)
+        self.stats.bits += u64::from(by_bits);
+        v
     }
 
     fn push_site(&mut self, s: u32) {
@@ -1500,6 +1634,7 @@ impl<'w> Reach<'w> {
         let rank = self.next();
         self.grows[r].push(Grow { rank, bits: new, why });
         self.masks[r] |= new;
+        self.rules.set(&mut self.atoms, REGION, r, 1);
     }
 
     fn grow(&mut self, r: u32, m: u64, why: u32) {
@@ -1554,7 +1689,7 @@ impl<'w> Reach<'w> {
             return;
         }
         let target = w.site_target(s);
-        if !self.eval(self.plan.folded.sites[s], m) {
+        if !self.eval(s, m) {
             return;
         }
         self.done.insert(s);
@@ -1565,6 +1700,7 @@ impl<'w> Reach<'w> {
             EVENTS => {
                 let c = target as usize;
                 self.counters[c] += 1;
+                self.rules.set(&mut self.atoms, COUNTER, c, self.counters[c]);
                 let at = self.lit[c].partition_point(|x| *x < k);
                 self.lit[c].insert(at, k);
                 if w.def_reads_counter(c) {
@@ -1596,10 +1732,7 @@ impl<'w> Reach<'w> {
         let sc = w.site_count();
         for h in 0..self.half_rank.len() {
             let blocked = self.tm.active && !self.tm.out.contains(sc + h);
-            if self.half_rank[h] == NONE
-                && !blocked
-                && self.env().eval(self.plan.folded.halves[h] as usize, 0)
-            {
+            if self.half_rank[h] == NONE && !blocked && self.now(sc + h, 0) {
                 self.half_rank[h] = self.next();
             }
         }
@@ -1645,7 +1778,7 @@ impl<'w> Reach<'w> {
                     continue;
                 }
                 match stays.clone().find(|s| w.site_target(*s) == i) {
-                    Some(s) if !self.env().eval(self.plan.folded.sites[s] as usize, m) => {
+                    Some(s) if !self.now(s, m) => {
                         can_wait = false;
                     }
                     _ => out |= bit,
@@ -1659,9 +1792,8 @@ impl<'w> Reach<'w> {
     pub(crate) fn compute_owned(&self) -> u64 {
         let w = self.w;
         let Some(o) = w.time.owned.filter(|_| self.plan.clocks) else { return w.time.all };
-        let env = self.env();
         let m = (0..o.halves)
-            .filter(|h| env.eval(self.plan.folded.halves[*h] as usize, 0))
+            .filter(|h| self.now(w.site_count() + h, 0))
             .fold(0, |a, h| a | w.half(h).0);
         if m == 0 { o.none_owned_mask } else { m }
     }
@@ -1840,6 +1972,31 @@ mod tests {
         assert!(!r.reached(w.loc("la").unwrap()));
         let back = r.def_memo.bodies.get() - solve;
         assert!((1..=41 * 4).contains(&back), "take-back: {back} def bodies");
+    }
+
+    /// A forward solve checks nothing as of a rank, a removal does; and a replay of the fixed
+    /// point evaluates every exit, event and check of the reached regions, finding the ones
+    /// that are done.
+    #[test]
+    fn support_checks_and_a_replay_are_counted() {
+        let (w, inst) = cyclic();
+        let plan = Plan::new(&w, &inst).unwrap();
+        let item = |k: &str| w.item(k).unwrap();
+        let mut r = plan.state(&w, &[item("key"), item("boot")], &[]);
+        assert_eq!(r.stats.ranked, 0, "{:?}", r.stats);
+        // Every region is reached: 5 exits, 1 event and 4 checks, all holding; every rule of
+        // this world is a bit rule, so only the plan left as bytecode reads nodes.
+        assert_eq!(r.replay(), [10, 10, 0, 0]);
+        let plain = plan.clone().interpreted();
+        let [evals, held, nodes, bodies] =
+            plain.state(&w, &[item("key"), item("boot")], &[]).replay();
+        assert_eq!((evals, held, bodies), (10, 10, 0));
+        assert!(nodes >= evals, "{nodes} nodes");
+        let before = r.stats;
+        r.remove(item("boot"));
+        assert!(r.stats.ranked > 0 && r.stats.ranked <= r.stats.evals - before.evals);
+        // Without the boot the late check does not hold.
+        assert_eq!(r.replay()[..2], [10, 9]);
     }
 
     #[test]

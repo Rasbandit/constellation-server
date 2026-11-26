@@ -1,4 +1,5 @@
-//! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
+//! `synth_room [--profile light|heavy|wide] [--rules bits|bytecode] [--absent skip|check]
+//! [--path auto|carry|forward] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
@@ -9,7 +10,9 @@
 //! What is done once per world version is timed apart from what every seed pays. Once per
 //! world: `prepare_ms` compiles every world of the room into its stored ready form
 //! ([`data_fill::prepared::build`], on one thread), and `load_ms` loads those stored forms
-//! ([`Prepared::open`]). Per seed: `setup_ms` resolves every player's instance against their
+//! ([`Prepared::open`]); `bit_rules_ms` is the part of it that builds the worlds' bit rules,
+//! measured by building them once more, so `load_ms - bit_rules_ms` is the load without them.
+//! Per seed: `setup_ms` resolves every player's instance against their
 //! loaded world (on `--workers` threads; drawing the synthetic manifests is not timed), and
 //! `fill_ms` is the median of `reps` fills of the same seed (the work is identical, so the
 //! spread is timing noise only).
@@ -33,6 +36,23 @@
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
+//! `rule_evals` are counted by the solver, `rule_evals_ranked` the removals' support checks among
+//! them, and `ns_per_eval` is the fill's wall time over that count, so it carries the solver's
+//! bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
+//! every exit, event and check rule of the reached regions, timed over `REPLAYS` passes), with
+//! nothing held and with every progression item held, and the bytecode nodes and def bodies an
+//! evaluation reads (counted).
+//!
+//! `--rules bytecode` leaves every rule as bytecode (`Plan::interpreted`) and `--absent check`
+//! also evaluates the checks of absent locations (`Plan::with_absent_checks`): the engine as it
+//! was before each, for a before and after on one runner. The placements hash must not move.
+//! `rules_report` is the first player's `Plan::rules_report` (rule sites per class, what the
+//! seed's fold leaves and what the steps not built could remove, all counted).
+//!
+//! `row_s` is the wall time the whole row took (drawing, preparing, every fill and replay), and
+//! `fill_reps` how many fills the median is over: `--reps`, or two once a fill takes over a
+//! second.
+//!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
 //! fallbacks, and the rule evaluations of the mode's own solves.
@@ -40,10 +60,10 @@
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
+use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Shape, world};
-use data_fill::{Instance, World};
+use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
@@ -97,6 +117,22 @@ fn median(
     Ok((times[times.len() / 2], times))
 }
 
+/// Passes of [`data_fill::Reach::replay`] that `eval_only` times.
+const REPLAYS: u32 = 200;
+
+/// Evaluation alone on one seat's world holding `extra`: counted work, and ns per evaluation.
+fn eval_only(seat: &Seat<'_>, extra: &[u16]) -> Value {
+    let r = seat.plan.state(seat.w, extra, &[]);
+    let [evals, held, nodes, bodies] = r.replay();
+    let t = Instant::now();
+    let again: u64 = (0..REPLAYS).map(|_| std::hint::black_box(&r).replay()[1]).sum();
+    let ns = t.elapsed().as_secs_f64() * 1e9 / (f64::from(REPLAYS) * evals.max(1) as f64);
+    let per = |x: u64| (x as f64 / evals.max(1) as f64 * 100.0).round() / 100.0;
+    json!({"evals": evals, "held": held, "same_every_pass": again == held * u64::from(REPLAYS),
+           "ns_per_eval": (ns * 10.0).round() / 10.0,
+           "nodes_per_eval": per(nodes), "def_bodies_per_eval": per(bodies)})
+}
+
 /// To a hundredth of a millisecond.
 fn fine(ms: f64) -> f64 {
     (ms * 100.0).round() / 100.0
@@ -108,7 +144,9 @@ fn one(
     players: usize,
     reps: usize,
     (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
+    (bits, skip): (bool, bool),
 ) -> Result<Value, String> {
+    let row = Instant::now();
     let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
     let drawn: Vec<(Value, Instance)> = (0..count as u64)
@@ -126,18 +164,30 @@ fn one(
     let loaded: Vec<Prepared> =
         files.iter().map(|f| Prepared::open(f)).collect::<Result<_, _>>()?;
     let load_ms = ms(t);
+    // Of `load_ms`: building every world's bit rules, done once more and timed alone.
+    let t = Instant::now();
+    let rebuilt: usize = loaded.iter().map(|p| p.world().build_bit_rules()).sum();
+    std::hint::black_box(rebuilt);
+    let bit_rules_ms = ms(t);
     let insts: Vec<&Instance> = (0..players).map(|p| &drawn[p % count].1).collect();
     // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
     let t = Instant::now();
     let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
-    let c = Compiled::resolve(worlds, &insts, workers)?;
+    let mut c = Compiled::resolve(worlds, &insts, workers)?;
     let setup_ms = ms(t);
+    let plain = |p: Plan| if bits { p } else { p.interpreted() };
+    let whole = |p: Plan| if skip { p } else { p.with_absent_checks() };
+    c.plans = c.plans.into_iter().map(|p| whole(plain(p))).collect();
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
         fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
     };
+    let t = Instant::now();
     let (first, heap) = peak(fill);
+    // A fill of over a second is timed twice more, not `reps` times: its noise is small
+    // against it, and the job's time goes to these rows.
+    let reps = if ms(t) > 1e3 { reps.min(2) } else { reps };
     let (f, sp) = first.map_err(|e| format!("{players} players: {e:?}"))?;
     if !f.all_beatable() {
         return Err(format!("{players} players: not beatable: {:?}", f.beatable));
@@ -186,8 +236,16 @@ fn one(
         .iter()
         .fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
     let s = &f.stats;
+    let pool: Vec<u16> = insts[0]
+        .pool
+        .iter()
+        .filter_map(|k| seats[0].w.item(k).ok())
+        .filter(|i| seats[0].progression[usize::from(*i)])
+        .collect();
+    let replay = json!({"nothing_held": eval_only(&seats[0], &[]),
+                        "all_held": eval_only(&seats[0], &pool)});
     let work = s.summary(1, u64::from(f.solves));
-    Ok(json!({
+    let mut out = json!({
         "players": players,
         "path": if path == Path::Carry { "carry" } else { "forward" },
         "workers": match path {
@@ -207,6 +265,12 @@ fn one(
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
         "rule_evals": s.evals,
+        "rule_evals_ranked": s.ranked,
+        "rule_evals_bits": s.bits,
+        "rules": if bits { "bits" } else { "bytecode" },
+        "absent": if skip { "skip" } else { "check" },
+        "rules_report": seats[0].plan.rules_report(seats[0].w),
+        "eval_only": replay,
         "ns_per_eval": (fill_ms * 1e6 / s.evals.max(1) as f64 * 10.0).round() / 10.0,
         "removals": s.removals,
         "retractions": s.retractions,
@@ -227,7 +291,19 @@ fn one(
         "peak_heap_bytes": heap,
         "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
-    }))
+    });
+    let r = f.profile;
+    let share = |x: u64| (x as f64 / r.solved.max(1) as f64 * 1e3).round() / 1e3;
+    let ms = |ns: u64| (ns as f64 / 1e6 * 10.0).round() / 10.0;
+    // One fill's rounds (the first, untimed fill's): counted, and its wall time by phase.
+    out["rounds_profile"] = json!({
+        "world_solves": r.solved, "changed_share": share(r.changed),
+        "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
+    });
+    out["bit_rules_ms"] = json!(fine(bit_rules_ms));
+    out["fill_reps"] = json!(reps);
+    out["row_s"] = json!((row.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+    Ok(out)
 }
 
 /// Least-squares slope of `ln y` over `ln x`: `y` grows about as `x` to this power.
@@ -250,7 +326,8 @@ fn main() -> Result<(), String> {
     let d = match profile.as_str() {
         "light" => Shape::default(),
         "heavy" => Shape::heavy(),
-        x => return Err(format!("--profile: light or heavy, got {x}")),
+        "wide" => Shape::wide(),
+        x => return Err(format!("--profile: light, heavy or wide, got {x}")),
     };
     let on = |b: bool| if b { "on" } else { "off" }.to_owned();
     let shape = Shape {
@@ -280,6 +357,12 @@ fn main() -> Result<(), String> {
         "one" => true,
         x => return Err(format!("--worlds: each or one, got {x}")),
     };
+    let pick = |name: &str, on: &str, off: &str| match arg(&args, name, on.to_owned())?.as_str() {
+        x if x == on => Ok(true),
+        x if x == off => Ok(false),
+        x => Err(format!("{name}: {on} or {off}, got {x}")),
+    };
+    let engine = (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?);
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -288,7 +371,7 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world))?;
+        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world), engine)?;
         row["profile"] = json!(profile);
         row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
@@ -298,6 +381,8 @@ fn main() -> Result<(), String> {
     println!(
         "{}",
         json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
+               "rules": if engine.0 { "bits" } else { "bytecode" },
+               "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },
                "fitted_exponent": fitted, "points": points})
     );

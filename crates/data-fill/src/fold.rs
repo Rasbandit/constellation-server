@@ -1,11 +1,13 @@
 //! The per-seed fold: the section's bytecode with this seed's option and roll values folded
-//! in, so a solve never re-evaluates what the seed already decided. Same bytecode layout; a
+//! in, and the `has` tests its start items already meet (a solve never holds fewer: only
+//! copies a fill added are taken back), so a solve never re-evaluates what the seed already
+//! decided. Same bytecode layout; a
 //! site whose rule folds to a constant points at offset 0 (true) or 1 (false). Built once per
 //! seed, about the size of the section's bytecode.
 
 use std::collections::HashMap;
 
-use crate::section::{Node, compare, node, op};
+use crate::section::{Node, compare, node, op, operand};
 use crate::world::World;
 
 /// Folded rules for one seed.
@@ -36,12 +38,14 @@ struct Folder<'a> {
     code: &'a [u8],
     opts: &'a [i32],
     rolls: &'a [i16],
+    /// Copies held from the start, per item (may be shorter than the item table: 0 beyond).
+    held: &'a [i64],
     defs: Vec<Option<Option<bool>>>,
 }
 
-/// Fold every rule of `w` for these values.
-pub(crate) fn fold(w: &World, opts: &[i32], rolls: &[i16]) -> Folded {
-    let mut f = Folder { w, code: w.code(), opts, rolls, defs: vec![None; w.defs()] };
+/// Fold every rule of `w` for these values and start copies (`held`, by item).
+pub(crate) fn fold(w: &World, opts: &[i32], rolls: &[i16], held: &[i64]) -> Folded {
+    let mut f = Folder { w, code: w.code(), opts, rolls, held, defs: vec![None; w.defs()] };
     let mut out = Folded { code: vec![op::TRUE, op::FALSE], ..Folded::default() };
     let mut memo: HashMap<u32, u32> = HashMap::new();
     let mut top = |f: &mut Folder<'_>, out: &mut Folded, at: u32| -> u32 {
@@ -68,6 +72,10 @@ pub(crate) fn fold(w: &World, opts: &[i32], rolls: &[i16]) -> Folded {
 }
 
 impl Folder<'_> {
+    fn start(&self, item: u16) -> i64 {
+        self.held.get(usize::from(item)).copied().unwrap_or(0)
+    }
+
     fn def(&mut self, d: usize) -> Option<bool> {
         if let Some(k) = self.defs[d] {
             return k;
@@ -131,9 +139,14 @@ impl Folder<'_> {
                 }
             }
             Node::HasAny(k) => {
-                let end = at + usize::from(k) * usize::from(self.w.widths.item);
-                (orig(end, self.code), end)
+                let iw = self.w.widths.item;
+                let end = at + usize::from(k) * usize::from(iw);
+                let got = (0..usize::from(k))
+                    .filter_map(|j| operand(self.code, at + j * usize::from(iw), iw))
+                    .any(|i| self.start(i) > 0);
+                (if got { B::K(true) } else { orig(end, self.code) }, end)
             }
+            Node::Has(i, c) if self.start(i) >= i64::from(c) => (B::K(true), at),
             Node::Has(..) | Node::TimeAny(_) | Node::Reach(_) => (orig(at, self.code), at),
             Node::Ref(d) => match self.def(usize::from(d)) {
                 Some(v) => (B::K(v), at),
@@ -234,5 +247,82 @@ impl Folder<'_> {
             }
             _ => (I::K(0), at),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::fill::{Instance, Plan};
+    use crate::world::World;
+    use serde_json::{Value, json};
+
+    /// One region whose check `l{k}` has rule `rules[k]`, over items `a` to `j`, a counter lit
+    /// by two events, and a group sum.
+    pub(crate) fn world(rules: &[Value]) -> (World, Instance) {
+        let keys: Vec<String> = ('a'..='j').map(String::from).collect();
+        world_of(&keys, &json!({"d": {"any": [{"has": "a"}, {"has": "b", "n": 2}]}}), rules)
+    }
+
+    /// [`world`] over the items `keys` (the events read `c` and `d`) and the defs `defs`.
+    pub(crate) fn world_of(keys: &[String], defs: &Value, rules: &[Value]) -> (World, Instance) {
+        let checks: Vec<Value> = rules
+            .iter()
+            .enumerate()
+            .map(|(k, r)| json!({"loc": format!("l{k}"), "rule": r}))
+            .collect();
+        let m = json!({
+            "options": [{"key": "hard", "default": 1}],
+            "items": keys.iter().enumerate().map(|(k, i)| json!({"key": i, "id": k + 1}))
+                .collect::<Vec<_>>(),
+            "locations": (0..rules.len()).map(|k| json!({"key": format!("l{k}"), "id": k + 1}))
+                .collect::<Vec<_>>(),
+            "start": "s",
+            "x.time": {"slices": 2, "start_mask": 1},
+            "defs": defs,
+            "regions": [{"key": "s", "can_stay": false, "stays": [], "exits": [],
+                         "events": [{"event": "lit", "rule": {"has": "c"}},
+                                    {"event": "lit", "rule": {"has": "d"}}],
+                         "checks": checks}],
+            "goal": {"reach": "region:s"}
+        });
+        let inst = Instance {
+            locations: (0..rules.len()).map(|k| format!("l{k}")).collect(),
+            ..Instance::default()
+        };
+        (World::load(&m).unwrap(), inst)
+    }
+
+    /// A `has` the start items already meet is folded to a constant: only copies a fill added
+    /// are ever taken back, so no state of the seed holds fewer.
+    #[test]
+    fn has_tests_the_start_items_meet_fold_to_constants() {
+        let rules = [
+            json!({"has": "a"}),
+            json!({"has": "b", "n": 2}),
+            json!({"has": "b", "n": 3}),
+            json!({"has_any": ["e", "f"]}),
+            json!({"all": [{"has": "a"}, {"has": "g"}]}),
+            json!({"any": [{"has": "a"}, {"has": "g"}]}),
+        ];
+        let (w, mut inst) = world(&rules);
+        let count = |inst: &Instance, key: &str| {
+            let plan = Plan::new(&w, inst).unwrap();
+            let reached: Vec<bool> = (0..6).map(|l| plan.solve(&w, &[]).reached(l)).collect();
+            (plan.rules_report(&w)[key].as_u64().unwrap(), reached)
+        };
+        assert_eq!(count(&inst, "constant_sites_with_start_items").0, 0);
+        inst.start_inventory = vec!["a".to_owned(), "f".to_owned()];
+        inst.logic_start.insert("b".to_owned(), 2);
+        assert_eq!(count(&inst, "constant_sites_by_options").0, 0);
+        // `l0`, `l1`, `l3` and `l5` are met; `l2` needs a third `b`, `l4` still reads `g`.
+        let (constant, reached) = count(&inst, "constant_sites_with_start_items");
+        assert_eq!((constant, reached), (4, vec![true, true, false, true, false, true]));
+        let plan = Plan::new(&w, &inst).unwrap();
+        let g = w.item("g").unwrap();
+        assert!(plan.solve(&w, &[g]).reached(4) && !plan.solve(&w, &[g]).reached(2));
+    }
+
+    pub(crate) fn any_of(items: [&str; 2]) -> Value {
+        json!({"any": [{"has": items[0]}, {"has": items[1]}]})
     }
 }
