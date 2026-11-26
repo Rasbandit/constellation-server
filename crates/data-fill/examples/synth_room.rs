@@ -2,7 +2,7 @@
 //! [--path auto|carry|forward|split] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
@@ -52,6 +52,9 @@
 //! `row_s` is the wall time the whole row took (drawing, preparing, every fill and replay), and
 //! `fill_reps` how many fills the median is over: `--reps`, or two once a fill takes over a
 //! second.
+//!
+//! `--failed-row`: a room whose fill ends in an error (stuck on every attempt) prints
+//! `{"room": players, "failed": error, ...}` instead of ending the run with that error.
 //!
 //! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
 //! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
@@ -386,8 +389,21 @@ fn main() -> Result<(), String> {
         .map(|p| p.trim().parse().map_err(|_| format!("--players: bad count {p:?}")))
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
+    // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
+    let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world), engine)?;
+        let row = one(&shape, seed, n, reps, (path, workers, mode, one_world), engine);
+        let mut row = match row {
+            Err(e) if failed_row => {
+                println!(
+                    "{}",
+                    json!({"room": n, "profile": profile, "path": path_arg, "seed": seed,
+                           "failed": e})
+                );
+                continue;
+            }
+            row => row?,
+        };
         row["profile"] = json!(profile);
         row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));

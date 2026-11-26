@@ -87,15 +87,14 @@ jobs:
           for profile in chain gated keys brink tight; do for path in forward split; do
             bench --profile "$profile" --path "$path" --workers 1 --players 1,10 --reps 3
           done; done
-          # The same at 100 players, where the fill ends within two minutes. A row that does
-          # not is left out and named here.
+          # The same at 100 players. A room that is stuck on every attempt prints a row that
+          # says so (`--failed-row`), and so does one that takes over two minutes.
           for profile in chain gated keys brink; do for path in forward split; do
-            if timeout 120 target/release/examples/synth_room --profile "$profile" --path "$path" \
-                --workers 1 --players 100 --reps 1 > hostile.jsonl; then
-              tee -a bench-room.jsonl < hostile.jsonl
-            else
-              echo "$profile $path 100: no row" | tee -a hostile-missing.txt
+            if ! timeout 120 target/release/examples/synth_room --profile "$profile" --path "$path" \
+                --workers 1 --players 100 --reps 1 --failed-row > hostile.jsonl; then
+              echo "{\"room\":100,\"profile\":\"$profile\",\"path\":\"$path\",\"seed\":1,\"failed\":\"no result within two minutes\"}" > hostile.jsonl
             fi
+            tee -a bench-room.jsonl < hostile.jsonl
           done; done
           # Other seeds: the two paths at 100 players on seeds 2 and 3 (the rows above are seed
           # 1), in a file of their own so that no table above matches them twice.
@@ -263,10 +262,10 @@ jobs:
               | $rows[] | select(.path == "split") as $s
               | ($rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world and .players == $s.players)) as $f
               | "| \($s.profile) | \($s.world) | \($s.players) | \($f.fill_ms) | \($s.fill_ms) | \(if $s.fill_ms > 0 then ($f.fill_ms / $s.fill_ms * 100 | round) / 100 else "n/a" end) | \($f.rule_evals) | \($s.rule_evals) | \($f.rounds_profile.settle_ms) | \($s.rounds_profile.settle_ms) | \($s.rounds_profile.undone) | \($s.rounds_profile.undone / $s.rounds_profile.world_solves | round) | \($s.rounds_profile.journal_peak / $s.players | round) | \(if $f.peak_heap_bytes then ($f.peak_heap_bytes / $f.players | round) else "n/a" end) | \(if $s.peak_heap_bytes then ($s.peak_heap_bytes / $s.players | round) else "n/a" end) |"' bench-room.jsonl
-            if [ -s hostile-missing.txt ]; then
-              echo
-              echo "No row within two minutes (or stuck on every attempt): $(paste -sd, hostile-missing.txt)."
-            fi
+            echo
+            echo "Rooms that were not filled (the fill's own error, or the two minute limit of this job):"
+            echo
+            jq -r 'select(.failed != null) | "- \(.profile), \(.room) players, \(.path): failed: \(.failed)"' bench-room.jsonl
             echo
             echo "#### Other seeds, 100 players, a world per player (one timed fill per row)"
             echo
