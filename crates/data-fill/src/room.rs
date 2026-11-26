@@ -27,6 +27,7 @@ use serde::Deserialize;
 use spec_rng::SpecRng;
 
 use crate::fill::{FillError, Instance, Plan};
+use crate::live::Live;
 use crate::par::map_ordered;
 use crate::reach::{Msg, Reach, Stats};
 use crate::spheres::{RoomSpheres, room_from_states};
@@ -716,16 +717,16 @@ impl Steps<'_, '_> {
             return Err(FillError::Count { items, locations: free.len() });
         }
         // Confined items first, as the world's pre_fill does, each into its own group.
-        let (mut confined, mut prog): (Vec<Given>, Vec<Given>) = prog
-            .into_iter()
-            .partition(|g| seats[usize::from(g.to)].plan.item_group.contains_key(&g.item));
+        let (mut confined, mut prog): (Vec<Given>, Vec<Given>) =
+            prog.into_iter().partition(|g| seats[usize::from(g.to)].plan.confined(g.item));
         rng.shuffle(&mut confined);
         rng.shuffle(&mut prog);
         let mut locs = free.clone();
         rng.shuffle(&mut locs);
+        let mut locs = Live::new(locs);
         let mut prev = Vec::new();
         self.restrictive(&groups(confined, false), &prog, &mut locs, &mut placed, &mut prev)?;
-        locs.retain(|(p, l)| !seats[usize::from(*p)].plan.excluded[*l as usize]);
+        locs.retain(|(p, l)| !seats[usize::from(p)].plan.excluded[l as usize]);
         self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
         // Everything else goes anywhere left, excluded locations included.
         rng.shuffle(&mut rest);
@@ -768,7 +769,7 @@ impl Steps<'_, '_> {
         &mut self,
         groups: &[Vec<Given>],
         also_held: &[Given],
-        locs: &mut Vec<(u16, u32)>,
+        locs: &mut Live<(u16, u32)>,
         placed: &mut [Vec<Option<Given>>],
         prev: &mut Vec<((u16, u32), Given)>,
     ) -> Result<(), FillError> {
@@ -801,18 +802,17 @@ impl Steps<'_, '_> {
             }
             prev.clear();
             for item in group {
-                let pos = locs.iter().position(|(p, l)| {
-                    self.room.models[usize::from(*p)].reached(*l)
-                        && confined_ok(seats, *item, *p, *l)
+                let models = &self.room.models;
+                let free = locs.take_first(|(p, l)| {
+                    models[usize::from(p)].reached(l) && confined_ok(seats, *item, p, l)
                 });
-                let Some(pos) = pos else {
+                let Some((p, l)) = free else {
                     let w = seats[usize::from(item.to)].w;
                     return Err(FillError::Stuck {
                         item: w.item_key(item.item).to_owned(),
                         attempts: 1,
                     });
                 };
-                let (p, l) = locs.remove(pos);
                 placed[usize::from(p)][l as usize] = Some(*item);
                 prev.push(((p, l), *item));
             }
@@ -858,8 +858,7 @@ fn groups(pool: Vec<Given>, per_player: bool) -> Vec<Vec<Given>> {
 /// phases' location lists).
 fn confined_ok(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
     let owner = &seats[usize::from(g.to)];
-    !owner.plan.item_group.contains_key(&g.item)
-        || (player == g.to && owner.plan.allowed(g.item, loc))
+    !owner.plan.confined(g.item) || (player == g.to && owner.plan.allowed(g.item, loc))
 }
 
 #[cfg(test)]
