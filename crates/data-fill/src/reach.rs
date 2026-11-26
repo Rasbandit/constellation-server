@@ -590,6 +590,29 @@ pub struct Reach<'w> {
     /// Per item: copies held from the start (before any run, less what was removed).
     adjust: Vec<i64>,
     tm: Tms,
+    /// Every step since [`Reach::keep_journal`], in order, for [`Reach::undo_to`].
+    journal: Vec<Step>,
+    journaling: bool,
+}
+
+/// One change a forward run or its caller made to a state, as the journal keeps it: enough to
+/// take it back when everything after it was taken back first.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The site held and took a rank.
+    Fired(u32),
+    /// The region's mask gained its last growth.
+    Grow(u32),
+    /// The region was visited for the first time.
+    Seen(u32),
+    /// The half-day rule held and took a rank.
+    Half(u32),
+    /// A copy of the item was collected at the rank.
+    Copy(u16, u32),
+    /// The location, which held nothing, was given something to hold.
+    Hold(u32),
+    /// The location was given another player's item to hold.
+    Away(u32),
 }
 
 /// Slices a region's mask gained at one rank, from one support.
@@ -681,6 +704,8 @@ impl<'w> Reach<'w> {
                 lost_flag: BitSet::new(n),
                 active: false,
             },
+            journal: Vec::new(),
+            journaling: false,
         };
         r.start();
         r
@@ -741,6 +766,8 @@ impl<'w> Reach<'w> {
         self.copies.iter_mut().for_each(Vec::clear);
         self.lit.iter_mut().for_each(Vec::clear);
         self.adjust.fill(0);
+        self.journal.clear();
+        self.journaling = false;
         self.start();
         if self.lean {
             self.skip_absent();
@@ -912,7 +939,9 @@ impl<'w> Reach<'w> {
         if self.holds[l] == Some(item) {
             return;
         }
-        self.holds[l] = Some(item);
+        let before = self.holds[l].replace(item);
+        debug_assert!(before.is_none() || !self.journaling, "a journaled location held an item");
+        self.log(Step::Hold(loc));
         if self.reached.contains(l) {
             self.collect(item, self.loc_rank[l]);
         }
@@ -936,6 +965,7 @@ impl<'w> Reach<'w> {
         }
         debug_assert!(self.away[l].is_none() && self.holds[l].is_none(), "one item per location");
         self.away[l] = Some((to, item));
+        self.log(Step::Away(loc));
         if self.reached.contains(l) {
             self.outbox.push(Msg::Give { to, item, rank: self.loc_rank[l] });
         }
@@ -976,6 +1006,87 @@ impl<'w> Reach<'w> {
         }
         let w = self.w;
         self.suspect_readers(w.item_sites(usize::from(item)), from, rank);
+    }
+
+    fn log(&mut self, step: Step) {
+        if self.journaling {
+            self.journal.push(step);
+        }
+    }
+
+    /// From now until the next reset, keep a journal of every step, so that what is added to
+    /// this fixed point (items, what locations hold, and all a run derives from them) can be
+    /// taken back with [`Reach::undo_to`]. Call after a [`Reach::run`].
+    pub(crate) fn keep_journal(&mut self) {
+        debug_assert!(self.ran && self.idle(), "a journal starts at a fixed point");
+        self.journaling = true;
+    }
+
+    /// Stop keeping the journal and forget it: nothing more is taken back.
+    pub(crate) fn end_journal(&mut self) {
+        self.journaling = false;
+        self.journal.clear();
+    }
+
+    /// Where the journal stands: a fixed point to come back to.
+    pub(crate) fn mark(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Take back every step after `mark` ([`Reach::mark`], taken at a fixed point), last
+    /// first: the state is again the fixed point it was then, value for value. Only additions
+    /// followed the mark (rules are monotone, a forward run retracts nothing), so each step is
+    /// undone by removing what it added. Returns the steps taken back.
+    pub(crate) fn undo_to(&mut self, mark: usize) -> usize {
+        debug_assert!(self.idle(), "undo from a fixed point");
+        let w = self.w;
+        let undone = self.journal.len().saturating_sub(mark);
+        while self.journal.len() > mark {
+            let Some(step) = self.journal.pop() else { break };
+            match step {
+                Step::Copy(item, k) => self.uncollect(item, k),
+                Step::Hold(l) => self.holds[l as usize] = None,
+                Step::Away(l) => self.away[l as usize] = None,
+                Step::Seen(r) => self.seen.remove(r as usize),
+                Step::Half(h) => {
+                    // The owned clocks are what the half-days that hold give (`clocks`).
+                    self.half_rank[h as usize] = NONE;
+                    self.owned = self.owned_at(NONE);
+                }
+                Step::Grow(r) => {
+                    let r = r as usize;
+                    if let Some(g) = self.grows[r].pop() {
+                        self.masks[r] &= !g.bits;
+                        self.rules.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
+                    }
+                }
+                Step::Fired(s) => {
+                    let s = s as usize;
+                    let k = std::mem::replace(&mut self.fired[s], NONE);
+                    self.done.remove(s);
+                    let t = w.site_target(s) as usize;
+                    match w.site_place(s).1 {
+                        EVENTS => {
+                            self.counters[t] -= 1;
+                            self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
+                            if let Ok(at) = self.lit[t].binary_search(&k) {
+                                self.lit[t].remove(at);
+                            }
+                        }
+                        CHECKS if self.loc_rank[t] == k => {
+                            self.loc_rank[t] = NONE;
+                            self.reached.remove(t);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if undone > 0 {
+            // A def found true with what was taken back is no longer known.
+            self.forget_defs();
+        }
+        undone
     }
 
     /// Add `n` copies of an item (rules that read it are rechecked on the next [`Reach::run`]).
@@ -1029,6 +1140,7 @@ impl<'w> Reach<'w> {
     /// A copy of `item` collected at rank `k`; after the first run the rules reading it are
     /// rechecked.
     fn collect(&mut self, item: u16, k: u32) {
+        self.log(Step::Copy(item, k));
         self.count_change(item, 1);
         let v = &mut self.copies[usize::from(item)];
         let at = v.partition_point(|x| *x < k);
@@ -1627,6 +1739,7 @@ impl<'w> Reach<'w> {
             return;
         }
         let rank = self.next();
+        self.log(Step::Grow(u32::try_from(r).unwrap_or(0)));
         self.grows[r].push(Grow { rank, bits: new, why });
         self.masks[r] |= new;
         self.rules.set(&mut self.atoms, REGION, r, 1);
@@ -1644,6 +1757,9 @@ impl<'w> Reach<'w> {
     fn visit(&mut self, r: usize) {
         let w = self.w;
         let first = !self.seen.contains(r);
+        if first {
+            self.log(Step::Seen(u32::try_from(r).unwrap_or(0)));
+        }
         self.seen.insert(r);
         if self.can_stay[r] {
             let m = self.expand(r, self.masks[r]);
@@ -1690,6 +1806,7 @@ impl<'w> Reach<'w> {
         self.done.insert(s);
         let k = self.next();
         self.fired[s] = k;
+        self.log(Step::Fired(u32::try_from(s).unwrap_or(0)));
         match g {
             EXITS => self.grow(target, m, u32::try_from(s).unwrap_or(0)),
             EVENTS => {
@@ -1729,6 +1846,7 @@ impl<'w> Reach<'w> {
             let blocked = self.tm.active && !self.tm.out.contains(sc + h);
             if self.half_rank[h] == NONE && !blocked && self.now(sc + h, 0) {
                 self.half_rank[h] = self.next();
+                self.log(Step::Half(u32::try_from(h).unwrap_or(0)));
             }
         }
         let owned = self.owned_at(NONE);
@@ -1791,6 +1909,40 @@ impl<'w> Reach<'w> {
             .filter(|h| self.now(w.site_count() + h, 0))
             .fold(0, |a, h| a | w.half(h).0);
         if m == 0 { o.none_owned_mask } else { m }
+    }
+}
+
+#[cfg(test)]
+impl Reach<'_> {
+    /// The first difference between two states of one world and plan, value for value and
+    /// rank for rank (not only the fixed point), or `None`.
+    pub(crate) fn differs(&self, o: &Self) -> Option<&'static str> {
+        let grows = |r: &Self| -> Vec<Vec<(u32, u64, u32)>> {
+            r.grows.iter().map(|g| g.iter().map(|g| (g.rank, g.bits, g.why)).collect()).collect()
+        };
+        [
+            (self.counts != o.counts, "counts"),
+            (self.counters != o.counters, "counters"),
+            (self.groups != o.groups, "groups"),
+            (self.atoms != o.atoms, "atoms"),
+            (self.masks != o.masks, "masks"),
+            (self.reached.words() != o.reached.words(), "reached"),
+            (self.holds != o.holds, "holds"),
+            (self.away != o.away, "away"),
+            (self.seen.words() != o.seen.words(), "seen"),
+            (self.done.words() != o.done.words(), "done"),
+            (self.fired != o.fired, "fired"),
+            (self.half_rank != o.half_rank, "half_rank"),
+            (self.loc_rank != o.loc_rank, "loc_rank"),
+            (self.copies != o.copies, "copies"),
+            (self.lit != o.lit, "lit"),
+            (self.adjust != o.adjust, "adjust"),
+            (self.owned != o.owned, "owned"),
+            (grows(self) != grows(o), "grows"),
+            (!self.idle() || !o.idle(), "queues"),
+        ]
+        .into_iter()
+        .find_map(|(differs, what)| differs.then_some(what))
     }
 }
 

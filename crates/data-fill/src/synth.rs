@@ -438,6 +438,67 @@ mod tests {
         }
     }
 
+    /// The same pin with the rooms forced onto the split path.
+    #[test]
+    fn the_pinned_placements_are_the_same_on_the_split_path() {
+        let out = pinned(Some(Path::Split));
+        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// The split path reaches every round's state by adding to one solve and taking the
+    /// additions back; that state is the least fixed point a fresh solve of the round gives,
+    /// so it must decide everything exactly as the forward path and truth maintenance do:
+    /// placements, spheres, attempts, rounds, what is reached, or the error. Rooms of 1 to 12
+    /// players; both profiles, clocks on and off, a high progression share; excluded and
+    /// locked locations, start items, confined items; fills that are stuck on every attempt
+    /// and fills that need a retry (an attempt that ends in the middle of the rounds).
+    #[test]
+    fn the_split_path_places_what_a_solve_per_round_places() {
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let dense = Shape { progression: 0.7, ..small(true) };
+        let cases = [
+            (small(false), ""),
+            (small(true), "confined"),
+            (small(false), "excluded+locked+start"),
+            (heavy, ""),
+            (heavy, "confined+excluded+locked+start"),
+            (dense, "excluded"),
+            (dense, "confined+locked"),
+            (small(true), "cramped"),
+        ];
+        let (mut rooms, mut stuck, mut retried, mut undone) = (0, 0, 0, 0);
+        for (shape, what) in cases {
+            for players in [1u64, 2, 3, 8, 12] {
+                let c = room_with(&shape, 23, players, |p, inst| change(what, p, inst)).unwrap();
+                for seed in 1..=4 {
+                    let at = format!("{what:?}, {players} players, seed {seed}");
+                    let (split, _, _) = outcome(&c, seed, Path::Split);
+                    assert_eq!(split, outcome(&c, seed, Path::Forward { workers: 1 }).0, "{at}");
+                    assert_eq!(split, outcome(&c, seed, Path::Carry).0, "{at}");
+                    rooms += 1;
+                    stuck += u32::from(split.is_err());
+                    retried += u32::from(split.is_ok_and(|x| x.2 > 1));
+                    let mut rng = SpecRng::from_u64(seed);
+                    let filled =
+                        fill_room_on(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, Path::Split);
+                    undone += filled.map_or(0, |f| f.0.profile.undone);
+                }
+            }
+        }
+        // As much progression as locations that take it: stuck at first, filled on a later
+        // attempt, with the same draws on every path.
+        let tight = Shape { progression: 0.5, ..small(true) };
+        for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
+            let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
+            let (split, _, _) = outcome(&c, seed, Path::Split);
+            assert_eq!(split, outcome(&c, seed, Path::Carry).0, "{players} players, seed {seed}");
+            retried += u32::from(split.is_ok_and(|x| x.2 > 1));
+        }
+        assert_eq!(rooms, 160);
+        assert!(stuck > 0 && retried == 4, "{stuck} stuck, {retried} retried");
+        assert!(undone > 100_000, "{undone} journal steps undone");
+    }
+
     /// Rule nodes of a rule in the manifest's JSON: one per object, plus its list operands.
     fn nodes(rule: &Value) -> usize {
         let inner = |v: &Value| v.as_array().map_or(0, |a| a.iter().map(nodes).sum());

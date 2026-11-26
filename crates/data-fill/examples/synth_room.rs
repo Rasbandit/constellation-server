@@ -1,5 +1,5 @@
 //! `synth_room [--profile light|heavy|wide] [--rules bits|bytecode] [--absent skip|check]
-//! [--path auto|carry|forward] [--workers 4]
+//! [--path auto|carry|forward|split] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
@@ -247,9 +247,13 @@ fn one(
     let work = s.summary(1, u64::from(f.solves));
     let mut out = json!({
         "players": players,
-        "path": if path == Path::Carry { "carry" } else { "forward" },
+        "path": match path {
+            Path::Carry => "carry",
+            Path::Forward { .. } => "forward",
+            Path::Split => "split",
+        },
         "workers": match path {
-            Path::Carry => 1,
+            Path::Carry | Path::Split => 1,
             Path::Forward { workers } => workers,
         },
         "solves": f.solves,
@@ -299,6 +303,7 @@ fn one(
     out["rounds_profile"] = json!({
         "world_solves": r.solved, "changed_share": share(r.changed),
         "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
+        "undone": r.undone, "journal_peak": r.journaled,
     });
     out["bit_rules_ms"] = json!(fine(bit_rules_ms));
     out["fill_reps"] = json!(reps);
@@ -348,7 +353,8 @@ fn main() -> Result<(), String> {
         "auto" => None,
         "carry" => Some(Path::Carry),
         "forward" => Some(Path::Forward { workers }),
-        x => return Err(format!("--path: auto, carry or forward, got {x}")),
+        "split" => Some(Path::Split),
+        x => return Err(format!("--path: auto, carry, forward or split, got {x}")),
     };
     let mode_arg = arg(&args, "--mode", "exact".to_owned())?;
     let mode: Algorithm = mode_arg.parse()?;
