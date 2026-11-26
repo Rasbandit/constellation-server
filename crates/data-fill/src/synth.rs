@@ -507,7 +507,7 @@ mod tests {
         assert!(size / 137 >= 15, "{} nodes per rule site", size / 137);
         for players in [1, 3] {
             let c = room(&shape, 1, players, 1).unwrap();
-            let classes = c.plans[0].bit_rules().0;
+            let classes = c.plans[0].bit_rules(&c.worlds[0]).0;
             assert!(classes[2] > 15 && classes[4] > 30, "counted and bytecode rules: {classes:?}");
             let plain = Compiled {
                 plans: c.plans.iter().cloned().map(crate::Plan::interpreted).collect(),

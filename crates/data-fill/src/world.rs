@@ -10,6 +10,7 @@ use bits::{BitSet, PackedRef, bytes_for, read};
 use seed_bundle::package::{SECTION_GAME, SECTION_RULES, stored};
 use serde_json::Value;
 
+use crate::bitrules::Bits;
 use crate::section::{
     self, CMP_OPS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths, node, sub,
 };
@@ -139,6 +140,8 @@ pub struct World {
     groups: (List, List, List),
     /// Per item, the groups it is a member of and its cap there (computed at load).
     item_groups: (Vec<u32>, Vec<(u16, u16)>),
+    /// The rules as bit rules, where they fit (computed at load).
+    bits: Bits,
 }
 
 const ITEMS: usize = 0;
@@ -357,6 +360,7 @@ impl World {
             loc_ids,
             groups: (g_starts, g_items, g_caps),
             item_groups: (Vec::new(), Vec::new()),
+            bits: Bits::clone(&crate::bitrules::NONE),
             game,
             rules: Vec::new(),
         };
@@ -373,6 +377,7 @@ impl World {
         });
         w.hot.time_dep = td;
         w.check_index(&mut memo)?;
+        w.bits = Bits::of(&w);
         for k in [ITEMS, LOCS, N_REGIONS] {
             let mut v: Vec<u16> = (0..u16::try_from(w.names[k].spans.len()).unwrap_or(0)).collect();
             let bytes = if k == N_REGIONS { &w.rules } else { &w.game };
@@ -830,6 +835,11 @@ impl World {
         PackedRef::from_bytes(self.rules.get(l.at..).unwrap_or_default(), l.width, l.len)
             .and_then(|p| p.get(i))
             .unwrap_or(0)
+    }
+
+    /// The rules as bit rules.
+    pub(crate) fn bits(&self) -> &Bits {
+        &self.bits
     }
 
     pub(crate) fn code(&self) -> &[u8] {

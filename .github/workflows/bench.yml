@@ -160,14 +160,14 @@ jobs:
                 | "| \($b.mode) | \($b.path) | \($b.players) | \($b.fill_ms) | \($m.fill_ms) | \($a.fill_ms) | \(if $a.fill_ms > 0 then ($b.fill_ms / $a.fill_ms * 100 | round) / 100 else "n/a" end) | \($b.rule_evals) | \($a.rule_evals) | \($a.rule_evals_ranked) | \($a.rule_evals_bits) | \($b.ns_per_eval) | \($m.ns_per_eval) | \($a.ns_per_eval) | \($b.eval_only.nothing_held.ns_per_eval) / \($b.eval_only.all_held.ns_per_eval) | \($a.eval_only.nothing_held.ns_per_eval) / \($a.eval_only.all_held.ns_per_eval) | \($b.peak_heap_bytes) | \($a.peak_heap_bytes) |"' bench-room.jsonl
             done
             echo
-            echo "#### Rule sites per class, first player's world (counted when the seed's plan is built)"
+            echo "#### Rule sites per class, first player's world (counted when the world is loaded)"
             echo
-            echo "Constant: decided by the seed's options and start items. Plain: an AND/OR of has-item, event-fired and region-reached. Counted: the same with a count above one or a sum of counts. Timed: either with a time window. Bytecode: any other shape, or more than \`config::RULE_BITS_MAX_TERMS\` terms."
+            echo "Constant: no atom a solve can change (a constant, or options only). Plain: an AND/OR of has-item, event-fired and region-reached. Counted: the same with a count above one or a sum of counts. Timed: either with a time window. Bytecode: any other shape, or more than \`config::RULE_BITS_MAX_TERMS\` terms."
             echo
-            echo "| profile | rule sites | constant | plain | counted | timed | bytecode | bit rule bytes per player | absent locations' check sites (skipped) | regions | never reachable | always-open exits | regions entered only by one open exit |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "| profile | rule sites | constant | plain | counted | timed | bytecode | bit rule bytes per world (counted) | atom set bytes per player | absent locations' check sites (skipped) | regions | never reachable | always-open exits | regions entered only by one open exit |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
             jq -r -s '[.[] | select(.players != null and .rules == "bits" and .absent == "skip")] | group_by(.profile)[] | .[0] | .rules_report as $r
-              | "| \(.profile) | \($r.rule_sites) | \($r.classes.constant) | \($r.classes.plain) | \($r.classes.counted) | \($r.classes.timed) | \($r.classes.bytecode) | \($r.bit_rule_bytes) | \($r.absent_check_sites) | \($r.regions) | \($r.unreachable_regions) | \($r.always_open_exits) | \($r.regions_entered_only_by_one_open_exit) |"' bench-room.jsonl
+              | "| \(.profile) | \($r.rule_sites) | \($r.classes.constant) | \($r.classes.plain) | \($r.classes.counted) | \($r.classes.timed) | \($r.classes.bytecode) | \($r.bit_rule_bytes_per_world) | \($r.atom_set_bytes_per_player) | \($r.absent_check_sites) | \($r.regions) | \($r.unreachable_regions) | \($r.always_open_exits) | \($r.regions_entered_only_by_one_open_exit) |"' bench-room.jsonl
             echo
             echo "#### One region of deep rules (profile wide: 131 checks and 6 events in one region, carried path)"
             echo

@@ -18,8 +18,8 @@ use std::collections::BinaryHeap;
 
 use bits::BitSet;
 
+use crate::bitrules::{Bits, COUNTER, GROUP, ITEM, REGION, STATIC};
 use crate::fill::Plan;
-use crate::fold::{COUNTER, GROUP, ITEM, REGION};
 use crate::section::{CHECKS, EVENTS, EXITS, Node, STAYS, compare, node, operand};
 use crate::world::World;
 
@@ -254,6 +254,16 @@ impl<V: View> Env<'_, V> {
 
 /// Evaluate an option-only rule (no state) for a seed's option and roll values.
 pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> bool {
+    eval_statics(w, opts, rolls, [rule])[0]
+}
+
+/// [`eval_static`] for several rules.
+pub(crate) fn eval_statics(
+    w: &World,
+    opts: &[i32],
+    rolls: &[i16],
+    rules: impl IntoIterator<Item = u32>,
+) -> Vec<bool> {
     let defs: Vec<u32> = (0..w.defs()).map(|d| w.def(d)).collect();
     let env = Env {
         w,
@@ -266,7 +276,7 @@ pub(crate) fn eval_static(w: &World, opts: &[i32], rolls: &[i16], rule: u32) -> 
         epoch: 1,
         memo: &DefMemo::new(w.defs()),
     };
-    env.eval(rule as usize, 0)
+    rules.into_iter().map(|rule| env.eval(rule as usize, 0)).collect()
 }
 
 /// The held count of `item` from which no rule this seed reads more copies: with at least that
@@ -523,8 +533,10 @@ pub struct Reach<'w> {
     pub counters: Vec<i64>,
     /// Item group sums (capped copies), kept up to date as items are added.
     groups: Vec<i64>,
-    /// One bit per atom of the plan's bit rules: whether it holds now. Kept up to date with
-    /// `counts`, `counters`, `groups` and `masks`.
+    /// The bit rules this state answers by ([`Plan::rules`]).
+    rules: &'w Bits,
+    /// One bit per atom of the bit rules: whether it holds now. Kept up to date with `counts`,
+    /// `counters`, `groups` and `masks`; the option atoms are the plan's.
     atoms: Vec<u64>,
     /// Time mask per region; 0 means not reached.
     pub masks: Vec<u64>,
@@ -624,7 +636,8 @@ impl<'w> Reach<'w> {
                 .map(|c| Vec::with_capacity(w.sites_into(EVENTS, c).len()))
                 .collect(),
             groups: vec![0; w.groups()],
-            atoms: vec![0; plan.folded.bits.words()],
+            rules: plan.rules(w),
+            atoms: plan.atoms.clone(),
             masks: vec![0; n],
             reached: BitSet::new(w.locations()),
             holds: vec![None; w.locations()],
@@ -702,7 +715,7 @@ impl<'w> Reach<'w> {
         self.counts.fill(0);
         self.counters.fill(0);
         self.groups.fill(0);
-        self.atoms.fill(0);
+        self.atoms.copy_from_slice(&self.plan.atoms);
         self.masks.fill(0);
         self.reached.clear();
         self.holds.fill(None);
@@ -982,7 +995,7 @@ impl<'w> Reach<'w> {
         let before = self.counts[i];
         let after = before + n;
         self.counts[i] = after;
-        let bits = &self.plan.folded.bits;
+        let bits = self.rules;
         bits.set(&mut self.atoms, ITEM, i, after);
         for &(g, cap) in self.w.item_groups(i) {
             let (g, cap) = (usize::from(g), i64::from(cap));
@@ -993,13 +1006,15 @@ impl<'w> Reach<'w> {
 
     /// Whether every atom bit says what the values it is kept from say.
     fn atoms_agree(&self) -> bool {
-        self.plan.folded.bits.atoms.iter().enumerate().all(|(bit, a)| {
+        self.rules.atoms.iter().enumerate().all(|(bit, a)| {
             let i = usize::from(a.idx);
-            let v = match a.kind {
+            let v = match usize::from(a.kind) {
                 ITEM => self.counts[i],
                 COUNTER => self.counters[i],
                 GROUP => self.groups[i],
-                _ => i64::from(self.masks[i] != 0),
+                REGION => i64::from(self.masks[i] != 0),
+                // An option atom: the seed decided it, no value of the state moves it.
+                _ => return usize::from(a.kind) == STATIC,
             };
             (self.atoms[bit / 64] >> (bit % 64) & 1 == 1) == (v >= i64::from(a.n))
         })
@@ -1319,7 +1334,7 @@ impl<'w> Reach<'w> {
             }
             EVENTS => {
                 self.counters[t] -= 1;
-                self.plan.folded.bits.set(&mut self.atoms, COUNTER, t, self.counters[t]);
+                self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
                 if let Ok(at) = self.lit[t].binary_search(&was) {
                     self.lit[t].remove(at);
                 }
@@ -1383,7 +1398,7 @@ impl<'w> Reach<'w> {
     fn retract_bits(&mut self, r: usize, lost: u64, k: u32) {
         let w = self.w;
         self.masks[r] &= !lost;
-        self.plan.folded.bits.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
+        self.rules.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
         if !self.tm.lost_flag.contains(r) {
             self.tm.lost_flag.insert(r);
             self.tm.lost.push(u32::try_from(r).unwrap_or(0));
@@ -1561,7 +1576,7 @@ impl<'w> Reach<'w> {
 
     /// Whether fact `f` holds now, in a region of mask `t`: by its bit rule, or its bytecode.
     fn now(&self, f: usize, t: u64) -> bool {
-        match self.plan.folded.bits.holds(&self.atoms, f, t) {
+        match self.rules.holds(&self.atoms, f, t) {
             Some(v) => v,
             None => self.env().eval(self.rule(f) as usize, t),
         }
@@ -1570,7 +1585,7 @@ impl<'w> Reach<'w> {
     /// [`Reach::now`] for site `s`, counted as a rule evaluation.
     fn eval(&mut self, s: usize, t: u64) -> bool {
         self.stats.evals += 1;
-        let v = self.plan.folded.bits.holds(&self.atoms, s, t);
+        let v = self.rules.holds(&self.atoms, s, t);
         self.stats.bits += u64::from(v.is_some());
         v.unwrap_or_else(|| self.env().eval(self.rule(s) as usize, t))
     }
@@ -1600,7 +1615,7 @@ impl<'w> Reach<'w> {
         let rank = self.next();
         self.grows[r].push(Grow { rank, bits: new, why });
         self.masks[r] |= new;
-        self.plan.folded.bits.set(&mut self.atoms, REGION, r, 1);
+        self.rules.set(&mut self.atoms, REGION, r, 1);
     }
 
     fn grow(&mut self, r: u32, m: u64, why: u32) {
@@ -1666,7 +1681,7 @@ impl<'w> Reach<'w> {
             EVENTS => {
                 let c = target as usize;
                 self.counters[c] += 1;
-                self.plan.folded.bits.set(&mut self.atoms, COUNTER, c, self.counters[c]);
+                self.rules.set(&mut self.atoms, COUNTER, c, self.counters[c]);
                 let at = self.lit[c].partition_point(|x| *x < k);
                 self.lit[c].insert(at, k);
                 if w.def_reads_counter(c) {

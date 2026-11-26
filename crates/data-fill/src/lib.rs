@@ -1,6 +1,7 @@
 //! Experiment: fill and reachability for a data-only world (doc 07), no world code at
 //! generation time. See `docs/data-only-world-experiment.md` for the format extensions it reads.
 
+mod bitrules;
 pub mod check;
 pub mod decode;
 pub mod fairness;
@@ -20,8 +21,8 @@ pub mod spheres;
 pub mod synth;
 pub mod world;
 
+pub use bitrules::CLASSES as RULE_CLASSES;
 pub use fill::{FillError, Filled, Instance, Plan, fill, fill_spheres, validate};
-pub use fold::CLASSES as RULE_CLASSES;
 pub use reach::{Reach, Stats};
 pub use room::{Given, RoomFilled, Seat, fill_room, fill_room_spheres};
 pub use world::World;
