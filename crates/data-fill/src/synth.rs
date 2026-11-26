@@ -613,6 +613,38 @@ mod tests {
         assert!(swaps > 0, "no shuffle needed a swap");
     }
 
+    /// Rooms where a round moves several items: a move that lands in its owner's own world is
+    /// counted at once, and the moves after it in the round must see the same reached
+    /// locations whether the checks of empty locations sleep or not.
+    #[test]
+    fn skipping_empty_checks_places_the_same_in_rooms_of_several_moves_a_round() {
+        use crate::room::{Algorithm, Dials, fill_room_by};
+        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
+        let (mut rooms, mut moved) = (0, 0);
+        for (shape, players) in [(small(false), 3), (small(true), 4), (heavy, 3), (heavy, 6)] {
+            let c = room(&shape, 23, players, 1).unwrap();
+            let seats = c.seats();
+            for seed in 1..=40 {
+                let run = |skip_empty| {
+                    let mode = Algorithm::Shuffle(Dials { skip_empty, ..Dials::default() });
+                    let mut rng = SpecRng::from_u64(seed);
+                    fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, Path::Carry, mode)
+                        .map(|x| (x.0.placed, x.0.swaps, x.0.fast, x.1))
+                        .map_err(|e| format!("{e:?}"))
+                };
+                let (with, without) = (run(true), run(false));
+                assert_eq!(
+                    with, without,
+                    "{players} players, clocks {}, seed {seed}",
+                    shape.clocks
+                );
+                rooms += 1;
+                moved += with.map_or(0, |x| x.1);
+            }
+        }
+        assert!(moved > rooms / 2, "{moved} moves in {rooms} rooms: too few to test rounds");
+    }
+
     /// The point of the mode: far fewer rule evaluations than a solve per round, and the same
     /// seed for the same draws.
     #[test]

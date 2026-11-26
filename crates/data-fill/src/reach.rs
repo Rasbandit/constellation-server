@@ -746,19 +746,23 @@ impl<'w> Reach<'w> {
         }
     }
 
-    /// Whether location `l` is reached, evaluating its sleeping checks now. A location that is
-    /// not reached sleeps on.
+    /// Whether location `l` is reached, evaluating now every check of it that has not held:
+    /// the sleeping ones, and the awake ones too, which may be waiting in the queue for an item
+    /// counted since the last run (the answer must not depend on which they are). A location
+    /// that was asleep and is not reached sleeps on.
     pub(crate) fn probe(&mut self, l: u32) -> bool {
-        let (w, mut woken) = (self.w, false);
+        let (w, mut slept) = (self.w, false);
         for &s in w.sites_into(CHECKS, l as usize) {
             let s = s as usize;
-            if !self.reached(l) && self.done.contains(s) && self.fired[s] == NONE {
-                self.done.remove(s);
+            if !self.reached(l) && self.fired[s] == NONE {
+                if self.done.contains(s) {
+                    self.done.remove(s);
+                    slept = true;
+                }
                 self.site(s);
-                woken = true;
             }
         }
-        if woken && !self.reached(l) {
+        if slept && !self.reached(l) {
             self.doze(l as usize);
         }
         self.reached(l)
