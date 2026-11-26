@@ -69,15 +69,17 @@ jobs:
           for rules in bits bytecode; do
             bench --profile wide --path carry --workers 1 --rules "$rules" --players 1,10
           done
-          if [ "$FULL" = on ]; then
-            # A room as the server generates it: every player on one world, prepared once and
-            # loaded from its stored form, on one thread, on the path a room of that size takes.
-            # Its peak RSS covers the per-player rows above too: the mark never falls.
-            for profile in light heavy; do
-              bench \
-                --profile "$profile" --path auto --workers 1 --worlds one \
+          # The split path (`data_fill::room::Path::Split`) next to the forward path, same rooms
+          # and seed: a world per player, and a room as the server generates it, every player on
+          # one world, prepared once and loaded from its stored form (`--worlds one`), on both.
+          for profile in light heavy; do
+            bench --profile "$profile" --path split --workers 1 --players "$PLAYERS" --checks "$CHECKS"
+            for path in forward split; do
+              bench --profile "$profile" --path "$path" --workers 1 --worlds one \
                 --players "$PLAYERS" --checks "$CHECKS"
             done
+          done
+          if [ "$FULL" = on ]; then
             for profile in light heavy; do for run in "forward 4"; do
               read -r path workers <<< "$run"
               bench \
@@ -141,6 +143,16 @@ jobs:
             | [$pairs[] | select((.f | length) != 1 or .c.placements_hash != .f[0].placements_hash)
                | "\(.c.profile) \(.c.players) \(.c.rules) \(.c.absent)"]
             | if length == 0 then true else error("paths differ, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The split path places what the forward path places, a world per player and one world.
+          jq -s -e '
+            [.[] | select(.players != null and .mode == "exact" and .workers == 1 and .rules == "bits" and .absent == "skip")] as $rows
+            | [$rows[] | select(.path == "split") | . as $s
+               | {s: $s, f: [$rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world
+                                               and .players == $s.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no split row") else . end
+            | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
+               | "\(.s.profile) \(.s.world) \(.s.players)"]
+            | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-room.jsonl
       # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
       # on the two small fixture worlds against uniform beatable placements. Full size only on a
       # dispatch with `full` on; every other run draws few seeds of three modes, enough to fail
@@ -205,6 +217,18 @@ jobs:
                 | ($rows[] | select(.rules == "bits" and .absent == "skip" and .path == $b.path and .mode == $b.mode and .players == $b.players)) as $a
                 | "| \($b.mode) | \($b.path) | \($b.players) | \($b.fill_ms) | \($m.fill_ms) | \($a.fill_ms) | \(if $a.fill_ms > 0 then ($b.fill_ms / $a.fill_ms * 100 | round) / 100 else "n/a" end) | \($b.rule_evals) | \($a.rule_evals) | \($a.rule_evals_ranked) | \($a.rule_evals_bits) | \($b.ns_per_eval) | \($m.ns_per_eval) | \($a.ns_per_eval) | \($b.eval_only.nothing_held.ns_per_eval) / \($b.eval_only.all_held.ns_per_eval) | \($a.eval_only.nothing_held.ns_per_eval) / \($a.eval_only.all_held.ns_per_eval) | \($b.peak_heap_bytes) | \($a.peak_heap_bytes) |"' bench-room.jsonl
             done
+            echo
+            echo "#### The split path against the forward path (same runner, same run, one thread, exact fill, same placements)"
+            echo
+            echo "Forward: a fresh solve of every world per round. Split: one solve, then every round's state by adding to it and taking the additions back. World each: a world per player; one: every player on one world, as the server generates a room. Fill ms are measured (median of the fill reps; of 2 once a fill takes over a second); rule evals, journal steps undone and the journal's peak are counted; peak heap is measured for one fill on the calling thread."
+            echo
+            echo "| profile | world | players | fill ms forward | split | forward / split | rule evals forward | split | settle ms forward | split | journal steps undone | per world and round | journal peak steps per player | peak heap bytes per player forward | split |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players != null and .mode == "exact" and .workers == 1 and .rules == "bits" and .absent == "skip")] as $rows
+              | $rows[] | select(.path == "split") as $s
+              | ($rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world and .players == $s.players)) as $f
+              | "| \($s.profile) | \($s.world) | \($s.players) | \($f.fill_ms) | \($s.fill_ms) | \(if $s.fill_ms > 0 then ($f.fill_ms / $s.fill_ms * 100 | round) / 100 else "n/a" end) | \($f.rule_evals) | \($s.rule_evals) | \($f.rounds_profile.settle_ms) | \($s.rounds_profile.settle_ms) | \($s.rounds_profile.undone) | \($s.rounds_profile.undone / $s.rounds_profile.world_solves | round) | \($s.rounds_profile.journal_peak / $s.players | round) | \(if $f.peak_heap_bytes then ($f.peak_heap_bytes / $f.players | round) else "n/a" end) | \(if $s.peak_heap_bytes then ($s.peak_heap_bytes / $s.players | round) else "n/a" end) |"' bench-room.jsonl
             echo
             echo "#### Loading a world with and without its bit rules (measured; the engine as it is, forward path)"
             echo
