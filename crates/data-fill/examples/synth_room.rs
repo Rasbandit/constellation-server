@@ -1,13 +1,25 @@
 //! `synth_room [--profile light|heavy] [--path auto|carry|forward] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
-//! `setup_ms` draws, compiles and resolves every player's world. `fill_ms` is the median of
-//! `reps` fills of the same seed (the work is identical, so the spread is timing noise only).
+//! What is done once per world version is timed apart from what every seed pays. Once per
+//! world: `prepare_ms` compiles every world of the room into its stored ready form
+//! ([`data_fill::prepared::build`], on one thread), and `load_ms` loads those stored forms
+//! ([`Prepared::open`]). Per seed: `setup_ms` resolves every player's instance against their
+//! loaded world (on `--workers` threads; drawing the synthetic manifests is not timed), and
+//! `fill_ms` is the median of `reps` fills of the same seed (the work is identical, so the
+//! spread is timing noise only).
+//!
+//! `--worlds each` (the default) draws a world per player, the scaling measurement; `--worlds
+//! one` is a room as the server generates it, every player on one world, loaded once. Only
+//! then is a seed assembled: `assemble_ms` builds the bundle on the prepared tables
+//! ([`data_fill::seed::assemble_on`]), `encode_ms` checks, hashes and encodes it as the seed
+//! file ([`data_fill::seed::encode_on`]), and `import_v1_ms` is what the path before did in
+//! its place (the bundle as JSON text, then `seed_bundle::import_v1`); medians of `reps`.
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
 //! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
 //! is left out: read it from a `--workers 1` run); without the feature, `null`.
@@ -21,8 +33,11 @@
 
 use std::time::Instant;
 
+use data_fill::prepared::{Prepared, build};
 use data_fill::room::{Algorithm, Compiled, Path, cross_world_share, fill_room_by};
-use data_fill::synth::{Shape, room};
+use data_fill::seed::{Player, assemble_on, encode_on};
+use data_fill::synth::{Shape, world};
+use data_fill::{Instance, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
@@ -61,16 +76,58 @@ fn peak_rss() -> Option<u64> {
     kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
+/// The median of `reps` timings of `f`, and every timing, ascending (ms).
+fn median(
+    reps: usize,
+    mut f: impl FnMut() -> Result<(), String>,
+) -> Result<(f64, Vec<f64>), String> {
+    let mut times = Vec::with_capacity(reps.max(1));
+    for _ in 0..reps.max(1) {
+        let t = Instant::now();
+        f()?;
+        times.push(ms(t));
+    }
+    times.sort_by(f64::total_cmp);
+    Ok((times[times.len() / 2], times))
+}
+
+/// To a hundredth of a millisecond.
+fn fine(ms: f64) -> f64 {
+    (ms * 100.0).round() / 100.0
+}
+
+/// The seed cap of the encodes here.
+const SEED_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
+
 fn one(
     shape: &Shape,
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers, mode): (Option<Path>, usize, Algorithm),
+    (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
 ) -> Result<Value, String> {
     let path = path.unwrap_or(Path::of(players, workers));
+    let count = if one_world { 1 } else { players };
+    let drawn: Vec<(Value, Instance)> = (0..count as u64)
+        .map(|p| {
+            let (mut manifest, instance) = world(shape, seed, p);
+            manifest["game"] = json!("Synth");
+            (manifest, instance)
+        })
+        .collect();
     let t = Instant::now();
-    let c: Compiled = room(shape, seed, players, config::FILL_SETUP_WORKERS)?;
+    let files: Vec<Vec<u8>> =
+        drawn.iter().map(|(m, _)| build(m).map(|b| b.0)).collect::<Result<_, _>>()?;
+    let prepare_ms = ms(t);
+    let t = Instant::now();
+    let loaded: Vec<Prepared> =
+        files.iter().map(|f| Prepared::open(f)).collect::<Result<_, _>>()?;
+    let load_ms = ms(t);
+    let insts: Vec<&Instance> = (0..players).map(|p| &drawn[p % count].1).collect();
+    // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
+    let t = Instant::now();
+    let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
+    let c = Compiled::resolve(worlds, &insts, workers)?;
     let setup_ms = ms(t);
     let seats = c.seats();
     let fill = || {
@@ -82,15 +139,32 @@ fn one(
     if !f.all_beatable() {
         return Err(format!("{players} players: not beatable: {:?}", f.beatable));
     }
-    let mut times: Vec<f64> = (0..reps.max(1))
-        .map(|_| {
-            let t = Instant::now();
-            drop(fill());
-            ms(t)
-        })
-        .collect();
-    times.sort_by(f64::total_cmp);
-    let fill_ms = times[times.len() / 2];
+    let (fill_ms, times) = median(reps, || {
+        drop(fill());
+        Ok(())
+    })?;
+    // The seed of a room on one world, on the tables its world was prepared with.
+    let mut seed_row = json!({});
+    if let (true, Some(on)) = (one_world, loaded.first()) {
+        let named: Vec<Player> = (0..players)
+            .map(|p| Player { name: format!("P{p}"), instance: drawn[0].1.clone() })
+            .collect();
+        let assemble = || assemble_on(on, "bench", &named, &seats, &f.placed, &sp);
+        let bundle = assemble()?;
+        let seed_file = encode_on(on, &bundle, SEED_MAX_BYTES)?;
+        let (assemble_ms, _) = median(reps, || assemble().map(drop))?;
+        let (encode_ms, _) = median(reps, || encode_on(on, &bundle, SEED_MAX_BYTES).map(drop))?;
+        let (import_v1_ms, _) = median(reps, || {
+            let text = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
+            let (old, _) = seed_bundle::import_v1(&text, SEED_MAX_BYTES)?;
+            if old.bytes() != seed_file {
+                return Err("the seed file differs from the v1 import's".to_owned());
+            }
+            Ok(())
+        })?;
+        seed_row = json!({"assemble_ms": fine(assemble_ms), "encode_ms": fine(encode_ms),
+                          "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len()});
+    }
     let (crossed, all) = cross_world_share(&seats, &f.placed)
         .map_err(|e| format!("{e:?}"))?
         .iter()
@@ -107,6 +181,13 @@ fn one(
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks,
+        "world": if one_world { "one" } else { "each" },
+        "worlds": count,
+        "prepare_ms": fine(prepare_ms),
+        "load_ms": fine(load_ms),
+        "prepared_bytes": files.iter().map(Vec::len).sum::<usize>(),
+        "loaded_bytes": loaded.iter().map(Prepared::held_bytes).sum::<usize>(),
+        "seed": seed_row,
         "setup_ms": (setup_ms * 10.0).round() / 10.0,
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
@@ -176,6 +257,11 @@ fn main() -> Result<(), String> {
     };
     let mode_arg = arg(&args, "--mode", "exact".to_owned())?;
     let mode: Algorithm = mode_arg.parse()?;
+    let one_world = match arg(&args, "--worlds", "each".to_owned())?.as_str() {
+        "each" => false,
+        "one" => true,
+        x => return Err(format!("--worlds: each or one, got {x}")),
+    };
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?
@@ -184,7 +270,7 @@ fn main() -> Result<(), String> {
         .collect::<Result<_, _>>()?;
     let mut points = Vec::new();
     for n in players {
-        let mut row = one(&shape, seed, n, reps, (path, workers, mode))?;
+        let mut row = one(&shape, seed, n, reps, (path, workers, mode, one_world))?;
         row["profile"] = json!(profile);
         row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
@@ -194,6 +280,7 @@ fn main() -> Result<(), String> {
     println!(
         "{}",
         json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
+               "world": if one_world { "one" } else { "each" },
                "fitted_exponent": fitted, "points": points})
     );
     Ok(())

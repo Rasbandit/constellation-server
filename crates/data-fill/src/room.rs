@@ -143,8 +143,16 @@ impl Compiled {
         Self::resolve(vec![world], insts, workers)
     }
 
-    /// Resolve each player's instance against their world (`worlds`: one each, or one for all).
-    fn resolve(worlds: Vec<World>, insts: &[&Instance], workers: usize) -> Result<Self, String> {
+    /// Resolve each player's instance against their world (`worlds`, already loaded: one each,
+    /// or one for all), on up to `workers` threads.
+    ///
+    /// # Errors
+    /// As [`plans`].
+    pub fn resolve(
+        worlds: Vec<World>,
+        insts: &[&Instance],
+        workers: usize,
+    ) -> Result<Self, String> {
         let world = |p: usize| &worlds[p % worlds.len().max(1)];
         let pairs: Vec<(&World, &Instance)> =
             insts.iter().enumerate().map(|(p, i)| (world(p), *i)).collect();
