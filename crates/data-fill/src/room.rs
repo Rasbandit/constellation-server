@@ -1652,7 +1652,7 @@ pub(crate) fn assert_fast(
             assert_eq!(g.is_some(), here, "{what}: location {l} of player {p}");
             if let Some(g) = g {
                 // Confined items are placed before either mode, the same for the same draws
-                // (the exact fill lets one sit on an excluded location of its group).
+                // (the exact fill lets one sit on an excluded location of its group, see #203).
                 let shared = exact.placed[usize::from(p)][l as usize] == Some(*g)
                     && seats[usize::from(g.to)].plan.confined(g.item);
                 assert!(shared || permits(seats, *g, p, l), "{what}: {g:?} at {l} of player {p}");
