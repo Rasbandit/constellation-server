@@ -332,12 +332,20 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// text (local and test builds).
 pub const PREPARED_WORLD_LAYOUT: u16 = 1;
 
-/// Most bytes of prepared world files whose loaded worlds one pooled fill worker keeps between
-/// jobs (`server::pool`), the least recently used going first. Counted by the file a world
-/// was loaded from, not by what the loaded world holds in memory: the `bench` CI job measures
-/// a worker's resident memory with the cache full. The worker's address-space cap
+/// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
+/// (`server::pool`), the least recently used going first. A loaded world is counted as its
+/// prepared file's length times [`PREPARED_HELD_PER_FILE_BYTE`], an estimate; the `bench` CI
+/// job measures a worker's resident memory with the cache full. The worker's address-space cap
 /// (`fill_memory_bytes`) is the hard bound either way (design value, from issue 200).
 pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes a loaded prepared world holds in memory per byte of its file, rounded: what
+/// [`PREPARED_CACHE_BYTES`] counts a kept world by. Estimated from one measurement (bench run
+/// 45907973588, a release build on a CI runner): a worker's resident memory grew by 278 MB
+/// while it came to keep about 468 heavy synthetic worlds of 1,000 checks, 71,687 file bytes
+/// each, which is 8.3 per file byte, memory its fills left unused included. The counts taken
+/// before the pool (issue 200: 0.23 MB and 0.46 MB a world) are 8.4 and 6.4 per file byte.
+pub const PREPARED_HELD_PER_FILE_BYTE: usize = 8;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. A room's fill runs on one thread on
@@ -1129,7 +1137,7 @@ mod tests {
         let l = Limits::DESIGN;
         assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (1, 256));
         assert_eq!(l.fill_pool_workers, l.gen_concurrency, "never more workers than busy jobs");
-        assert_eq!(PREPARED_CACHE_BYTES, 32 << 20);
+        assert_eq!((PREPARED_CACHE_BYTES, PREPARED_HELD_PER_FILE_BYTE), (32 << 20, 8));
         assert!(Limits { fill_pool_workers: 0, ..l }.check().is_ok(), "zero turns the pool off");
         let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
         assert!(e.contains("fill_worker_jobs"), "{e}");

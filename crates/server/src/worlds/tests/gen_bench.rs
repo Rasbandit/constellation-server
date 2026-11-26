@@ -243,8 +243,8 @@ async fn by_pool(exe: &Path, profile: &str, shape: &Shape, players: usize, seed:
 
 /// A worker's resident memory as its cache fills: one worker (never replaced here, so this is
 /// the most a worker can come to hold) fills one player on world after world until the files
-/// of the worlds it was sent pass `config::PREPARED_CACHE_BYTES` and the cache has begun to
-/// drop the oldest. Every world is the heavy world of the rows above under another game name:
+/// of the worlds it was sent, counted as the cache counts them, pass
+/// `config::PREPARED_CACHE_BYTES` and the cache has begun to drop the oldest. Every world is the heavy world of the rows above under another game name:
 /// another file and key, loaded apart, and a fill that is known to succeed (a refusal would
 /// end the worker). A debug build stops after a few worlds.
 async fn memory(exe: &Path) -> Value {
@@ -259,7 +259,8 @@ async fn memory(exe: &Path) -> Value {
     let (mut worlds, mut sent, mut file_bytes) = (0_usize, 0_usize, 0);
     let (mut pid, mut rss_one_world) = (0, 0);
     // A tenth past the cap, so the cache is full and has dropped worlds.
-    while sent <= full + full / 10 && worlds < most {
+    let counted = |sent: usize| sent * config::PREPARED_HELD_PER_FILE_BYTE;
+    while counted(sent) <= full + full / 10 && worlds < most {
         manifest["game"] = json!(format!("Synth {worlds}"));
         let out = data_fill::job::prepare(manifest.to_string().as_bytes()).unwrap();
         let (_, file) = data_fill::job::unframe(&out).unwrap();
@@ -276,7 +277,9 @@ async fn memory(exe: &Path) -> Value {
     json!({
         "bench": "gen-memory", "profile": "heavy", "checks": shape.checks, "worlds": worlds,
         "bytes_per_prepared_file": file_bytes, "prepared_bytes_sent": sent,
-        "cache_cap_bytes": full, "cache_full": sent > full,
+        "cache_cap_bytes": full, "counted_per_file_byte": config::PREPARED_HELD_PER_FILE_BYTE,
+        "worlds_kept": worlds.min(full / counted(file_bytes).max(1)),
+        "cache_full": counted(sent) > full,
         "rss_one_world_bytes": rss_one_world, "rss_full_cache_bytes": rss(pid),
     })
 }

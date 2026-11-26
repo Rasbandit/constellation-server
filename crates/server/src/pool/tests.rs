@@ -39,6 +39,11 @@ fn roomy() -> Cache<Loaded> {
     Cache::new(config::PREPARED_CACHE_BYTES)
 }
 
+/// What a kept world loaded from `file` counts against the cap.
+fn held(file: &[u8]) -> usize {
+    file.len() * config::PREPARED_HELD_PER_FILE_BYTE
+}
+
 fn kept(worlds: &Cache<Loaded>) -> Vec<BlobKey> {
     let mut keys: Vec<BlobKey> = worlds.held.keys().copied().collect();
     keys.sort_unstable();
@@ -122,7 +127,7 @@ fn a_job_gets_nothing_of_the_jobs_before_it() {
     let mut both = [x.0, y.0];
     both.sort_unstable();
     assert_eq!(kept(&worlds), both);
-    assert_eq!(worlds.used, x.1.len() + y.1.len());
+    assert_eq!(worlds.used, held(&x.1) + held(&y.1));
 }
 
 /// A file is kept only under the key it hashes to: sent under another world's key it ends the
@@ -181,7 +186,7 @@ fn kept_worlds_stay_under_the_cap_and_the_least_recently_used_goes_first() {
     };
     let script = [cold(&hx, &x), cold(&hy, &y), cold(&hx, &x)].concat();
     let miss_done = [Kind::Miss, Kind::Done];
-    for (cap, left) in [(x.1.len() + y.1.len() - 1, vec![x.0]), (0, vec![])] {
+    for (cap, left) in [(held(&x.1) + held(&y.1) - 1, vec![x.0]), (0, vec![])] {
         let mut worlds = Cache::new(cap);
         let (ended, answers) = scripted(&script, &mut worlds);
         assert_eq!(ended, Ok(()), "cap {cap}");

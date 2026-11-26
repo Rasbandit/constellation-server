@@ -2,7 +2,7 @@
 //! take one fill after another, so a generation pays neither a process start nor, for a world
 //! its worker filled lately, the load of the prepared world (#200). Generation still never
 //! runs in the serving process: a worker is this executable in job mode, started through
-//! [`job_argv`] exactly as a one-job child is, so under the same caps (address space, CPU
+//! `job_argv` exactly as a one-job child is, so under the same caps (address space, CPU
 //! seconds, open files, no file writes, the process brake) and with an empty environment.
 //!
 //! What a job keeps of the one-process path:
@@ -10,9 +10,9 @@
 //!   with the same message; the next job gets a fresh worker.
 //! - **CPU.** The CPU cap is the worker's for its whole life, so no job can use more than a
 //!   one-job child could. A worker is replaced before the cap could end a job that did nothing
-//!   wrong ([`has_cpu_left`]).
+//!   wrong (`has_cpu_left`).
 //! - **Memory.** The address-space cap is the worker's too: a job gets it less what the worker
-//!   holds (its kept worlds, at most `config::PREPARED_CACHE_BYTES` of prepared files, and what
+//!   holds (its kept worlds, about `config::PREPARED_CACHE_BYTES` at most, and what
 //!   earlier fills left fragmented, bounded by replacing the worker every `fill_worker_jobs`).
 //!   A job past it ends the worker and fails alone.
 //! - **Any failure ends the worker.** A refusal, a broken pipe, a worker that stopped or
@@ -21,7 +21,7 @@
 //!   here (`gen_concurrency`, `gen_queue_max`).
 //!
 //! What a worker holds between two jobs, and nothing else: its loaded prepared worlds
-//! ([`serve`]'s cache), each under the hash of the file it was loaded from, checked by the
+//! (`serve`'s cache), each under the hash of the file it was loaded from, checked by the
 //! worker itself before it keeps one. A world is immutable and depends only on an uploaded
 //! manifest and the engine; a fill reads it and never writes to it. A job's request (the
 //! players, their options, the seed) and its seed are dropped when the job answers. So a job
@@ -29,10 +29,10 @@
 //! fill answers), which the manifest listing shows anyway.
 //!
 //! The pipe: one message is a kind (1 byte), its body's length (4 bytes, little endian) and
-//! the body. The server sends [`Kind::Job`], a `data_fill::job::frame` of the fill request and
-//! the world's key. The worker answers [`Kind::Done`] (the seed file), [`Kind::Refused`] (why,
-//! as text) or, once, [`Kind::Miss`]: it does not hold that world, and the server sends it as
-//! [`Kind::World`]. Each side treats the other's bytes as untrusted: lengths are capped, a kind
+//! the body. The server sends `Kind::Job`, a `data_fill::job::frame` of the fill request and
+//! the world's key. The worker answers `Kind::Done` (the seed file), `Kind::Refused` (why,
+//! as text) or, once, `Kind::Miss`: it does not hold that world, and the server sends it as
+//! `Kind::World`. Each side treats the other's bytes as untrusted: lengths are capped, a kind
 //! out of turn ends the worker, and a world that does not hash to its key is never loaded.
 
 use crate::cache::{Cache, Held};
@@ -83,7 +83,8 @@ fn announced(header: [u8; 5]) -> Result<(Kind, usize), String> {
     Ok((kind, u32::from_le_bytes(len) as usize))
 }
 
-/// A loaded world, counted against the cache's cap by the file it was loaded from.
+/// A loaded world, counted against the cache's cap by the file it was loaded from: an
+/// estimate of what it holds in memory (`config::PREPARED_HELD_PER_FILE_BYTE`).
 #[derive(Debug)]
 struct Loaded {
     world: Prepared,
@@ -92,7 +93,7 @@ struct Loaded {
 
 impl Held for Loaded {
     fn held_bytes(&self) -> usize {
-        self.file_bytes
+        self.file_bytes.saturating_mul(config::PREPARED_HELD_PER_FILE_BYTE)
     }
 }
 
