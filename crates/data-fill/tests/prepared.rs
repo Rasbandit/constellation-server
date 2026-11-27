@@ -7,7 +7,7 @@
 use data_fill::job::{self, Fill};
 use data_fill::prepared::{self, Prepared};
 use data_fill::room::{Algorithm, Dials};
-use data_fill::seed::{Player, generate, generate_by};
+use data_fill::seed::{Player, encode_on, generate, generate_by, generate_on};
 use data_fill::synth::{Shape, world};
 use seed_bundle::package::key_of;
 use serde_json::{Value, json};
@@ -246,10 +246,15 @@ fn the_fill_prints_a_seed_file_with_the_hash_of_its_bundle() {
 /// A room of three players on one world, each instance changed as `what` says (the changes
 /// the fill's own path test uses): start items, excluded locations, locked locations.
 fn varied(shape: &Shape, what: &str) -> (Value, Vec<Player>) {
+    varied_of(shape, what, 3)
+}
+
+/// [`varied`] with `n` players.
+fn varied_of(shape: &Shape, what: &str, n: usize) -> (Value, Vec<Player>) {
     let (mut manifest, instance) = world(shape, 1, 0);
     manifest["game"] = json!("Synth");
     manifest["version"] = json!("1");
-    let players = (0..3)
+    let players = (0..n)
         .map(|p| {
             let mut i = instance.clone();
             if what.contains("start") {
@@ -259,7 +264,7 @@ fn varied(shape: &Shape, what: &str) -> (Value, Vec<Player>) {
             if what.contains("excluded") {
                 // A sixth of the locations take no progression; other ones for each player.
                 i.excluded = (0..i.locations.len())
-                    .filter(|l| l % 6 == p)
+                    .filter(|l| l % 6 == p % 6)
                     .map(|l| format!("l{l}"))
                     .collect();
             }
@@ -319,4 +324,41 @@ fn the_prepared_path_matches_on_start_items_excluded_and_locked_locations_and_fi
         }
     }
     assert!(made >= 40, "most of the 45 rooms fill: {made}");
+}
+
+/// The seed file `seed::encode_on` writes, against the bundle's JSON text read back as an
+/// uploaded bundle is (`seed_bundle::import_v1`, which hashes the text as a JSON tree,
+/// `seed_bundle::bundle_hash`): the same bytes, hash and package at 1, 10 and 100 players, on
+/// plain rooms, with start items, excluded and locked locations, and on a world with shuffled
+/// doors. Fails if the hash written without a tree, or a slot found by index, differs.
+#[test]
+fn the_encoded_seed_is_the_import_of_its_json_at_1_10_and_100_players() {
+    let plain = Shape { checks: 60, layers: 3, ..Shape::default() };
+    let doors = Shape { doors: true, timeless: true, ..plain };
+    let mut made = 0;
+    for (shape, what) in [(&plain, ""), (&plain, "start+excluded+locked"), (&doors, "shuffled")] {
+        for n in [1, 10, 100] {
+            let (m, p) = varied_of(shape, what, n);
+            let (_, file) = prepared(&m);
+            let on = Prepared::open(&file).unwrap();
+            let (mut bundle, _) =
+                generate_on(&on, "s", &p, 1, 1, Algorithm::Exact).expect("the room fills");
+            assert_eq!(m["shuffles"].is_object(), what == "shuffled");
+            let text = serde_json::to_string(&bundle).unwrap();
+            let (old, packages) = seed_bundle::import_v1(text.as_bytes(), MAX).unwrap();
+            let new = encode_on(&on, &mut bundle, MAX).unwrap();
+            assert!(new == old.bytes(), "{what}, {n} players: the seed files differ");
+            assert_eq!(packages, [prepared::seed_game(&file).unwrap()], "{what}, {n} players");
+            let hash = seed_bundle::bundle_hash(&text).unwrap();
+            assert_eq!(seed_bundle::v2::bundle_hash_of(&new).unwrap()[..], hash[..]);
+            assert_eq!(bundle.hash().unwrap()[..], hash[..], "{what}, {n} players");
+            assert_eq!(
+                serde_json::to_string(&bundle).unwrap(),
+                text,
+                "the bundle is left as it was"
+            );
+            made += 1;
+        }
+    }
+    assert_eq!(made, 9);
 }
