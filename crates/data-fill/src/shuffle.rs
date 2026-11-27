@@ -164,7 +164,7 @@ impl Bound {
         stream: &dyn Fn(&str) -> R<SpecRng>,
     ) -> Result<Staged, Fail> {
         let mut table = Table::new();
-        // Wall time of each step, for the bench: five clock reads an attempt.
+        // Wall time of each step, for the bench: six clock reads an attempt.
         let (mut nanos, mut at) = ([0u64; STEPS.len()], Instant::now());
         let mut lap = |step: usize| {
             let now = Instant::now();
@@ -194,9 +194,9 @@ impl Bound {
             lap(4);
             return Ok(Staged { world, plan, table, attempts: 1, nanos });
         };
-        let mut rng = stream(LAYOUT).map_err(Fail::Hard)?;
+        let (mut rng, mut pairs) = (stream(LAYOUT).map_err(Fail::Hard)?, Vec::new());
         let exits = layout
-            .grow(&self.decl, &mut rng, w.start as usize, &mut table)
+            .grow(&self.decl, &mut rng, w.start as usize, &mut pairs)
             .map_err(|why| Fail::Attempt(self.names(true), why))?;
         lap(1);
         let world = w.staged(&exits);
@@ -206,6 +206,9 @@ impl Bound {
         let checked = whole_world(&world, &plan);
         lap(4);
         let Err(why) = checked else {
+            // Only a layout that passed is written out by name.
+            Layout::record(&self.decl, pairs, &mut table);
+            lap(5);
             return Ok(Staged { world, plan, table, attempts: 1, nanos });
         };
         // Is the layout at fault? The same seed with every exit where the manifest has it.
@@ -273,8 +276,8 @@ pub struct Staged {
 
 /// The steps of one attempt, as [`Staged::nanos`] times them: the `none` draws, the joint
 /// layout solve, making the seed's world, resolving the instance on it (which a world without
-/// shuffles pays too), and the whole-world check.
-pub const STEPS: [&str; 5] = ["draws", "layout", "world", "plan", "check"];
+/// shuffles pays too), the whole-world check, and writing the layout's table by name.
+pub const STEPS: [&str; 6] = ["draws", "layout", "world", "plan", "check", "table"];
 
 /// Run the shuffles of `w` for `player` (from 0) of the room seeded `seed`. `None` for a world
 /// that declares no shuffle: nothing is drawn and the caller fills it as before. The same

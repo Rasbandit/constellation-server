@@ -459,9 +459,23 @@ impl Shuffle {
 
     /// Whether the permission table lets `thing` go to `slot`: the one reading of the table.
     pub(super) fn allows(&self, slot: usize, thing: usize) -> bool {
-        let k = slot * self.things.len() + thing;
-        thing < self.things.len()
-            && self.allowed.get(k / 64).is_some_and(|w| w >> (k % 64) & 1 == 1)
+        self.row(slot, thing / 64) >> (thing % 64) & 1 == 1
+    }
+
+    /// The same reading 64 things at a time: bit `j` is whether thing `64 * word + j` may go
+    /// to `slot`, and 0 past the last thing.
+    pub(super) fn row(&self, slot: usize, word: usize) -> u64 {
+        let (m, from) = (self.things.len(), word * 64);
+        if from >= m {
+            return 0;
+        }
+        let k = slot * m + from;
+        let at = |i: usize| self.allowed.get(i).copied().unwrap_or(0);
+        let bits = match k % 64 {
+            0 => at(k / 64),
+            shift => at(k / 64) >> shift | at(k / 64 + 1) << (64 - shift),
+        };
+        if m - from < 64 { bits & ((1 << (m - from)) - 1) } else { bits }
     }
 }
 

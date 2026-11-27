@@ -1,7 +1,7 @@
 //! The joint layout solve: every exit the `layout` shuffles of one world list, connected in
 //! one growth from the start region (doc 17 section 4.5).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use spec_rng::SpecRng;
 
@@ -21,9 +21,12 @@ struct Door {
     /// Where it leads in the unshuffled game.
     target: usize,
     shuffle: usize,
-    /// Its position among its shuffle's slots, and the first door of that shuffle.
+    /// Its position among its shuffle's slots, the first door of that shuffle, and the first
+    /// word of that shuffle in the sets of things [`Layout::grow`] keeps (bit `local` from
+    /// there is this door as a thing).
     local: usize,
     first: usize,
+    word: usize,
     /// For a door side of a coupled shuffle: the far side's site and exit.
     partner: Option<(usize, usize)>,
     /// Index in [`Layout::behind`].
@@ -43,7 +46,15 @@ pub(super) struct Layout {
     behind: Vec<Vec<u16>>,
     /// Per region: how many doors it reaches by fixed exits.
     opens: Vec<u32>,
+    /// Per region: the things that lead to it, as bits of the sets of things.
+    into: Vec<Vec<usize>>,
+    /// The set of things that lead to a region with a door in reach (`opens` above 0), and
+    /// the words a set of things has.
+    live: Vec<u64>,
 }
+
+/// One connection of a growth: the shuffle, the slot's exit and the thing's exit.
+pub(super) type Pair = (usize, usize, usize);
 
 impl Layout {
     /// The layout of `decl`'s `layout` shuffles on world `w`, whose keyed exits are at `sites`
@@ -56,8 +67,10 @@ impl Layout {
         let mut doors = Vec::new();
         // Sites a shuffle writes: its slots, and the far sides that follow.
         let mut moved = HashSet::new();
+        let mut words = 0;
         for (shuffle, sh) in decl.shuffles.iter().enumerate().filter(|x| x.1.layout) {
-            let first = doors.len();
+            let (first, word) = (doors.len(), words);
+            words += sh.exits.len().div_ceil(64);
             for (local, exit) in sh.exits.iter().copied().enumerate() {
                 let (site, region, target) = sites[exit];
                 let partner = decl.exits[exit].partner.filter(|_| sh.coupled);
@@ -73,6 +86,7 @@ impl Layout {
                     shuffle,
                     local,
                     first,
+                    word,
                     partner,
                     behind,
                 });
@@ -135,7 +149,13 @@ impl Layout {
             }
             behind[d.behind].iter().for_each(|r| opens[usize::from(*r)] += 1);
         }
-        let layout = Layout { doors, fixed, doors_in, behind, opens };
+        let (mut into, mut live) = (vec![Vec::new(); regions], vec![0u64; words]);
+        for d in &doors {
+            let bit = d.word * 64 + d.local;
+            into[d.target].push(bit);
+            live[bit / 64] |= u64::from(opens[d.target] > 0) << (bit % 64);
+        }
+        let layout = Layout { doors, fixed, doors_in, behind, opens, into, live };
         layout.listed_from_the_near_side(w, decl)?;
         Ok(Some(layout))
     }
@@ -168,7 +188,8 @@ impl Layout {
     /// The joint layout solve: grow from the start, each step connecting one open door in a
     /// region already placed to an allowed thing, preferring a branch that leads to a new
     /// region, then a dead end that leads to a new region, then anything allowed. Returns
-    /// every exit site it wrote with its new target, and records the result in `table`.
+    /// every exit site it wrote with its new target, and lists what it connected in `pairs`
+    /// ([`Layout::record`] names them).
     ///
     /// The preference is also the look-ahead of doc 17 section 4.5 step 4: when the door
     /// being connected is the last open one, a thing that opens another door is in the first
@@ -178,77 +199,102 @@ impl Layout {
     /// met there is left to the whole-world check, which runs the real solver on the result
     /// (growing a running solve exit by exit: see #211). The far side of a coupled door
     /// follows its near side whatever its own group is.
+    ///
+    /// The things still to choose from are kept as three sets, a bit per thing: not yet used,
+    /// leading to a region not yet placed, and leading to a region with an open door in
+    /// reach. A step reads its candidates from them a word at a time, in the order of the
+    /// things, so it costs the words of its shuffle and not its things.
     pub(super) fn grow(
         &self,
         decl: &Decl,
         rng: &mut SpecRng,
         start: usize,
-        table: &mut Table,
+        pairs: &mut Vec<Pair>,
     ) -> Result<Vec<(usize, u32)>, String> {
         let n = self.doors.len();
         let key = |d: &Door| decl.exits[d.exit].key.as_str();
         let mut placed = vec![false; self.fixed.len()];
         let mut opens = self.opens.clone();
-        let mut used = vec![false; n];
+        let (mut free, mut fresh) =
+            (vec![u64::MAX; self.live.len()], vec![u64::MAX; self.live.len()]);
+        let mut live = self.live.clone();
+        // Take the things that lead to region `r` out of a set.
+        let drop = |set: &mut [u64], r: usize| {
+            self.into[r].iter().for_each(|bit| set[bit / 64] &= !(1 << (bit % 64)));
+        };
         // Open doors in placed regions.
         let mut open: Vec<usize> = Vec::new();
         let mut out = Vec::with_capacity(2 * n);
-        let reach = |from: usize, placed: &mut Vec<bool>, open: &mut Vec<usize>| {
-            let mut stack = vec![from];
-            while let Some(r) = stack.pop() {
-                if std::mem::replace(&mut placed[r], true) {
-                    continue;
+        let reach =
+            |from: usize, placed: &mut Vec<bool>, open: &mut Vec<usize>, fresh: &mut [u64]| {
+                let mut stack = vec![from];
+                while let Some(r) = stack.pop() {
+                    if std::mem::replace(&mut placed[r], true) {
+                        continue;
+                    }
+                    drop(fresh, r);
+                    open.extend_from_slice(&self.doors_in[r]);
+                    stack.extend(self.fixed[r].iter().map(|t| usize::from(*t)));
                 }
-                open.extend_from_slice(&self.doors_in[r]);
-                stack.extend(self.fixed[r].iter().map(|t| usize::from(*t)));
-            }
-        };
-        reach(start, &mut placed, &mut open);
-        let mut candidates = Vec::new();
+            };
+        reach(start, &mut placed, &mut open, &mut fresh);
+        let ones = |bits: u64| usize::try_from(bits.count_ones()).unwrap_or(0);
         for _ in 0..n {
             let Some(k) = pick(rng, open.len()) else {
                 return Err("exits are left in regions the layout cannot reach".to_owned());
             };
             let x = &self.doors[open.swap_remove(k)];
             let sh = &decl.shuffles[x.shuffle];
-            let near = &self.behind[x.behind];
-            let mut best = 3;
-            for (t, thing) in self.doors.iter().enumerate().skip(x.first).take(sh.slots.len()) {
-                if used[t] || !sh.allows(x.local, thing.local) {
-                    continue;
-                }
-                let to = thing.target;
-                // The door being connected is no longer one the new region opens.
-                let own = near.binary_search(&u16::try_from(to).unwrap_or(u16::MAX)).is_ok();
-                let tier = match (placed[to], opens[to] > u32::from(own)) {
-                    (false, true) => 0,
-                    (false, false) => 1,
-                    (true, _) => 2,
-                };
-                if tier < best {
-                    best = tier;
-                    candidates.clear();
-                }
-                if tier == best {
-                    candidates.push(t);
+            // The door being connected is no longer one a region opens.
+            for r in self.behind[x.behind].iter().map(|r| usize::from(*r)) {
+                opens[r] -= 1;
+                if opens[r] == 0 {
+                    drop(&mut live, r);
                 }
             }
-            let Some(t) = pick(rng, candidates.len()).map(|k| candidates[k]) else {
+            // Word `i` of the allowed free things of one tier: a branch to a new region, a
+            // dead end to a new region, anything.
+            let tier = |i: usize, tier: usize| {
+                let (allowed, at) = (sh.row(x.local, i), x.word + i);
+                allowed & free[at] & [fresh[at] & live[at], fresh[at] & !live[at], !fresh[at]][tier]
+            };
+            let words = 0..sh.slots.len().div_ceil(64);
+            let count = |t: usize| words.clone().map(|i| ones(tier(i, t))).sum::<usize>();
+            let best = (0..3).find(|t| count(*t) > 0).unwrap_or(2);
+            // The candidate drawn, counted in the order of the things.
+            let mut skip = pick(rng, count(best));
+            let local = words.clone().find_map(|i| {
+                let (mut bits, k) = (tier(i, best), skip?);
+                if let Some(rest) = k.checked_sub(ones(bits)) {
+                    skip = Some(rest);
+                    return None;
+                }
+                (0..k).for_each(|_| bits &= bits - 1);
+                Some(i * 64 + usize::try_from(bits.trailing_zeros()).unwrap_or(0))
+            });
+            let Some(thing) = local.and_then(|j| self.doors.get(x.first + j)) else {
                 return Err(format!("no allowed thing is left for exit {:?}", key(x)));
             };
-            let thing = &self.doors[t];
-            used[t] = true;
-            let row = table.entry(sh.name.clone()).or_default();
-            row.insert(key(x).to_owned(), key(thing).to_owned());
+            free[x.word + thing.local / 64] &= !(1 << (thing.local % 64));
+            pairs.push((x.shuffle, x.exit, thing.exit));
             out.push((x.site, u32::try_from(thing.target).unwrap_or(0)));
             // Coupled: the far side of where this door now leads comes back here.
             if let (Some((site, far)), Some(own)) = (thing.partner, decl.exits[x.exit].partner) {
                 out.push((site, u32::try_from(x.region).unwrap_or(0)));
-                row.insert(decl.exits[far].key.clone(), decl.exits[own].key.clone());
+                pairs.push((x.shuffle, far, own));
             }
-            near.iter().for_each(|r| opens[usize::from(*r)] -= 1);
-            reach(thing.target, &mut placed, &mut open);
+            reach(thing.target, &mut placed, &mut open, &mut fresh);
         }
         Ok(out)
+    }
+
+    /// Write what a growth connected into `table`: per shuffle, slot key to thing key.
+    pub(super) fn record(decl: &Decl, mut pairs: Vec<Pair>, table: &mut Table) {
+        let key = |exit: usize| decl.exits[exit].key.clone();
+        pairs.sort_unstable();
+        for of_shuffle in pairs.chunk_by(|a, b| a.0 == b.0) {
+            let row: BTreeMap<_, _> = of_shuffle.iter().map(|p| (key(p.1), key(p.2))).collect();
+            table.entry(decl.shuffles[of_shuffle[0].0].name.clone()).or_default().extend(row);
+        }
     }
 }
