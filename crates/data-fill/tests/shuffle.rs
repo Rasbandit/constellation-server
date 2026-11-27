@@ -805,6 +805,65 @@ fn the_results_of_fixed_seeds_are_pinned() {
     assert_eq!(got, ["a4521a4a03bded05", "7e7645c7fd61def5", "7b5053b20fdcc435"]);
 }
 
+/// A staged world is an ordinary world to every way the room fill places its rounds: taking
+/// items back (carried), a fresh forward solve per round, and the split path with its journal
+/// all read the seed's exits and the seed's `none` results, and decide the same placements and
+/// spheres. Hand-written and synthetic worlds, an entrance shuffle and a `none` shuffle, 1 and
+/// 10 players, 30 seeds each. A room of worlds without shuffles staged through the same call
+/// fills as it does resolved directly.
+#[test]
+fn a_shuffled_room_fills_the_same_on_the_carried_forward_and_split_paths() {
+    use data_fill::room::{Compiled, Path, fill_room_on};
+    let fill = |c: &Compiled, seed: u64, path: Path| {
+        let mut rng = SpecRng::from_u64(seed);
+        let (f, sp) = fill_room_on(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path)
+            .unwrap_or_else(|e| panic!("seed {seed}, {path:?}: {e:?}"));
+        assert!(f.all_beatable(), "seed {seed}, {path:?}");
+        (f.placed, sp, f.attempts)
+    };
+    let doors_shape =
+        Shape { checks: 60, layers: 3, doors: true, timeless: true, ..Shape::default() };
+    let guards_shape = Shape { checks: 60, layers: 3, guards: true, ..Shape::heavy() };
+    let mut both = guardians();
+    both["entrances"] = entrances()["entrances"].clone();
+    let worlds = [
+        doors(),
+        manifest(doors_regions(), both),
+        synth_world(&Shape { branching: 1, ..doors_shape }, 3, 0),
+        synth_world(&doors_shape, 4, 0),
+        synth_world(&guards_shape, 7, 0),
+    ];
+    let (mut rooms, mut layouts) = (0, BTreeSet::new());
+    for (m, inst) in &worlds {
+        let w = World::load(m).unwrap();
+        for players in [1usize, 10] {
+            let insts = vec![inst; players];
+            for seed in 1..=30 {
+                let (c, tables) = room(&[&w], &insts, seed, 1).unwrap();
+                let carried = fill(&c, seed, Path::Carry);
+                for path in
+                    [Path::Forward { workers: 1 }, Path::Forward { workers: 4 }, Path::Split]
+                {
+                    assert_eq!(carried, fill(&c, seed, path), "{players} players, seed {seed}");
+                }
+                rooms += 1;
+                layouts.insert(format!("{tables:?}"));
+            }
+        }
+    }
+    assert!(rooms == 300 && layouts.len() > 200, "{rooms} rooms, {} layouts", layouts.len());
+    // Without shuffles nothing is staged: the same room as resolving it directly.
+    let (m, inst) = synth_world(&Shape { checks: 60, layers: 3, ..Shape::default() }, 5, 0);
+    let w = World::load(&m).unwrap();
+    let insts = vec![&inst; 10];
+    let direct = Compiled::shared(w.clone(), &insts, 1).unwrap();
+    let (staged, tables) = room(&[&w], &insts, 9, 1).unwrap();
+    assert!(tables.iter().all(|t| t.is_empty()));
+    for path in [Path::Carry, Path::Split] {
+        assert_eq!(fill(&direct, 9, path), fill(&staged, 9, path), "{path:?}");
+    }
+}
+
 /// The comparison form: the same world with every exit where the manifest has it.
 #[test]
 fn the_unshuffled_form_of_a_world_keeps_every_exit_and_passes_the_same_check() {
