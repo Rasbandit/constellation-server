@@ -219,7 +219,12 @@ fn a_bare_no_progression_ends_before_key_and_was() {
     ok(&world("region a {\n  check c\n  event was: true\n}"));
     let all =
         errors(&world("def key = true\nregion a {\n  check c no_progression key\n}")).join("\n");
-    assert!(all.contains("a def cannot be named `key`"), "{all}");
+    assert!(
+        all.contains("expected the ledger key (`key` always starts one here) in quotes"),
+        "{all}"
+    );
+    let all = errors(&world("region a {\n  check c no_progression no_progression\n}")).join("\n");
+    assert!(all.contains("`no_progression` is given twice"), "{all}");
     // So no def may be named a modifier word: a rule could never read it there.
     for (decl, what) in [
         ("def key = true", "a def"),

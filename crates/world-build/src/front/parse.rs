@@ -767,7 +767,7 @@ impl P<'_> {
     fn ident(&mut self, key: &mut Option<At<String>>, was: &mut Option<At<String>>) -> R<bool> {
         if self.ctx("key") {
             self.k += 1;
-            *key = Some(self.string("the ledger key in quotes (a def cannot be named `key`)")?);
+            *key = Some(self.string("the ledger key (`key` always starts one here)")?);
         } else if self.ctx("was") {
             self.k += 1;
             *was = Some(self.name("the old name")?);
@@ -906,9 +906,13 @@ impl P<'_> {
                         c.holds = Some(self.tname("an item")?);
                     } else if self.ctx("no_progression") {
                         let at = self.here();
+                        if c.no_progression.is_some() {
+                            return Err((at, "`no_progression` is given twice".into()));
+                        }
                         self.k += 1;
-                        // A modifier word after it starts the next modifier, not a rule (no def
-                        // or event may take one of these names, so it is never a rule here).
+                        // A modifier word after it starts the next modifier, not a rule: no def
+                        // may take one of these names, and an event is state, which
+                        // `no_progression` never reads.
                         let next = CHECK_MODIFIERS.iter().any(|w| self.ctx(w));
                         let r = if self.rule_starts() && !next {
                             Some(self.rule(depth)?)
