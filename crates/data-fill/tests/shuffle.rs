@@ -505,7 +505,6 @@ fn a_prepared_world_carries_its_shuffles_through_the_child_jobs() {
         players: p,
         rng_seed: 9,
         workers: 1,
-        algorithm: data_fill::room::Algorithm::Exact,
         seed_max_bytes: 1 << 24,
     };
     let seed = fill(&frame(&serde_json::to_vec(&head).unwrap(), file).unwrap()).unwrap();

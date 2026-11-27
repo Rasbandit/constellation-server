@@ -1,6 +1,5 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
-//! [--path auto|carry|forward|split] [--workers 4]
-//! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]|drawn|deepest|repaired|single] [--players 1,10,20,50,100]
+//! [--path auto|carry|forward|split] [--workers 4] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
@@ -71,15 +70,11 @@
 //!
 //! `--failed-row`: a room whose fill ends in an error (stuck on every attempt) prints
 //! `{"room": players, "failed": error, ...}` instead of ending the run with that error.
-//!
-//! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
-//! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
-//! fallbacks, and the rule evaluations of the mode's own solves.
 
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by, plans};
+use data_fill::room::{Compiled, Path, Seat, cross_world_share, fill_room_on, plans};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
@@ -176,7 +171,7 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
+    (path, workers, one_world): (Option<Path>, usize, bool),
     (bits, skip, vanilla): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
@@ -268,7 +263,7 @@ fn one(
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path)
     };
     let t = Instant::now();
     let (first, heap) = peak(fill);
@@ -373,13 +368,9 @@ fn one(
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
-        "placed_by_the_mode": mode.dials().is_none() || f.fast,
-        // The same hash in two rows means the same placements (the `noskip` rows against theirs).
+        // The same hash in two rows means the same placements.
         "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
-        "repairs": f.repairs,
         "swaps": f.swaps,
-        "fallbacks": f.fallbacks,
-        "mode_rule_evals": f.mode_evals,
         "peak_heap_bytes": heap,
         "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
@@ -400,7 +391,7 @@ fn one(
         seats.iter().map(|s| data_fill::capacity::early(s.w, s.plan)).collect();
     out["capacity_ms"] = json!(fine(t.elapsed().as_secs_f64() * 1e3));
     out["capacity_lowest"] = json!(ratios.into_iter().flatten().reduce(f64::min));
-    // The exact fill's repairs in the attempt that placed the seed, and the restarts before it.
+    // The fill's repairs in the attempt that placed the seed, and the restarts before it.
     out["divided"] = json!(f.divided);
     out["repair_evals"] = json!(f.repair_evals);
     out["restarts"] = json!(f.attempts - 1);
@@ -497,8 +488,6 @@ fn main() -> Result<(), String> {
         "split" => Some(Path::Split),
         x => return Err(format!("--path: auto, carry, forward or split, got {x}")),
     };
-    let mode_arg = arg(&args, "--mode", "exact".to_owned())?;
-    let mode: Algorithm = mode_arg.parse()?;
     let one_world = match arg(&args, "--worlds", "each".to_owned())?.as_str() {
         "each" => false,
         "one" => true,
@@ -521,27 +510,26 @@ fn main() -> Result<(), String> {
     // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
     let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let row = one(&shapes, seed, n, reps, (path, workers, mode, one_world), engine);
+        let row = one(&shapes, seed, n, reps, (path, workers, one_world), engine);
         let mut row = match row {
             Err(e) if failed_row => {
                 println!(
                     "{}",
                     json!({"room": n, "profile": profile, "path": path_arg, "seed": seed,
-                           "mode": mode_arg, "failed": e})
+                           "failed": e})
                 );
                 continue;
             }
             row => row?,
         };
         row["profile"] = json!(profile);
-        row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
     }
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
+        json!({"profile": profile, "path": path_arg, "workers": workers,
                "rules": if engine.0 { "bits" } else { "bytecode" },
                "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },

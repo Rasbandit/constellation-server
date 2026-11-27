@@ -6,19 +6,16 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::fairness::{
-    FILLS, Flat, OTHER_FILLS, report, report_named, sample, sample_room, sample_room_by, shape,
-    shape_report,
-};
-use data_fill::room::{self, Algorithm};
+use data_fill::fairness::{Flat, report, report_named, sample, sample_room, shape, shape_report};
+use data_fill::room;
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: fill-fairness (--world <world.json> | --manifest <m.json> --instance <i.json>)
     [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]
-  or, to compare fill modes on one room (the exact fill is always the reference):
+  or, for the shape of the fill's seeds on one room:
     fill-fairness (--world <world.json> | --synth light|heavy|mixed [--players N] [--checks N] [--room-seed S])
-    --modes \"exact level level,depth=100 shuffle,goal\" [--reference MODE] [--seeds N] [--required N] [--baseline N]";
+    --shape on [--seeds N] [--required N] [--baseline N]";
 
 fn read(p: &str) -> Result<Value, String> {
     serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?)
@@ -37,8 +34,8 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     let num = |k: &str, d: u64| {
         m.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|e| format!("{k}: {e}")))
     };
-    if let Some(modes) = m.get("--modes") {
-        return modes_report(modes, &m, &num);
+    if m.get("--shape") == Some(&"on") {
+        return shape_of(&m, &num);
     }
     // A room: `--world` with an `instances` list is one world played by several players.
     if let Some(w) = m.get("--world") {
@@ -91,12 +88,10 @@ fn room_report(
     finish(r, s.failed == 0, t, m)
 }
 
-/// Every mode of `--modes` over the same room and the same fill seeds (another stream than the
-/// exact fill reference's): its shape (spheres, where
-/// progression lies, waiting, required spheres for the first `--required` seeds), its distance
-/// from the exact fill, and with `--baseline N` (a small world) from N uniform beatable rooms.
-fn modes_report(
-    modes: &str,
+/// The fill's seeds over one room: their shape (spheres, where progression lies, waiting,
+/// required spheres for the first `--required` seeds), and with `--baseline N` (a small world)
+/// their distance from N uniform beatable rooms.
+fn shape_of(
     m: &HashMap<&str, &str>,
     num: &dyn Fn(&str, u64) -> Result<u64, String>,
 ) -> Result<(Value, bool), String> {
@@ -137,28 +132,13 @@ fn modes_report(
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
     let t = Instant::now();
     let err = |e| format!("{e:?}");
-    // The reference is the exact fill (or `--reference`) on one stream of seeds; every row, a
-    // row of the reference's own mode too, is filled on another, so its distance from the
-    // reference is between independent samples and that row is the noise floor.
-    let reference: Algorithm = m.get("--reference").map_or(Ok(Algorithm::Exact), |r| r.parse())?;
-    let exact = shape(&seats, (seeds, FILLS), reference, 0).map_err(err)?;
-    let mut rows = Vec::new();
-    for name in modes.split_whitespace() {
-        let mode: Algorithm = name.parse()?;
-        let s = shape(&seats, (seeds, OTHER_FILLS), mode, required).map_err(err)?;
-        let mut row = shape_report(&s, Some(&exact));
-        row["mode"] = json!(name);
-        if baseline > 0 {
-            let sampled = sample_room_by(&seats, &flat, (seeds, baseline, max_attempts), mode)
-                .map_err(err)?;
-            row["against_uniform"] =
-                report_named(&|i| flat.item(i), &|l| flat.loc(l), &sampled)["baseline"].clone();
-        }
-        rows.push(row);
+    let mut out = shape_report(&shape(&seats, seeds, required).map_err(err)?);
+    if baseline > 0 {
+        let sampled = sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(err)?;
+        out["against_uniform"] =
+            report_named(&|i| flat.item(i), &|l| flat.loc(l), &sampled)["baseline"].clone();
     }
-    let reference = m.get("--reference").copied().unwrap_or("exact");
-    let out =
-        json!({"players": seats.len(), "seeds": seeds, "reference": reference, "modes": rows});
+    out["players"] = json!(seats.len());
     finish(out, true, t, m)
 }
 

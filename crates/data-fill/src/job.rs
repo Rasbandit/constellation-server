@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::prepared::{self, Prepared, SEED_MAX_BYTES};
-use crate::room::Algorithm;
 use crate::seed::{FillReport, Player, checked_name, encode_on, generate_on, manifest_game};
 use crate::world::World;
 
@@ -29,9 +28,6 @@ pub struct Fill<P> {
     pub rng_seed: u64,
     /// Threads the fill may use.
     pub workers: usize,
-    /// How progression is placed; a request without it gets the exact fill.
-    #[serde(default)]
-    pub algorithm: Algorithm,
     /// Most bytes the seed file may take; a request without it gets the design cap.
     #[serde(default = "seed_max_bytes")]
     pub seed_max_bytes: u64,
@@ -90,19 +86,16 @@ pub fn unframe(framed: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// Fill a room on a prepared world: the input is a [`frame`] of the request ([`Fill`] as
 /// JSON) and the prepared world's file ([`prepare`]). Nothing is compiled. The output is the
 /// seed file itself (v2), which names the game's package in the prepared world
-/// (`crate::prepared::seed_game`) by key. When the asked mode fell back to the exact fill, when
-/// a fill that needed repairs has a world with an early capacity ratio under 1, and when the
-/// exact fill restarted, one line on stderr says so each (stdout is the seed and nothing else).
+/// (`crate::prepared::seed_game`) by key. When a fill that needed repairs has a world with an
+/// early capacity ratio under 1, and when the fill restarted, one line on stderr says so each
+/// (stdout is the seed and nothing else).
 ///
 /// # Errors
 /// A message for a frame or request that does not parse, a prepared world that does not load
-/// (the message then starts with [`UNLOADABLE`]), what [`crate::seed::generate`] refuses, or a
-/// seed over its cap.
+/// (the message then starts with [`UNLOADABLE`]), what [`crate::seed::generate_on`] refuses, or
+/// a seed over its cap.
 pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     let (seed, report) = fill_reported(input)?;
-    if report.fallbacks > 0 {
-        eprintln!("fill: the asked mode fell back to the exact fill: {report:?}");
-    }
     if report.tight_players > 0 {
         eprintln!(
             "fill: the fill needed repairs, and {} players' worlds have an early capacity ratio \
@@ -112,12 +105,12 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
         );
     }
     if report.attempts > 1 {
-        eprintln!("fill: the exact fill restarted {} times: {report:?}", report.attempts - 1);
+        eprintln!("fill: the fill restarted {} times: {report:?}", report.attempts - 1);
     }
     Ok(seed)
 }
 
-/// [`fill`], and how the progression was placed (whether the asked mode fell back).
+/// [`fill`], and how its fill went.
 ///
 /// # Errors
 /// As [`fill`].
@@ -143,8 +136,7 @@ pub fn request(head: &[u8]) -> Result<Fill<Player>, String> {
 /// # Errors
 /// As [`fill`], less what the frame, the request's text and loading the world can refuse.
 pub fn fill_on(world: &Prepared, f: &Fill<Player>) -> Result<(Vec<u8>, FillReport), String> {
-    let (mut bundle, report) =
-        generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm)?;
+    let (mut bundle, report) = generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers)?;
     Ok((encode_on(world, &mut bundle, f.seed_max_bytes)?, report))
 }
 

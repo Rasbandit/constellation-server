@@ -14,7 +14,6 @@ mod support {
 use config::Limits;
 use data_fill::job;
 use data_fill::prepared::Prepared;
-use data_fill::room::{Algorithm, Dials};
 use data_fill::synth::Shape;
 use log::BlobKey;
 use server::pool::{Job, Pool};
@@ -185,8 +184,8 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     until_some(what, || done().then_some(())).await;
 }
 
-/// Byte identity through real processes: on two worlds, for one and ten players, the three
-/// fill modes and two seeds, the pooled seed is the seed of a `fill` job in its own process,
+/// Byte identity through real processes: on two worlds, for one and ten players and six
+/// seeds, the pooled seed is the seed of a `fill` job in its own process,
 /// which is the seed the job's code gives in this process. The worker's cache holds one of
 /// the two worlds, so every other job drops a world and loads it again, and a worker is
 /// replaced every five jobs, so the jobs of one request run on both sides of a recycle.
@@ -197,27 +196,20 @@ async fn a_pooled_seed_is_byte_for_byte_the_seed_of_a_job_in_its_own_process() {
     let one_world = held(&worlds[0]).max(held(&worlds[1]));
     let limits = Limits { fill_worker_cache_bytes: one_world, fill_worker_jobs: 5, ..ON };
     let pool = pool(Path::new(BIN), limits);
-    let modes = [
-        Algorithm::Exact,
-        Algorithm::Level(Dials::default()),
-        Algorithm::Shuffle(Dials::default()),
-    ];
     let ten: Vec<String> = (0..10).map(|p| format!("P{p}")).collect();
     let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
     let (mut pids, mut filled) = (Vec::new(), 0);
-    for rng in 1..=2 {
-        for mode in modes {
-            for names in [&["Ann"][..], &ten] {
-                for (key, file, instance) in &worlds {
-                    let head = head(names, instance, rng, mode);
-                    let own = own_process(&head, file).await;
-                    assert_eq!(pool.fill(job(&head, key, file)).await, own);
-                    if let Ok(seed) = own {
-                        assert_eq!(alone(&head, file).unwrap(), seed);
-                        filled += 1;
-                    }
-                    pids.extend(pool.idle_pids());
+    for rng in 1..=6 {
+        for names in [&["Ann"][..], &ten] {
+            for (key, file, instance) in &worlds {
+                let head = head(names, instance, rng);
+                let own = own_process(&head, file).await;
+                assert_eq!(pool.fill(job(&head, key, file)).await, own);
+                if let Ok(seed) = own {
+                    assert_eq!(alone(&head, file).unwrap(), seed);
+                    filled += 1;
                 }
+                pids.extend(pool.idle_pids());
             }
         }
     }
@@ -232,7 +224,7 @@ async fn a_pooled_seed_is_byte_for_byte_the_seed_of_a_job_in_its_own_process() {
 async fn a_refusal_is_worded_as_a_job_in_its_own_process_words_it() {
     let pool = pool(Path::new(BIN), ON);
     let (key, file, instance) = prepared(&small(), 1);
-    let good = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let good = head(&["Ann"], &instance, 1);
     let junk = b"not a prepared world".to_vec();
     let junk_key = log::blob_key(&junk);
     for (head, key, file) in [(&b"{"[..], &key, &file), (&good[..], &junk_key, &junk)] {
@@ -255,13 +247,13 @@ async fn a_job_whose_reused_worker_is_killed_runs_again_on_a_new_one() {
     let bin = own_binary("killed-reused");
     let pool = Arc::new(pool(&bin, ON));
     let (key, file, instance) = prepared(&small(), 1);
-    let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let quick = head(&["Ann"], &instance, 1);
     assert!(pool.fill(job(&quick, &key, &file)).await.is_ok());
     let first = pool.idle_pids();
     assert_eq!(first.len(), 1);
     freeze(first[0]).await;
 
-    let other = head(&["Bo"], &instance, 2, Algorithm::Exact);
+    let other = head(&["Bo"], &instance, 2);
     let want = alone(&other, &file).unwrap();
     let caught = {
         let (pool, file) = (Arc::clone(&pool), file.clone());
@@ -292,7 +284,7 @@ async fn a_job_whose_new_worker_is_killed_fails_alone_and_the_pool_recovers() {
     bin.stand_in();
     let pool = Arc::new(pool(&bin, ON));
     let (key, file, instance) = prepared(&small(), 1);
-    let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let quick = head(&["Ann"], &instance, 1);
     let doomed = {
         let (pool, quick, file) = (Arc::clone(&pool), quick.clone(), file.clone());
         tokio::spawn(async move { pool.fill(job(&quick, &key, &file)).await })
@@ -320,7 +312,7 @@ async fn a_worker_killed_between_jobs_fails_no_job() {
     let bin = own_binary("killed-idle");
     let pool = pool(&bin, ON);
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let want = alone(&head, &file).unwrap();
     for _ in 0..5 {
         assert_eq!(pool.fill(job(&head, &key, &file)).await.as_ref(), Ok(&want));
@@ -353,7 +345,7 @@ async fn a_job_whose_worker_ran_out_of_memory_after_others_is_filled_on_a_new_on
     // What one such job needs of address space, at its peak, in a worker of its own.
     let probe = pool(&bin, never_early);
     let (key, file, instance) = world(0);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let want = probe.fill(job(&head, &key, &file)).await.unwrap();
     let status = std::fs::read_to_string(format!("/proc/{}/status", probe.idle_pids()[0])).unwrap();
     let peak_kb = status.lines().find_map(|l| l.strip_prefix("VmPeak:")).unwrap();
@@ -384,7 +376,7 @@ async fn a_job_over_the_address_space_cap_fails_and_leaves_no_process() {
     let bin = own_binary("too-small");
     let pool = pool(&bin, Limits { fill_memory_bytes: 4 << 20, ..ON });
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let failed = pool.fill(job(&head, &key, &file)).await.unwrap_err();
     let Failure::Broken(why) = &failed else { panic!("{failed:?}") };
     assert!(why.contains("the fill worker stopped"), "{why}");
@@ -399,7 +391,7 @@ async fn a_job_past_its_time_ends_its_worker_and_leaves_no_process() {
     // Too short for any process to start and answer.
     let pool = pool(&bin, Limits { fill_timeout_ms: 1, ..ON });
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let failed = pool.fill(job(&head, &key, &file)).await.unwrap_err();
     assert_eq!(failed, Failure::Broken("timed out after 0 s and was killed".into()));
     assert!(pool.idle_pids().is_empty() && running(&bin).is_empty(), "{:?}", running(&bin));
@@ -412,7 +404,7 @@ async fn a_worker_is_replaced_after_its_jobs_and_after_a_refusal() {
     let bin = own_binary("recycled");
     let pool = pool(&bin, Limits { fill_worker_jobs: 2, ..ON });
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let want = alone(&head, &file).unwrap();
     let fill = || pool.fill(job(&head, &key, &file));
 
@@ -438,7 +430,7 @@ async fn a_worker_is_replaced_after_its_jobs_and_after_a_refusal() {
 #[tokio::test]
 async fn a_worker_is_replaced_when_its_size_or_its_cpu_time_leave_the_next_job_too_little() {
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let want = alone(&head, &file).unwrap();
     // One percent of the cap is less than any process's address space; one CPU second past a
     // job's time leaves no margin.
@@ -473,7 +465,7 @@ async fn a_worker_is_replaced_when_its_size_or_its_cpu_time_leave_the_next_job_t
 #[tokio::test]
 async fn jobs_past_the_pools_size_wait_for_a_free_worker() {
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 1);
     let want = alone(&head, &file).unwrap();
     for workers in [1, 2] {
         let bin = own_binary(&format!("line-{workers}"));
@@ -498,7 +490,7 @@ async fn a_dropped_job_and_a_dropped_pool_leave_no_process() {
     let bin = own_binary("dropped");
     let pool = Arc::new(pool(&bin, ON));
     let (key, file, instance) = prepared(&small(), 1);
-    let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    let quick = head(&["Ann"], &instance, 1);
     let want = alone(&quick, &file).unwrap();
     assert_eq!(pool.fill(job(&quick, &key, &file)).await.as_ref(), Ok(&want));
     let worker = pool.idle_pids()[0];

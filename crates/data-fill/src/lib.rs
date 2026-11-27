@@ -10,7 +10,6 @@ pub mod fairness;
 pub mod fill;
 mod fold;
 pub mod job;
-mod level;
 mod live;
 pub mod par;
 pub mod parity_rng;

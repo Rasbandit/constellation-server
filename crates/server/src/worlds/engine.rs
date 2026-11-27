@@ -235,7 +235,6 @@ pub(super) fn fill_head(
         players: player_requests(files)?,
         rng_seed,
         workers: fill_threads(),
-        algorithm: data_fill::room::Algorithm::Exact,
         seed_max_bytes,
     };
     serde_json::to_vec(&head).map_err(|e| e.to_string())

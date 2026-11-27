@@ -530,7 +530,7 @@ pub fn mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room::{Algorithm, Given, Path, fill_room_by, fill_room_on, fill_room_spheres};
+    use crate::room::{Given, Path, Rule, fill_room_on, fill_room_ruled, fill_room_spheres};
     use crate::spheres::RoomSpheres;
     use crate::world::World;
 
@@ -645,7 +645,7 @@ mod tests {
     fn the_repaired_rounds_of_a_room_of_chains_are_pinned() {
         let c = room(&Shape::hostile(Hostile::Chain), 1, 22, 1).unwrap();
         for path in [Path::Split, Path::Forward { workers: 1 }, Path::Carry] {
-            let f = once(&c, 1, path, Algorithm::Exact).unwrap();
+            let f = once(&c, 1, path).unwrap();
             let counts = (f.attempts, f.rounds, f.divided, f.swaps);
             let hash =
                 format!("{:016x}", crate::check::fnv1a(format!("{:?}", f.placed).as_bytes()));
@@ -704,45 +704,6 @@ mod tests {
         // Only two of the group's 24 locations take progression: fewer than p0's copies.
         let e = room_with(&shape, 23, 1, |_, inst| grouped(inst, 4)).unwrap_err();
         assert!(e.contains("p0") && e.contains("excluded"), "{e}");
-    }
-
-    /// An opt-in mode in a room of several players: whether it places the seed itself or
-    /// gives up and the exact fill places it, the split path decides what the carried and the
-    /// forward path decide. Tight rooms, where the modes do fall back.
-    #[test]
-    fn a_mode_in_a_room_places_the_same_on_the_split_path_fallen_back_or_not() {
-        use crate::room::{Algorithm, Dials, fill_room_by};
-        let tight = Shape { checks: 60, ..Shape::hostile(Hostile::Tight) };
-        let (mut fell, mut fast, mut filled) = (0, 0, 0);
-        for (shape, players) in [(tight, 3), (tight, 9), (small(true), 4)] {
-            let c = room_with(&shape, 23, players, |_, _| {}).unwrap();
-            let seats = c.seats();
-            for seed in 1..=8 {
-                for mode in
-                    [Algorithm::Shuffle(Dials::default()), Algorithm::Level(Dials::default())]
-                {
-                    let on = |path| {
-                        let mut rng = SpecRng::from_u64(seed);
-                        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
-                            .map(|(f, sp)| (f.placed, f.fast, f.fallbacks, f.attempts, sp))
-                            .map_err(|e| format!("{e:?}"))
-                    };
-                    let split = on(Path::Split);
-                    let at = format!("{players} players, seed {seed}, {mode:?}");
-                    assert_eq!(split, on(Path::Carry), "{at}");
-                    assert_eq!(split, on(Path::Forward { workers: 1 }), "{at}");
-                    if let Ok(f) = split {
-                        fell += f.2;
-                        fast += u32::from(f.1);
-                        filled += 1;
-                    }
-                }
-            }
-        }
-        assert!(
-            fell > 0 && fast > 0 && filled > 20,
-            "{fell} fallbacks, {fast} fast, {filled} filled"
-        );
     }
 
     /// The split path reaches every round's state by adding to one solve and taking the
@@ -831,24 +792,28 @@ mod tests {
         assert!(undone > 100_000, "{undone} journal steps undone");
     }
 
-    /// One attempt of `mode` on `path`: everything it decides, or its error.
-    fn one_pass(c: &Compiled, seed: u64, path: Path, mode: Algorithm) -> Outcome {
-        fill_room_by(&c.seats(), &mut SpecRng::from_u64(seed), 1, path, mode)
+    /// One attempt on `path`: everything it decides, or its error.
+    fn one_pass(c: &Compiled, seed: u64, path: Path) -> Outcome {
+        fill_room_on(&c.seats(), &mut SpecRng::from_u64(seed), 1, path)
             .map(|(f, sp)| (f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached))
             .map_err(|e| format!("{e:?}"))
     }
 
-    /// One attempt of `mode` on `path`, as filled, or its error.
-    fn once(
-        c: &Compiled,
-        seed: u64,
-        path: Path,
-        mode: Algorithm,
-    ) -> Result<crate::RoomFilled, String> {
-        fill_room_by(&c.seats(), &mut SpecRng::from_u64(seed), 1, path, mode)
+    /// One attempt on `path`, as filled, or its error.
+    fn once(c: &Compiled, seed: u64, path: Path) -> Result<crate::RoomFilled, String> {
+        fill_room_on(&c.seats(), &mut SpecRng::from_u64(seed), 1, path)
             .map(|(f, _)| f)
             .map_err(|e| format!("{e:?}"))
     }
+
+    /// One attempt whose rounds are formed by `rule` (a baseline), or its error.
+    fn baseline(c: &Compiled, seed: u64, rule: Rule) -> Result<crate::RoomFilled, String> {
+        fill_room_ruled(&c.seats(), &mut SpecRng::from_u64(seed), 1, Path::Split, rule)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// The rounds before issue 212: drawn order, never divided, no item moved.
+    const DRAWN: Rule = Rule { deepest: false, repair: false };
 
     /// A fill that holds up by itself: every goal reachable, the report a fresh solve's, every
     /// location that exists holds one item, and every progression item lies where it is reached.
@@ -884,7 +849,7 @@ mod tests {
             let seats = c.seats();
             for seed in [1, 2] {
                 let at = format!("{how:?}, {players} players, seed {seed}");
-                let f = once(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
+                let f = once(&c, seed, Path::Split).expect(&at);
                 assert_eq!(f.attempts, 1, "{at}");
                 assert!(
                     f.divided > 0 && f.swaps > 0,
@@ -896,14 +861,14 @@ mod tests {
                 let spheres = |f: &crate::RoomFilled| {
                     crate::spheres::room_spheres(&seats, &f.placed).unwrap().spheres.len()
                 };
-                let deepest = once(&c, seed, Path::Split, Algorithm::Deepest).expect(&at);
+                let deepest = baseline(&c, seed, Rule { deepest: true, repair: true }).expect(&at);
                 assert!(
                     spheres(&f) > spheres(&deepest),
                     "{at}: {} against {}",
                     spheres(&f),
                     spheres(&deepest)
                 );
-                let drawn = once(&c, seed, Path::Split, Algorithm::Drawn);
+                let drawn = baseline(&c, seed, DRAWN);
                 assert!(drawn.is_err_and(|e| e.contains("Stuck")), "{at}: drawn order filled");
             }
         }
@@ -920,12 +885,12 @@ mod tests {
         let mut moved = 0;
         for seed in 1..=24 {
             let at = format!("seed {seed}");
-            let f = once(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
+            let f = once(&c, seed, Path::Split).expect(&at);
             assert_eq!((f.attempts, f.divided), (1, 0), "{at}");
             sound(&c, &f, &at);
             if f.swaps > 0 {
                 moved += 1;
-                assert!(once(&c, seed, Path::Split, Algorithm::Drawn).is_err(), "{at}");
+                assert!(baseline(&c, seed, DRAWN).is_err(), "{at}");
             }
         }
         assert!(moved > 2, "{moved} seeds moved an item");
@@ -1009,8 +974,8 @@ mod tests {
                 let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
                 for seed in 1..=6 {
                     let at = format!("shape {n}, {players} players, seed {seed}");
-                    let got = one_pass(&c, seed, Path::Split, Algorithm::Exact);
-                    assert_eq!(got, one_pass(&c, seed, Path::Split, Algorithm::Exact), "{at}");
+                    let got = one_pass(&c, seed, Path::Split);
+                    assert_eq!(got, one_pass(&c, seed, Path::Split), "{at}");
                     let Ok((placed, _, _, rounds, beatable, reached)) = got else {
                         stuck += 1;
                         continue;
@@ -1019,8 +984,7 @@ mod tests {
                     // More groups placed than the longest pile has items: one was divided, or
                     // the rounds went on after an item was moved.
                     divided += u32::from(rounds as usize > piles);
-                    moved +=
-                        u32::from(once(&c, seed, Path::Split, Algorithm::Exact).unwrap().swaps > 0);
+                    moved += u32::from(once(&c, seed, Path::Split).unwrap().swaps > 0);
                     assert!(beatable.iter().all(|b| *b), "{at}");
                     let fresh = crate::room::validate_room(&seats, &placed).unwrap();
                     assert_eq!((beatable, reached), fresh, "{at}");
@@ -1057,16 +1021,14 @@ mod tests {
             let piles = c.seats().iter().map(|s| s.plan.progression.len()).max().unwrap();
             for seed in 1..=8 {
                 let at = format!("{shapes:?}, {players} players, seed {seed}");
-                let split = one_pass(&c, seed, Path::Split, Algorithm::Exact);
+                let split = one_pass(&c, seed, Path::Split);
                 for path in
                     [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }]
                 {
-                    assert_eq!(split, one_pass(&c, seed, path, Algorithm::Exact), "{at}, {path:?}");
+                    assert_eq!(split, one_pass(&c, seed, path), "{at}, {path:?}");
                 }
                 repaired += u32::from(split.is_ok_and(|x| x.3 as usize > piles));
-                moved += u32::from(
-                    once(&c, seed, Path::Split, Algorithm::Exact).is_ok_and(|f| f.swaps > 0),
-                );
+                moved += u32::from(once(&c, seed, Path::Split).is_ok_and(|f| f.swaps > 0));
             }
         }
         assert!(repaired > 8 && moved > 0, "{repaired} repaired, {moved} moved");
@@ -1333,11 +1295,9 @@ mod tests {
     /// A plan's bit rules answer what its bytecode does: fills with them, and with every rule
     /// left as bytecode (`Plan::interpreted`), agree in everything they decide and in every work
     /// counter but the one that says who answered. Both profiles, clocks on and off, start
-    /// items, locked, excluded and confined locations; one player and rooms; both paths and the
-    /// level mode.
+    /// items, locked, excluded and confined locations; one player and rooms; both paths.
     #[test]
     fn bit_rules_decide_what_the_bytecode_does() {
-        use crate::room::{Algorithm, Dials, fill_room_by};
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
         let (mut bits, mut evals) = (0, 0);
         for (shape, what) in [
@@ -1367,15 +1327,6 @@ mod tests {
                         bits += sa.bits;
                         evals += sa.evals;
                     }
-                    let level = |c: &Compiled| {
-                        let (path, mode) =
-                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
-                        let mut rng = SpecRng::from_u64(seed);
-                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
-                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.0.stats.evals, x.1))
-                            .map_err(|e| format!("{e:?}"))
-                    };
-                    assert_eq!(level(&c), level(&plain), "{at}, level fill");
                 }
             }
         }
@@ -1384,12 +1335,11 @@ mod tests {
 
     /// A fill's states never evaluate the checks of locations that do not exist this seed and
     /// grant nothing. Against the same plans with those checks evaluated
-    /// (`Plan::with_absent_checks`): everything a fill decides is the same, on both paths and
-    /// in the level mode, with fewer rule evaluations on the heavy profile (about every second
+    /// (`Plan::with_absent_checks`): everything a fill decides is the same, on both paths, with
+    /// fewer rule evaluations on the heavy profile (about every second
     /// location of it is absent) and the same count on the light one (none is).
     #[test]
     fn skipping_absent_checks_decides_the_same_with_fewer_evaluations() {
-        use crate::room::{Algorithm, Dials, fill_room_by};
         let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
         for (shape, what) in
             [(small(true), "confined+locked+start"), (heavy, ""), (heavy, "locked")]
@@ -1416,15 +1366,6 @@ mod tests {
                             assert_eq!(sa, sb, "{at}");
                         }
                     }
-                    let level = |c: &Compiled| {
-                        let (path, mode) =
-                            (Path::Forward { workers: 1 }, Algorithm::Level(Dials::default()));
-                        let mut rng = SpecRng::from_u64(seed);
-                        fill_room_by(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
-                            .map(|x| (x.0.placed, x.0.fast, x.0.repairs, x.1))
-                            .map_err(|e| format!("{e:?}"))
-                    };
-                    assert_eq!(level(&c), level(&whole), "{at}, level fill");
                 }
             }
         }
@@ -1473,122 +1414,6 @@ mod tests {
             }
         }
         assert!(threaded, "one room has enough rule sites for a step to start threads");
-    }
-
-    /// Level fill and shuffle fill over both profiles, one player and rooms, with placement groups, excluded
-    /// and locked locations, start items and clocks: every seed is held against the exact
-    /// fill's (`assert_fast`), on the carried path and forward on one thread and on several,
-    /// which must all place the same.
-    #[test]
-    fn the_opt_in_modes_are_beatable_reach_what_the_exact_fill_does_and_ignore_the_worker_count() {
-        use crate::room::{Algorithm, Dials, assert_fast};
-        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
-        let (mut fast, mut fell, mut all, mut swaps) = (0, 0, 0, 0);
-        for (shape, players, what) in [
-            (small(false), 1, ""),
-            (small(true), 1, "confined+excluded"),
-            (small(false), 3, "confined+excluded+locked"),
-            (small(true), 3, "locked+start"),
-            (heavy, 1, "locked"),
-            (heavy, 3, "confined"),
-            (heavy, 9, "excluded"),
-            (small(false), 2, "half"),
-        ] {
-            let c = room_with(&shape, 17, players, |p, inst| change(what, p, inst)).unwrap();
-            let seats = c.seats();
-            for seed in 1..=24 {
-                let dials = Dials {
-                    depth: [0, 100, -100][seed as usize % 3],
-                    goal_only: seed % 12 > 9,
-                    skip_empty: seed % 4 < 2,
-                };
-                let mode =
-                    if seed > 12 { Algorithm::Shuffle(dials) } else { Algorithm::Level(dials) };
-                let Some(one) = assert_fast(&seats, seed, Path::Forward { workers: 1 }, mode)
-                else {
-                    continue;
-                };
-                for path in [Path::Carry, Path::Forward { workers: 4 }] {
-                    let other = assert_fast(&seats, seed, path, mode).unwrap();
-                    assert_eq!(one.placed, other.placed, "{what}, seed {seed}, {path:?}");
-                    assert_eq!(
-                        (one.fast, one.repairs, one.fallbacks),
-                        (other.fast, other.repairs, other.fallbacks),
-                        "{what}, seed {seed}, {path:?}"
-                    );
-                    // The same steps on any number of threads; the carried path's first solve
-                    // runs in rank order, which evaluates in another order.
-                    assert!(path == Path::Carry || one.stats == other.stats, "{what}, {seed}");
-                }
-                all += 1;
-                fast += u32::from(one.fast);
-                fell += one.fallbacks;
-                swaps += one.swaps;
-            }
-        }
-        println!(
-            "the modes placed {fast} of {all} rooms themselves, {fell} fallbacks, {swaps} swaps"
-        );
-        assert!(all > 160 && fast * 2 > all, "the modes placed {fast} of {all} rooms themselves");
-        assert!(swaps > 0, "no shuffle needed a swap");
-    }
-
-    /// Rooms where a round moves several items: a move that lands in its owner's own world is
-    /// counted at once, and the moves after it in the round must see the same reached
-    /// locations whether the checks of empty locations sleep or not.
-    #[test]
-    fn skipping_empty_checks_places_the_same_in_rooms_of_several_moves_a_round() {
-        use crate::room::{Algorithm, Dials, fill_room_by};
-        let heavy = Shape { checks: 60, layers: 3, ..Shape::heavy() };
-        let (mut rooms, mut moved) = (0, 0);
-        for (shape, players) in [(small(false), 3), (small(true), 4), (heavy, 3), (heavy, 6)] {
-            let c = room(&shape, 23, players, 1).unwrap();
-            let seats = c.seats();
-            for seed in 1..=40 {
-                let run = |skip_empty| {
-                    let mode = Algorithm::Shuffle(Dials { skip_empty, ..Dials::default() });
-                    let mut rng = SpecRng::from_u64(seed);
-                    fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, Path::Carry, mode)
-                        .map(|x| (x.0.placed, x.0.swaps, x.0.fast, x.1))
-                        .map_err(|e| format!("{e:?}"))
-                };
-                let (with, without) = (run(true), run(false));
-                assert_eq!(
-                    with, without,
-                    "{players} players, clocks {}, seed {seed}",
-                    shape.clocks
-                );
-                rooms += 1;
-                moved += with.map_or(0, |x| x.1);
-            }
-        }
-        assert!(moved > rooms / 2, "{moved} moves in {rooms} rooms: too few to test rounds");
-    }
-
-    /// The point of the mode: far fewer rule evaluations than a solve per round, and the same
-    /// seed for the same draws.
-    #[test]
-    fn level_fill_evaluates_far_fewer_rules_and_is_deterministic() {
-        use crate::room::{Algorithm, Dials, fill_room_by};
-        let c = room(&Shape { checks: 200, ..Shape::default() }, 5, 9, 1).unwrap();
-        let seats = c.seats();
-        let path = Path::Forward { workers: 1 };
-        let run = |seed, mode| {
-            let mut rng = SpecRng::from_u64(seed);
-            fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode).unwrap().0
-        };
-        let (mut exact, mut level) = (0, 0);
-        for seed in 1..=3 {
-            let mode = Algorithm::Level(Dials::default());
-            let (a, b) = (run(seed, mode), run(seed, mode));
-            assert_eq!(a.placed, b.placed, "seed {seed}");
-            assert_ne!(a.placed, run(seed + 100, mode).placed, "seed {seed}: seeds differ");
-            if a.fast {
-                exact += run(seed, Algorithm::Exact).stats.evals;
-                level += a.stats.evals;
-            }
-        }
-        assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
     }
 
     /// Every room takes the split path, whatever the workers asked for.

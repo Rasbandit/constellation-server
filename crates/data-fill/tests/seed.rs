@@ -119,7 +119,6 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
         players: p.clone(),
         rng_seed: 7,
         workers: 1,
-        algorithm: data_fill::room::Algorithm::Exact,
         seed_max_bytes: 1 << 24,
     };
     let req = serde_json::to_value(&head).unwrap();
@@ -128,29 +127,14 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     let back: SeedBundle = bundle(out.clone());
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
     assert!(fill(&frame(b"{", &file).unwrap()).unwrap_err().contains("bad fill request"));
-    // The mode is a field of the request: without it, and with "exact", the exact fill.
+    // A field the request does not know is refused: the fill mode it once named too.
     let mut asked = req.clone();
-    asked.as_object_mut().unwrap().remove("algorithm");
-    assert_eq!(fill(&framed(&asked)).unwrap(), out);
     asked["algorithm"] = json!("exact");
-    assert_eq!(fill(&framed(&asked)).unwrap(), out);
-    asked["algorithm"] = json!({"level": {"depth": 100}});
-    let level = fill(&framed(&asked)).unwrap();
-    let level: SeedBundle = bundle(level);
-    let dials = data_fill::room::Dials { depth: 100, ..Default::default() };
-    let mode = data_fill::room::Algorithm::Level(dials);
-    let (same, report) = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
-    // The job says how the seed was placed, since the bundle cannot.
-    let said = fill_reported(&framed(&asked)).unwrap().1;
-    assert_eq!(said, report);
-    assert_eq!(report.placed_by_the_mode, report.fallbacks == 0, "one attempt: {report:?}");
-    assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
-    assert_eq!(level.slots.len(), direct.slots.len());
-    // The depth dial is bounded where the request comes in.
-    asked["algorithm"] = json!({"shuffle": {"depth": i32::MAX}});
-    assert!(fill(&framed(&asked)).unwrap_err().contains("depth"));
-    asked["algorithm"] = json!("fastest");
-    assert!(fill(&framed(&asked)).unwrap_err().contains("bad"));
+    assert!(fill(&framed(&asked)).unwrap_err().contains("bad fill request"));
+    // The job says how the fill went, since the bundle cannot: what the library says.
+    let on = data_fill::prepared::Prepared::open(&file).unwrap();
+    let (_, report) = data_fill::seed::generate_on(&on, "seed-one", &p, 7, 1).unwrap();
+    assert_eq!(fill_reported(&framed(&req)).unwrap().1, report);
 
     assert_eq!(
         (&found["game"], &found["version"], &found["items"]),
@@ -191,15 +175,16 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
 /// repaired flag every player, the others are not read; light rooms need no repair.
 #[test]
 fn the_fill_report_flags_worlds_with_little_room_early_on() {
-    use data_fill::room::Algorithm;
-    use data_fill::seed::{FillReport, generate_by};
+    use data_fill::prepared::{Prepared, build};
+    use data_fill::seed::{FillReport, generate_on};
     use data_fill::synth::{Hostile, Shape, world};
     let report = |shape: &Shape, n: u32, seed: u64| -> FillReport {
         let (mut m, inst) = world(shape, 23, 0);
         (m["game"], m["version"]) = (json!("Synth"), json!("1"));
         let players: Vec<Player> =
             (0..n).map(|p| Player { name: format!("P{p}"), instance: inst.clone() }).collect();
-        generate_by(&m, "s", &players, seed, 1, Algorithm::Exact).unwrap().1
+        let on = Prepared::open(&build(&m).unwrap().0).unwrap();
+        generate_on(&on, "s", &players, seed, 1).unwrap().1
     };
     let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
     let mut repaired = 0;

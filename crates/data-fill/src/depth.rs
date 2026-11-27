@@ -45,7 +45,7 @@ pub(crate) fn waves(w: &World, plan: &Plan, stats: &mut Stats) -> Vec<Vec<u32>> 
         let has = |i: &u16| left[usize::from(*i)] > 0;
         let mut now: Vec<u16> = Vec::new();
         for i in kinds.iter().copied().filter(has) {
-            if r.opens(i, true) {
+            if r.opens(i) {
                 now.push(i);
             }
         }

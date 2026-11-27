@@ -134,8 +134,6 @@ pub enum FillError {
     /// The world declares shuffles that have not run for this seed: the caller has to stage
     /// it ([`crate::shuffle::stage`]). Not a fault of the instance.
     Unstaged(&'static str),
-    /// A fill mode's own check of its result failed: a bug in the mode, never the input.
-    Invalid(String),
     /// More items than locations, or the reverse.
     Count {
         /// Items to place.

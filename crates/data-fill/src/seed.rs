@@ -72,28 +72,22 @@ pub fn generate(
     rng_seed: u64,
     workers: usize,
 ) -> Result<SeedBundle, String> {
-    generate_by(manifest, seed_name, players, rng_seed, workers, room::Algorithm::Exact)
-        .map(|x| x.0)
+    let game = manifest_game(manifest)?;
+    named(players)?;
+    let w = World::load(manifest)?;
+    let data = game_data(&w)?;
+    fill_on((&w, game, data), seed_name, players, rng_seed, workers).map(|x| x.0)
 }
 
-/// How a seed's progression was placed, for a caller that asked for an opt-in mode: the
-/// bundle itself cannot say.
+/// How a seed's fill went, beside the bundle, which cannot say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillReport {
-    /// The asked mode placed the seed itself (always for the exact fill); `false`: it fell
-    /// back and the seed is the exact fill's.
-    pub placed_by_the_mode: bool,
-    /// Attempts the mode gave up on.
-    pub fallbacks: u32,
     /// Full fills started: above 1, the exact fill restarted (a net for what its repairs
     /// could not mend, at most `config::FILL_MAX_ATTEMPTS`).
     pub attempts: u32,
-    /// Items moved in the seed: by a shuffle fill into reach, or by the exact fill out of a
-    /// location an item with nowhere else to go took. Orders a level fill repaired: `repairs`.
+    /// Items moved in the seed out of a location an item with nowhere else to go took.
     pub swaps: u32,
-    /// See `swaps`.
-    pub repairs: u32,
-    /// Exact fill: rounds (or parts of one) divided because they did not fit their state.
+    /// Rounds (or parts of one) divided because they did not fit their state.
     pub divided: u32,
     /// Players whose world leaves less room early on than it has progression to seat (early
     /// capacity ratio under 1, `crate::capacity`). Read only for a fill that divided a round,
@@ -106,29 +100,9 @@ pub struct FillReport {
     pub capacity_milli: u32,
 }
 
-/// [`generate`] with the mode that places the progression items ([`room::Algorithm`]). The
-/// bundle has no field that names the mode: the same bundle shape whichever made it, so what
-/// happened comes back beside it.
-///
-/// # Errors
-/// As [`generate`].
-pub fn generate_by(
-    manifest: &Value,
-    seed_name: &str,
-    players: &[Player],
-    rng_seed: u64,
-    workers: usize,
-    algorithm: room::Algorithm,
-) -> Result<(SeedBundle, FillReport), String> {
-    let game = manifest_game(manifest)?;
-    named(players)?;
-    let w = World::load(manifest)?;
-    let data = game_data(&w)?;
-    fill_on((&w, game, data), seed_name, players, rng_seed, workers, algorithm)
-}
-
-/// [`generate_by`] on a prepared world: nothing is compiled and the game's tables are not
-/// built again, the fill starts from the stored form. The same bundle as the manifest gives.
+/// [`generate`] on a prepared world: nothing is compiled and the game's tables are not built
+/// again, the fill starts from the stored form. The same bundle as the manifest gives, and how
+/// its fill went.
 ///
 /// # Errors
 /// As [`generate`], less what only a manifest can get wrong.
@@ -138,11 +112,10 @@ pub fn generate_on(
     players: &[Player],
     rng_seed: u64,
     workers: usize,
-    algorithm: room::Algorithm,
 ) -> Result<(SeedBundle, FillReport), String> {
     named(players)?;
     let on = (prepared.world(), prepared.game(), prepared.data().clone());
-    fill_on(on, seed_name, players, rng_seed, workers, algorithm)
+    fill_on(on, seed_name, players, rng_seed, workers)
 }
 
 /// The bundle of a room filled on a prepared world: `placed` (one row per seat) and the
@@ -210,7 +183,6 @@ fn fill_on(
     players: &[Player],
     rng_seed: u64,
     workers: usize,
-    algorithm: room::Algorithm,
 ) -> Result<(SeedBundle, FillReport), String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
     // A world that declares shuffles is staged per player first: each gets their own layout,
@@ -223,12 +195,11 @@ fn fill_on(
         (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
     };
     let seats = room.seats();
-    let (filled, spheres) = room::fill_room_by(
+    let (filled, spheres) = room::fill_room_on(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
         config::FILL_MAX_ATTEMPTS,
         room::Path::of(seats.len(), workers),
-        algorithm,
     )
     .map_err(|e| format!("{e:?}"))?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
@@ -238,11 +209,8 @@ fn fill_on(
     let (tight_players, capacity_milli) =
         if repaired { capacity(&seats, &insts) } else { (0, u32::MAX) };
     let report = FillReport {
-        placed_by_the_mode: algorithm == room::Algorithm::Exact || filled.fast,
-        fallbacks: filled.fallbacks,
         attempts: filled.attempts,
         swaps: filled.swaps,
-        repairs: filled.repairs,
         divided: filled.divided,
         tight_players,
         capacity_milli,
