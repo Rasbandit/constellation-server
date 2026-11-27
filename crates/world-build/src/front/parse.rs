@@ -3,7 +3,7 @@
 //! after an error the parser skips to the next one and goes on: one pass reports every error.
 //! It also records where the canonical layout breaks lines, for the formatter.
 
-use crate::lex::{Comment, Tok, Token, lex, show};
+use crate::lex::{CHECK_MODIFIERS, Comment, Tok, Token, lex, show};
 use crate::model::{At, Lit, Pos, Verb};
 use crate::rule::{E, Expr, Piece, parse_in};
 
@@ -907,14 +907,9 @@ impl P<'_> {
                     } else if self.ctx("no_progression") {
                         let at = self.here();
                         self.k += 1;
-                        // A modifier after it starts the next modifier, not a rule: `key` then a
-                        // string, `was`/`vanilla`/`holds` then a name, or `no_progression`. So a
-                        // def named `key` is still a rule when it reads as one (`key and x`).
-                        let then = self.toks.get(self.k + 1).map(|t| &t.t);
-                        let next = self.ctx("no_progression")
-                            || (self.ctx("key") && matches!(then, Some(Tok::Str(_))))
-                            || (["was", "vanilla", "holds"].iter().any(|w| self.ctx(w))
-                                && matches!(then, Some(Tok::Name(_))));
+                        // A modifier word after it starts the next modifier, not a rule (no def
+                        // or event may take one of these names, so it is never a rule here).
+                        let next = CHECK_MODIFIERS.iter().any(|w| self.ctx(w));
                         let r = if self.rule_starts() && !next {
                             Some(self.rule(depth)?)
                         } else {

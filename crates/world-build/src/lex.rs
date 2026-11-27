@@ -18,6 +18,10 @@ pub const RESERVED: [&str; 33] = [
     "match", "and", "or", "not",
 ];
 
+/// The words that start a check's modifiers. After a bare `no_progression` they start the next
+/// modifier, never a rule, so no def or event (the bare names a rule reads) may be named one.
+pub const CHECK_MODIFIERS: [&str; 5] = ["key", "was", "vanilla", "holds", "no_progression"];
+
 /// More words a rule reads as operators or constants: reserved as well.
 pub const RULE_WORDS: [&str; 5] = ["in", "div", "mod", "true", "false"];
 

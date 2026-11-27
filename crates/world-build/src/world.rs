@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
+use crate::lex::CHECK_MODIFIERS;
 use crate::lower::{Lower, Mode, Names, OptTy, Readable, Sort, truth};
 use crate::model::{At, Lit, Members, Pos, Rule, Verb, World};
 use crate::{Built, Error, instance};
@@ -220,6 +221,14 @@ struct Space {
 impl Space {
     fn declare(&mut self, errs: &mut Errs, n: &At<String>, sort: Sort) -> bool {
         if !name_ok(errs, n, sort.word().trim_start_matches("an ").trim_start_matches("a ")) {
+            return false;
+        }
+        if matches!(sort, Sort::Def | Sort::Event) && CHECK_MODIFIERS.contains(&n.v.as_str()) {
+            errs.err(
+                n.pos,
+                format!("`{}` starts a check modifier, so it cannot name {}", n.v, sort.word()),
+                "a rule reads a def or event by its bare name, and after `no_progression` this word starts the next modifier; pick another name",
+            );
             return false;
         }
         match self.first.get(&n.v) {

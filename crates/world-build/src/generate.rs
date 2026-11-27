@@ -67,6 +67,14 @@ impl<'b> Generator<'b> {
         players: u32,
         seed: u64,
     ) -> Result<Seed, String> {
+        // Before any copy is made: a room has at most `ROOM_MAX_PLAYERS`, and a seed number
+        // stays within what a JSON spoiler holds exactly.
+        if players == 0 || usize::try_from(players).is_ok_and(|n| n > config::ROOM_MAX_PLAYERS) {
+            return Err(format!("a room has 1 to {} players", config::ROOM_MAX_PLAYERS));
+        }
+        if seed > config::SEED_NUMBER_MAX {
+            return Err(format!("a seed is a number from 0 to {}", config::SEED_NUMBER_MAX));
+        }
         let instance = self.built.instance(options)?;
         let players: Vec<Player> = (1..=players)
             .map(|k| Player { name: format!("P{k}"), instance: instance.clone() })
@@ -204,18 +212,28 @@ pub fn spoiler_text(s: &Value) -> String {
             str_of(p, "item")
         }
     };
-    let mut by_region: BTreeMap<(String, String), Vec<&Value>> = BTreeMap::new();
+    // Players in room order (P2 before P10), from the order the placements are listed in.
+    let mut order: Vec<String> = Vec::new();
+    for p in &all {
+        let name = str_of(p, "player");
+        if !order.contains(&name) {
+            order.push(name);
+        }
+    }
+    let rank = |name: &str| order.iter().position(|x| x == name).unwrap_or(order.len());
+    let mut by_region: BTreeMap<(usize, String, String), Vec<&Value>> = BTreeMap::new();
     let mut by_item: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     let mut spheres: BTreeMap<u64, Vec<&Value>> = BTreeMap::new();
     for p in &all {
-        by_region.entry((str_of(p, "player"), str_of(p, "region"))).or_default().push(p);
+        let player = str_of(p, "player");
+        by_region.entry((rank(&player), player, str_of(p, "region"))).or_default().push(p);
         by_item.entry(str_of(p, "item")).or_default().push(p);
         if p["class"] == "progression" {
             spheres.entry(p["sphere"].as_u64().unwrap_or(u64::MAX)).or_default().push(p);
         }
     }
     line(&mut out, format!("\nPlacements by region ({})", all.len()));
-    for ((player, region), ps) in &by_region {
+    for ((_, player, region), ps) in &by_region {
         line(&mut out, if multi { format!("  {player} {region}") } else { format!("  {region}") });
         for p in ps {
             line(&mut out, format!("    {}: {}", str_of(p, "location"), got(p)));
@@ -240,6 +258,8 @@ pub fn spoiler_text(s: &Value) -> String {
         line(&mut out, "\nShuffle results".into());
         // Per player, each shuffle by name: its slots and what each got, in key order.
         let pad = if multi { "    " } else { "  " };
+        let mut sh: Vec<(&String, &Value)> = sh.iter().collect();
+        sh.sort_by_key(|(player, _)| rank(player));
         for (player, tables) in sh {
             if multi {
                 line(&mut out, format!("  {player}"));
@@ -272,6 +292,27 @@ pub fn spoiler_text(s: &Value) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every engine refusal reads as words, never as a type's debug form.
+    #[test]
+    fn engine_refusals_read_as_words() {
+        let one = |e| explain(e, &[]);
+        assert_eq!(
+            one(GenerateError::Fill(FillError::Instance("no item `x`".into()))),
+            "no item `x`"
+        );
+        assert_eq!(one(GenerateError::Message("bad".into())), "bad");
+        let u = one(GenerateError::Fill(FillError::Unstaged("shuffles")));
+        assert!(u.starts_with("the engine did not stage") && !u.contains("Unstaged"), "{u}");
+        let c = one(GenerateError::Fill(FillError::Count { items: 3, locations: 2 }));
+        assert!(c.starts_with("3 items to place and 2 free checks"), "{c}");
+        assert!(one(GenerateError::Unbeatable { player: 0 }).contains("the goal unreachable"));
+    }
+}
+
 /// How `rando generate --check-seeds` went over a run of seeds.
 #[derive(Debug, Clone, Default)]
 pub struct SeedCheck {
@@ -291,16 +332,28 @@ pub struct SeedCheck {
 
 impl Generator<'_> {
     /// Fill seeds `from` to `from + count - 1` and count what happened.
-    #[must_use]
+    ///
+    /// # Errors
+    /// No seeds, or a range that goes past the largest seed number.
     pub fn check_seeds(
         &self,
         options: &HashMap<String, i64>,
         players: u32,
         from: u64,
         count: u64,
-    ) -> SeedCheck {
+    ) -> Result<SeedCheck, String> {
+        let last = count
+            .checked_sub(1)
+            .and_then(|n| from.checked_add(n))
+            .filter(|l| *l <= config::SEED_NUMBER_MAX)
+            .ok_or_else(|| {
+                format!(
+                    "{count} seeds from {from} go past the largest seed number, {}",
+                    config::SEED_NUMBER_MAX
+                )
+            })?;
         let mut c = SeedCheck::default();
-        for seed in from..from.saturating_add(count) {
+        for seed in from..=last {
             let t = Instant::now();
             let r = self.run(options, players, seed);
             c.times.push(t.elapsed());
@@ -316,6 +369,6 @@ impl Generator<'_> {
                 }
             }
         }
-        c
+        Ok(c)
     }
 }

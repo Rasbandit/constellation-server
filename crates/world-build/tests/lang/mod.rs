@@ -214,16 +214,25 @@ fn a_bare_no_progression_ends_before_key_and_was() {
     for c in ["c1", "c2"] {
         assert!(inst.excluded.contains(&c.to_owned()), "{c}: {:?}", inst.excluded);
     }
-    // A def named like a modifier is still a rule where it reads as one.
-    let w = world(
-        "option o: toggle = on\ndef key = opt.o\ndef was = opt.o\nregion a {\n  check c1 no_progression key and true\n  check c2 no_progression was\n}",
+    // So no def or event may be named a modifier word: a rule could never read it there.
+    for (decl, what) in [
+        ("def key = true", "a def"),
+        ("def holds = true", "a def"),
+        ("region b {\n  event was: true\n}", "an event"),
+    ] {
+        let all = errors(&world(&format!("{decl}\nregion a {{\n  check c\n}}"))).join("\n");
+        assert!(
+            all.contains("starts a check modifier, so it cannot name ") && all.contains(what),
+            "{decl}: {all}"
+        );
+    }
+    // A family's name pieces after a bare `no_progression`: the modifier is read as one.
+    let fam = world(
+        "item a_it filler\nitem b_it filler\ntable t(key: name) {\n  a\n  b\n}\nregion a {\n  check extra\n  for r in t {\n    check c_{r.key} no_progression vanilla {r.key}_it\n  }\n}",
     );
-    let inst = ok(&w).default_instance().unwrap();
-    assert!(
-        inst.excluded.contains(&"c1".to_owned()) && inst.excluded.contains(&"c2".to_owned()),
-        "{:?}",
-        inst.excluded
-    );
+    let inst = ok(&fam).default_instance().unwrap();
+    assert!(inst.excluded.contains(&"c_a".to_owned()), "{:?}", inst.excluded);
+    assert!(inst.excluded.contains(&"c_b".to_owned()), "{:?}", inst.excluded);
 }
 
 #[test]
@@ -609,6 +618,25 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
         serde_json::json!({"id": 1, "published": true, "retired": false})
     );
     assert_eq!(l1["items"]["k"]["published"], true);
+    // A published item cannot be dropped, and an overlay `remove` of a published check is the
+    // same as dropping it.
+    let mut no_item = mem(&[(
+        "world.rando",
+        "world t\nstart a\nitem junk filler\npool fill { junk 1 }\nregion a {\n  check one\n  check two\n}\ngoal reach(a)\n",
+    )]);
+    no_item.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    let all = errors(&no_item).join("\n");
+    assert!(all.contains("published item `k` (id 1) is no longer declared"), "{all}");
+    let mut removed = mem(&[
+        (
+            "world.rando",
+            "world t\nuse tweaks\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\nregion a {\n  check one\n  check two\n}\ngoal reach(a)\n",
+        ),
+        ("tweaks.rando", "remove check a.two\n"),
+    ]);
+    removed.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    let all = errors(&removed).join("\n");
+    assert!(all.contains("published check `two` (id 2) is no longer declared"), "{all}");
     // Without `--publish` nothing is marked.
     let plain: serde_json::Value = serde_json::from_str(ok(&v1).ledger.as_ref().unwrap()).unwrap();
     assert!(plain["checks"]["one"].get("published").is_none(), "{plain}");
@@ -812,6 +840,12 @@ fn always_true_comparisons_fold_away() {
     assert_eq!(rule("count(k) * 3 + count(junk) > -1"), truth);
     assert_eq!(rule("has(k) or count(k) >= 0"), truth);
     assert_eq!(rule("count(k) >= 0 and 0 <= count(k)"), truth);
+    assert_eq!(rule("count(k) + count(junk) >= 0"), truth);
+    assert_eq!(rule("min(count(k), 2) >= 0"), truth);
+    assert_eq!(rule("max(count(k), 2) >= 2"), truth);
+    // `min(count(k), 2) >= 1` and a sum against 1 can still be false: kept.
+    assert!(rule("min(count(k), 2) >= 1").get("ge").is_some());
+    assert!(rule("count(k) + count(junk) >= 1").get("ge").is_some());
     // What can still be false is kept.
     assert_eq!(rule("count(k) >= 1"), serde_json::json!({"ge": [{"count": "k"}, 1]}));
     // An option can be negative, so a comparison with one is not folded.

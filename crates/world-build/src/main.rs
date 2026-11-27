@@ -189,8 +189,9 @@ fn main() -> ExitCode {
                 .and_then(|t| write(p, &t)),
         );
     }
-    // The ledger last, and only when the rest is written: a build that failed must not record
-    // ids (or publish them) for a manifest nobody has.
+    // The ledger last, and only when the rest is written: a failed build records and publishes
+    // no ids. A manifest written before a failed `--instance` keeps its ids, which the next
+    // build gives again, since the ledger did not move.
     if steps.iter().all(Result::is_ok)
         && let Some(l) = &built.ledger
     {
@@ -301,15 +302,14 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
     let players = g.players.unwrap_or(1);
     if let Some(count) = g.check_seeds {
         let from = g.seed.unwrap_or(1);
-        let Some(last) = from.checked_add(count - 1).filter(|l| *l <= config::SEED_NUMBER_MAX)
-        else {
-            eprintln!(
-                "error: seeds {from} and the {count} after it go past {}",
-                config::SEED_NUMBER_MAX
-            );
-            return ExitCode::from(2);
+        let c = match generator.check_seeds(&options, players, from, count) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
         };
-        let c = generator.check_seeds(&options, players, from, count);
+        let last = from + (c.tried - 1);
         let mut ms: Vec<f64> = c.times.iter().map(|t| t.as_secs_f64() * 1000.0).collect();
         ms.sort_by(f64::total_cmp);
         let s = if players == 1 { "" } else { "s" };
@@ -365,7 +365,7 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
             // A seed without its spoiler is not left behind.
             write_file(&spoiler_path, spoiler.as_bytes()).map_err(|e| {
                 match std::fs::remove_file(&seed_path) {
-                    Ok(()) => e,
+                    Ok(()) => format!("{e}; the seed file {} was removed", seed_path.display()),
                     Err(r) => format!("{e}; {} is left behind: {r}", seed_path.display()),
                 }
             })

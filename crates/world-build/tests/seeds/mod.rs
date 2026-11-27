@@ -188,6 +188,17 @@ fn the_spoiler_lists_every_placement() {
         assert!(t.contains(want), "{want:?} in\n{t}");
     }
     assert_eq!(s["fill"]["attempts"], seed.report.attempts);
+    // In a room of 10 the text lists players in room order: P2 before P10.
+    let ten = spoiler_text(&g.run(&opts, 10, 5).unwrap().spoiler);
+    let at = |h: &str| ten.find(h).unwrap_or_else(|| panic!("{h} in\n{ten}"));
+    assert!(at("  P2 dock\n") < at("  P10 dock\n"));
+    let shuffles = &ten[at("Shuffle results")..];
+    assert!(shuffles.find("  P2\n").unwrap() < shuffles.find("  P10\n").unwrap(), "{shuffles}");
+    // The library refuses what the CLI refuses, before any copy is made.
+    assert!(g.run(&opts, 1025, 1).unwrap_err().contains("1 to 1024 players"));
+    assert!(g.run(&opts, 1, 1 << 53).is_err());
+    assert!(g.check_seeds(&opts, 1, u64::MAX, 2).is_err());
+    assert!(g.check_seeds(&opts, 1, 1, 0).is_err());
 }
 
 #[test]
@@ -254,6 +265,7 @@ fn a_seed_is_not_left_without_its_spoiler() {
     let r = rando(&["generate", ex.to_str().unwrap(), "--seed", "3", "-o", &t.s("out")]);
     assert_eq!(r.status.code(), Some(1));
     assert!(!t.0.join("out/tidewell_isle-3.seed").exists(), "{}", text(&r.stderr));
+    assert!(text(&r.stderr).contains("the seed file"), "{}", text(&r.stderr));
 }
 
 #[test]
@@ -286,7 +298,10 @@ fn bad_options_are_refused_by_name() {
         &["--seed", "9007199254740992"],
         "--seed takes a whole number from 0 to 9007199254740991",
     );
-    refused(&["--seed", "9007199254740991", "--check-seeds", "2"], "go past 9007199254740991");
+    refused(
+        &["--seed", "9007199254740991", "--check-seeds", "2"],
+        "2 seeds from 9007199254740991 go past the largest seed number, 9007199254740991",
+    );
     refused(&["--check-seeds", "0"], "--check-seeds takes a number of at least 1");
     refused(&["--format", "yaml"], "--format is text or json");
     std::fs::write(t.0.join("o.txt"), "# options\npearls_needed = 3\nnope = 1\n").unwrap();

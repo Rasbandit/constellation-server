@@ -137,11 +137,18 @@ pub enum FillError {
     },
 }
 
-/// A fill error as the text a caller reports: its debug form (what every message of a failed
-/// fill has always read). The one conversion, so a call site needs only `?`.
+/// A fill error as the text a caller reports: a stuck fill in words, players counted from 1 as
+/// people count them (the field counts from 0); the rest in their debug form, what every
+/// message of a failed fill has always read. The one conversion, so a call site needs only `?`.
 impl From<FillError> for String {
     fn from(e: FillError) -> Self {
-        format!("{e:?}")
+        match e {
+            FillError::Stuck { item, player, attempts } => format!(
+                "Stuck: player {}'s item {item:?} had no reachable location left after {attempts} attempts",
+                player + 1
+            ),
+            e => format!("{e:?}"),
+        }
     }
 }
 
