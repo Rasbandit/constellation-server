@@ -90,21 +90,8 @@ pub mod op {
     pub const GROUP: u8 = 22;
 }
 
-/// Comparison operators, in their `CMP` operand order (the manifest spells them the same).
-pub const CMP_OPS: [&str; 6] = ["eq", "ne", "lt", "le", "gt", "ge"];
-
-/// Compare two integers by `CMP` operand.
-#[must_use]
-pub fn compare(op: u8, a: i64, b: i64) -> bool {
-    match op {
-        0 => a == b,
-        1 => a != b,
-        2 => a < b,
-        3 => a <= b,
-        4 => a > b,
-        _ => a >= b,
-    }
-}
+/// The comparison operators, their evaluation and the monotone rule: one shared crate.
+pub use rule_ops::{CMP_OPS, compare, monotone_cmp};
 
 /// Operand sizes in bytes (1 when the count is at most 256, else 2), fixed per section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,19 +231,6 @@ fn put_ids(out: &mut Vec<u8>, rows: &[(&str, i64)]) {
 }
 
 type R<T> = Result<T, String>;
-
-/// Whether `CMP` operand `op` over sides that do (or do not) read state can only turn from
-/// false to true as state grows: state may sit only on the side that must be larger.
-#[must_use]
-pub fn monotone_cmp(op: usize, left_state: bool, right_state: bool) -> bool {
-    match op {
-        // lt, le: the right side must be the larger one.
-        2 | 3 => !left_state,
-        // gt, ge.
-        4 | 5 => !right_state,
-        _ => !left_state && !right_state,
-    }
-}
 
 /// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`:
 /// its members as (key, cap).

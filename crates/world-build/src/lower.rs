@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use data_fill::section::monotone_cmp;
+use rule_ops::monotone_cmp;
 use serde_json::{Value, json};
 
 use crate::model::{Pos, Rule, RuleAt};
@@ -317,7 +317,7 @@ impl<'a> Lower<'a> {
                     None => self.err(
                         e.at,
                         format!("unknown item `{n}`"),
-                        "items are declared under `items:`",
+                        "declare it with `item NAME CLASS`",
                     ),
                 };
                 None
@@ -350,7 +350,7 @@ impl<'a> Lower<'a> {
                     self.err(
                         at,
                         format!("unknown option `{k}`"),
-                        "options are declared under `options:`",
+                        "declare it with `option NAME: TYPE`",
                     );
                     None
                 }
@@ -654,7 +654,7 @@ impl<'a> Lower<'a> {
             };
             return self.err(at, "this comparison can turn false as the player collects (rules are monotone, format rule a, D-132)", help);
         }
-        let key = data_fill::section::CMP_OPS[op.index()];
+        let key = rule_ops::CMP_OPS[op.index()];
         Some((json!({key: [x, y]}), xs || ys))
     }
 
@@ -809,7 +809,7 @@ impl<'a> Lower<'a> {
                 _ => self.err(
                     at,
                     "`group_count` takes one item group",
-                    "groups are declared under `item_groups:`",
+                    "declare it with `group NAME = { items }`",
                 ),
             },
             "min" | "max" => {

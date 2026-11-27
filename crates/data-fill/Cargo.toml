@@ -37,6 +37,8 @@ allocation-counter = { version = "0.8", optional = true }
 bits = { path = "../bits" }
 # The one source of limits (rule nesting depth, fill attempts).
 config = { path = "../config", default-features = false }
+# The comparison operators and their monotone rule, shared with the world build tool.
+rule-ops = { path = "../rule-ops" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }

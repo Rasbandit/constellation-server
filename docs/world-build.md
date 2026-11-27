@@ -1,94 +1,126 @@
 # The world build tool (`crates/world-build`)
 
-Turns a world as an author wrote it into the manifest JSON the fill engine loads (`crates/data-fill`), and into the per-seed instance the engine fills from. The design is doc 16 (the world file standard) and doc 17 (generic shuffles) in the `constellation` docs repo. Issue #27.
+Turns a world written in the `.rando` language into the manifest JSON the fill engine loads (`crates/data-fill`), and into the per-seed instance the engine fills from. The design is doc 18 (the authoring language), doc 16 (the world file standard) and doc 17 (generic shuffles) in the `constellation` docs repo. Issue #27. `.rando` and `rando` are working names, cleared by a lawyer before anything external.
 
-**Status.** The owner has chosen an authoring language of its own, with its own file extension, over YAML; its design is being written (docs repo, draft doc 18). So everything here is built on a syntax-neutral model, and the front end that reads a file is one function (`world_build::front::read`) that is not built yet and refuses every input. A world is built today from its model, in Rust.
+## Write a world
 
-Two things the model is shaped for: a front end that expands location families and tables into many plain checks, each keeping the place of the declaration it came from (a test builds 20,000 generated checks in about 2 s in a debug build, measured once on a shared machine); and a ledger of permanent ids, held apart from names (`id` on items and checks).
+A world is a folder with an entry file `world.rando`, any modules it names with `use`, and the `ledger.json` the tool writes. The example world, "Tidewell Isle" (invented for the tests: 9 regions, 17 checks, 7 items, 4 options, two shuffles), is in `crates/world-build/tests/fixtures/tidewell/`. Its entry file starts:
+
+```rando
+world tidewell_isle "Tidewell Isle" version 1
+use items
+use regions/coast
+use regions/lighthouse
+start dock
+
+option tricky_climbs: toggle = off
+option start_gift: choice(none, lamp) = none
+
+start_item lamp when opt.start_gift == lamp
+def can_climb = has(crowbar) or opt.tricky_climbs
+```
+
+and a region, from `regions/coast.rando`:
+
+```rando
+region market {
+  for s in [fruit, fish] {
+    check {s}_stall when opt.market_stalls
+  }
+  check notice_board
+  exit dock door market_door group inside
+}
+```
+
+Rules are written bare. A check or exit with no rule is open. `when` reads options only. Every declaration starts with a keyword, and a rule ends at the first token it cannot continue with, so newlines matter only inside tables (one row per line).
+
+## Run it
+
+```sh
+cargo run -p world-build --bin rando -- check crates/world-build/tests/fixtures/tidewell
+cargo run -p world-build --bin rando -- build <dir> -o manifest.json --instance instance.json
+cargo run -p world-build --bin rando -- fmt <dir> [--check]
+```
+
+- `check` reads and checks the world and prints every error and warning as `file:line:col: message` with a `help:` line.
+- `build` also writes the canonical manifest (to standard output without `-o`) and writes `ledger.json` back into the folder. `--instance` writes the per-seed instance at every option's default. `--allow-edited` accepts a hand-edited generated file as a warning. `--publish` refuses edited files and any warning.
+- `fmt` rewrites every `.rando` file under the folder in the canonical layout. `--check` fails when a file would change, for CI.
+
+Tests: `cargo test -p world-build` (`tests/build.rs` for the checks on the model, `tests/lang/` for the language). The end-to-end tests build Tidewell, load it in the engine and generate seeds 1 to 50 at 1 and 4 players. `data_fill::seed::generate` refuses a world a player cannot finish, so every seed passing means every seed is beatable. Tidewell's `.rando` files build to the same bytes as its model in `tests/support/mod.rs`.
 
 ## The parts
 
 | Part | Where | What it does |
 |---|---|---|
-| Model | `src/model.rs` | The world as written, every value with its line and column. What a front end produces. |
-| Rule parser | `src/rule.rs` | Rule strings to a tree, by the precedence of doc 16 section 5.0. Recursive descent with a depth cap. |
-| Checks and lowering | `src/world.rs`, `src/lower.rs` | Names, duplicates, the format rules, the shuffle slice; rules to the engine's trees. Collects every error. |
-| Canonical JSON | `src/canon.rs` | Sorted keys by bytes, integers only, no whitespace, one newline at the end. |
-| Instance | `src/instance.rs` | Per option values: which checks exist, the pool, classes, start items, fixed placements, placement sets. Also the build-time pool test. |
-| Front end | `src/front.rs` | Source text to model. Not built. |
+| Lexer | `src/lex.rs` | Tokens with file, line and column, glue (no space before) and line breaks; comments kept. |
+| Rule parser | `src/rule.rs` | Doc 16 section 5.0 precedence, recursive descent on tokens, depth cap (arithmetic chains count; a sum is one node). |
+| Front end | `src/front/` | `parse.rs`: one file to a tree with error recovery and layout marks. `mod.rs`: modules, tables and families, overlays, visibility, generated headers. `ledger.rs`: ids. `fmt.rs`: the formatter. |
+| Model | `src/model.rs` | The world as written, syntax-neutral, every value with its place; ledger ids apart from names. |
+| Checks and lowering | `src/world.rs`, `src/lower.rs` | Names, the format rules, the shuffle slice, the pool test; rules to the engine's trees. |
+| Canonical JSON | `src/canon.rs` | Keys sorted by bytes, integers only, no whitespace, one newline at the end. |
+| Instance | `src/instance.rs` | Per option values: checks that exist, the pool, classes, start items, fixed placements, placement sets, as the engine's instance JSON. |
+| CLI | `src/main.rs` | `rando check`, `fmt`, `build`. |
 
-```rust
-let built = world_build::build_model(&world, "tidewell.world")?; // Err: every error, file order
-built.json();                       // the manifest, canonical text
-built.default_instance()?;          // data_fill::Instance at every option's default
-built.instance(&options)?;          // for other option values
-```
+The engine is optional: feature `engine` (on by default) adds `data-fill`, for the last check (the engine's own compiler runs on every manifest) and `Built::instance`. `cargo build -p world-build --no-default-features` builds a tool that checks, formats and writes canonical JSON and instance JSON without Constellation. The comparison operators and the monotone rule live in `crates/rule-ops`, which both use. Everything is Rust, with no new dependency except `sha2`, which the workspace already had.
 
-Every built manifest goes through the engine's own compiler (`data_fill::section::compile`) before it is returned, as a last check.
+## Grammar decisions (corrections for doc 18)
 
-## The example world
+Where doc 18's sketch was ambiguous, did not parse its own examples, or said nothing, the parser does the following:
 
-"Tidewell Isle", invented for the tests: `crates/world-build/tests/support/mod.rs` (`tidewell()`). 9 regions, 17 checks, 7 items, 4 options (a toggle for tricky climbs, a range for pearls needed, a toggle for market stalls, a choice of start gift), one def, one item group, one start item, a fixed placement, an excluded check, an event, a coupled entrance shuffle over the three doors from the dock (`doors`, check `layout`), and a shuffle of two wardens whose rules the exits behind them read (`wardens`, check `none`). The same file has doc 16's smallest world (`two_rooms()`), whose manifest bytes are pinned.
-
-Run the tests: `cargo test -p world-build`. The end-to-end test builds Tidewell, loads it in the engine and generates seeds 1 to 50 at 1 and 4 players; `data_fill::seed::generate` refuses a world a player cannot finish, so every seed passing means every seed is beatable.
-
-## The rule language this version builds
-
-| Written | Engine form | Notes |
-|---|---|---|
-| `true`, `false` | `{"true": {}}` | |
-| `a and b`, `a or b` | `all`, `any` | At most 255 parts. Mixing without parentheses is a warning. |
-| `not a` | `not` | Options and shuffle name tests only (D-132). |
-| `has(x)`, `has(x, n)` | `has`, with `n` only when it is not 1 | `n` a literal, 0 to 255 (engine limit). |
-| `has_all(..)`, `has_any(..)` | same, items sorted | |
-| a def's name | `ref` | Cycles are errors. In a field settled from options, the def must read options only; the per-seed step evaluates each def once. |
-| an event's name | `counter >= 1` | |
-| `opt.k` (toggle) | `opt.k != 0` | Other option types must be compared. |
-| `opt.k == value` (choice) | `eq` with the value's position | Also `!=` and `opt.k in [a, b]`. |
-| `>= > <= < == !=` | `ge gt le lt eq ne` | Monotone only: state on the larger side; `==`, `!=` never over state. |
-| `count(x)`, `level(x)`, `counter(e)`, `group_count(g)` | `count`, `count`, `counter`, a sum of counts | |
-| `+`, `min`, `max`, `*`, `div` | `int` | `*` over state needs a literal factor of at least 0; `div` a positive literal. Literals fit 16 bits. |
-| `reach(region)` | `reach` | Goal only. |
-| `at.s.slot` | `at` | As a rule (every thing needs a rule) or tested by thing name. Not on an exit shuffle. |
-
-Refused with a message that names them: `-` and `mod` (the engine cannot evaluate them), `during` (no time contexts yet), `roll` (its draw waits on D-47), any dotted name other than `opt.` and `at.` (a rule reads only its own world, D-133).
+1. **Reserved words**: the words that start a declaration or a member (`world start option item pool start_item assumed def group score steps table for placement region shuffle require trick goal extend replace remove generated use check exit event stay`), plus `when`, `match`, `and`, `or`, `not`, `in`, `div`, `mod`, `true`, `false`. A reserved word is written as a name in backticks: `` `group` ``.
+2. **Contextual words are not reserved**: `key`, `was`, `door`, `vanilla`, `holds`, `no_progression`, `can_stay`, `x`, `version`, `fill`, `from`, `where`, `kind`, `slots`, `things`, `thing`, `coupled`, `only`, `deny`, `only_in`, `deny_in`, `again`, `exits`, `tool`, `source`, `content`, `sha256`, `expect`, the option and column types, and `on`/`off`. Each comes only after a complete name or rule, where a rule has already ended. So `key` stays usable as a name (doc 16's example item) and as a table column.
+3. **Table rows are one per line.** This is the one place a newline means something. A row with too few or too many values is an error at the end of the line.
+4. **Field access** `d.key` is a family variable's column. Dotted names are one token: `opt.k`, `at.s.slot`, `var.field`, and overlay targets `region.name`.
+5. **Name pieces** `{d.key}_ante{ante}` are glued tokens: a piece joins the name only with no space before it. `_` alone is the `match` wildcard. `_` glued between pieces (`c{i}_{j}`) is text, and a name may not be `_` alone.
+6. **`use PATH`**: `PATH` is names joined by `/`, without quotes, read as `PATH.rando` inside the world folder.
+7. **`shuffle NAME [kind NAME] { ... }`**, one item per line: `slots exits(g, ...)`, `things exits(...)`, `slots a, b` (free names), `thing NAME [: rule] [group NAME]`, `coupled [rule]`, `check none|layout`, `when rule`, and rows `slots S only|deny T [when r] [again]` and `things T only_in|deny_in S ...`. `kind`, `when`, row `when` and `again`, `pin`, `vanilla`, `pool`, `after` and `scope` are parsed and refused as not supported yet (the engine's first slice).
+8. **Overlay targets** are `region NAME`, `check REGION.NAME`, `exit REGION.TO`, `def NAME` and `item NAME`. `extend` takes a region and a block, `replace` takes `: rule` for a check, exit or def, and `remove` takes any target. There is no syntax for the base hash an overlay was last built against, so the missing-target message cannot name the hashes doc 18 section 2.8 shows.
+9. **`generated { ... }`** must be the first thing in its file. `content` is the SHA-256 of the file after the block, formatted. `expect NAME >= N` names a table declared in that file. Families have no names to expect.
+10. **Toggles**: their default is `on`/`off` (also `true`/`false`), and `match` on a toggle has arms `on` and `off`. `match` on a range is an error.
+11. **`no_progression`** alone means always. A rule after it is read only if a rule starts there.
+12. **Declarations doc 18 shows but this version does not build** (`score`, `steps`, `trick`, `require`, `stay`, an item `when`, a class `match`) are parsed far enough to be skipped and reported as not supported yet, with their place.
+13. **A family's `where`** may read options. What folds at build time drops combinations; what is left joins each generated check's (or region's) `when`, and an exit's or event's rule. A `where` cannot switch off declarations that have no `when` (options, defs, shuffles, items).
+14. **Ledger keys in a family** are the expanded names. A written `key "..."` applies to one declaration outside a family.
+15. **Visibility**: a file may read a name declared in itself, in a file it reaches by `use`, or in the entry file. An exit's target region does not count, so region files can lead to each other without a `use` each way.
+16. **Def parameters**: an argument is a number, a name or `opt.<key>`, after folding. The written def is named `<def>__<arg>__<arg>`, so a user name may not contain `__`.
 
 ## What is checked
 
-Each error names the line, the column and what to do.
+Each error names the file, line and column and what to do. All errors are collected; the parser recovers at the next keyword.
 
+- Syntax, everywhere, with recovery; modules that do not exist; names read without a `use`.
+- Families and tables: unknown tables and variables, a row or name piece of the wrong type, CSV header, types and line numbers, duplicate rows, and at most 100,000 expanded declarations.
 - Names: unknown names, a name used as the wrong kind ("`lamp` is an item; did you mean `has(lamp)`?"), duplicates across the one namespace (events may repeat), reserved words, name shape.
 - Regions: an exit to a missing region, two exits to one region, a region no exit leads to from the start.
 - Format rule a (D-132): `not` over state, comparisons that can turn false, products and divisions that can.
-- Format rule b (D-133): dotted names that are not options or shuffle reads.
-- Format rule c (D-134): check and region `when`, `no_progression`, `start_items` and `assumed` conditions read options only, never state or a shuffle result.
-- Items: class, count bounds, `fill_with` items and weights, `holds` with no copy left, start items, placement sets (an item in one set).
-- Pool (doc 16 section 3.4): every combination of the options the counts read; past 4,096, every combination of each option's lowest and highest value; past that, each option alone at its two ends, with a warning. Too many items for the checks names the settings. Counts are checked before any copy is written out, and start items are capped.
-- Shuffles, the engine's first slice: exit shuffles (`layout`) and free-name shuffles (`none`). Refused: `when`, `pin`, `vanilla`, `pool`, `after`, `kind`, `scope`, thing fields other than `rule` and `group`, row fields `again` and `when`, `check: reach`, a `coupled` that reads options, coupling on a name shuffle, the reserved names `layout` and `own_fill`, and any name a row or slot list does not have.
-- Nesting: a rule string nests at most 64 deep as written (a sum is one node however long), and lowering counts the defs a rule reaches against the engine's own cap of 256, so no input exhausts the stack. The engine counts a few short forms as one or two nodes more, so near the cap its own check may be the one that refuses; both messages say what to do.
-- Shuffles whose things' rules read each other in a cycle, a shuffle reading itself included.
-- Table sizes: at most 65,536 items, checks or regions (`WORLD_TABLE_MAX`, the engine's index width).
-- Fields the model carries but this version does not build (`rolls`, `contexts`, `require`, `stays`, ...) are reported as not supported yet.
+- Format rule b (D-133): dotted names that are not options, shuffle reads or family fields.
+- Format rule c (D-134): check and region `when`, `no_progression`, start item and assumed conditions read options only, never state or a shuffle result, through defs too.
+- `match` covers every value; defs with parameters get the right number of fixed arguments.
+- Items, the pool test across option values, shuffles in the engine's first slice, read cycles, nesting depth, and table sizes, as before.
+- The ledger: ids unique, in 1 to 2^53 - 1, and for this world. Renames with `was` keep ids. Retired ids are never given again.
+- Generated files: a content hash that does not match (an error, or a warning with `--allow-edited` when not publishing), sources that changed (a warning), and tables smaller than their `expect`.
+- Overlays: a target that is gone (`overlay.target_missing`), and two replacements of one target where neither file uses the other.
 
-Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERRORS` (200 errors and 200 warnings, the rest counted in one last line), `RULE_MAX_PARTS` (255, the engine's), `WORLD_POOL_TEST_MAX_COMBINATIONS` (4,096), `WORLD_ITEM_COPIES_MAX` (32,767), `WORLD_OPTIONS_MAX` (256, the engine's), `WORLD_START_COPIES_MAX` (1,024). All design values except the engine's.
+Limits are in `crates/config` (`WORLD_*`, `RULE_MAX_PARTS`). All are design values except the engine's own.
 
-## Choices made where doc 16 is silent
+## Choices made where the docs are silent
 
-- **Output is the engine's manifest shape, not all of doc 16's canonical JSON.** The engine reads a subset (doc 16 section 3.5 table); fields it would ignore are not written. Doc 16's world-side fields (class, count, pool, `when`, `holds`, `no_progression`, placement, start items, assumed) go into the per-seed instance instead.
-- **Canonical text is compact**: no whitespace, a newline at the end.
-- **Ids**: an item's or check's `id` from the ledger when the model has one (1 to 2^53, each used once per table); the rest are numbered on from the largest given, in file order, so a world with no ledger is numbered from 1. Ids that would pass 2^53 are an error. Numbering on from the largest given id is safe only while the ledger gives every name it has ever seen its id (so a deleted entry's id is never reused); reading and writing the ledger file is the front end's job and is not built.
-- **`nothing`** is added as an item (filler, the id after the largest) only when the world has no `fill_with`.
+- **Output is the engine's manifest shape, not all of doc 16's canonical JSON.** Fields the engine would ignore are not written. The world-side fields go into the per-seed instance.
+- **Canonical text is compact**: no whitespace, a newline at the end. The ledger is canonical JSON too.
+- **Ids**: from `ledger.json`, keyed by name or written key. A world with no ledger is numbered in declaration order from 1, items and checks apart, and the ledger is then written. Without a ledger, ids follow the order the files apply: each module after the modules it uses.
+- **`nothing`** is added as an item (filler, the id after the largest) only when the world has no `pool fill`.
 - **Free slots are split by weight deterministically** (largest remainder, ties by key), since the seeded draw waits on D-47.
 - **A `holds` copy of a check that does not exist this seed stays in the pool.**
-- **`class` is required**; the doc's proposed default by use is not built.
-- **Names** are `[a-z_][a-z0-9_]*`; a game key also allows `-`. Exit keys are `region:to`.
-- **A region's `when`** is joined with `and` into its exits' and events' rules and its checks' `when`.
-- **A rule error in a rule written over several lines** reports where the rule starts.
+- **`class` is required.**
+- **Exit keys are `region:to`.** A region's `when` joins its exits', events' and checks' conditions.
+- **Number-only arithmetic folds** at build time, `-` and `mod` included. Over options or state they stay refused, because the engine cannot evaluate them.
+- **`count(a, b)`** is a sum of counts over the items in key order, like a group.
+- **Builds run on their own thread** with a stack sized for the depth cap (`WORLD_BUILD_STACK_BYTES`).
 
 ## What the manifest cannot express (gaps)
 
-- `format`, `name` and `requires` (no header fields beyond `game` and `version`).
-- Item class, count, the pool and `fill_with`, check `when`, `holds`, `no_progression`, placement sets, start items and assumed items: all per-seed instance fields, which this tool computes, but a manifest alone does not carry them.
-- An option's type, values and range (the manifest holds a key and an integer default).
-- Item groups as named lists (a group count is written out as its sum).
+- `format`, the display name, option and player-facing texts, and `requires`. The manifest has no header fields beyond `game` and `version`.
+- Item class, count, the pool, check `when`, `holds`, `no_progression`, placement sets, start items and assumed items. These are per-seed instance fields, which this tool computes.
+- An option's type, values and range. The manifest holds a key and an integer default.
+- Item groups as named lists (a group count is written out as its sum), and the defs with parameters (written out per argument list).
 - A thing's `count`, `min`, `weight`, payloads, shuffle `when`, pins and the other later fields of doc 17.

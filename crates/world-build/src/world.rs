@@ -273,7 +273,7 @@ fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
     if errs.errors.is_empty()
         && let Some((manifest, model)) = out
     {
-        if let Err(e) = data_fill::section::compile(&manifest) {
+        if let Err(e) = engine_check(&manifest) {
             // The engine counts depth over its own nodes, which a short form (a toggle, an
             // event, `in`, a shuffle read) turns into one or two more than the build counts:
             // past the build's own cap the engine's check is the one that decides.
@@ -403,7 +403,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                     errs.err(
                         o.ty.pos,
                         format!("choice `{}` has no values", o.key.v),
-                        "list them under `values`",
+                        "list them: `choice(a, b)`",
                     );
                 }
                 let d = match o.default.as_ref().map(|d| &d.v) {
@@ -669,7 +669,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 lw.errs().err(
                     s.pos,
                     format!("`{}` is not a placement set", s.v),
-                    "declare it under `placement`",
+                    "declare it with `placement NAME { items }`",
                 );
                 None
             }
@@ -1256,4 +1256,16 @@ fn ids(errs: &mut Errs, given: &[Option<&At<i64>>], what: &str) -> Vec<i64> {
         );
     }
     out
+}
+
+/// The engine's own compiler over the built manifest, the last check (doc 18 section 5.2):
+/// only when the build tool is built with the engine (feature `engine`, on by default).
+#[cfg(feature = "engine")]
+fn engine_check(m: &Value) -> Result<(), String> {
+    data_fill::section::compile(m).map(|_| ())
+}
+
+#[cfg(not(feature = "engine"))]
+fn engine_check(_: &Value) -> Result<(), String> {
+    Ok(())
 }

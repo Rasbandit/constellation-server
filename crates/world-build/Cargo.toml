@@ -14,13 +14,32 @@ categories.workspace = true
 [dependencies]
 # The one source of limits (rule nesting, error count, pool test size).
 config = { path = "../config", default-features = false }
-# The engine: its per-seed instance type, its monotone rule for comparisons, and its compiler,
-# which every built manifest goes through as a last check.
-data-fill = { path = "../data-fill" }
+# The engine (feature `engine`, on by default): its per-seed instance type, and its compiler,
+# which every built manifest goes through as a last check. Without it the tool still checks
+# and builds canonical JSON (doc 18 section 5.2).
+data-fill = { path = "../data-fill", optional = true }
+# The comparison operators and their monotone rule, shared with the engine.
+rule-ops = { path = "../rule-ops" }
 serde_json = { workspace = true, features = ["std"] }
 # SHA-256 of generated files' content and sources (doc 18 section 2.9): the RustCrypto crate the
 # workspace already uses (MIT OR Apache-2.0).
 sha2 = { version = "0.11", default-features = false }
+
+[features]
+default = ["engine"]
+engine = ["dep:data-fill"]
+
+[dev-dependencies]
+data-fill = { path = "../data-fill" }
+
+[[bin]]
+name = "rando"
+path = "src/main.rs"
+
+# The end-to-end tests fill seeds with the engine.
+[[test]]
+name = "build"
+required-features = ["engine"]
 
 [lints]
 workspace = true

@@ -9,10 +9,8 @@
 //! the model. What is checked and the choices made where the design doc is silent are in
 //! `docs/world-build.md`.
 
-use std::collections::HashMap;
 use std::fmt;
 
-use data_fill::Instance;
 use serde_json::Value;
 
 pub mod canon;
@@ -74,21 +72,37 @@ impl Built {
     }
 
     /// The per-seed instance of this world for the option values in `options` (an option left
-    /// out takes its default): which checks exist, the item pool and classes, start items,
-    /// fixed placements and placement sets, as the engine's fill reads them.
+    /// out takes its default), as the engine's instance JSON: which checks exist, the item pool
+    /// and classes, start items, fixed placements and placement sets.
     ///
     /// # Errors
     /// An unknown option, a value outside its option's range, or more items than checks.
-    pub fn instance(&self, options: &HashMap<String, i64>) -> Result<Instance, String> {
+    pub fn instance_json(
+        &self,
+        options: &std::collections::HashMap<String, i64>,
+    ) -> Result<Value, String> {
         instance::of(&self.model, options)
+    }
+
+    /// [`Built::instance_json`] read as the engine's instance.
+    ///
+    /// # Errors
+    /// As [`Built::instance_json`].
+    #[cfg(feature = "engine")]
+    pub fn instance(
+        &self,
+        options: &std::collections::HashMap<String, i64>,
+    ) -> Result<data_fill::Instance, String> {
+        serde_json::from_value(self.instance_json(options)?).map_err(|e| e.to_string())
     }
 
     /// The instance at every option's default.
     ///
     /// # Errors
     /// As [`Built::instance`].
-    pub fn default_instance(&self) -> Result<Instance, String> {
-        self.instance(&HashMap::new())
+    #[cfg(feature = "engine")]
+    pub fn default_instance(&self) -> Result<data_fill::Instance, String> {
+        self.instance(&std::collections::HashMap::new())
     }
 }
 

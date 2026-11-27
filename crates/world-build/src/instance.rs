@@ -4,11 +4,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use data_fill::Instance;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::lower::OptTy;
-use crate::world::{Errs, Model, NOTHING, OptM};
+use crate::world::{CheckM, Errs, GrantM, Model, NOTHING, OptM};
 
 /// An options-only integer expression's value (the build lets nothing else into these).
 fn int(v: &Value, o: &HashMap<&str, i64>) -> Option<i64> {
@@ -65,13 +64,9 @@ impl<'m> Ev<'m> {
                 b
             }
             op => {
-                let ix = data_fill::section::CMP_OPS.iter().position(|x| *x == op)?;
+                let ix = rule_ops::CMP_OPS.iter().position(|x| *x == op)?;
                 let [x, y] = a.as_array()?.as_slice() else { return None };
-                data_fill::section::compare(
-                    u8::try_from(ix).ok()?,
-                    int(x, self.o)?,
-                    int(y, self.o)?,
-                )
+                rule_ops::compare(u8::try_from(ix).ok()?, int(x, self.o)?, int(y, self.o)?)
             }
         })
     }
@@ -91,8 +86,21 @@ fn split(free: i64, weights: &[(String, i64)]) -> Vec<(String, i64)> {
     out.into_iter().map(|(k, n, _)| (k, n)).collect()
 }
 
-/// The instance of `m` for `given` option values.
-pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, String> {
+/// One seed's settled world: options to numbers, and what exists, is fixed, granted and
+/// placed, counted and checked before any copy is written out.
+struct Settled<'m> {
+    o: HashMap<&'m str, i64>,
+    included: Vec<&'m CheckM>,
+    excluded: Vec<&'m str>,
+    granted: Vec<&'m GrantM>,
+    assumed: Vec<&'m GrantM>,
+    taken: HashMap<&'m str, i64>,
+    placed: i64,
+    slots: i64,
+}
+
+/// Settle `m` for `given` option values.
+fn settle<'m>(m: &'m Model, given: &HashMap<String, i64>) -> Result<Settled<'m>, String> {
     let mut o: HashMap<&str, i64> = HashMap::new();
     for opt in &m.options {
         let v = given.get(&opt.key).copied().unwrap_or(opt.default);
@@ -105,42 +113,37 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
     if let Some(k) = given.keys().find(|k| !o.contains_key(k.as_str())) {
         return Err(format!("unknown option {k:?}"));
     }
-    let mut ev = Ev { o: &o, defs: &m.defs, memo: HashMap::new() };
-    let mut holds =
-        |v| ev.rule(v).ok_or_else(|| format!("a rule here reads more than options: {v}"));
-    let mut inst = Instance::default();
+    let (mut included, mut excluded, mut granted, mut assumed) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut taken: HashMap<&str, i64> = HashMap::new();
-    for c in &m.checks {
-        if !holds(&c.when)? {
-            continue;
+    {
+        let mut ev = Ev { o: &o, defs: &m.defs, memo: HashMap::new() };
+        let mut holds =
+            |v| ev.rule(v).ok_or_else(|| format!("a rule here reads more than options: {v}"));
+        for c in &m.checks {
+            if !holds(&c.when)? {
+                continue;
+            }
+            included.push(c);
+            if holds(&c.no_progression)? {
+                excluded.push(c.key.as_str());
+            }
+            if let Some(i) = &c.holds {
+                *taken.entry(i).or_default() += 1;
+            }
         }
-        inst.locations.push(c.key.clone());
-        if holds(&c.no_progression)? {
-            inst.excluded.push(c.key.clone());
+        for g in &m.start_items {
+            if holds(&g.when)? {
+                *taken.entry(&g.item).or_default() += g.n;
+                granted.push(g);
+            }
         }
-        if let Some(i) = &c.holds {
-            inst.locked.insert(c.key.clone(), i.clone());
-            *taken.entry(i).or_default() += 1;
-        }
-        if let Some(s) = &c.set {
-            inst.location_groups.insert(c.key.clone(), s.clone());
+        for g in &m.assumed {
+            if holds(&g.when)? {
+                assumed.push(g);
+            }
         }
     }
-    let mut granted = Vec::new();
-    for g in &m.start_items {
-        if holds(&g.when)? {
-            *taken.entry(&g.item).or_default() += g.n;
-            granted.push(g);
-        }
-    }
-    for g in &m.assumed {
-        if holds(&g.when)? {
-            *inst.logic_start.entry(g.item.clone()).or_default() += g.n;
-        }
-    }
-    // Every count is checked before any copy is written out, so a world's numbers never
-    // decide how much memory this takes: the pool is at most the checks, the start items at
-    // most their cap.
     let mut placed = 0i64;
     for (key, _, count) in &m.items {
         let n = count - taken.get(key.as_str()).copied().unwrap_or(0);
@@ -152,7 +155,8 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
         }
         placed += n;
     }
-    let slots = i64::try_from(inst.locations.len() - inst.locked.len()).unwrap_or(i64::MAX);
+    let locked = i64::try_from(included.iter().filter(|c| c.holds.is_some()).count()).unwrap_or(0);
+    let slots = i64::try_from(included.len()).unwrap_or(i64::MAX) - locked;
     if placed > slots {
         return Err(format!("{placed} items to place and {slots} checks to hold them"));
     }
@@ -161,22 +165,56 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
     if start > i64::try_from(most).unwrap_or(i64::MAX) {
         return Err(format!("{start} start item copies, at most {most}"));
     }
-    for g in granted {
-        inst.start_inventory.extend((0..g.n).map(|_| g.item.clone()));
+    Ok(Settled { o, included, excluded, granted, assumed, taken, placed, slots })
+}
+
+/// The per-seed instance of `m` for `given` option values, in the engine's instance shape
+/// (`data_fill::Instance`, the player file's `instance`), as JSON: the tool writes it with or
+/// without the engine.
+pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Value, String> {
+    let s = settle(m, given)?;
+    let (mut locked, mut location_groups) = (BTreeMap::new(), BTreeMap::new());
+    for c in &s.included {
+        if let Some(i) = &c.holds {
+            locked.insert(c.key.clone(), i.clone());
+        }
+        if let Some(set) = &c.set {
+            location_groups.insert(c.key.clone(), set.clone());
+        }
     }
+    let start: Vec<&str> =
+        s.granted.iter().flat_map(|g| (0..g.n).map(|_| g.item.as_str())).collect();
+    let mut logic: BTreeMap<&str, i64> = BTreeMap::new();
+    for g in &s.assumed {
+        *logic.entry(&g.item).or_default() += g.n;
+    }
+    let mut pool: Vec<&str> = Vec::new();
+    let mut classes: BTreeMap<&str, &str> = BTreeMap::new();
     for (key, class, count) in &m.items {
-        let n = count - taken.get(key.as_str()).copied().unwrap_or(0);
-        inst.pool.extend((0..n).map(|_| key.clone()));
-        inst.pool_class.insert(key.clone(), class.clone());
+        let n = count - s.taken.get(key.as_str()).copied().unwrap_or(0);
+        pool.extend((0..n).map(|_| key.as_str()));
+        classes.insert(key, class);
     }
-    for (k, n) in split(slots - placed, &m.fill_with) {
-        inst.pool.extend((0..n).map(|_| k.clone()));
+    let fill = split(s.slots - s.placed, &m.fill_with);
+    for (k, n) in &fill {
+        pool.extend((0..*n).map(|_| k.as_str()));
     }
-    inst.pool.sort();
-    inst.pool_class.entry(NOTHING.to_owned()).or_insert_with(|| "filler".to_owned());
-    inst.item_groups = m.confined.clone().into_iter().collect();
-    inst.options = o.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
-    Ok(inst)
+    pool.sort_unstable();
+    classes.entry(NOTHING).or_insert("filler");
+    let options: BTreeMap<&str, i64> = s.o.iter().map(|(k, v)| (*k, *v)).collect();
+    Ok(json!({
+        "excluded": s.excluded,
+        "item_groups": m.confined,
+        "locations": s.included.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        "location_groups": location_groups,
+        "locked": locked,
+        "logic_start": logic,
+        "options": options,
+        "pool": pool,
+        "pool_class": classes,
+        "rolls": {},
+        "start_inventory": start,
+    }))
 }
 
 /// Every option key an options-only rule of `m` reads, through the defs it names (each def
@@ -282,7 +320,7 @@ fn bounds(ty: &OptTy) -> (i64, i64) {
 
 /// Whether the pool fits with `given`; when not, the error, naming the settings.
 fn fill(m: &Model, given: &[(String, i64)], errs: &mut Errs) -> bool {
-    let Err(e) = of(m, &given.iter().cloned().collect()) else { return true };
+    let Err(e) = settle(m, &given.iter().cloned().collect()).map(|_| ()) else { return true };
     let mut set: Vec<String> = given.iter().map(|(k, v)| format!("{k} = {v}")).collect();
     set.sort();
     let with = if set.is_empty() { String::new() } else { format!(" with {}", set.join(", ")) };

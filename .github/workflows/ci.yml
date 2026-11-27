@@ -58,6 +58,9 @@ jobs:
       # The world build tool's unit and integration tests (the example world filled end to end).
       - if: steps.scope.outputs.code != 'false'
         run: cargo test -p world-build --tests --locked
+      # The build tool without the engine (doc 18 section 5.2): it must still build.
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo check -p world-build --no-default-features --locked
       # The data-only fill engine's unit, integration and binary tests (damaged sections,
       # fixtures, fairness), once.
       - if: steps.scope.outputs.code != 'false'
