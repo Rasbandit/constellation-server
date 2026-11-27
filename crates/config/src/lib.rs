@@ -400,12 +400,12 @@ pub const GENERATION_WORKERS: usize = 1;
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
-/// Players from which a room's fill stops taking a round's items back by truth maintenance
-/// (the carried path) and takes the split path instead: one solve, then every round's state by
-/// adding to it and undoing (`data_fill::room::Path`; every path gives the same placements).
-/// On the synthetic rooms of the `bench-room` CI job the split path is faster than the carried
-/// one at 1 and at 10 players too; smaller rooms stay carried until a real world is timed.
-pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
+/// Players from which a room's fill takes the split path: one solve, then every round's state
+/// by adding to it and undoing (`data_fill::room::Path`; every path gives the same
+/// placements). 1: every room. On the `bench-room` CI job the split path was 4.1 times faster
+/// than the carried one for one heavy player (11.6 against 2.8 ms, measured, run 45924343167);
+/// the carried path stays for a caller that names it and for confined items.
+pub const ROOM_FORWARD_MIN_PLAYERS: usize = 1;
 
 /// Most threads the players' states of a room run on while a round is solved forward: a fill
 /// takes the worker count of its request, at most this many and at most the cores the process
