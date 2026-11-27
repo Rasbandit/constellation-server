@@ -1,6 +1,6 @@
-//! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight] [--rules bits|bytecode] [--absent skip|check]
+//! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
 //! [--path auto|carry|forward|split] [--workers 4]
-//! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]|drawn|single] [--players 1,10,20,50,100]
+//! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]|drawn|deepest|repaired|single] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
@@ -172,7 +172,7 @@ fn fine(ms: f64) -> f64 {
 }
 
 fn one(
-    shape: &Shape,
+    shapes: &[Shape],
     seed: u64,
     players: usize,
     reps: usize,
@@ -180,11 +180,13 @@ fn one(
     (bits, skip, vanilla): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
+    // A mixed room's switches are its first shape's (no mixed shape has doors or guards).
+    let shape = &shapes[0];
     let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
     let drawn: Vec<(Value, Instance)> = (0..count as u64)
         .map(|p| {
-            let (mut manifest, instance) = world(shape, seed, p);
+            let (mut manifest, instance) = world(&shapes[p as usize % shapes.len()], seed, p);
             manifest["game"] = json!("Synth");
             (manifest, instance)
         })
@@ -370,7 +372,7 @@ fn one(
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
-        "placed_by_the_mode": mode == Algorithm::Exact || f.fast,
+        "placed_by_the_mode": mode.dials().is_none() || f.fast,
         // The same hash in two rows means the same placements (the `noskip` rows against theirs).
         "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
         "repairs": f.repairs,
@@ -390,6 +392,10 @@ fn one(
         "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
         "undone": r.undone, "journal_peak": r.journaled,
     });
+    // The exact fill's repairs in the attempt that placed the seed, and the restarts before it.
+    out["divided"] = json!(f.divided);
+    out["repair_evals"] = json!(f.repair_evals);
+    out["restarts"] = json!(f.attempts - 1);
     out["entrances"] = json!(shape.doors);
     out["layout"] = json!(match (shape.doors, vanilla) {
         (false, _) => None,
@@ -436,9 +442,10 @@ fn main() -> Result<(), String> {
         "keys" => Shape::hostile(Hostile::Keys),
         "brink" => Shape::hostile(Hostile::Brink),
         "tight" => Shape::hostile(Hostile::Tight),
+        "mixed" => Shape::hostile(Hostile::Chain),
         x => {
             return Err(format!(
-                "--profile: light, heavy, wide, chain, gated, keys, brink or tight, got {x}"
+                "--profile: light, heavy, wide, chain, gated, keys, brink, tight or mixed, got {x}"
             ));
         }
     };
@@ -464,6 +471,14 @@ fn main() -> Result<(), String> {
         guards: flag("--guards", d.guards)?,
         timeless: flag("--timeless", d.timeless)?,
         ..d
+    };
+    // `mixed`: chain, light, keys and heavy worlds in turn, at their own sizes (piles of
+    // different lengths and shapes in one room); the switches above apply to one-shape rooms.
+    let shapes = if profile == "mixed" {
+        let (chain, keys) = (Shape::hostile(Hostile::Chain), Shape::hostile(Hostile::Keys));
+        vec![chain, Shape::default(), keys, Shape::heavy()]
+    } else {
+        vec![shape]
     };
     let workers: usize = arg(&args, "--workers", config::ROOM_FORWARD_WORKERS)?;
     let path_arg = arg(&args, "--path", "auto".to_owned())?;
@@ -498,7 +513,7 @@ fn main() -> Result<(), String> {
     // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
     let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let row = one(&shape, seed, n, reps, (path, workers, mode, one_world), engine);
+        let row = one(&shapes, seed, n, reps, (path, workers, mode, one_world), engine);
         let mut row = match row {
             Err(e) if failed_row => {
                 println!(

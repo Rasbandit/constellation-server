@@ -66,8 +66,8 @@ jobs:
       # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), on
       # one thread. Three engines per profile: as it is (bit rules, absent checks skipped), as it
       # was (every rule as bytecode, absent checks evaluated) and bit rules alone. The carried
-      # path (`data_fill::room::Path::Carry`) only at 1 and 10 players: it is what a room under
-      # `config::ROOM_FORWARD_MIN_PLAYERS` takes, and at 100 players a row of it took half a minute.
+      # path (`data_fill::room::Path::Carry`) only at 1 and 10 players: no room takes it by itself
+      # any more, and at 100 players a row of it took half a minute.
       - name: synth_room
         env:
           PLAYERS: ${{ inputs.players || '1,10,100' }}
@@ -113,14 +113,15 @@ jobs:
             fi
             tee -a bench-room.jsonl < hostile.jsonl
           done; done
-          # The round procedure (issue 212): the exact fill (each player's items deepest first,
-          # a round divided when it does not fit, an item with nowhere to go moved in place)
-          # against the rounds as they were (`--mode drawn`: drawn order, never divided; a
-          # measurement variant), same rooms and seed, split path, three seeds. Rooms of chains
-          # at sizes drawn order fills, barely fills and never fills; a room with no spare
-          # location; and the two ordinary profiles.
-          for mode in exact drawn; do for seed in 1 2 3; do
-            for profile in chain keys; do
+          # The round procedure (issue 212): the exact fill (drawn order, a round divided when it
+          # does not fit, an item with nowhere to go moved in place; a stuck attempt restarts
+          # deepest first) against the rounds as they were (`--mode drawn`: never divided, no
+          # move) and every attempt deepest first (`--mode deepest`), measurement variants; same
+          # rooms and seed, split path, three seeds. Rooms of chains at sizes drawn order fills,
+          # barely fills and never fills; a room of chain, light, key and heavy worlds in turn
+          # (`mixed`); a room with no spare location; and the two ordinary profiles.
+          for mode in exact drawn deepest; do for seed in 1 2 3; do
+            for profile in chain keys mixed; do
               timeout 300 target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
                 --mode "$mode" --players 16,22,100 --seed "$seed" --reps 3 --failed-row | tee -a bench-rounds.jsonl || true
             done
@@ -253,14 +254,14 @@ jobs:
       - name: quality
         env:
           CHECKS: ${{ inputs.checks || '1000' }}
-          MODES: exact drawn level level,depth=100 level,depth=300 level,depth=-100 level,goal shuffle shuffle,depth=100 shuffle,depth=300 shuffle,depth=-100 shuffle,goal
+          MODES: exact drawn deepest level level,depth=100 level,depth=300 level,depth=-100 level,goal shuffle shuffle,depth=100 shuffle,depth=300 shuffle,depth=-100 shuffle,goal
         run: |
           set -o pipefail
           fair() { cargo run --release --locked -p data-fill --features memory-harness --bin fill-fairness -- "$@" > /dev/null; }
           if [ "$FULL" = on ]; then
             one=200; ten=20; fixture=10000; required=200
           else
-            MODES="exact drawn level shuffle"; one=10; ten=2; fixture=500; required=20
+            MODES="exact drawn deepest level shuffle"; one=10; ten=2; fixture=500; required=20
           fi
           for profile in light heavy; do
             fair --synth "$profile" --players 1 --checks "$CHECKS" --seeds "$one" --required 5 --modes "$MODES" --out "quality-$profile-1.json"
@@ -269,6 +270,15 @@ jobs:
           for world in fairness_world room_world; do
             fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds "$fixture" --baseline "$fixture" --required "$required" --modes "$MODES" --out "quality-$world.json"
           done
+          # The round procedure against the rounds as they were (`--reference drawn`; the
+          # `drawn` row, on another stream, is the noise floor): the fixture worlds, ten light
+          # players, and a mixed room of chain, light, key and heavy worlds.
+          ROUNDS="drawn exact deepest"
+          for world in fairness_world room_world; do
+            fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds "$fixture" --baseline "$fixture" --modes "$ROUNDS" --reference drawn --out "quality-rounds-$world.json"
+          done
+          fair --synth light --players 10 --checks "$CHECKS" --seeds "$ten" --modes "$ROUNDS" --reference drawn --out "quality-rounds-light-10.json"
+          fair --synth mixed --players 8 --checks "$CHECKS" --seeds "$ten" --modes "$ROUNDS" --reference drawn --out "quality-rounds-mixed-8.json"
       - name: summary
         run: |
           {
@@ -374,22 +384,22 @@ jobs:
               | ($rows[] | select(.path == "split" and .profile == $four.profile and .world == $four.world)) as $s
               | "| \($four.profile) | \($four.world) | \($one.fill_ms) | \($four.fill_ms) | \($s.fill_ms) | \(($four.fill_ms / $s.fill_ms * 100 | round) / 100) |"' bench-room.jsonl
             echo
-            echo "#### The round procedure: exact (deepest first, divided, repaired in place) against drawn order (as before issue 212)"
+            echo "#### The round procedure: exact (drawn order, divided, repaired in place, deepest first after a stuck attempt) against drawn order as before issue 212 and deepest first on every attempt"
             echo
-            echo "Split path, one thread, same rooms and seeds. Fill ms is measured (median of the reps); attempts, rounds, moved items, spheres and rule evaluations are counted. A failed row is a room stuck on all \`config::FILL_MAX_ATTEMPTS\` attempts."
+            echo "Split path, one thread, same rooms and seeds. Fill ms is measured (median of the reps); attempts, restarts, rounds, divided rounds, moved items, repair evaluations, spheres and rule evaluations are counted. A failed row is a room stuck on all \`config::FILL_MAX_ATTEMPTS\` attempts."
             echo
-            echo "| profile | players | seed | mode | result | attempts | fill ms | reps, ms | rounds | items moved | spheres | rule evals |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
-            jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.players // .room) | \(.seed) | \(.mode) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.fill_ms // "") | \(.fill_ms_runs // "") | \(.rounds // "") | \(.swaps // "") | \(.spheres // "") | \(.rule_evals // "") |"' bench-rounds.jsonl
+            echo "| profile | players | seed | mode | result | attempts | restarts | fill ms | reps, ms | rounds | divided | items moved | repair evals | spheres | rule evals |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.players // .room) | \(.seed) | \(.mode) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.restarts // "") | \(.fill_ms // "") | \(.fill_ms_runs // "") | \(.rounds // "") | \(.divided // "") | \(.swaps // "") | \(.repair_evals // "") | \(.spheres // "") | \(.rule_evals // "") |"' bench-rounds.jsonl
             echo
-            echo "Median over the three seeds, exact over drawn:"
+            echo "Median over the three seeds, exact over drawn (and deepest first for its spheres):"
             echo
-            echo "| profile | players | exact fill ms, median (range) | drawn fill ms, median (range) | exact / drawn | exact spheres | drawn spheres |"
-            echo "|---|---|---|---|---|---|---|"
+            echo "| profile | players | exact fill ms, median (range) | drawn fill ms, median (range) | exact / drawn | exact spheres | drawn spheres | deepest spheres | exact seeds filled in one attempt |"
+            echo "|---|---|---|---|---|---|---|---|---|"
             jq -s -r 'def med: sort | .[length / 2 | floor]; def cell: if length == 0 then "none filled" else "\(med) (\(min) to \(max))" end;
               [.[] | select(.players != null)] | group_by([.profile, .players]) | .[]
-              | map(select(.mode == "exact")) as $e | map(select(.mode == "drawn")) as $d
-              | "| \(.[0].profile) | \(.[0].players) | \($e | map(.fill_ms) | cell) | \($d | map(.fill_ms) | cell) | \(if ($e | length) > 0 and ($d | length) > 0 then (($e | map(.fill_ms) | med) / ($d | map(.fill_ms) | med) * 100 | round) / 100 else "n/a" end) | \($e | map(.spheres) | cell) | \($d | map(.spheres) | cell) |"' bench-rounds.jsonl
+              | map(select(.mode == "exact")) as $e | map(select(.mode == "drawn")) as $d | map(select(.mode == "deepest")) as $p
+              | "| \(.[0].profile) | \(.[0].players) | \($e | map(.fill_ms) | cell) | \($d | map(.fill_ms) | cell) | \(if ($e | length) > 0 and ($d | length) > 0 then (($e | map(.fill_ms) | med) / ($d | map(.fill_ms) | med) * 100 | round) / 100 else "n/a" end) | \($e | map(.spheres) | cell) | \($d | map(.spheres) | cell) | \($p | map(.spheres) | cell) | \($e | map(select(.attempts == 1)) | length) of \($e | length) |"' bench-rounds.jsonl
             if [ -s bench-212.jsonl ]; then
               echo
               echo "#### Issue 212: room sizes and rounds of one item (split path, one fill each; a measurement, not the product's rule)"
@@ -444,7 +454,7 @@ jobs:
             echo "### Room fill scaling (same runner; a world per player)"
             echo
             echo "Prepare and load are once per world version and summed over the room's worlds (one per player here, on one thread); setup is the per-seed rest, on the row's threads."
-            echo "A room of at least \`config::ROOM_FORWARD_MIN_PLAYERS\` players takes the forward path, a smaller one the carried path."
+            echo "Every room the server fills takes the split path; these rows force the carried and the forward path."
             echo "Peak heap counts the calling thread only: on several threads it leaves out what the workers allocate."
             for profile in light heavy; do for run in "carry 1" "forward 1" "forward 4"; do
               read -r path workers <<< "$run"
@@ -475,7 +485,7 @@ jobs:
             echo "Required spheres: spheres holding an item no goal can be reached without (first seeds only, see the n in brackets). Stuck: share of a player's rounds in which no location of theirs opens. Uniform columns exist only for the small fixture worlds (rejection sampling of beatable uniform placements)."
             for q in quality-*.json; do
               echo
-              echo "#### $q: $(jq -r '"\(.players) players, \(.seeds) seeds"' "$q")"
+              echo "#### $q: $(jq -r '"\(.players) players, \(.seeds) seeds, distances from \(.reference // "exact")"' "$q")"
               echo
               echo "| mode | failed | placed by the mode | fell back (seeds) | untouched share | swaps/seed | repairs | fallback attempts | spheres mean | progression in sphere 0 | in first two | locations in first two | relative depth | required spheres (n) | location entropy | stuck mean | stuck worst 5% | sphere distance from exact | location chi2/dof vs exact | max gap vs uniform | chi2 vs uniform (dof) | coverage gaps vs uniform | fill ms median | worst 1% |"
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
