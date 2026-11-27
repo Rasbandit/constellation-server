@@ -104,13 +104,23 @@ fn fmt(dir: &Path, check_only: bool) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(verb) = args.first() else { return usage() };
+    if verb == "generate" && !cfg!(feature = "engine") {
+        eprintln!(
+            "error: this rando was built without the engine (feature `engine`), so it cannot generate seeds; build it with default features"
+        );
+        return ExitCode::FAILURE;
+    }
     let mut dir = PathBuf::from(".");
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
     let (mut opts, mut check_only) = (Options::default(), false);
+    #[cfg(feature = "engine")]
     let (mut g, mut gen_flags) = (Gen::default(), false);
+    #[cfg(not(feature = "engine"))]
+    let gen_flags = false;
     let mut rest = args[1..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
+            #[cfg(feature = "engine")]
             "--seed" | "--players" | "--option" | "--options" | "--format" | "--check-seeds" => {
                 let Some(v) = rest.next() else { return usage() };
                 gen_flags = true;
@@ -161,6 +171,7 @@ fn main() -> ExitCode {
     if verb == "check" {
         return ExitCode::SUCCESS;
     }
+    #[cfg(feature = "engine")]
     if verb == "generate" {
         return generate(&built, &g, out.as_deref());
     }
@@ -187,6 +198,7 @@ fn main() -> ExitCode {
 }
 
 /// What `rando generate` was asked for.
+#[cfg(feature = "engine")]
 #[derive(Default)]
 struct Gen {
     seed: Option<u64>,
@@ -197,6 +209,7 @@ struct Gen {
     check_seeds: Option<u64>,
 }
 
+#[cfg(feature = "engine")]
 impl Gen {
     fn set(&mut self, flag: &str, v: &str) -> Result<(), String> {
         let num = |what: &str| {
@@ -234,6 +247,7 @@ impl Gen {
     }
 }
 
+#[cfg(feature = "engine")]
 fn pair(v: &str) -> Result<(String, String), String> {
     let (k, x) =
         v.split_once('=').ok_or_else(|| format!("an option is `name=value`, not `{v}`"))?;
@@ -242,12 +256,14 @@ fn pair(v: &str) -> Result<(String, String), String> {
 
 /// A seed when none was asked for: from the process's random hash keys, printed so the seed
 /// can be made again.
+#[cfg(feature = "engine")]
 fn random_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     // Within 2^53, so the number survives any JSON reader.
     std::collections::hash_map::RandomState::new().build_hasher().finish() & ((1 << 53) - 1)
 }
 
+#[cfg(feature = "engine")]
 fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode {
     use world_build::generate::{Generator, spoiler_text};
     let mut options = std::collections::HashMap::new();
