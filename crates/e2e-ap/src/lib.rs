@@ -73,14 +73,15 @@ mod tests {
     }
 
     /// The Archipelago server warns clients that do not compress; ours must never send such
-    /// a print, and every connection it accepted must have negotiated permessage-deflate.
-    fn assert_compressed(server: &Server, events: &[Event]) {
+    /// a print, and each of the `sockets` connections the test opened must have negotiated
+    /// permessage-deflate. Waiting for every accept line, not a snapshot of the log, so a
+    /// line the stderr reader has not pushed yet cannot drop out of the check.
+    fn assert_compressed(server: &Server, events: &[Event], sockets: usize) {
         for p in prints(events) {
             assert!(!p.to_lowercase().contains("compress"), "compression warning: {p}");
         }
-        let accepted: Vec<_> =
-            server.log().into_iter().filter(|l| l.contains("websocket accepted")).collect();
-        assert_ne!(accepted.len(), 0, "no accepted socket was logged");
+        let accepted = server.wait_for_logs("websocket accepted", sockets).unwrap();
+        assert_eq!(accepted.len(), sockets, "{accepted:?}");
         for line in accepted {
             assert!(line.contains("deflate=true"), "{line}");
         }
@@ -164,7 +165,8 @@ mod tests {
         });
         log.extend(heard);
         log.extend(pump(&mut alice, |_, _| true));
-        assert_compressed(&server, &log);
+        // Alice, Bob, and Bob again after the reconnect.
+        assert_compressed(&server, &log, 3);
     }
 
     /// Data storage through the library's own calls: `watch` (`SetNotify`), `change` (`Set`
