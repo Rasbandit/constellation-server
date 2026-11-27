@@ -24,9 +24,9 @@ const RESERVED: [&str; 11] =
 const RESERVED_SHUFFLES: [&str; 2] = ["layout", "own_fill"];
 
 /// Errors and warnings collected over one build.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Errs {
-    file: String,
+    pub(crate) files: Vec<String>,
     pub errors: Vec<Error>,
     pub warnings: Vec<Error>,
     /// Errors past the cap, dropped.
@@ -36,19 +36,14 @@ pub(crate) struct Errs {
 }
 
 impl Errs {
-    fn new(file: &str) -> Self {
-        Errs {
-            file: file.to_owned(),
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            dropped: 0,
-            dropped_warnings: 0,
-        }
+    pub(crate) fn new(files: Vec<String>) -> Self {
+        Errs { files, errors: Vec::new(), warnings: Vec::new(), dropped: 0, dropped_warnings: 0 }
     }
 
     fn make(&self, pos: Option<Pos>, msg: impl Into<String>, help: &str) -> Error {
         let help = (!help.is_empty()).then(|| help.to_owned());
-        Error { file: self.file.clone(), pos, msg: msg.into(), help }
+        let file = pos.and_then(|p| self.files.get(p.file as usize)).or(self.files.first());
+        Error { file: file.cloned().unwrap_or_default(), pos, msg: msg.into(), help }
     }
 
     /// An error at `pos`. Past [`config::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
@@ -89,7 +84,7 @@ impl Errs {
     }
 
     /// The warnings, and one more line for what the cap dropped.
-    fn warnings(mut self) -> Vec<Error> {
+    pub(crate) fn warnings_list(mut self) -> Vec<Error> {
         if self.dropped_warnings > 0 {
             let e =
                 self.make(None, format!("{} more warnings not shown", self.dropped_warnings), "");
@@ -99,7 +94,7 @@ impl Errs {
     }
 
     /// The errors in file order, and one more line for what the cap dropped.
-    fn finish(mut self) -> Vec<Error> {
+    pub(crate) fn finish(mut self) -> Vec<Error> {
         self.errors.sort_by_key(|e| e.pos);
         if self.dropped > 0 {
             let e = self.make(
@@ -272,7 +267,8 @@ pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
 }
 
 fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
-    let mut errs = Errs::new(file);
+    let files = if w.files.is_empty() { vec![file.to_owned()] } else { w.files.clone() };
+    let mut errs = Errs::new(files);
     let out = check(w, &mut errs);
     if errs.errors.is_empty()
         && let Some((manifest, model)) = out
@@ -299,7 +295,13 @@ fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
         }
         match crate::canon::to_string(&manifest) {
             Ok(text) if errs.errors.is_empty() => {
-                return Ok(Built { manifest, warnings: errs.warnings(), text, model });
+                return Ok(Built {
+                    manifest,
+                    warnings: errs.warnings_list(),
+                    text,
+                    model,
+                    ledger: None,
+                });
             }
             Ok(_) => {}
             Err(e) => errs.whole(format!("the manifest is not canonical: {e}"), ""),

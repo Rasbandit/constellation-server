@@ -118,7 +118,7 @@ pub fn two_rooms() -> World {
     let f = F::default();
     World {
         format: Some(f.s("cgm-data/1")),
-        game: Some(f.s("two-rooms")),
+        game: Some(f.s("two_rooms")),
         start: Some(f.s("hall")),
         items: vec![f.item("key", "progression", None)],
         regions: vec![
@@ -260,7 +260,7 @@ pub fn tidewell() -> World {
     };
     World {
         format: Some(f.s("cgm-data/1")),
-        game: Some(f.s("tidewell-isle")),
+        game: Some(f.s("tidewell_isle")),
         version: Some(f.at(1)),
         name: Some(f.s("Tidewell Isle")),
         start: Some(f.s("dock")),

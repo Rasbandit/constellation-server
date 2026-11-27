@@ -5,8 +5,8 @@
 //!
 //! The parts do not depend on the file syntax: the [`model`] a front end produces, the rule
 //! language ([`rule`]), the checks and the manifest ([`build_model`]), the canonical writer
-//! ([`canon`]). The front end ([`front`]) is one function, not built until the syntax is
-//! decided. What is checked and the choices made where the design doc is silent are in
+//! ([`canon`]). The front end ([`front`]) reads the `.rando` language of design doc 18 into
+//! the model. What is checked and the choices made where the design doc is silent are in
 //! `docs/world-build.md`.
 
 use std::collections::HashMap;
@@ -61,6 +61,8 @@ pub struct Built {
     pub warnings: Vec<Error>,
     text: String,
     model: world::Model,
+    /// The ledger to write back after a build from files (`ledger.json`).
+    pub ledger: Option<String>,
 }
 
 impl Built {
@@ -90,13 +92,19 @@ impl Built {
     }
 }
 
-/// Build the world in `src`, the text of the file called `file` (used in messages only): the
-/// front end, then [`build_model`].
+/// Build the world whose `.rando` files are in `files`: the front end ([`front::read`]), then
+/// [`build_model`]. The ledger to write back is in [`Built::ledger`].
 ///
 /// # Errors
-/// The front end's syntax errors, or every error [`build_model`] finds.
-pub fn build(src: &str, file: &str) -> Result<Built, Vec<Error>> {
-    build_model(&front::read(src, file)?, file)
+/// Every error the front end and the checks find.
+pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, Vec<Error>> {
+    let read = front::read(files, opts)?;
+    let mut built = build_model(&read.world, front::ENTRY)?;
+    let mut warnings = read.warnings;
+    warnings.append(&mut built.warnings);
+    built.warnings = warnings;
+    built.ledger = Some(read.ledger);
+    Ok(built)
 }
 
 /// Check `w`, a world read from `file`, and build its manifest.

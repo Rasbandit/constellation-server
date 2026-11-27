@@ -1,0 +1,14 @@
+use items
+
+region lighthouse {
+  check keeper_desk: at.wardens.tower_door != crab or has(crowbar)
+  check spiral_stair: can_climb
+  exit dock
+  exit lighthouse_top: at.wardens.tower_door
+}
+
+region lighthouse_top {
+  check lantern_room: beacon_lit
+  exit lighthouse
+  event beacon_lit: has(lamp)
+}

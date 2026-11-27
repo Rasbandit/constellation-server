@@ -1,6 +1,7 @@
 //! The build tool end to end: the example world builds to a manifest the engine prepares and
 //! fills beatable, the canonical bytes are pinned, and every check names its place.
 
+mod lang;
 mod support;
 
 use std::collections::HashMap;
@@ -9,7 +10,7 @@ use data_fill::seed::{Player, generate};
 use data_fill::{World as EngineWorld, job};
 use support::{F, tidewell, two_rooms};
 use world_build::model::{At, Def, Grant, Members, Pos, Rule, Verb, World};
-use world_build::{Built, build, build_model};
+use world_build::{Built, build_model};
 
 fn built(w: &World) -> Built {
     build_model(w, "w").unwrap_or_else(|e| {
@@ -44,13 +45,13 @@ fn with_check_rule(key: &str, rule: &str, pos: Pos) -> World {
     w
 }
 
-const P: Pos = Pos { line: 900, col: 5 };
+const P: Pos = Pos { file: 0, line: 900, col: 5 };
 
 #[test]
 fn the_smallest_world_builds_to_the_pinned_canonical_bytes() {
     let b = built(&two_rooms());
     let want = concat!(
-        r#"{"defs":{},"game":"two-rooms","goal":{"reach":"region:vault"},"#,
+        r#"{"defs":{},"game":"two_rooms","goal":{"reach":"region:vault"},"#,
         r#""items":[{"id":1,"key":"key"},{"id":2,"key":"nothing"}],"#,
         r#""locations":[{"id":2,"key":"chest"},{"id":1,"key":"shelf"}],"options":[],"#,
         r#""regions":[{"can_stay":false,"checks":[{"loc":"shelf","rule":{"true":{}}}],"events":[],"#,
@@ -404,13 +405,6 @@ fn fields_this_version_does_not_build_are_named() {
     let mut w = tidewell();
     w.goal = None;
     assert!(errors(&w).iter().any(|e| e == "w: the world has no `goal`"));
-}
-
-#[test]
-fn the_front_end_is_one_function_and_reads_nothing_yet() {
-    let e = build("format: cgm-data/1\n", "world.yaml").unwrap_err();
-    assert_eq!(e.len(), 1);
-    assert!(e[0].to_string().starts_with("world.yaml: no front end reads world files yet"));
 }
 
 #[test]

@@ -63,6 +63,8 @@ pub struct Arm {
     pub values: Vec<(String, Pos)>,
     /// Its rule.
     pub rule: Expr,
+    /// Index of its first token (a value or `_`).
+    pub start: usize,
 }
 
 /// One parsed node.
@@ -139,6 +141,44 @@ pub fn parse_in(toks: &[Token], from: usize, to: usize) -> Result<(Expr, usize),
     Ok((e, p.k))
 }
 
+/// `{` NAME `}` glued at `k`: a variable piece of a name.
+fn var_piece(toks: &[Token], k: usize, end: usize) -> Option<String> {
+    let t = |i: usize| (i < end).then(|| toks.get(i)).flatten();
+    match (t(k)?, t(k + 1)?, t(k + 2)?) {
+        (
+            Token { t: Tok::LBrace, .. },
+            b @ Token { t: Tok::Name(n), .. },
+            c @ Token { t: Tok::RBrace, .. },
+        ) if b.glued && c.glued => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// The pieces of a name starting at `k` (plain text and glued `{var}` pieces), and the index
+/// after them. A plain name is one text piece.
+#[must_use]
+pub fn pieces_at(toks: &[Token], mut k: usize, end: usize) -> (Vec<Piece>, usize) {
+    let mut out: Vec<Piece> = Vec::new();
+    while k < end.min(toks.len()) {
+        if !out.is_empty() && !toks[k].glued {
+            break;
+        }
+        if let Some(v) = var_piece(toks, k, end) {
+            out.push(Piece::Var(v));
+            k += 3;
+        } else if let Tok::Name(n) = &toks[k].t {
+            if matches!(out.last(), Some(Piece::Text(_))) {
+                break;
+            }
+            out.push(Piece::Text(n.clone()));
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    (out, k)
+}
+
 struct P<'t> {
     toks: &'t [Token],
     k: usize,
@@ -149,10 +189,6 @@ struct P<'t> {
 impl P<'_> {
     fn peek(&self) -> Option<&Tok> {
         (self.k < self.end).then(|| &self.toks[self.k].t)
-    }
-
-    fn peek_at(&self, n: usize) -> Option<&Token> {
-        (self.k + n < self.end).then(|| &self.toks[self.k + n])
     }
 
     fn here(&self) -> Pos {
@@ -321,34 +357,9 @@ impl P<'_> {
         }
     }
 
-    /// `{` NAME `}` glued at the cursor: a variable piece of a name.
-    fn var_piece(&self) -> Option<String> {
-        let (a, b, c) = (self.peek_at(0)?, self.peek_at(1)?, self.peek_at(2)?);
-        match (&a.t, &b.t, &c.t) {
-            (Tok::LBrace, Tok::Name(n), Tok::RBrace) if b.glued && c.glued => Some(n.clone()),
-            _ => None,
-        }
-    }
-
-    /// A name and any glued `{var}` or text pieces after it: a plain name or an interpolation.
-    fn pieces(&mut self, first: Option<String>) -> E {
-        let mut out: Vec<Piece> = Vec::new();
-        out.extend(first.map(Piece::Text));
-        loop {
-            let glued = self.peek_at(0).is_some_and(|t| t.glued) || out.is_empty();
-            if !glued {
-                break;
-            }
-            if let Some(v) = self.var_piece() {
-                self.k += 3;
-                out.push(Piece::Var(v));
-            } else if let (false, Some(Tok::Name(n))) = (out.is_empty(), self.peek().cloned()) {
-                self.k += 1;
-                out.push(Piece::Text(n));
-            } else {
-                break;
-            }
-        }
+    fn pieces(&mut self) -> E {
+        let (out, end) = pieces_at(self.toks, self.k, self.end);
+        self.k = end;
         match out.as_slice() {
             [Piece::Text(n)] => E::Name(n.clone()),
             _ => E::Interp(out),
@@ -357,8 +368,8 @@ impl P<'_> {
 
     fn atom(&mut self) -> Result<Expr, Fail> {
         let (at, from) = (self.here(), self.k);
-        if self.var_piece().is_some() {
-            let e = self.pieces(None);
+        if var_piece(self.toks, self.k, self.end).is_some() {
+            let e = self.pieces();
             return self.call_or(e, at, from);
         }
         let Some(t) = self.peek().cloned() else {
@@ -377,8 +388,9 @@ impl P<'_> {
                 Ok(inner)
             }
             Tok::Kw("match") => self.matching(at, from),
-            Tok::Name(n) => {
-                let e = self.pieces(Some(n));
+            Tok::Name(_) => {
+                self.k -= 1;
+                let e = self.pieces();
                 self.call_or(e, at, from)
             }
             Tok::Kw(k) => Err((
@@ -418,6 +430,7 @@ impl P<'_> {
         self.enter()?;
         let mut arms = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
+            let start = self.k;
             let mut values = Vec::new();
             if self.peek() == Some(&Tok::Under) {
                 self.k += 1;
@@ -443,7 +456,7 @@ impl P<'_> {
             }
             self.expect(&Tok::Arrow, "`=>`")?;
             let rule = self.or()?;
-            arms.push(Arm { values, rule });
+            arms.push(Arm { values, rule, start });
         }
         self.k += 1;
         self.depth -= 1;
@@ -557,7 +570,7 @@ mod tests {
             p("match opt.d { easy => has(a) _ => true }"),
             "(match d [easy] (has a) [_] true)"
         );
-        assert_eq!(p("`key` and has(`group`)"), "(and key (has group))");
+        assert_eq!(p("`region` and has(`group`)"), "(and region (has group))");
     }
 
     #[test]

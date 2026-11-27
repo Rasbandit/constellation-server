@@ -5,9 +5,12 @@
 //! checks nothing a model can say wrongly (names, rules, the format rules), so every front end
 //! gets the same checks.
 
-/// A place in the source: line and column, both from 1.
+/// A place in the source: the file (an index into [`World::files`]), line and column, both
+/// from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Pos {
+    /// The file, by index.
+    pub file: u32,
     /// Line, from 1.
     pub line: usize,
     /// Column in characters, from 1.
@@ -18,13 +21,19 @@ impl Pos {
     /// A place.
     #[must_use]
     pub fn new(line: usize, col: usize) -> Pos {
-        Pos { line, col }
+        Pos { file: 0, line, col }
+    }
+
+    /// A place in file `file`.
+    #[must_use]
+    pub fn in_file(file: u32, line: usize, col: usize) -> Pos {
+        Pos { file, line, col }
     }
 
     /// `n` characters further along the same line.
     #[must_use]
     pub fn right(self, n: usize) -> Pos {
-        Pos { line: self.line, col: self.col + n }
+        Pos { file: self.file, line: self.line, col: self.col + n }
     }
 }
 
@@ -73,6 +82,8 @@ pub enum Lit {
 /// A whole world file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct World {
+    /// The files the world was read from, by [`Pos::file`]; empty for a model built in code.
+    pub files: Vec<String>,
     /// The format line, `cgm-data/1`.
     pub format: Option<At<String>>,
     /// The game's key.

@@ -18,6 +18,9 @@ config = { path = "../config", default-features = false }
 # which every built manifest goes through as a last check.
 data-fill = { path = "../data-fill" }
 serde_json = { workspace = true, features = ["std"] }
+# SHA-256 of generated files' content and sources (doc 18 section 2.9): the RustCrypto crate the
+# workspace already uses (MIT OR Apache-2.0).
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

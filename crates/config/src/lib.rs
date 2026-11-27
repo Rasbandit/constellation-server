@@ -449,6 +449,17 @@ pub const RULE_MAX_PARTS: usize = 255;
 /// (design doc 16 section 5.3).
 pub const WORLD_TABLE_MAX: usize = 65_536;
 
+/// Largest `.rando` file (or table file) the build tool reads, bytes: the input is untrusted,
+/// and a world of a few thousand checks is well under a megabyte (a design value).
+pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most files (modules and table files) one world may read (a design value).
+pub const WORLD_MODULES_MAX: usize = 256;
+
+/// Most declarations the families of one world may expand to, so a product of a few long
+/// lists cannot run away (a design value: the survey's largest family is a few thousand).
+pub const WORLD_FAMILY_MAX: usize = 100_000;
+
 /// Stack of the thread a world build runs on, bytes: lowering recurses once per rule node, up
 /// to [`RULES_MAX_DEPTH`] nodes deep through defs, at several frames a node (a design value,
 /// well over what that depth takes in a debug build; only the pages used are committed).

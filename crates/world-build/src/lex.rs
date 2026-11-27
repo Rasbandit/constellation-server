@@ -6,49 +6,16 @@
 use crate::model::Pos;
 use crate::rule::Cmp;
 
-/// Words that are always keywords. A reserved word is written as a name in backticks:
-/// `` `key` ``.
-pub const RESERVED: [&str; 40] = [
-    "world",
-    "start",
-    "option",
-    "item",
-    "pool",
-    "start_item",
-    "assumed",
-    "def",
-    "group",
-    "score",
-    "steps",
-    "table",
-    "for",
-    "placement",
-    "region",
-    "shuffle",
-    "require",
-    "trick",
-    "goal",
-    "extend",
-    "replace",
-    "remove",
-    "generated",
-    "use",
-    "check",
-    "exit",
-    "event",
-    "stay",
-    "when",
-    "vanilla",
-    "holds",
-    "no_progression",
-    "key",
-    "was",
-    "door",
-    "can_stay",
-    "match",
-    "and",
-    "or",
-    "not",
+/// Words that are always keywords: those that start a declaration or a member, `when`,
+/// `match`, and the rule's own words. A reserved word is written as a name in backticks:
+/// `` `group` ``. Words that follow a complete name or rule (`key`, `was`, `door`,
+/// `vanilla`, `holds`, `no_progression`, `can_stay`) are not reserved: a rule ends before them.
+#[rustfmt::skip]
+pub const RESERVED: [&str; 33] = [
+    "world", "start", "option", "item", "pool", "start_item", "assumed", "def", "group", "score",
+    "steps", "table", "for", "placement", "region", "shuffle", "require", "trick", "goal",
+    "extend", "replace", "remove", "generated", "use", "check", "exit", "event", "stay", "when",
+    "match", "and", "or", "not",
 ];
 
 /// More words a rule reads as operators or constants: reserved as well.
@@ -162,7 +129,7 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
     let (mut i, mut glued, mut nl) = (0, false, true);
     while i < chars.len() {
         let c = chars[i];
-        let at = Pos::new(line, col);
+        let at = Pos::in_file(base.file, line, col);
         let step = |n: usize, col: &mut usize| *col += n;
         if c == '\n' {
             (line, col, i, glued, nl) = (line + 1, 1, i + 1, false, true);
@@ -230,7 +197,7 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
                             }
                             _ => {
                                 return Err((
-                                    Pos::new(line, col + k - i),
+                                    Pos::in_file(base.file, line, col + k - i),
                                     "a string escapes only `\\\"` and `\\\\`".into(),
                                 ));
                             }
@@ -259,7 +226,12 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
                 let (n, len) = number(&chars, i, at)?;
                 (Tok::Int(n), len)
             }
-            '_' if !next.is_some_and(|x| x.is_ascii_alphanumeric() || x == '_') => (Tok::Under, 1),
+            // `_` alone is a `match` wildcard; glued between name pieces (`c{i}_{j}`) it is text.
+            '_' if !next.is_some_and(|x| x.is_ascii_alphanumeric() || x == '_' || x == '{')
+                && !(glued && matches!(toks.last().map(|t| &t.t), Some(Tok::RBrace))) =>
+            {
+                (Tok::Under, 1)
+            }
             a if a.is_ascii_alphabetic() || a == '_' => {
                 let mut end = i;
                 while end < chars.len()
@@ -343,7 +315,10 @@ mod tests {
         );
         assert_eq!(kinds("or -3"), [Tok::Kw("or"), Tok::Int(-3)]);
         assert_eq!(kinds(r#""a \"b\"""#), [Tok::Str("a \"b\"".into())]);
-        assert_eq!(kinds("`key` key"), [Tok::Name("key".into()), Tok::Kw("key")]);
+        assert_eq!(
+            kinds("`group` group key"),
+            [Tok::Name("group".into()), Tok::Kw("group"), Tok::Name("key".into())]
+        );
         assert_eq!(kinds("_ => _x"), [Tok::Under, Tok::Arrow, Tok::Name("_x".into())]);
         assert_eq!(
             kinds("a == b = c"),
