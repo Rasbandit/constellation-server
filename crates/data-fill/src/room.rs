@@ -811,6 +811,8 @@ fn fill_by(
         moved: 0,
         repair_evals: 0,
         repair_budget,
+        unit: None,
+        start: Vec::new(),
         attempt: 0,
         divided: 0,
         depth: Vec::new(),
@@ -1285,6 +1287,12 @@ struct Steps<'a, 'w> {
     /// most it may (`config::FILL_REPAIR_EVALS`).
     repair_evals: u64,
     repair_budget: u64,
+    /// What one division of a round is charged against `repair_budget`: the rule evaluations
+    /// of a solve in rank order with none of the rounds' items, at the start of the attempt's
+    /// rounds (the split path's first solve), the same on every path. And the placements it is
+    /// read on, for the other paths, which read it at their first division.
+    unit: Option<u64>,
+    start: Placed,
     /// The attempt being made (from 1), and the groups it divided.
     attempt: u32,
     divided: u32,
@@ -1429,6 +1437,10 @@ impl Steps<'_, '_> {
             self.divide = repair;
             self.seated.clear();
             self.moved = 0;
+            self.unit = None;
+            if self.path != Path::Split {
+                self.start.clone_from(&placed);
+            }
             let groups = groups(prog, per_player);
             let mut groups: Vec<&[Given]> = groups.iter().map(Vec::as_slice).collect();
             loop {
@@ -1787,6 +1799,7 @@ impl Steps<'_, '_> {
             }
             halved = !self.fits(group, locs);
             if halved {
+                self.charge_division(group)?;
                 self.divided += 1;
                 let (first, second) = group.split_at(group.len() / 2);
                 todo.extend([second, first]);
@@ -1916,6 +1929,36 @@ impl Steps<'_, '_> {
     /// are not divided, or the state reaches a free location for each of its items. A group
     /// that does not fit is divided in halves, down to single items if need be: a round is
     /// never stuck where its items, placed one at a time, would not be.
+    /// Charge dividing `group` to the repair budget (one [`Steps::unit`] each): halving is
+    /// repair work as much as a move is, and its worst case is rounds of one item.
+    ///
+    /// # Errors
+    /// [`FillError::Stuck`] naming the group's first item once the budget is spent.
+    fn charge_division(&mut self, group: &[Given]) -> Result<(), FillError> {
+        let unit = match self.unit {
+            Some(u) => u,
+            None => {
+                // Not the split path: the same solve, read now on the placements it had then.
+                // The round's state is solved afresh after a division on these paths anyway.
+                let forward = self.room.forward.take();
+                let none = vec![Vec::new(); self.room.seats.len()];
+                self.room.solve(&none, &self.start);
+                self.room.forward = forward;
+                let u = self.room.models.iter().map(|m| m.stats.evals).sum();
+                self.room.absorb(&mut self.stats);
+                self.unit = Some(u);
+                u
+            }
+        };
+        self.repair_evals += unit;
+        if self.repair_evals > self.repair_budget {
+            let g = group[0];
+            let w = self.room.seats[usize::from(g.to)].w;
+            return Err(FillError::Stuck { item: w.item_key(g.item).to_owned(), attempts: 1 });
+        }
+        Ok(())
+    }
+
     fn fits(&self, group: &[Given], locs: &Live<(u16, u32)>) -> bool {
         let models = &self.room.models;
         let reached = |(p, l): &(u16, u32)| models[usize::from(*p)].reached(*l);
@@ -1998,6 +2041,9 @@ impl Steps<'_, '_> {
         self.held.iter_mut().for_each(Vec::clear);
         self.room.solve(&self.held, placed);
         self.solves += 1;
+        if self.unit.is_none() {
+            self.unit = Some(self.room.models.iter().map(|m| m.stats.evals).sum());
+        }
         let start = crate::COUNTED.then(std::time::Instant::now);
         let picked = self.profile.nanos[2];
         self.room.models.iter_mut().for_each(Reach::keep_journal);
@@ -2027,6 +2073,7 @@ impl Steps<'_, '_> {
     ) -> Result<(), FillError> {
         if let [group] = groups {
             if !self.fits(group, locs) {
+                self.charge_division(group)?;
                 self.divided += 1;
                 let (first, second) = group.split_at(group.len() / 2);
                 return self.halve(&[first, second], locs, placed, put);

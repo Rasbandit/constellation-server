@@ -105,8 +105,8 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     }
     if report.tight_players > 0 {
         eprintln!(
-            "fill: {} players' worlds have an early capacity ratio under 1 (lowest {:.3}): \
-             their fill leans on repairs: {report:?}",
+            "fill: the fill needed repairs, and {} players' worlds have an early capacity ratio \
+             under 1 (lowest {:.3}), a likely cause: {report:?}",
             report.tight_players,
             f64::from(report.capacity_milli) / 1000.0
         );

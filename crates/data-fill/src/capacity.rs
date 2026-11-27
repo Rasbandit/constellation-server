@@ -5,9 +5,12 @@
 //! random order; holding the first `j - 1` items of it, count the free locations that may take
 //! progression and are reached, and divide by `j`, the items that would have to fit there.
 //! Mean over `config::FILL_CAPACITY_ORDERS` orders, lowest over `j`. Under 1, at some point
-//! there are more items to seat than places to seat them, and an assumed fill of such a world
-//! leans on repairs (counted on real worlds: the only worlds that needed a restart were under
-//! 1, every world that never needed one was at 1.4 or above).
+//! there are more items to seat than places to seat them, which is a likely cause when an
+//! assumed fill of such a world needs repairs. It is a forward-fill notion (the first `j - 1`
+//! items held, where the assumed fill holds everything unplaced), so worlds under 1 can fill
+//! without any: the heavy synthetic profile reads 0.83 and never restarted on the bench. On 14
+//! converted worlds measured locally on 2026-11-26 (not reproducible from this repo) the three
+//! that needed restarts were the three under 1.
 
 use spec_rng::SpecRng;
 

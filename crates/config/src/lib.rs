@@ -334,7 +334,10 @@ pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
 /// Full fills a seed may start before the data-only fill gives up as stuck: a net for what the
 /// exact fill's repairs in place cannot mend, not its way of coping (each retry takes the next
 /// draws of the seed's random stream and goes deepest first; how often it is entered is in the
-/// fill report, `attempts`). A design value.
+/// fill report, `attempts`). A design value. Counted on 9,926 rooms with 20 allowed (tight
+/// synthetic worlds of 60 to 1,000 checks at 1, 3, 10 and 100 players, both fixture worlds,
+/// 3,000 seeds each): none needed more than 3, one needed 3, and none that drawn order fills in
+/// 20 attempts is stuck here in 3.
 pub const FILL_MAX_ATTEMPTS: u32 = 3;
 
 /// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
@@ -447,18 +450,21 @@ pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
 pub const FILL_DISPLACE_TRIES: usize = 32;
 
 /// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
-/// of such moves, and for each move one more solve's worth for the pass over the rounds left
-/// after it (counted as the move's first solve, so the count is the same on every path).
-/// Checked before each solve, so a fill ends at most one solve past it; past it the attempt is
-/// stuck, and so is any later one that needs a move. A budget of work, not of time, so a seed
-/// is the same on every machine and every path, and no world can drive a fill to its time
-/// limit (`fill_timeout_ms`, 60 s) by needing repair after repair. A design value. On the
-/// `bench-room` job (run 45944219837, seeds 1 to 3) a room of 100 key worlds, the most
-/// repaired room there, spent 31 to 34 million on its moves' solves (counted, before the pass
-/// was charged) in a fill of 8.3 to 8.7 s (measured); at that rate the whole budget is about
-/// 13 s of fill, and at the heavy profile's 186 ns an evaluation about 9 s for the solves
-/// alone (both estimated), inside the time limit with the fill's own work.
-pub const FILL_REPAIR_EVALS: u64 = 48_000_000;
+/// of moves, one solve's worth more per move for the pass over the rounds after it, and per
+/// divided round the evaluations of the attempt's first solve in rank order with none of the
+/// rounds' items (`data_fill::room`, `charge_division`), all counted the same on every path.
+/// Checked before each solve and at each division, so a fill ends at most one solve past it;
+/// then the attempt is stuck, and so is any later one that needs a move or a division. A budget
+/// of work, not of time: a seed is the same on every machine and path. A design value with a
+/// margin over the most repaired bench room, keys at 100 players, which charges about 37
+/// million (counted on seed 1; 33 to 35 million before divisions were charged, `bench-room`
+/// run 45946179688, seeds 1 to 3): 1.7 times that. By the growth of that charge over room
+/// size (counted at 22 and 100 players) it lets key rooms up to about 120 players and chain
+/// rooms up to about 200 fill without a restart (estimated). Time is not bounded by it: on that
+/// run keys at 100 players took 6.2 to 6.5 s for 78 to 83 million evaluations in all
+/// (measured), about 80 ns an evaluation; at that rate the budget is about 5 s of repair, and
+/// at the heavy profile's 186 ns about 12 s (both estimated).
+pub const FILL_REPAIR_EVALS: u64 = 64_000_000;
 
 /// The least p value the product's fill may show against uniform beatable placements on the
 /// one-player fixture world (`data-fill` `tests/fairness.rs`; a design value: drawn order gives

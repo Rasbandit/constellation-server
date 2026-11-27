@@ -933,7 +933,7 @@ mod tests {
 
     /// The work an attempt may spend on moves is bounded (`config::FILL_REPAIR_EVALS`): with no
     /// budget at all, or one that stops after the first solve, the room of chains that needs
-    /// moves is stuck in one attempt, with the clean error and the item's name; given a second
+    /// divisions and moves (both charged) is stuck in one attempt, with the clean error and the item's name; given a second
     /// attempt, it goes deepest first and fills without a move. With the configured budget it
     /// fills in one attempt within it, and the work counted is the same on every path.
     #[test]
@@ -950,8 +950,10 @@ mod tests {
                 other => panic!("budget {budget}: {:?}", other.map(|f| f.attempts)),
             }
         }
+        // The first attempt's first division spent the (empty) budget; deepest first needs no
+        // division and no move.
         let f = fill_room_budget(&seats, &mut rng(), (2, 0), Path::Split).unwrap();
-        assert_eq!((f.attempts, f.swaps, f.repair_evals), (2, 0, 0));
+        assert_eq!((f.attempts, f.swaps, f.divided), (2, 0, 0));
         sound(&c, &f, "deepest first");
         let budget = config::FILL_REPAIR_EVALS;
         let f = fill_room_budget(&seats, &mut rng(), (1, budget), Path::Split).unwrap();
