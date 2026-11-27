@@ -561,7 +561,7 @@ impl P<'_> {
     }
 
     fn deep(&self, depth: usize) -> R<()> {
-        if depth >= config::WORLD_BLOCK_MAX_DEPTH {
+        if depth > config::WORLD_BLOCK_MAX_DEPTH {
             return Err((
                 self.here(),
                 format!("blocks nest more than {} deep", config::WORLD_BLOCK_MAX_DEPTH),

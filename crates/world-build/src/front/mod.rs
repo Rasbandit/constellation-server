@@ -59,12 +59,19 @@ impl Files for Dir {
         }
         let p = self.0.join(path);
         std::fs::symlink_metadata(&p).ok()?;
-        // A link may not lead out of the folder.
-        let (root, real) = (self.0.canonicalize().ok()?, p.canonicalize().ok()?);
+        // A link may not lead out of the folder, nor to nothing (a later write would follow it).
+        let root = self.0.canonicalize().map_err(|e| e.to_string());
+        let (root, real) = match (root, p.canonicalize()) {
+            (Ok(r), Ok(x)) => (r, x),
+            _ => return Some(Err(format!("{path} is a link that leads nowhere"))),
+        };
         if !real.starts_with(&root) {
             return Some(Err(format!("{path} leads outside the world's folder")));
         }
         let meta = std::fs::metadata(&real).ok()?;
+        if !meta.is_file() {
+            return Some(Err(format!("{path} is not a plain file")));
+        }
         if meta.len() > config::WORLD_SOURCE_MAX_BYTES as u64 {
             return Some(Err(format!("{path} is over {} bytes", config::WORLD_SOURCE_MAX_BYTES)));
         }
@@ -851,6 +858,9 @@ impl X {
             Decl::Pool(fill) => self.world.fill_with.extend(fill.iter().cloned()),
             Decl::Grant { assumed, item, n, when } => {
                 let Some(item) = self.tn(item, env) else { return };
+                if !self.grow(env, item.pos) {
+                    return;
+                }
                 let when = self.opt_rule(f, when.as_ref(), env, cond);
                 let g = Grant { item, n: n.clone(), when };
                 if *assumed { self.world.assumed.push(g) } else { self.world.start_items.push(g) }
@@ -1095,7 +1105,7 @@ impl X {
     /// a target that is gone an error, two replacements of one target an error unless one
     /// file uses the other.
     fn apply_overlays(&mut self) {
-        let mut replaced: HashMap<String, (u32, Pos)> = HashMap::new();
+        let mut changes: Vec<(String, u32, Pos)> = Vec::new();
         for (f, o) in std::mem::take(&mut self.overlays) {
             let (verb, pos, target) = match &o {
                 Overlay::Extend(p, t, _) => ("extend", *p, t),
@@ -1109,34 +1119,24 @@ impl X {
                 Target::Def(d) => format!("def {}", d.v),
                 Target::Item(i) => format!("item {}", i.v),
             };
-            // What this overlay touches: its target, and for `extend` each check or exit it
-            // adds. Two overlays touching one thing must be ordered by a `use`.
-            let mut touched = vec![label.clone()];
-            if let (Overlay::Extend(_, Target::Region(r), members), "extend") = (&o, verb) {
-                touched.clear();
-                for m in members {
-                    match m {
-                        Member::Check(c) => {
-                            touched.extend(plain(&c.name).map(|n| format!("check {}.{n}", r.v)))
-                        }
-                        Member::Exit(x) => {
-                            touched.extend(plain(&x.to).map(|n| format!("exit {}.{n}", r.v)))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            for t in touched {
-                if let Some((g, at)) = replaced.get(&t).copied()
-                    && g != f
-                    && !self.closure(f).contains(&g)
-                    && !self.closure(g).contains(&f)
-                {
-                    let other = self.paths[g as usize].clone();
-                    self.errs.err(pos, format!("`{verb} {label}` changes `{t}`, which `{other}` line {} also changes, and neither file uses the other", at.line), "add a `use` from the overlay that should win to the other");
-                }
-                replaced.insert(t, (f, pos));
-            }
+            // What this overlay touches: its target, or for `extend` the region and each check
+            // or exit it adds (families included, so read after applying it).
+            let names = |w: &World, r: &str| -> HashSet<String> {
+                w.regions
+                    .iter()
+                    .filter(|x| x.key.v == r)
+                    .flat_map(|x| {
+                        let checks = x.checks.iter().map(|c| format!("check {r}.{}", c.key.v));
+                        checks
+                            .chain(x.exits.iter().map(|e| format!("exit {r}.{}", e.to.v)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            let before = match target {
+                Target::Region(r) if verb == "extend" => names(&self.world, &r.v),
+                _ => HashSet::new(),
+            };
             let found = self.overlay(&o);
             if !found {
                 self.errs.err(
@@ -1147,6 +1147,29 @@ impl X {
                     ),
                     "retarget or delete this overlay",
                 );
+            }
+            let touched = match target {
+                Target::Region(r) if verb == "extend" => {
+                    let mut t: Vec<String> =
+                        names(&self.world, &r.v).difference(&before).cloned().collect();
+                    t.push(format!("extend region {}", r.v));
+                    t
+                }
+                _ => vec![label.clone()],
+            };
+            // Two overlays touching one thing must be ordered by a `use`.
+            for t in touched {
+                let clash = changes.iter().find(|(u, g, _)| {
+                    *g != f
+                        && clashes(&t, u)
+                        && !self.closure(f).contains(g)
+                        && !self.closure(*g).contains(&f)
+                });
+                if let Some((u, g, at)) = clash {
+                    let other = self.paths[*g as usize].clone();
+                    self.errs.err(pos, format!("`{verb} {label}` changes `{t}`, which `{other}` line {} also changes (`{u}`), and neither file uses the other", at.line), "add a `use` from the overlay that should win to the other");
+                }
+                changes.push((t, f, pos));
             }
         }
     }
@@ -1332,12 +1355,21 @@ impl X {
     }
 }
 
-/// A name without `{var}` pieces, as written.
-fn plain(n: &Tn) -> Option<&str> {
-    match n.v.as_slice() {
-        [Piece::Text(t)] => Some(t),
-        _ => None,
-    }
+/// Whether two things overlays change are one: the same target, or a whole region (replaced
+/// or removed) and anything in it. Two `extend`s of one region do not clash by themselves.
+fn clashes(a: &str, b: &str) -> bool {
+    let region = |x: &str| -> Option<String> {
+        let (kind, rest) = x.split_once(' ')?;
+        match kind {
+            "check" | "exit" => rest.split_once('.').map(|(r, _)| r.to_owned()),
+            "region" => Some(rest.to_owned()),
+            "extend" => rest.strip_prefix("region ").map(str::to_owned),
+            _ => None,
+        }
+    };
+    let whole = |x: &str| x.starts_with("region ");
+    (a == b && !a.starts_with("extend "))
+        || ((whole(a) || whole(b)) && region(a).is_some() && region(a) == region(b))
 }
 
 /// A rule simplified with what is known at build time.

@@ -89,6 +89,7 @@ pub(crate) fn assign(
         let key_of = |i: &Ident| i.key.clone().unwrap_or_else(|| i.name.clone());
         let declared: HashSet<String> = mine.iter().map(|i| key_of(i)).collect();
         let mut used: HashSet<String> = HashSet::new();
+        let mut moved: HashSet<String> = HashSet::new();
         let mut ids: BTreeMap<String, i64> = BTreeMap::new();
         for i in mine {
             let key = key_of(i);
@@ -108,6 +109,17 @@ pub(crate) fn assign(
                 && declared.contains(o)
             {
                 errs.err(i.pos, format!("`was {o}` names a key that is still declared"), "a rename moves an id from a name that is gone; drop the `was`, or the old declaration");
+                continue;
+            }
+            if let Some(o) = &i.was
+                && !table.contains_key(&key)
+                && !moved.insert(o.clone())
+            {
+                errs.err(
+                    i.pos,
+                    format!("`was {o}` is also written on another declaration"),
+                    "an id moves to one new name; drop one of the `was`",
+                );
                 continue;
             }
             let id = match (

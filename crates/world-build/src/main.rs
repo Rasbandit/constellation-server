@@ -142,8 +142,13 @@ fn main() -> ExitCode {
     if verb == "check" {
         return ExitCode::SUCCESS;
     }
-    let write =
-        |p: &Path, text: &str| std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()));
+    // A link is not written through: it could lead out of the folder.
+    let write = |p: &Path, text: &str| {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a link; not writing through it", p.display()));
+        }
+        std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()))
+    };
     let mut steps = Vec::new();
     if let Some(l) = &built.ledger {
         steps.push(write(&dir.join(LEDGER), l));

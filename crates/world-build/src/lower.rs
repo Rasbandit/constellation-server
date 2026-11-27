@@ -242,8 +242,8 @@ impl<'a> Lower<'a> {
                 None => a.clone(),
             })
             .collect();
-        // Each argument's spelling cannot be another's: numbers and constants start with a
-        // digit, which no name does, and no name holds `__`, which joins them.
+        // Each piece is its length, `_`, then its spelling, so pieces cannot run into each other
+        // (names may start or end with `_`): `need(p_, q)` is `need__2_p___1_q`.
         for a in &args {
             let piece = match &a.e {
                 E::Int(n) if *n < 0 => format!("{}n", n.unsigned_abs()),
@@ -255,7 +255,7 @@ impl<'a> Lower<'a> {
                     return self.err(a.at, "an argument is a number, a name or `opt.<key>`", "the build writes one def per distinct argument list, so arguments are fixed when it builds");
                 }
             };
-            key = format!("{key}__{piece}");
+            key = format!("{key}__{}_{piece}", piece.len());
         }
         let body = self.tree(&node)?;
         let map: HashMap<&str, &Expr> = params.iter().map(String::as_str).zip(&args).collect();

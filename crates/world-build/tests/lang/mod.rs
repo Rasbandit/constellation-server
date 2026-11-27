@@ -240,8 +240,8 @@ fn match_and_defs_with_parameters_in_the_language() {
     );
     let b = ok(&files);
     assert!(
-        b.manifest["defs"].get("enough__1").is_some()
-            && b.manifest["defs"].get("enough__2").is_some()
+        b.manifest["defs"].get("enough__1_1").is_some()
+            && b.manifest["defs"].get("enough__1_2").is_some()
     );
     fails(
         &world(
@@ -494,6 +494,16 @@ fn the_ledger_refuses_renames_and_keys_that_would_move_an_id() {
     let mut w = world("region a {\n  check c3 was c1\n  check c1\n}");
     w.0.insert("ledger.json".into(), "{\"checks\":{\"c1\":{\"id\":1,\"retired\":false},\"c2\":{\"id\":2,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into());
     fails(&w, &format!("world.rando:{}:9", line(2)), "`was c1` names a key that is still declared");
+    let mut twice = world("region a {\n  check n1 was gone\n  check n2 was gone\n}");
+    twice.0.insert(
+        "ledger.json".into(),
+        "{\"checks\":{\"gone\":{\"id\":1,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into(),
+    );
+    assert!(
+        errors(&twice)
+            .iter()
+            .any(|e| e.contains("`was gone` is also written on another declaration"))
+    );
     let k = world("region a {\n  check c1 key \"c2\"\n  check c2\n}");
     assert!(errors(&k).iter().any(|e| e.contains("ledger key `c2` is used twice")));
     // A removed check is retired.
@@ -511,9 +521,17 @@ fn defs_with_arguments_of_different_kinds_never_share_a_written_def() {
     let b = ok(&files);
     let mut names: Vec<&String> = b.manifest["defs"].as_object().unwrap().keys().collect();
     names.sort();
-    assert_eq!(names, ["atleast__1", "atleast__1n", "need__0opt_k", "need__m1", "need__opt_k"]);
     assert_eq!(
-        b.manifest["defs"]["need__opt_k"],
+        names,
+        ["atleast__1_1", "atleast__2_1n", "need__2_m1", "need__5_opt_k", "need__6_0opt_k"]
+    );
+    // Names that start or end with `_` do not run into each other.
+    let edges = ok(&world(
+        "region a {\n  check c1: two(p_, q) and two(p, _q)\n  event p_: true\n  event q: true\n  event p: true\n  event _q: true\n}\ndef two(x, y) = x and y",
+    ));
+    assert_eq!(edges.manifest["defs"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        b.manifest["defs"]["need__5_opt_k"],
         serde_json::json!({"ge": [{"counter": "opt_k"}, 1]})
     );
 }
@@ -536,6 +554,27 @@ fn an_overlay_conflict_covers_remove_and_extend_too() {
         ("two.rando", "use base\nremove check a.n\n"),
     ]);
     fails(&added, "two.rando:2:1", "neither file uses the other");
+    let in_family = mem(&[
+        ("world.rando", entry),
+        ("base.rando", base),
+        ("one.rando", "use base\nextend region a {\n  for i in 1..2 {\n    check n{i}\n  }\n}\n"),
+        ("two.rando", "use base\nremove check a.n1\n"),
+    ]);
+    fails(&in_family, "two.rando:2:1", "neither file uses the other");
+    let whole = mem(&[
+        ("world.rando", entry),
+        ("base.rando", "region a {\n  check x\n}\nregion b {\n  check d\n}\n"),
+        ("one.rando", "use base\nreplace check b.d: true\n"),
+        ("two.rando", "use base\nremove region b\n"),
+    ]);
+    fails(&whole, "two.rando:2:1", "neither file uses the other");
+    let both_extend = mem(&[
+        ("world.rando", entry),
+        ("base.rando", base),
+        ("one.rando", "use base\nextend region a {\n  check n\n}\n"),
+        ("two.rando", "use base\nextend region a {\n  check m\n}\n"),
+    ]);
+    ok(&both_extend);
 }
 
 #[test]
