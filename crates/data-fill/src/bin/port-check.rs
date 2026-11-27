@@ -474,6 +474,10 @@ fn run(a: &Args) -> R<Value> {
     let m = read_json(&a.manifest)?;
     // The compiled section is per world version: one compile shared by every seed.
     let world = World::load(&m)?;
+    if world.has_shuffles() {
+        // The comparison solves and fills the world as loaded.
+        return Err(data_fill::shuffle::UNSTAGED.to_owned());
+    }
     let mut legacy = Legacy::spawn(&a.legacy)?;
     let hello = legacy.call(&json!({"op": "hello"}))?;
     let mut cx = Ctx {

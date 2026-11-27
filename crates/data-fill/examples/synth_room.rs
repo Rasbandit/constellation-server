@@ -2,7 +2,7 @@
 //! [--path auto|carry|forward|split] [--workers 4]
 //! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--rounds players|single]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--rounds players|single] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). `--path` forces one way of placing rounds
 //! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
@@ -53,6 +53,22 @@
 //! `fill_reps` how many fills the median is over: `--reps`, or two once a fill takes over a
 //! second.
 //!
+//! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`), `--guards
+//! on` with a `none` shuffle that rules read (`Shape::guards`), and `--timeless on` without a
+//! time context (`Shape::timeless`, which an exit shuffle needs). With a shuffle, every
+//! player's world is staged before the fill ([`data_fill::shuffle::room`]) and the row's
+//! `shuffle` holds, as medians of `reps`: `stage_ms` (the shuffles, the fold, the whole-world
+//! check and resolving the instances, every player, one thread), `plans_ms` (resolving the
+//! instances alone on the staged worlds, which a room without shuffles pays too) and
+//! `shuffle_ms`, their difference: what the shuffles add per seed. `restarts` counts attempts
+//! after the first over the room, `exits` the shuffled exits of the first world.
+//! `--entrances vanilla` draws the same worlds as `--entrances on` and fills them with every
+//! door where the manifest has it ([`data_fill::shuffle::unshuffled`]), so the two rows differ
+//! in the layout alone; the row's `layout` says which. Every row has `room_bytes`: the heap
+//! the room's worlds and plans keep after setup (with feature `memory-harness`; the loaded
+//! worlds they share are not in it), `room_bytes_per_player`, and `world_bytes`, the heap of
+//! the first world loaded once more.
+//!
 //! `--failed-row`: a room whose fill ends in an error (stuck on every attempt) prints
 //! `{"room": players, "failed": error, ...}` instead of ending the run with that error.
 //!
@@ -65,6 +81,7 @@ use std::time::Instant;
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{
     Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by, fill_room_one_item_rounds,
+    plans,
 };
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
@@ -93,6 +110,20 @@ fn peak<T>(f: impl FnOnce() -> T) -> (T, Option<u64>) {
 
 #[cfg(not(feature = "memory-harness"))]
 fn peak<T>(f: impl FnOnce() -> T) -> (T, Option<u64>) {
+    (f(), None)
+}
+
+/// The heap what `f` returns still holds when `f` is done, when the counting allocator is
+/// linked.
+#[cfg(feature = "memory-harness")]
+fn kept<T>(f: impl FnOnce() -> T) -> (T, Option<i64>) {
+    let mut out = None;
+    let a = allocation_counter::measure(|| out = Some(f()));
+    (out.unwrap_or_else(|| unreachable!("measure runs its closure")), Some(a.bytes_current))
+}
+
+#[cfg(not(feature = "memory-harness"))]
+fn kept<T>(f: impl FnOnce() -> T) -> (T, Option<i64>) {
     (f(), None)
 }
 
@@ -149,7 +180,7 @@ fn one(
     players: usize,
     reps: usize,
     (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
-    (bits, skip, single): (bool, bool, bool),
+    (bits, skip, single, vanilla): (bool, bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
     let path = path.unwrap_or(Path::of(players, workers));
@@ -175,11 +206,63 @@ fn one(
     std::hint::black_box(rebuilt);
     let bit_rules_ms = ms(t);
     let insts: Vec<&Instance> = (0..players).map(|p| &drawn[p % count].1).collect();
-    // A room owns its worlds: the copy is part of what a seed pays, as in `seed::generate_on`.
+    let mut shuffle_row = Value::Null;
+    let base: Vec<&World> = loaded.iter().map(Prepared::world).collect();
     let t = Instant::now();
-    let worlds: Vec<World> = loaded.iter().map(|p| p.world().clone()).collect();
-    let mut c = Compiled::resolve(worlds, &insts, workers)?;
+    // A room owns its worlds, as in `seed::generate_on`: staged per player when the world
+    // declares shuffles, packed copies of the loaded world otherwise.
+    let setup = || {
+        if vanilla {
+            // The doors-shaped worlds with every door where the manifest has it.
+            let mut c = Compiled { worlds: Vec::new(), plans: Vec::new(), progression: Vec::new() };
+            for (p, inst) in insts.iter().enumerate() {
+                let s = data_fill::shuffle::unshuffled(base[p % count], inst)?
+                    .ok_or("--entrances vanilla: the world declares no shuffle")?;
+                c.progression.push(inst.progression(&s.world));
+                c.worlds.push(s.world);
+                c.plans.push(s.plan);
+            }
+            Ok(c)
+        } else if shape.doors || shape.guards {
+            data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
+        } else {
+            // Several worlds are copied side by side; one is shared as loaded.
+            let own = |w: &&World| if count > 1 { w.packed() } else { (*w).clone() };
+            Compiled::resolve(base.iter().map(own).collect(), &insts, workers)
+        }
+    };
+    let (c, room_bytes) = kept(setup);
+    let mut c = c?;
     let setup_ms = ms(t);
+    if !vanilla && (shape.doors || shape.guards) {
+        let (stage_ms, _) = median(reps, || setup().map(drop))?;
+        let pairs: Vec<(&World, &Instance)> =
+            (0..players).map(|p| (c.world(p), insts[p])).collect();
+        let (plans_ms, _) =
+            median(reps, || plans(&pairs, 1).map(drop).map_err(|e| format!("{e:?}")))?;
+        let (mut restarts, mut steps) = (0, [0u64; data_fill::shuffle::STEPS.len()]);
+        for (p, inst) in insts.iter().enumerate() {
+            let player = u32::try_from(p).map_err(|e| e.to_string())?;
+            if let Some(s) = data_fill::shuffle::stage(base[p % count], inst, seed, player)? {
+                restarts += s.attempts.saturating_sub(1);
+                steps.iter_mut().zip(s.nanos).for_each(|(sum, ns)| *sum += ns);
+            }
+        }
+        // The passing attempts' steps over the room, ms (one more pass, timed inside).
+        let steps: serde_json::Map<String, Value> = data_fill::shuffle::STEPS
+            .iter()
+            .zip(steps)
+            .map(|(name, ns)| ((*name).to_owned(), json!(fine(ns as f64 / 1e6))))
+            .collect();
+        let shuffle_ms = stage_ms - plans_ms;
+        shuffle_row = json!({
+            "stage_ms": fine(stage_ms), "plans_ms": fine(plans_ms), "shuffle_ms": fine(shuffle_ms),
+            "per_world_ms": (shuffle_ms / players as f64 * 1e3).round() / 1e3,
+            "restarts": restarts,
+            "steps_ms": steps,
+            "exits": drawn[0].0["shuffles"]["entrances"]["slots"]["names"].as_array().map(Vec::len),
+        });
+    }
     let plain = |p: Plan| if bits { p } else { p.interpreted() };
     let whole = |p: Plan| if skip { p } else { p.with_absent_checks() };
     c.plans = c.plans.into_iter().map(|p| whole(plain(p))).collect();
@@ -266,7 +349,7 @@ fn one(
         },
         "solves": f.solves,
         "checks": shape.checks,
-        "clocks": shape.clocks,
+        "clocks": shape.clocks && !shape.timeless,
         "world": if one_world { "one" } else { "each" },
         "worlds": count,
         "prepare_ms": fine(prepare_ms),
@@ -313,6 +396,19 @@ fn one(
         "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
         "undone": r.undone, "journal_peak": r.journaled,
     });
+    out["entrances"] = json!(shape.doors);
+    out["layout"] = json!(match (shape.doors, vanilla) {
+        (false, _) => None,
+        (true, true) => Some("vanilla"),
+        (true, false) => Some("shuffled"),
+    });
+    out["guards"] = json!(shape.guards);
+    out["timeless"] = json!(shape.timeless);
+    out["shuffle"] = shuffle_row;
+    // One loaded world's heap: what a room shares, and what a copy per player would add.
+    out["world_bytes"] = json!(kept(|| World::from_package(&files[0])).1);
+    out["room_bytes"] = json!(room_bytes);
+    out["room_bytes_per_player"] = json!(room_bytes.map(|b| b / players.max(1) as i64));
     out["bit_rules_ms"] = json!(fine(bit_rules_ms));
     out["seed"] = json!(seed);
     out["round"] = json!(if single { "one item" } else { "one item per player" });
@@ -354,6 +450,13 @@ fn main() -> Result<(), String> {
         }
     };
     let on = |b: bool| if b { "on" } else { "off" }.to_owned();
+    // `--entrances vanilla`: the doors-shaped world, filled with no door moved.
+    let vanilla = arg(&args, "--entrances", String::new())? == "vanilla";
+    let flag = |name: &str, default: bool| match arg(&args, name, on(default))?.as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        x => Err(format!("{name}: on or off, got {x}")),
+    };
     let shape = Shape {
         checks: arg(&args, "--checks", d.checks)?,
         layers: arg(&args, "--layers", d.layers)?,
@@ -364,6 +467,9 @@ fn main() -> Result<(), String> {
             "off" => false,
             x => return Err(format!("--clocks: on or off, got {x}")),
         },
+        doors: vanilla || flag("--entrances", d.doors)?,
+        guards: flag("--guards", d.guards)?,
+        timeless: flag("--timeless", d.timeless)?,
         ..d
     };
     let workers: usize = arg(&args, "--workers", config::ROOM_FORWARD_WORKERS)?;
@@ -389,7 +495,8 @@ fn main() -> Result<(), String> {
     };
     // `--rounds single`: for measurements, rounds of one item on the split path (issue 212).
     let single = pick("--rounds", "players", "single").map(|per_player| !per_player)?;
-    let engine = (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?, single);
+    let engine =
+        (pick("--rules", "bits", "bytecode")?, pick("--absent", "skip", "check")?, single, vanilla);
     let seed: u64 = arg(&args, "--seed", 1)?;
     let reps: usize = arg(&args, "--reps", 5)?;
     let players: Vec<usize> = arg(&args, "--players", "1,10,20,50,100".to_owned())?

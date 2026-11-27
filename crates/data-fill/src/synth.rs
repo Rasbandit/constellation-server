@@ -58,6 +58,18 @@ pub struct Shape {
     pub wide: bool,
     /// A world built to be hard for a fill; `None`: the layered world or the wide one.
     pub hostile: Option<Hostile>,
+    /// Entrance shuffle ([`crate::shuffle`]): the first exit into every region is the outside
+    /// of a two-way door with an open way back, and one coupled `layout` shuffle moves all of
+    /// them inside two type groups. With `branching` 1 a door is the only way into a region.
+    /// The start region's checks are then all open, so a first item can always be found
+    /// (without it the heavy profile can draw a world nothing can fill, issue 209).
+    pub doors: bool,
+    /// No time context: one slice, no clocks, no stays, and what would test time tests an
+    /// item. An exit shuffle needs it (`crate::shuffle` refuses a world with a time context).
+    pub timeless: bool,
+    /// A `none` shuffle ([`crate::shuffle`]): eight guards over eight halls, each guard
+    /// beaten with one kind of progression item, and one check in eight behind a hall's guard.
+    pub guards: bool,
 }
 
 /// Worlds where taking one item out of what is held changes much of what is reached, or where
@@ -99,6 +111,9 @@ impl Default for Shape {
             rich: false,
             wide: false,
             hostile: None,
+            doors: false,
+            timeless: false,
+            guards: false,
         }
     }
 }
@@ -304,7 +319,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     }
     let checks = shape.checks.max(1);
     let regions = ((checks as f64 * shape.regions) as usize).max(2);
-    let slices = shape.slices.clamp(2, 64);
+    let slices = if shape.timeless { 1 } else { shape.slices.clamp(2, 64) };
     let halves = (slices / 8).max(2);
     // Half-day `h` is slices `half(h).0..=half(h).1`; the later half of the day as a mask.
     let half = |h: usize| (h * slices / halves, (h + 1) * slices / halves - 1);
@@ -328,6 +343,9 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     };
     // A time leaf: the later half of the day, or (rich) a window of up to eight slices.
     let time_leaf = |pick: &mut dyn FnMut(usize) -> usize| {
+        if shape.timeless {
+            return has(pick);
+        }
         if !shape.rich || slices <= 2 {
             return json!({"x.time_any": late});
         }
@@ -376,19 +394,30 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut exits: Vec<Vec<Value>> = vec![Vec::new(); regions];
     for r in 1..regions {
         let d = layer(r);
-        for _ in 0..shape.branching.max(1) {
+        for b in 0..shape.branching.max(1) {
             let from = in_layer[d - 1][pick(in_layer[d - 1].len())];
-            exits[from].push(json!({"to": format!("r{r}"), "rule": gate(d, &mut pick)}));
+            let mut exit = json!({"to": format!("r{r}"), "rule": gate(d, &mut pick)});
+            if shape.doors && b == 0 {
+                let door = format!("d{r}");
+                exit["key"] = json!(format!("e{r}"));
+                exit["group"] = json!(format!("g{}", r % 2));
+                exits[r].push(json!({"to": format!("r{from}"), "rule": {"true": {}},
+                                     "key": format!("b{r}"), "door": door}));
+                exit["door"] = json!(door);
+            }
+            exits[from].push(exit);
         }
     }
     // Every fourth region past the start can wait into the later slice.
-    let can_stay = |r: usize| r % 4 == 3;
+    let can_stay = |r: usize| r % 4 == 3 && !shape.timeless;
     let mut region_checks: Vec<Vec<Value>> = vec![Vec::new(); regions];
     // The checks that exist, then the absent ones (in the manifest, not in the instance).
     let locations = checks + (checks as f64 * shape.absent) as usize;
     for l in 0..locations {
         let r = l % regions;
         let rule = match pick(8) {
+            _ if shape.doors && r == 0 => json!({"true": {}}),
+            _ if shape.guards && l % 8 == 3 => json!({"at": ["guards", format!("h{}", l / 8 % 8)]}),
             0 if can_stay(r) => time_leaf(&mut pick),
             1 | 2 => has(&mut pick),
             3..=5 if shape.rich => gate(layer(r), &mut pick),
@@ -409,7 +438,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
         })
         .collect();
     let mut time = json!({"slices": slices, "start_mask": 1});
-    if shape.clocks {
+    if shape.clocks && !shape.timeless {
         // The first half-day is owned from the start, each later one with an item of its own.
         let half_days: Vec<Value> = (0..halves)
             .map(|h| {
@@ -425,7 +454,7 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut items: Vec<Value> = (0..kinds).map(|k| json!({"key": p(k), "id": k + 1})).collect();
     items.push(json!({"key": "useful", "id": kinds + 1}));
     items.push(json!({"key": "filler", "id": kinds + 2}));
-    let manifest = json!({
+    let mut manifest = json!({
         "options": [],
         "items": items,
         "locations": (0..locations).map(|l| json!({"key": format!("l{l}"), "id": l + 1}))
@@ -436,6 +465,21 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
         "regions": regions_json,
         "goal": {"all": goal},
     });
+    if shape.doors {
+        let group = |g: &str| json!({"slots": {"groups": [g]}, "only": {"groups": [g]}});
+        manifest["shuffles"] = json!({"entrances": {
+            "coupled": true,
+            "slots": {"type": "exit", "names": (1..regions).map(|r| format!("e{r}")).collect::<Vec<_>>()},
+            "allow": [group("g0"), group("g1")],
+        }});
+    }
+    if shape.guards {
+        let things: serde_json::Map<String, Value> =
+            (0..8).map(|k| (format!("g{k}"), json!({"rule": {"has": p(k % kinds)}}))).collect();
+        let halls: Vec<String> = (0..8).map(|k| format!("h{k}")).collect();
+        manifest["shuffles"]["guards"] =
+            json!({"slots": {"type": "name", "names": halls}, "things": things});
+    }
     let mut pool: Vec<String> = (0..kinds).flat_map(|k| vec![p(k); copies(k)]).collect();
     let rest = checks - pool.len();
     pool.extend((0..rest).map(|i| if i % 4 == 0 { "useful" } else { "filler" }.to_owned()));

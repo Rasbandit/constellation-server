@@ -339,7 +339,44 @@ pub const FILL_MAX_ATTEMPTS: u32 = 20;
 /// sections the file holds and what is in them. Raise it with any change to that. A world is
 /// also prepared again by every new server build, so this guards builds that share a version
 /// text (local and test builds).
-pub const PREPARED_WORLD_LAYOUT: u16 = 1;
+pub const PREPARED_WORLD_LAYOUT: u16 = 2;
+
+/// Attempts one world's shuffles get per seed (`data_fill::shuffle`): a failed layout or
+/// whole-world check starts every shuffle of that world again on the next attempt's random
+/// streams, and at the cap the room's generation fails naming the world and the shuffle (a
+/// design value, doc 17 section 4.7 of the design docs).
+pub const SHUFFLE_MAX_ATTEMPTS: u32 = 4;
+
+/// Most shuffles one world may declare (a design value).
+pub const SHUFFLES_MAX: usize = 64;
+
+/// Most slots over all shuffles of one world, and most things of one shuffle (a design value:
+/// the largest entrance shuffle we know of is reported at 611 exits). Bounds the permission
+/// tables, which hold a cell per slot and thing.
+pub const SHUFFLE_MAX_SLOTS: usize = 1024;
+
+/// Longest shuffle name in bytes: a name keys a random stream, and a stream label is short
+/// (`spec_rng::derive`).
+pub const SHUFFLE_NAME_MAX_BYTES: usize = 48;
+
+/// Most steps the load of a world's layout index may take: per shuffled exit, the regions
+/// that reach its region by exits that are not shuffled (what the layout solve tells a branch
+/// from a dead end by, about 2 bytes each), and the exits walked to find them (a design
+/// value).
+pub const SHUFFLE_MAX_BEHIND: usize = 1 << 20;
+
+/// Most permission rows one shuffle may carry: a row is applied to the whole table of its
+/// shuffle when the world is compiled (a design value).
+pub const SHUFFLE_MAX_ROWS: usize = 64;
+
+/// Most things a shuffle may have when a rule reads its result as a rule: such a read is one
+/// shared rule listing every candidate, and a rule lists at most this many parts (the
+/// engine's limit, one byte).
+pub const SHUFFLE_MAX_READ_THINGS: usize = 255;
+
+/// Longest error text the shuffle checks give back, bytes: a message may quote names from the
+/// manifest, and a name's length is not known to be small when it is quoted (a design value).
+pub const SHUFFLE_ERROR_MAX_BYTES: usize = 4096;
 
 /// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
 /// (`server::pool`; the design value of `Limits::fill_worker_cache_bytes`), the least recently
@@ -418,7 +455,8 @@ pub const SHUFFLE_FILL_MAX_PROBES: u32 = 32;
 pub const FILL_MAX_WORKERS: usize = 64;
 
 /// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
-/// listing columns and an index).
+/// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a
+/// thing, a group, an exit key, a door).
 pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 
 /// The generator version a data-only seed records (what clients of the compatible protocol

@@ -131,6 +131,9 @@ pub enum FillError {
         /// Attempts made.
         attempts: u32,
     },
+    /// The world declares shuffles that have not run for this seed: the caller has to stage
+    /// it ([`crate::shuffle::stage`]). Not a fault of the instance.
+    Unstaged(&'static str),
     /// A fill mode's own check of its result failed: a bug in the mode, never the input.
     Invalid(String),
     /// More items than locations, or the reverse.
@@ -154,6 +157,10 @@ impl Plan {
     /// Unknown keys, and start counts below 0 or above the location count.
     pub fn new(w: &World, inst: &Instance) -> Result<Self, FillError> {
         let e = FillError::Instance;
+        if w.has_shuffles() {
+            // Its exits and its `at` options are not this seed's yet.
+            return Err(FillError::Unstaged(crate::shuffle::UNSTAGED));
+        }
         let mut opts = Vec::with_capacity(w.options());
         for k in 0..w.options() {
             let key = w.option_key(k);

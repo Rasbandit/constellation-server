@@ -7,7 +7,7 @@
 //! seed of this world names it (the names and ids clients are sent, with their checksum). Its
 //! content is also what a seed's hash reads of the game, so that is not written per seed.
 
-use seed_bundle::package::{self, SECTION_GAME, SECTION_SEED_GAME};
+use seed_bundle::package::{self, SECTION_GAME, SECTION_SEED_GAME, SECTION_SHUFFLES};
 use seed_bundle::{GameData, GamePackage};
 use serde_json::Value;
 
@@ -59,10 +59,12 @@ pub fn seed_game(file: &[u8]) -> Result<&[u8], String> {
 /// A manifest without a `game`, or one the compiler or the loader refuses.
 pub fn build(manifest: &Value) -> Result<(Vec<u8>, World), String> {
     let game = manifest_game(manifest)?;
-    let (rules, keys) = section::sections(manifest)?;
-    let world = World::from_sections(rules.clone(), keys.clone())?;
+    let (rules, keys, shuffles) = section::compiled(manifest)?;
+    let world = World::from_parts(rules.clone(), keys.clone(), shuffles.as_deref())?;
     let seed_game = GamePackage::file(game, &game_data(&world)?).map_err(|e| e.to_string())?;
-    Ok((section::package(rules, keys, &[(SECTION_SEED_GAME, &seed_game)])?, world))
+    let mut more: Vec<(u16, &[u8])> = vec![(SECTION_SEED_GAME, &seed_game)];
+    more.extend(shuffles.iter().map(|b| (SECTION_SHUFFLES, &b[..])));
+    Ok((section::package(rules, keys, &more)?, world))
 }
 
 impl Prepared {

@@ -457,3 +457,121 @@ jobs:
             bench-seeds.jsonl
             bench-212.jsonl
             quality-*.json
+  # The base branch against this one on one runner: both builds of the bench, run in turns
+  # (which side goes first alternates), on worlds without shuffles, the path a room of that
+  # size takes. Runners differ too much between jobs to compare two jobs' numbers.
+  bench-ab:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - name: build both
+        env: { BASE: "${{ github.base_ref || 'main' }}" }
+        run: |
+          git worktree add ../base "origin/$BASE"
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+          (cd ../base && cargo build --release --locked -p data-fill --features memory-harness --example synth_room)
+      - name: in turns
+        run: |
+          set -o pipefail
+          for pair in $(seq 12); do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --path auto --workers 1 --players 1,10,100 --checks 1000 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab.jsonl
+            done
+          done; done
+      - name: summary
+        run: |
+          {
+            echo "### Base against head, worlds without shuffles, exact fill, one thread (measured on this runner, release build, 12 runs a side in turns; each run's fill ms is its own median)"
+            echo
+            echo "| profile | players | path | base fill ms median | base range | head fill ms median | head range | head / base | same placements |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[]
+              | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
+              | "| \(.[0].profile) | \(.[0].players) | \(.[0].path) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-ab
+          path: bench-ab.jsonl
+  # Shuffles (`data_fill::shuffle`), heavy worlds, one thread, the path a room of that size
+  # takes. The same doors-shaped worlds (no time context, which an exit shuffle needs) filled
+  # with their doors shuffled and with every door where the manifest has it, seed by seed:
+  # what a shuffled layout costs the fill, apart from what the shape costs. A `none` shuffle
+  # that rules read, against the same shape without it. And a room on one loaded world with
+  # and without an entrance shuffle, for what a player costs in memory. A room that does not
+  # fill prints a row that says so.
+  bench-shuffle:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - run: cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+      - name: rows
+        run: |
+          set -o pipefail
+          run() {
+            target/release/examples/synth_room --profile heavy --path auto --workers 1 --checks 1000 \
+              --failed-row "$@"
+          }
+          for seed in 1 2 3 4 5 6 7 8 9 10; do for layout in vanilla on; do
+            run --timeless on --entrances "$layout" --seed "$seed" --players 1,100 --reps 3 \
+              | jq -c --arg layout "$layout" 'select(has("players") or has("failed")) | . + {asked: $layout}' \
+              | tee -a bench-layout.jsonl
+          done; done
+          for guards in off on; do run --guards "$guards" --players 1,100 | tee -a bench-shuffle.jsonl; done
+          for entrances in off on; do
+            run --timeless on --entrances "$entrances" --worlds one --players 100 | tee -a bench-shuffle.jsonl
+          done
+      - name: summary
+        run: |
+          {
+            echo "### Shuffled doors against the same worlds with every door in place (heavy profile without a time context, 1,000 checks, 209 doors per world, one thread, seeds 1 to 10; measured on this runner, release build)"
+            echo
+            echo "Ratio is shuffled over vanilla, seed by seed. Staging ms is what the shuffles add before the fill, whole room."
+            echo
+            echo "| players | path | seeds | vanilla fill ms median | range | shuffled fill ms median | range | ratio median | ratio range | rule evals ratio median | range | spheres vanilla median | shuffled | staging ms median | staging / vanilla fill |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              def r3: (. * 1000 | round) / 1000;
+              [.[] | select(has("players"))] | group_by(.players) | .[]
+              | (map(select(.layout == "vanilla")) | map({key: (.seed | tostring), value: .}) | from_entries) as $v
+              | [.[] | select(.layout == "shuffled" and $v[.seed | tostring] != null) | {s: ., v: $v[.seed | tostring]}] as $p
+              | "| \(.[0].players) | \(.[0].path) | \($p | length) | \($p | map(.v.fill_ms) | med) | \($p | map(.v.fill_ms) | min) to \($p | map(.v.fill_ms) | max) | \($p | map(.s.fill_ms) | med) | \($p | map(.s.fill_ms) | min) to \($p | map(.s.fill_ms) | max) | \($p | map(.s.fill_ms / .v.fill_ms) | med | r3) | \($p | map(.s.fill_ms / .v.fill_ms) | min | r3) to \($p | map(.s.fill_ms / .v.fill_ms) | max | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | med | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | min | r3) to \($p | map(.s.rule_evals / .v.rule_evals) | max | r3) | \($p | map(.v.spheres) | med) | \($p | map(.s.spheres) | med) | \($p | map(.s.shuffle.shuffle_ms) | med) | \(($p | map(.s.shuffle.shuffle_ms) | med) / ($p | map(.v.fill_ms) | med) | r3) |"' bench-layout.jsonl
+            echo
+            echo "Rooms that did not fill: $(jq -s '[.[] | select(has("failed"))] | length' bench-layout.jsonl)"
+            echo
+            echo "### A \`none\` shuffle, and memory per player (same runner)"
+            echo
+            echo "guards: 8 things that one check in eight reads as a rule, against the heavy shape without it. entrances: a room on one loaded world. Room bytes per player is the heap the room keeps per player after setup; world bytes is one loaded world, which a room shares."
+            echo
+            echo "| shuffle | worlds | players | path | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | per world | restarts | room bytes per player plain | with | world bytes | peak RSS plain | with |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
+              | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
+              | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \($on.shuffle.restarts) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-shuffle
+          path: |
+            bench-layout.jsonl
+            bench-shuffle.jsonl
