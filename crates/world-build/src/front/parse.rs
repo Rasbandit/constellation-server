@@ -1361,7 +1361,13 @@ impl P<'_> {
 
 /// A name as written, its `{var}` pieces included.
 fn show_tn(n: &Tn) -> String {
-    n.v.iter()
+    pieces_text(&n.v)
+}
+
+/// Name pieces as written: `{s.pack}_pak`.
+pub(crate) fn pieces_text(pieces: &[Piece]) -> String {
+    pieces
+        .iter()
         .map(|p| match p {
             Piece::Text(t) => t.clone(),
             Piece::Var(v) => format!("{{{v}}}"),

@@ -141,6 +141,8 @@ pub struct Partial {
     /// any of them may be in the part that did not parse, so the checks' errors about them
     /// are left out as likely cascades.
     pub broken: Option<HashSet<String>>,
+    /// Every name a family wrote from a template ([`merge_repeats`]).
+    pub templates: Templates,
 }
 
 /// [`read`], keeping the world when there are errors, so the checks can still report the
@@ -180,7 +182,9 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     x.world.files.clone_from(&x.paths);
     let (errors, warnings) = x.errs.split();
     let world = x.world;
-    Partial { world, ledger, errors, warnings, broken }
+    let templates = x.templates.into_inner();
+    let errors = merge_repeats(errors, &templates);
+    Partial { world, ledger, errors, warnings, broken, templates }
 }
 
 /// Parse and format one file's text.
@@ -313,6 +317,66 @@ struct X {
     broken: HashSet<String>,
     /// The placement set whose block is being read: its regions join it.
     set: Option<At<String>>,
+    /// Every name a family wrote from a template, by the template's place.
+    templates: std::cell::RefCell<Templates>,
+}
+
+/// A family template's expansions: the template as written, and each name it gave with the
+/// binder values that gave it (`s = amber`).
+#[derive(Debug, Clone, Default)]
+pub struct Template {
+    /// The template, `{s.pack}_pak`.
+    pub text: String,
+    /// Each expansion: the name and its binder values.
+    pub names: Vec<(String, String)>,
+}
+
+/// Templates by their place.
+pub type Templates = BTreeMap<Pos, Template>;
+
+/// `errors` with each mistake a family template repeats written once: the template in place
+/// of the expanded name, the first expansion's name and binder values, and how many more. A
+/// mistake one expansion makes keeps its name, with the template and binder values after it.
+#[must_use]
+pub fn merge_repeats(errors: Vec<Error>, templates: &Templates) -> Vec<Error> {
+    // Each error, and for a templated one: its message with the template, the first name and
+    // binder values, the template, and how many expansions gave it.
+    type Seen = Option<(String, String, String, usize)>;
+    let mut out: Vec<(Error, Seen)> = Vec::new();
+    for e in errors {
+        let found = e.pos.and_then(|p| templates.get(&p)).and_then(|t| {
+            let (name, binders) =
+                t.names.iter().find(|(n, _)| e.msg.contains(&format!("`{n}`")))?;
+            let msg = e.msg.replace(&format!("`{name}`"), &format!("`{}`", t.text));
+            Some((msg, name.clone(), binders.clone(), t.text.clone()))
+        });
+        let Some((msg, name, binders, text)) = found else {
+            out.push((e, None));
+            continue;
+        };
+        let same = out.iter_mut().find(|(x, m)| {
+            x.pos == e.pos && x.help == e.help && m.as_ref().is_some_and(|m| m.0 == msg)
+        });
+        match same {
+            Some((_, Some(m))) => m.3 += 1,
+            _ => out.push((e, Some((msg, format!("`{name}` for `{binders}`"), text, 1)))),
+        }
+    }
+    out.into_iter()
+        .map(|(mut e, m)| {
+            match m {
+                Some((msg, first, _, n)) if n > 1 => {
+                    e.msg = format!("{msg} (as {first}, and {} more)", n - 1);
+                }
+                Some((_, first, text, _)) => {
+                    let first = first.split_once(" for ").map_or(first.clone(), |x| x.1.to_owned());
+                    e.msg = format!("{} (from `{text}` for {first})", e.msg);
+                }
+                None => {}
+            }
+            e
+        })
+        .collect()
 }
 
 impl X {
@@ -685,7 +749,42 @@ impl X {
                 },
             }
         }
+        if !env.is_empty() {
+            self.note_template(n.pos, &n.v, &s, env);
+        }
         Some(At::new(s, n.pos))
+    }
+
+    /// Note that the template `pieces` at `at` gave `name` with the family values `env`.
+    fn note_template(&self, at: Pos, pieces: &[Piece], name: &str, env: &Env) {
+        let vars: Vec<&str> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Var(v) => v.split('.').next(),
+                Piece::Text(_) => None,
+            })
+            .collect();
+        let binders: Vec<String> = env
+            .iter()
+            .filter(|(v, _)| vars.contains(&v.as_str()))
+            .map(|(v, val)| {
+                let shown = match val {
+                    Val::Int(n) => n.to_string(),
+                    Val::Name(n) => n.clone(),
+                    Val::Row(t, r) => match self.tables.get(t).and_then(|x| x.rows[*r].first()) {
+                        Some(Cell::Name(n)) => n.clone(),
+                        _ => format!("row {}", r + 1),
+                    },
+                };
+                format!("{v} = {shown}")
+            })
+            .collect();
+        let mut all = self.templates.borrow_mut();
+        let t = all.entry(at).or_default();
+        if t.text.is_empty() {
+            t.text = parse::pieces_text(pieces);
+        }
+        t.names.push((name.to_owned(), binders.join(", ")));
     }
 
     /// `e` with the family's variables put in.
@@ -726,6 +825,7 @@ impl X {
                             Piece::Var(v) => s.push_str(&self.piece(v, env, x.at)?),
                         }
                     }
+                    self.note_template(x.at, ps, &s, env);
                     Some(E::Name(s))
                 }
                 _ => None,

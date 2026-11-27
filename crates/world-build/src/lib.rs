@@ -147,6 +147,7 @@ pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, V
         // not hidden behind the syntax error; what may be a cascade of it is left out.
         let mut all = read.errors;
         if let Err(more) = build_model(&read.world, front::ENTRY) {
+            let more = front::merge_repeats(more, &read.templates);
             all.extend(more.into_iter().filter(|e| !cascade(e, broken)));
         }
         all.sort_by_key(|e| (e.pos.is_none(), e.pos));
@@ -156,7 +157,8 @@ pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, V
     if !read.errors.is_empty() {
         return Err(read.errors);
     }
-    let mut built = build_model(&read.world, front::ENTRY)?;
+    let mut built = build_model(&read.world, front::ENTRY)
+        .map_err(|e| front::merge_repeats(e, &read.templates))?;
     let mut warnings = read.warnings;
     warnings.append(&mut built.warnings);
     built.warnings = warnings;

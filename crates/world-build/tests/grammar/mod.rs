@@ -347,3 +347,30 @@ region a {
     assert_eq!(inst["location_groups"]["v1"], "vault");
     assert!(inst["location_groups"].get("a1").is_none());
 }
+
+/// A mistake in a family's template is one error, written with the template and the first
+/// expansion's binder values, and the count of the others.
+#[test]
+fn a_misspelling_in_a_template_is_one_error_with_its_count() {
+    let all = errors(&world(
+        "item dawn_pack progression\nitem dusk_pack progression\nitem noon_pack progression
+table song(key: name, pack: name) {
+  amber dawn
+  basalt dusk
+  cobalt noon
+}
+region a {
+  for s in song {
+    check {s.key}_clear: has({s.pack}_pak)
+  }
+}",
+    ));
+    assert_eq!(all.len(), 1, "{all:#?}");
+    assert!(
+        all[0].starts_with(&format!("world.rando:{}:30: ", line(11)))
+            && all[0].contains(
+                "unknown item `{s.pack}_pak` (as `dawn_pak` for `s = amber`, and 2 more)"
+            ),
+        "{all:#?}"
+    );
+}
