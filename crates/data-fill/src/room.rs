@@ -245,8 +245,8 @@ pub struct RoomFilled {
     /// Exact fill: rounds (or parts of one) that did not fit their state and were divided, in
     /// the attempt that made these placements.
     pub divided: u32,
-    /// Exact fill: rule evaluations the moves of `swaps` spent in that attempt, tried moves
-    /// included (`config::FILL_REPAIR_EVALS` an attempt, and the solve that crosses it).
+    /// Exact fill: rule evaluations the fill's repairs spent over all its attempts, tried moves
+    /// included (`config::FILL_REPAIR_EVALS`, and the solve that crosses it).
     pub repair_evals: u64,
     /// Rule evaluations of the opt-in mode's own solves, out of `stats.evals` (the rest are
     /// the confined items' steps and the final solve that checks and reports the seed).
@@ -1281,8 +1281,8 @@ struct Steps<'a, 'w> {
     /// items placed again by [`Steps::displace`].
     seated: Vec<((u16, u32), Given)>,
     moved: usize,
-    /// Rule evaluations the solves of [`Steps::displace`] made in this attempt, and the most
-    /// they may (`config::FILL_REPAIR_EVALS`).
+    /// Rule evaluations [`Steps::displace`] spent in this fill, over all its attempts, and the
+    /// most it may (`config::FILL_REPAIR_EVALS`).
     repair_evals: u64,
     repair_budget: u64,
     /// The attempt being made (from 1), and the groups it divided.
@@ -1428,7 +1428,7 @@ impl Steps<'_, '_> {
             }
             self.divide = repair;
             self.seated.clear();
-            (self.moved, self.repair_evals) = (0, 0);
+            self.moved = 0;
             let groups = groups(prog, per_player);
             let mut groups: Vec<&[Given]> = groups.iter().map(Vec::as_slice).collect();
             loop {
@@ -1805,9 +1805,9 @@ impl Steps<'_, '_> {
     /// held): the assumed fill's own step, so the seed is beatable for the same reason. The
     /// candidates are the seated items reached without `item`, at most
     /// `config::FILL_DISPLACE_TRIES` of them spread evenly over the order they were seated in,
-    /// each one fresh solve; an attempt's solves here stop once they have evaluated
-    /// `config::FILL_REPAIR_EVALS` rules. They run in rank order on every path, so that count is
-    /// the same on every path.
+    /// each one fresh solve; a fill's solves here stop once they have spent
+    /// `config::FILL_REPAIR_EVALS` rule evaluations. They run in rank order on every path, so
+    /// that count is the same on every path.
     ///
     /// # Errors
     /// [`FillError::Stuck`] when no seated item tried can be placed again, or the attempt's
@@ -1842,6 +1842,10 @@ impl Steps<'_, '_> {
         let w = seats[usize::from(item.to)].w;
         let stuck = || FillError::Stuck { item: w.item_key(item.item).to_owned(), attempts: 1 };
         let mut tried = Vec::new();
+        // The pass over the rounds left after a move starts with a fresh solve of about this
+        // state: charged as this first solve again, the same on every path (the pass's own
+        // counters depend on the path).
+        let mut pass = 0;
         for k in 0..=config::FILL_DISPLACE_TRIES {
             // A budget of work, not of time: a room that needs more repair than this is stuck.
             if self.repair_evals >= self.repair_budget {
@@ -1852,15 +1856,29 @@ impl Steps<'_, '_> {
             // Each solve starts its states' counters over: take them in before the next.
             let before = self.stats.evals;
             self.room.absorb(&mut self.stats);
-            self.repair_evals += self.stats.evals - before;
+            let spent = self.stats.evals - before;
+            self.repair_evals += spent;
             let models = &self.room.models;
             if k == 0 {
+                pass = spent;
+                // This state has the round's earlier items collected: it may reach a free
+                // location the round's state did not, and then no move is needed.
+                let free = locs.take_first(|(q, m)| {
+                    models[usize::from(q)].reached(m) && permits(seats, item, q, m)
+                });
+                if let Some((q, m)) = free {
+                    placed[usize::from(q)][m as usize] = Some(item);
+                    self.seated.push(((q, m), item));
+                    self.repair_evals += pass;
+                    return Ok(());
+                }
                 // The seated items reached without `item`, spread evenly over the order they
-                // were seated in (the oldest are the deepest: least lies behind them).
+                // were seated in (the oldest are the deepest: least lies behind them). A copy
+                // of the same item would change nothing.
                 let reached: Vec<usize> = (0..self.seated.len())
                     .filter(|i| {
-                        let ((p, l), _) = self.seated[*i];
-                        models[usize::from(p)].reached(l) && permits(seats, item, p, l)
+                        let ((p, l), g) = self.seated[*i];
+                        g != item && models[usize::from(p)].reached(l) && permits(seats, item, p, l)
                     })
                     .collect();
                 let step = reached.len().div_ceil(config::FILL_DISPLACE_TRIES).max(1);
@@ -1881,6 +1899,7 @@ impl Steps<'_, '_> {
                     self.seated.push(((q, m), out));
                     self.moved += 1;
                     self.swaps += 1;
+                    self.repair_evals += pass;
                     return Ok(());
                 }
                 placed[usize::from(p)][l as usize] = Some(out);
@@ -1889,13 +1908,7 @@ impl Steps<'_, '_> {
             let ((p, l), _) = self.seated[i];
             placed[usize::from(p)][l as usize] = Some(item);
         }
-        // Out of budget with a candidate tentatively moved out: put it back.
-        if let Some(&i) = tried.last() {
-            let ((p, l), out) = self.seated[i];
-            if placed[usize::from(p)][l as usize] == Some(item) && out != item {
-                placed[usize::from(p)][l as usize] = Some(out);
-            }
-        }
+        // A candidate may still be moved out here: the attempt ends, and its placements with it.
         Err(stuck())
     }
 

@@ -96,10 +96,13 @@ pub struct FillReport {
     /// Exact fill: rounds (or parts of one) divided because they did not fit their state.
     pub divided: u32,
     /// Players whose world leaves less room early on than it has progression to seat (early
-    /// capacity ratio under 1, `crate::capacity`), found when the room was set up.
+    /// capacity ratio under 1, `crate::capacity`). Read only for a fill that divided a round,
+    /// moved an item or restarted, to say which worlds leaned on that: reading it costs more
+    /// than a fill of the room (measured, 242 ms against 61 ms for one heavy player, debug
+    /// build), so a fill that needed none of it does not pay. 0 then.
     pub tight_players: u32,
-    /// The lowest early capacity ratio in the room, in thousandths (`u32::MAX`: no world with
-    /// progression).
+    /// The lowest early capacity ratio in the room, in thousandths (`u32::MAX`: not read, or no
+    /// world with progression).
     pub capacity_milli: u32,
 }
 
@@ -220,7 +223,6 @@ fn fill_on(
         (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
     };
     let seats = room.seats();
-    let (tight_players, capacity_milli) = capacity(&seats, &insts);
     let (filled, spheres) = room::fill_room_by(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
@@ -232,6 +234,9 @@ fn fill_on(
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
+    let repaired = filled.divided > 0 || filled.repair_evals > 0 || filled.attempts > 1;
+    let (tight_players, capacity_milli) =
+        if repaired { capacity(&seats, &insts) } else { (0, u32::MAX) };
     let report = FillReport {
         placed_by_the_mode: algorithm == room::Algorithm::Exact || filled.fast,
         fallbacks: filled.fallbacks,
@@ -354,4 +359,25 @@ pub(crate) fn game_data(w: &World) -> Result<GameData, String> {
         checksum,
         ..GameData::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::room::Compiled;
+    use crate::synth::{Hostile, Shape, world};
+    use crate::world::World;
+
+    /// Two instances of one world are judged apart: a player whose instance excludes every other
+    /// location (as much progression as locations that take it) is flagged, one whose instance
+    /// excludes none is not, and players with the same instance share one reading.
+    #[test]
+    fn capacity_is_read_once_per_world_and_instance() {
+        let (m, tight) = world(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 0);
+        let open = crate::Instance { excluded: Vec::new(), ..tight.clone() };
+        let insts = [&tight, &open, &tight, &open];
+        let c = Compiled::shared(World::load(&m).unwrap(), &insts, 1).unwrap();
+        let (flagged, lowest) = super::capacity(&c.seats(), &insts);
+        assert_eq!(flagged, 2);
+        assert!(lowest < 1000, "{lowest}");
+    }
 }

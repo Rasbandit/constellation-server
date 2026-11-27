@@ -1,5 +1,5 @@
-//! How much room a world leaves early on for the progression still to be placed: a warning a
-//! room's setup gives before the fill, never an input to it.
+//! How much room a world leaves early on for the progression still to be placed: a warning
+//! about a fill that needed repairs (`seed.rs`), never an input to a fill.
 //!
 //! The early capacity ratio of a world as one player plays it: draw the progression pool in a
 //! random order; holding the first `j - 1` items of it, count the free locations that may take
@@ -20,12 +20,13 @@ use crate::world::World;
 #[must_use]
 pub fn early(w: &World, plan: &Plan) -> Option<f64> {
     let locked = plan.locked_placed(w);
-    let usable: Vec<u32> = plan
-        .included
-        .iter()
-        .copied()
-        .filter(|l| locked[*l as usize].is_none() && !plan.excluded[*l as usize])
-        .collect();
+    // The usable locations as set words, laid out as a state's reached set.
+    let mut usable = vec![0u64; w.locations().div_ceil(64)];
+    for l in plan.included.iter().map(|l| *l as usize) {
+        if locked[l].is_none() && !plan.excluded[l] {
+            usable[l / 64] |= 1 << (l % 64);
+        }
+    }
     let mut pool = plan.progression.clone();
     let n = pool.len();
     if n == 0 {
@@ -36,8 +37,9 @@ pub fn early(w: &World, plan: &Plan) -> Option<f64> {
         SpecRng::from_u64(u64::from(k)).shuffle(&mut pool);
         let mut r = plan.state(w, &[], &locked);
         for (j, item) in pool.iter().enumerate() {
-            let reached = usable.iter().filter(|l| r.reached(**l)).count();
-            sum[j] += reached as f64 / (j + 1) as f64;
+            let words = r.reached_words().iter().zip(&usable);
+            let reached: u32 = words.map(|(a, b)| (a & b).count_ones()).sum();
+            sum[j] += f64::from(reached) / (j + 1) as f64;
             r.add(*item, 1);
             r.run();
         }

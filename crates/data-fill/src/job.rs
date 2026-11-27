@@ -91,8 +91,8 @@ pub fn unframe(framed: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// JSON) and the prepared world's file ([`prepare`]). Nothing is compiled. The output is the
 /// seed file itself (v2), which names the game's package in the prepared world
 /// (`crate::prepared::seed_game`) by key. When the asked mode fell back to the exact fill, when
-/// a world of the room has an early capacity ratio under 1, and when the exact fill restarted,
-/// one line on stderr says so each (stdout is the seed and nothing else).
+/// a fill that needed repairs has a world with an early capacity ratio under 1, and when the
+/// exact fill restarted, one line on stderr says so each (stdout is the seed and nothing else).
 ///
 /// # Errors
 /// A message for a frame or request that does not parse, a prepared world that does not load

@@ -393,6 +393,13 @@ fn one(
         "set_up_ms": ms(r.nanos[0]), "settle_ms": ms(r.nanos[1]), "pick_ms": ms(r.nanos[2]),
         "undone": r.undone, "journal_peak": r.journaled,
     });
+    // What the setup-time warning costs (`data_fill::capacity`): every seat's world read once,
+    // as a room of different instances pays it (measured), and the room's lowest ratio.
+    let t = Instant::now();
+    let ratios: Vec<Option<f64>> =
+        seats.iter().map(|s| data_fill::capacity::early(s.w, s.plan)).collect();
+    out["capacity_ms"] = json!(fine(t.elapsed().as_secs_f64() * 1e3));
+    out["capacity_lowest"] = json!(ratios.into_iter().flatten().reduce(f64::min));
     // The exact fill's repairs in the attempt that placed the seed, and the restarts before it.
     out["divided"] = json!(f.divided);
     out["repair_evals"] = json!(f.repair_evals);

@@ -561,7 +561,9 @@ pub struct Filled {
 ///
 /// Not the product's fill: a generation fills a room ([`crate::room`]), one player too, which
 /// places the same seed as this one except where this one starts over and the room moves an
-/// item in place instead. Kept for the command line tool and the measurements.
+/// item in place instead. Kept for the command line tool and the measurements. With no
+/// repair, it is stuck more often on tight worlds than the room fill at the same
+/// `max_attempts`.
 ///
 /// # Errors
 /// [`FillError`] when every attempt is stuck or the counts do not match.

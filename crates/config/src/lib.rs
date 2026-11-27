@@ -446,16 +446,24 @@ pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
 /// (a design value).
 pub const FILL_DISPLACE_TRIES: usize = 32;
 
-/// Rule evaluations the solves of such moves may spend in one attempt of an exact fill (the
-/// solve that crosses it finishes); past it the attempt is stuck, and the next one, if any,
-/// goes deepest first. A budget of work, not of time, so a seed is the same on every machine
-/// and every path, and no world can drive a fill to its time limit (`fill_timeout_ms`, 60 s)
-/// by needing repair after repair. A design value: at about 186 ns an evaluation (the heavy
-/// profile at 100 players, 458.8 ms for 2,471,572 evaluations, bench runs 45935649561,
-/// 45936573286 and 45937474625) it is about 9 s of repair in an attempt, 27 s over
-/// `FILL_MAX_ATTEMPTS` (estimated). Counted on the bench worlds, seed 1: a room of 100 chain
-/// worlds spent 6.6 million, one of 100 key worlds 33 million.
+/// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
+/// of such moves, and for each move one more solve's worth for the pass over the rounds left
+/// after it (counted as the move's first solve, so the count is the same on every path).
+/// Checked before each solve, so a fill ends at most one solve past it; past it the attempt is
+/// stuck, and so is any later one that needs a move. A budget of work, not of time, so a seed
+/// is the same on every machine and every path, and no world can drive a fill to its time
+/// limit (`fill_timeout_ms`, 60 s) by needing repair after repair. A design value. On the
+/// `bench-room` job (run 45944219837, seeds 1 to 3) a room of 100 key worlds, the most
+/// repaired room there, spent 31 to 34 million on its moves' solves (counted, before the pass
+/// was charged) in a fill of 8.3 to 8.7 s (measured); at that rate the whole budget is about
+/// 13 s of fill, and at the heavy profile's 186 ns an evaluation about 9 s for the solves
+/// alone (both estimated), inside the time limit with the fill's own work.
 pub const FILL_REPAIR_EVALS: u64 = 48_000_000;
+
+/// The least p value the product's fill may show against uniform beatable placements on the
+/// one-player fixture world (`data-fill` `tests/fairness.rs`; a design value: drawn order gives
+/// 0.39 there, each player's items deepest first gave 0.00008, counted over 300 seeds).
+pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
 
 /// Random orders of a world's progression the early capacity ratio is the mean over
 /// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
