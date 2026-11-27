@@ -144,6 +144,7 @@ fn failure_reply(e: Failure) -> (StatusCode, String) {
 }
 
 /// Run work that blocks and can fail off the runtime's threads; a panic in it is its error.
+/// One of four ways `worlds` does this, apart only in what a panic becomes: see #220.
 async fn try_blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {

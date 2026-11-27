@@ -132,7 +132,8 @@ impl Worlds {
         let file = record.with_extension(kind.ext());
         let meta = read_json(record).ok_or("its record is not readable JSON")?;
         let key = manifests::key_of(id).ok_or("bad id")?;
-        // Read and hashed off the runtime's threads: a file may be up to its cap.
+        // Read and hashed off the runtime's threads: a file may be up to its cap. Its own
+        // wording of a stopped read: see #220.
         let (path, want) = (file.clone(), id.to_owned());
         let read = tokio::task::spawn_blocking(move || {
             let bytes = std::fs::read(&path)?;
@@ -168,6 +169,7 @@ fn fail_restarted(status: &mut Value) {
 }
 
 /// Run blocking file work off the runtime's threads; `None` when it panicked (said in the log).
+/// Kept apart from `try_blocking`, whose panic is the caller's error and is not logged: see #220.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     tokio::task::spawn_blocking(f)
         .await

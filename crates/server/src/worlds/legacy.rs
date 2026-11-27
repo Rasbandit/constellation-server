@@ -195,7 +195,8 @@ pub(super) async fn prepare(
     apworlds: &[Value],
     yamls: &[Value],
 ) -> Result<(), String> {
-    // Written off the runtime's threads: an apworld may be up to its cap.
+    // Written off the runtime's threads: an apworld may be up to its cap. Its own wording of a
+    // stopped write: see #220.
     let blocking = async |f: Box<dyn FnOnce() -> std::io::Result<()> + Send>| {
         let done = tokio::task::spawn_blocking(f).await;
         done.map_err(|e| format!("the write stopped: {e}"))?.map_err(|e| e.to_string())
