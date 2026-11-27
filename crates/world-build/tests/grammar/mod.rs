@@ -374,3 +374,85 @@ region a {
         "{all:#?}"
     );
 }
+
+/// An unknown name close to a declared one suggests it.
+#[test]
+fn unknown_names_suggest_the_nearest_declared_one() {
+    let files = world(
+        "option tricky: toggle = off\ndef can_be_goron = has(k)\nregion a {\n  check c: can_be_gorn\n  check d: has(kk) or opt.tricy\n  exit hal\n}\nregion hall {\n  exit a\n}",
+    );
+    let all = errors(&files);
+    for want in [
+        "did you mean `can_be_goron`?",
+        "did you mean `k`?",
+        "did you mean `opt.tricky`?",
+        "did you mean `hall`?",
+    ] {
+        assert!(all.iter().any(|e| e.contains(want)), "{want} in {all:#?}");
+    }
+}
+
+/// `fmt` breaks a rule too long for one line before each top-level `or` (or each `and` when it
+/// has no `or`), indented under its line; the result is stable, and a generated file's hash
+/// does not depend on the line breaks.
+#[test]
+fn fmt_breaks_long_rules_at_or_and_and() {
+    let parts: Vec<String> = (0..8).map(|i| format!("has(item_number_{i})")).collect();
+    let src = format!(
+        "world t\nregion a {{\n  check c: {}\n  check d: {}\n  check e: has(x)\n}}\n",
+        parts.join(" or "),
+        parts.join(" and ")
+    );
+    let once = world_build::front::format_text(&src, "w.rando").unwrap();
+    assert!(once.lines().all(|l| l.chars().count() <= 100), "{once}");
+    assert!(once.contains("\n    or has(item_number_1)\n"), "{once}");
+    assert!(once.contains("\n    and has(item_number_1)\n"), "{once}");
+    assert!(once.contains("\n  check e: has(x)\n"), "{once}");
+    assert_eq!(world_build::front::format_text(&once, "w.rando").unwrap(), once);
+    let hash = |t: &str| {
+        world_build::front::content_hash(
+            &world_build::front::parse::parse(t, 0),
+            &super::lang::mem(&[]),
+        )
+    };
+    assert_eq!(hash(&src), hash(&once));
+}
+
+/// `stamp` writes a generated file's header for a body any tool wrote, and refreshes an old
+/// header: a generator need not link the library.
+#[test]
+fn stamp_writes_and_refreshes_a_generated_header() {
+    let body = "table song(key: name) {\n  a\n  b\n}\nregion a {\n  for s in song {\n    check {s.key}_c\n  }\n}\n";
+    let entry =
+        "world t\nuse songs\nstart a\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n";
+    let folder = super::lang::mem(&[("world.rando", entry), ("data/in.csv", "x")]);
+    let one = world_build::front::stamp(
+        body,
+        "export 1",
+        &[("data/in.csv", "x")],
+        &[("song", 2)],
+        &folder,
+    )
+    .unwrap();
+    assert!(one.starts_with("generated {\n  tool \"export 1\"\n"), "{one}");
+    let b = ok(&super::lang::mem(&[
+        ("world.rando", entry),
+        ("songs.rando", &one),
+        ("data/in.csv", "x"),
+    ]));
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    let again = world_build::front::stamp(
+        &one,
+        "export 1",
+        &[("data/in.csv", "x")],
+        &[("song", 2)],
+        &folder,
+    )
+    .unwrap();
+    assert_eq!(again, one);
+    let newer = world_build::front::stamp(&one, "export 2", &[], &[], &folder).unwrap();
+    assert!(
+        newer.contains("tool \"export 2\"") && !newer.contains("export 1") && newer.ends_with(body),
+        "{newer}"
+    );
+}

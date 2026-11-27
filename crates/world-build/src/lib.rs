@@ -23,6 +23,7 @@ mod lower;
 pub mod model;
 mod presence;
 pub mod rule;
+mod suggest;
 mod world;
 
 pub use model::Pos;

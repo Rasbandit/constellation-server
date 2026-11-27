@@ -215,6 +215,10 @@ pub struct Layout {
     pub glue: Vec<bool>,
     /// Token ranges `fmt` wraps in parentheses (`and` inside `or`).
     pub parens: Vec<(usize, usize)>,
+    /// Rules `fmt` may break over lines: first token, one past the last, and the tokens to
+    /// break before when the rule is too long for one line (its top-level `or`s, or its
+    /// top-level `and`s when it has no `or`).
+    pub wraps: Vec<(usize, usize, Vec<usize>)>,
 }
 
 /// A parsed file.
@@ -270,7 +274,12 @@ pub fn parse(src: &str, file: u32) -> FileAst {
         toks: &toks,
         k: 0,
         errors: Vec::new(),
-        layout: Layout { brk: vec![None; n], glue: vec![false; n], parens: Vec::new() },
+        layout: Layout {
+            brk: vec![None; n],
+            glue: vec![false; n],
+            parens: Vec::new(),
+            wraps: Vec::new(),
+        },
     };
     let generated = p.generated();
     let mut uses = Vec::new();
@@ -443,7 +452,27 @@ impl P<'_> {
         let (e, end) = parse_in(self.toks, self.k, self.toks.len())?;
         self.k = end;
         self.lay_rule(&e, depth);
+        self.lay_wrap(&e);
         Ok(e)
+    }
+
+    /// Where `fmt` may break `e` when it is too long for one line: before each top-level
+    /// `or`, or each top-level `and` when there is no `or`. A rule with a `match` (laid out
+    /// over lines already) is left alone.
+    fn lay_wrap(&mut self, e: &Expr) {
+        let parts = match &e.e {
+            E::Or(p) | E::And(p) if !e.paren => p,
+            _ => return,
+        };
+        let mut todo = vec![e];
+        while let Some(x) = todo.pop() {
+            if matches!(x.e, E::Match(..)) {
+                return;
+            }
+            todo.extend(x.children());
+        }
+        let at: Vec<usize> = parts.iter().skip(1).map(|p| p.span.0 - 1).collect();
+        self.layout.wraps.push((e.span.0, e.span.1, at));
     }
 
     /// A rule that must end on this line (a table cell).

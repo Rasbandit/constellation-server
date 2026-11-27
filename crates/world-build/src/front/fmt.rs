@@ -1,11 +1,17 @@
 //! The formatter (design doc 18 section 5.1, `fmt`): one canonical layout, comments kept.
 //! It writes the file's own tokens again, breaking lines where the parser marked a
 //! declaration, a member, a row or an arm, two spaces per level, one space between tokens
-//! except around punctuation, and parentheses around `and` inside `or`. Formatting a formatted
-//! file gives it back unchanged.
+//! except around punctuation, and parentheses around `and` inside `or`. A rule too long for a
+//! line of [`WIDTH`] characters is broken before each top-level `or` (or `and`), indented one
+//! level under its line; a generated file's hash does not count these breaks. Formatting a
+//! formatted file gives it back unchanged.
 
 use super::parse::FileAst;
 use crate::lex::{RESERVED, RULE_WORDS, Tok, Token};
+
+/// The longest line `fmt` writes a rule on before breaking it (a line with one long name can
+/// still be longer).
+pub const WIDTH: usize = 100;
 
 /// The file in its canonical layout.
 #[must_use]
@@ -45,7 +51,31 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
             *n += 1;
         }
     }
+    // Rules too long for one line, by first token; and the tokens to break before, with
+    // their indent, once one is found too long.
+    let wraps: std::collections::HashMap<usize, (usize, &Vec<usize>)> = if with_comments {
+        ast.layout.wraps.iter().map(|(a, b, at)| (*a, (*b, at))).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let mut wrap_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for i in from..=toks.len() {
+        if let Some((end, at)) = wraps.get(&i)
+            && !at.is_empty()
+        {
+            let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
+            let mut len = 0;
+            for k in i..(*end).min(toks.len()) {
+                let glue = ast.layout.glue.get(k).copied().unwrap_or(false);
+                len += text(&toks[k].t).chars().count() + open[k] + close[k];
+                len += usize::from(k > i && space(&toks[k - 1], &toks[k], glue));
+            }
+            if line + 1 + len > WIDTH {
+                at.iter().for_each(|k| {
+                    wrap_at.insert(*k, depth + 1);
+                });
+            }
+        }
         // Comments that come before this token.
         while let Some(c) = comments.get(ci).filter(|c| c.before == i) {
             if c.own_line {
@@ -76,7 +106,10 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
         if let Some(d) = brk {
             depth = d;
         }
-        if brk.is_some() || need_break {
+        if let Some(d) = wrap_at.get(&i).copied().filter(|_| brk.is_none() && !need_break) {
+            out.push('\n');
+            out.push_str(&"  ".repeat(d));
+        } else if brk.is_some() || need_break {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }

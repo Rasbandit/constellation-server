@@ -319,6 +319,16 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Every declared name of the given sorts, for "did you mean".
+    fn of_sort(&self, sorts: &[Sort]) -> Vec<&'a str> {
+        self.names
+            .sorts
+            .iter()
+            .filter(|(_, s)| sorts.contains(s))
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+
     fn sort_of(&self, n: &str) -> Option<Sort> {
         self.names.sorts.get(n).copied()
     }
@@ -333,11 +343,14 @@ impl<'a> Lower<'a> {
             E::Name(n) => {
                 match self.sort_of(n) {
                     Some(s) => self.err(e.at, format!("`{n}` is {}, not an item", s.word()), ""),
-                    None => self.err(
-                        e.at,
-                        format!("unknown item `{n}`"),
-                        "declare it with `item NAME CLASS`",
-                    ),
+                    None => {
+                        let help = crate::suggest::help(
+                            n,
+                            self.of_sort(&[Sort::Item]),
+                            "declare it with `item NAME CLASS`",
+                        );
+                        self.err(e.at, format!("unknown item `{n}`"), &help)
+                    }
                 };
                 None
             }
@@ -366,11 +379,14 @@ impl<'a> Lower<'a> {
             return match self.names.options.get(k) {
                 Some(ty) => Some(Dotted::Opt(k, ty.clone())),
                 None => {
-                    self.err(
-                        at,
-                        format!("unknown option `{k}`"),
+                    let opts: Vec<String> =
+                        self.names.options.keys().map(|o| format!("opt.{o}")).collect();
+                    let help = crate::suggest::help(
+                        n,
+                        opts.iter().map(String::as_str),
                         "declare it with `option NAME: TYPE`",
                     );
+                    self.err(at, format!("unknown option `{k}`"), &help);
                     None
                 }
             };
@@ -472,11 +488,14 @@ impl<'a> Lower<'a> {
                         ),
                         "fire an event next to the check and read the event",
                     ),
-                    None => self.err(
-                        e.at,
-                        format!("unknown name `{n}`"),
-                        "declare it as an item, def or event, or check the spelling",
-                    ),
+                    None => {
+                        let help = crate::suggest::help(
+                            n,
+                            self.of_sort(&[Sort::Def, Sort::Event]),
+                            "declare it as an item, def or event, or check the spelling",
+                        );
+                        self.err(e.at, format!("unknown name `{n}`"), &help)
+                    }
                 },
             },
             E::Not(x) => {

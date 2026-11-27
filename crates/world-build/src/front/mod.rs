@@ -259,6 +259,39 @@ pub fn write_generated(
     Ok(draft.replacen(&placeholder, &hash, 1))
 }
 
+/// `text` with a generated header for the tool, sources and table promises given: a header
+/// it already has is replaced, the body after it kept as written. What `rando stamp` writes,
+/// so a generator in any language can emit plain text.
+///
+/// # Errors
+/// The body's syntax errors.
+pub fn stamp(
+    text: &str,
+    tool: &str,
+    sources: &[(&str, &str)],
+    expect: &[(&str, i64)],
+    files: &dyn Files,
+) -> Result<String, Vec<Error>> {
+    let ast = parse::parse(text, 0);
+    let body = match ast.generated.as_ref().and_then(|g| ast.toks.get(g.end)) {
+        // The body starts on the line after the header's `}`, comments before it included.
+        Some(first) => {
+            let line = ast
+                .comments
+                .iter()
+                .map(|c| c.pos.line)
+                .filter(|l| *l > ast.generated.as_ref().map_or(0, |g| g.pos.line))
+                .chain([first.pos.line])
+                .min()
+                .unwrap_or(first.pos.line);
+            text.split_inclusive('\n').skip(line - 1).collect::<String>()
+        }
+        None if ast.generated.is_some() => String::new(),
+        None => text.to_owned(),
+    };
+    write_generated(tool, sources, expect, &body, files)
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -355,7 +388,8 @@ pub fn merge_repeats(errors: Vec<Error>, templates: &Templates) -> Vec<Error> {
             continue;
         };
         let same = out.iter_mut().find(|(x, m)| {
-            x.pos == e.pos && x.help == e.help && m.as_ref().is_some_and(|m| m.0 == msg)
+            // The help may differ by expansion (a suggestion): the first one's is kept.
+            x.pos == e.pos && m.as_ref().is_some_and(|m| m.0 == msg)
         });
         match same {
             Some((_, Some(m))) => m.3 += 1,

@@ -841,7 +841,12 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         for x in &r.exits {
             let parallel = ways.get(x.to.v.as_str()).copied().unwrap_or(0) > 1;
             if !region_of.contains(x.to.v.as_str()) {
-                lw.errs().err(x.to.pos, format!("exit to `{}`, which is not a region", x.to.v), "");
+                let help = crate::suggest::help(&x.to.v, region_of.iter().copied(), "");
+                lw.errs().err(
+                    x.to.pos,
+                    format!("exit to `{}`, which is not a region", x.to.v),
+                    &help,
+                );
             } else if parallel && shuffled {
                 match &x.door {
                     None => lw.errs().err(
@@ -934,7 +939,8 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let start = match &w.start {
         Some(s) if region_of.contains(s.v.as_str()) => Some(s.v.clone()),
         Some(s) => {
-            lw.errs().err(s.pos, format!("start `{}` is not a region", s.v), "");
+            let help = crate::suggest::help(&s.v, region_of.iter().copied(), "");
+            lw.errs().err(s.pos, format!("start `{}` is not a region", s.v), &help);
             None
         }
         None => {
