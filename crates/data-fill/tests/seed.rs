@@ -184,3 +184,27 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
         }
     }
 }
+
+/// The fill report says what the round procedure did and warns, at setup, about a world that
+/// leaves fewer places early on than progression to seat (early capacity ratio under 1): a
+/// room of tight synthetic worlds (as much progression as locations that take it) is flagged
+/// for every player, a room of light ones for none.
+#[test]
+fn the_fill_report_flags_worlds_with_little_room_early_on() {
+    use data_fill::room::Algorithm;
+    use data_fill::seed::generate_by;
+    use data_fill::synth::{Hostile, Shape, world};
+    let report = |shape: &Shape| {
+        let (mut m, inst) = world(shape, 23, 0);
+        (m["game"], m["version"]) = (json!("Synth"), json!("1"));
+        let players: Vec<Player> =
+            (0..3).map(|p| Player { name: format!("P{p}"), instance: inst.clone() }).collect();
+        generate_by(&m, "s", &players, 1, 1, Algorithm::Exact).unwrap().1
+    };
+    let tight = report(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) });
+    assert_eq!(tight.tight_players, 3, "{tight:?}");
+    assert!(tight.capacity_milli < 1000, "{tight:?}");
+    let light = report(&Shape { checks: 200, ..Shape::default() });
+    assert_eq!(light.tight_players, 0, "{light:?}");
+    assert!(light.capacity_milli >= 1000 && light.attempts == 1, "{light:?}");
+}
