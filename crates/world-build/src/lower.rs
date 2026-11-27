@@ -12,11 +12,10 @@ use crate::model::{Pos, Rule, RuleAt};
 use crate::rule::{Arith, Arm, Cmp, E, Expr, parse};
 use crate::world::Errs;
 
-/// What a name in the world's one namespace is.
+/// What a name in the world's one namespace is (checks have their own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sort {
     Item,
-    Check,
     Def,
     Event,
     Region,
@@ -29,7 +28,6 @@ impl Sort {
     pub(crate) fn word(self) -> &'static str {
         match self {
             Sort::Item => "an item",
-            Sort::Check => "a check",
             Sort::Def => "a def",
             Sort::Event => "an event",
             Sort::Region => "a region",
@@ -61,6 +59,8 @@ pub(crate) enum Readable {
 #[derive(Debug, Default)]
 pub(crate) struct Names {
     pub sorts: HashMap<String, Sort>,
+    /// Every check's name: not readable, named in the error when a rule tries.
+    pub checks: std::collections::HashSet<String>,
     pub options: HashMap<String, OptTy>,
     pub item_groups: HashMap<String, Vec<String>>,
     pub shuffles: HashMap<String, Readable>,
@@ -448,6 +448,13 @@ impl<'a> Lower<'a> {
                             s.word()
                         ),
                         "",
+                    ),
+                    None if self.names.checks.contains(n) => self.err(
+                        e.at,
+                        format!(
+                            "`{n}` is a check; a rule reads items, defs and events, not checks"
+                        ),
+                        "fire an event next to the check and read the event",
                     ),
                     None => self.err(
                         e.at,

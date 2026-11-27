@@ -213,3 +213,20 @@ fn several_exits_to_one_region_each_keep_their_rule_and_door() {
         "each needs its own `door`",
     );
 }
+
+/// Checks have their own namespace: rules never read them, so a check may share a name with
+/// an item, a region or an event, and keeps its own ledger id.
+#[test]
+fn a_check_may_share_a_name_with_an_item_a_region_or_an_event() {
+    let b = ok(&world(
+        "region a {\n  check k\n  check a\n  check opened: opened\n  event opened: true\n}",
+    ));
+    let ledger: serde_json::Value = serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap();
+    assert!(ledger["checks"]["k"]["id"].is_i64() && ledger["items"]["k"]["id"].is_i64());
+    // A rule still cannot read a check, and says so.
+    fails(
+        &world("region a {\n  check c1\n  check c2: c1\n}"),
+        &format!("world.rando:{}:13", line(3)),
+        "`c1` is a check; a rule reads items, defs and events",
+    );
+}

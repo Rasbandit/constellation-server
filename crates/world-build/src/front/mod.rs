@@ -1325,7 +1325,6 @@ impl X {
         w.shuffles.iter().for_each(|s| put(s.name.v.clone(), s.name.pos));
         for r in &w.regions {
             put(r.key.v.clone(), r.key.pos);
-            r.checks.iter().for_each(|c| put(c.key.v.clone(), c.key.pos));
             r.events.iter().for_each(|e| put(e.0.v.clone(), e.0.pos));
         }
         let mut closures: HashMap<u32, BTreeSet<u32>> = HashMap::new();

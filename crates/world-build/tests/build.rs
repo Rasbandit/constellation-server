@@ -181,8 +181,10 @@ fn unknown_names_say_what_the_name_is() {
 
 #[test]
 fn a_name_declared_twice_is_an_error_at_the_second() {
+    // A check may share a name with an item now (checks have their own namespace); a def
+    // still may not.
     let mut w = tidewell();
-    w.regions[0].checks[0].key = At::new("oar".into(), P);
+    w.defs[0].name = At::new("oar".into(), P);
     fails(&w, "`oar` is already an item", P);
     let mut w = tidewell();
     w.regions[1].key = At::new("dock".into(), P);

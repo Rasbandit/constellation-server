@@ -250,7 +250,7 @@ impl Space {
                 errs.err(
                     n.pos,
                     format!("`{}` is already {} ({file}:{}:{})", n.v, was.word(), at.line, at.col),
-                    "items, checks, defs, events, regions, item groups, placement sets and shuffles share one namespace",
+                    "items, defs, events, regions, item groups, placement sets and shuffles share one namespace (checks have their own)",
                 );
                 false
             }
@@ -628,8 +628,9 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             } else {
                 here.insert(c.key.v.as_str(), c.key.pos);
                 // Declared again in another region: the same check, reachable from both.
+                // Checks have their own namespace: rules never read them.
                 if checks_seen.insert(c.key.v.as_str()) {
-                    space.declare(errs, &c.key, Sort::Check);
+                    name_ok(errs, &c.key, "check");
                 }
             }
         }
@@ -690,6 +691,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         names.shuffles.insert(n.v.clone(), readable);
     }
     names.sorts = space.first.iter().map(|(k, (s, _))| (k.clone(), *s)).collect();
+    names.checks = checks_seen.iter().map(|c| (*c).to_owned()).collect();
     let region_of: HashSet<&str> = w.regions.iter().map(|r| r.key.v.as_str()).collect();
     let shuffled = !w.shuffles.is_empty();
 
