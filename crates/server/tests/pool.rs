@@ -44,8 +44,15 @@ async fn own_process(head: &[u8], file: &[u8]) -> Result<Vec<u8>, Failure> {
     run_job(Path::new(BIN), "fill", &input, &l, Duration::from_millis(l.fill_timeout_ms)).await
 }
 
-/// A copy of the server binary under a name of this test's own, so its workers can be told
-/// from every other test's in `/proc`. Reads as its path; the copy is removed with it.
+/// The server binary under a name of this test's own, so its workers can be told from every
+/// other test's in `/proc`: a hard link, in a folder of the test's own under cargo's folder
+/// for test files. Reads as its path; the folder is removed with it.
+///
+/// A link, never a copy. Writing a program and running it from a process that has other
+/// threads starting processes at the same time can fail: a child forked while the copy is
+/// still open for writing holds that open file until it execs, and meanwhile the kernel
+/// refuses to run the program (text file busy; `prlimit` then exits with status 126). A
+/// link opens nothing for writing, and costs no disk space either.
 struct OwnBinary {
     dir: PathBuf,
     bin: PathBuf,
@@ -61,20 +68,40 @@ impl std::ops::Deref for OwnBinary {
 
 impl Drop for OwnBinary {
     fn drop(&mut self) {
-        // A copy is the size of the server binary: none is left behind in the temp folder.
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             eprintln!("{}: not removed: {e}", self.dir.display());
         }
     }
 }
 
+impl OwnBinary {
+    /// Put the server binary at the path (again).
+    fn link(&self) {
+        drop(std::fs::remove_file(&self.bin));
+        std::fs::hard_link(BIN, &self.bin).expect("a hard link beside cargo's test files");
+    }
+
+    /// Put in its place a script that stops itself: a worker that takes a job and never
+    /// answers it. Written by a child process, so this one never holds it open for writing.
+    fn stand_in(&self) {
+        drop(std::fs::remove_file(&self.bin));
+        let write = "printf '#!/bin/sh\\nkill -STOP $$\\n' > \"$1\" && chmod +x \"$1\"";
+        let wrote =
+            std::process::Command::new("/bin/sh").args(["-c", write, "sh"]).arg(&self.bin).status();
+        assert!(wrote.unwrap().success(), "the stand-in script is written");
+    }
+}
+
 fn own_binary(test: &str) -> OwnBinary {
-    let dir = std::env::temp_dir().join(format!("pool-it-{test}-{}", std::process::id()));
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dir = tmp.join(format!("pool-it-{test}-{}", std::process::id()));
     drop(std::fs::remove_dir_all(&dir));
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("server-copy");
-    std::fs::copy(BIN, &bin).unwrap();
-    OwnBinary { dir, bin }
+    // As `/proc` names it: its executable link is compared with this path.
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let own = OwnBinary { bin: dir.join("server-copy"), dir };
+    own.link();
+    own
 }
 
 /// Whether process `pid` is a worker of `bin`, at any point of its start: `prlimit` about to
@@ -241,8 +268,7 @@ async fn a_job_whose_reused_worker_is_killed_runs_again_on_a_new_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_whose_new_worker_is_killed_fails_alone_and_the_pool_recovers() {
     let bin = own_binary("killed-new");
-    // Written over the copy: it keeps the copy's permission to run.
-    std::fs::write(&*bin, "#!/bin/sh\nkill -STOP $$\n").unwrap();
+    bin.stand_in();
     let pool = Arc::new(pool(&bin, ON));
     let (key, file, instance) = prepared(&small(), 1);
     let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
@@ -262,7 +288,7 @@ async fn a_job_whose_new_worker_is_killed_fails_alone_and_the_pool_recovers() {
     assert!(why.contains("the fill worker stopped") && why.contains("signal: 9"), "{why}");
     assert!(running(&bin).is_empty(), "nothing ran it a second time");
 
-    std::fs::copy(BIN, &*bin).unwrap();
+    bin.link();
     assert_eq!(pool.fill(job(&quick, &key, &file)).await, Ok(alone(&quick, &file).unwrap()));
 }
 
