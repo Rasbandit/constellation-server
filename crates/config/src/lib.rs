@@ -431,6 +431,20 @@ pub const FILL_CAPACITY_ORDERS: u32 = 30;
 /// thing, a group, an exit key, a door).
 pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 
+/// Deepest a rule string may nest (parentheses, `not`, function arguments), as written: the
+/// provisional author cap of design doc 16 (question 2, a design value), well inside the
+/// engine's [`RULES_MAX_DEPTH`].
+pub const WORLD_RULE_MAX_DEPTH: usize = 64;
+
+/// Most errors one build reports before it stops collecting (a design value: enough to fix a
+/// file in one pass, bounded so a broken file cannot print without end).
+pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
+
+/// Most option combinations the build tool's pool test tries (design doc 16 section 3.4): past
+/// it the test is skipped with a warning, and generation still checks the actual settings (a
+/// design value).
+pub const WORLD_POOL_TEST_MAX_COMBINATIONS: usize = 4096;
+
 /// The generator version a data-only seed records (what clients of the compatible protocol
 /// expect; a format value, not a limit).
 pub const SEED_GENERATOR_VERSION: (u32, u32, u32) = (0, 6, 8);
