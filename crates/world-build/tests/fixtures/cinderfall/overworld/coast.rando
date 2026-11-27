@@ -1,0 +1,38 @@
+# The coast east of the docks, the wreck and the tide vault.
+use items
+use logic
+
+region coast_strand {
+  for i in 1..5 {
+    check sand_mound_{i}: can_cut
+  }
+  check driftwood
+  check tidepool
+  check crab_burrow: can_cut
+  exit hearth_docks
+  exit coast_cliffs
+  exit tide_gate: can_swim and has(grapple)
+  exit coast_lighthouse door lighthouse_door group outside
+}
+
+region coast_cliffs {
+  check gull_nest: can_shoot
+  check cliff_cave: can_blast
+  check cliff_top: can_cross_gap
+  exit coast_strand
+  exit coast_wreck: can_swim
+}
+
+region coast_wreck {
+  check wreck_hold
+  check captains_chest: can_burn
+  check figurehead: can_fight(2)
+  exit coast_cliffs
+  exit sunken_gate: can_swim and can_blast
+}
+
+region tide_gate {
+  check barnacle_rock
+  exit coast_strand
+  exit tide_entry
+}

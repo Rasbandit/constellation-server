@@ -1,0 +1,63 @@
+# The hub town and the throne.
+use items
+use logic
+
+region hearth_square {
+  check well_bucket
+  check fountain_coin
+  check notice_board
+  exit hearth_market
+  exit hearth_gate
+  exit hearth_upper: can_lift(1)
+  exit throne_stair: count(relic) >= opt.relics_needed
+  exit hearth_inn door inn_door group outside
+  exit hearth_smithy door smithy_door group outside
+}
+
+region hearth_market {
+  for i in 1..4 {
+    check market_barrel_{i}
+  }
+  check fruit_cart
+  check rug_seller no_progression
+  check lost_purse
+  check spice_crate: can_cut
+  exit hearth_square
+  exit hearth_docks
+  exit hearth_chapel door chapel_door group outside
+}
+
+region hearth_docks {
+  check crate_stack
+  check fishing_line: can_shoot
+  check under_pier: can_swim
+  exit hearth_market
+  exit coast_strand: can_swim
+}
+
+region hearth_upper {
+  check belltower_top
+  check roof_garden
+  check chimney_nest: can_cross_gap
+  exit hearth_square
+}
+
+region hearth_gate {
+  check gate_lantern
+  check guard_post
+  exit hearth_square
+  exit ashen_road
+  exit marsh_edge
+}
+
+region throne_stair {
+  check stair_alcove
+  exit hearth_square
+  exit throne_hall: has(throne_seal) and can_fight(3)
+}
+
+region throne_hall {
+  check throne_cache
+  event throne_opened: can_see_dark
+  exit throne_stair
+}

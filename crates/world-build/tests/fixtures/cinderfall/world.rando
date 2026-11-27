@@ -1,0 +1,34 @@
+# Cinderfall Wilds: an adventure invented for the trial worlds of doc 18 (no game's names, data
+# or logic). A hub town, four overworld areas, four dungeons with their own keys, an optional
+# fifth dungeon, house interiors whose doors are shuffled, and a throne at the end.
+world cinderfall "Cinderfall Wilds" version 1
+use items
+use logic
+use overworld/hearth
+use overworld/fields
+use overworld/marsh
+use overworld/peaks
+use overworld/coast
+use overworld/interiors
+use dungeons/mire_temple
+use dungeons/ember_keep
+use dungeons/frost_spire
+use dungeons/tide_vault
+use dungeons/sunken_vault
+start hearth_square
+
+option difficulty: choice(casual, standard, expert) = standard
+option relics_needed: range 1..4 = 4
+option sunken_vault: toggle = off
+option start_lantern: toggle = off
+
+start_item lantern when opt.start_lantern
+
+# Every house door leads into a different house each seed, and back out the same door.
+shuffle interiors {
+  slots exits(outside)
+  coupled
+  check layout
+}
+
+goal throne_opened
