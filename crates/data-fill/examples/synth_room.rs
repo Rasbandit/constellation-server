@@ -1,7 +1,7 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
 //! [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off] [--confined on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
@@ -52,7 +52,8 @@
 //!
 //! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`), `--guards
 //! on` with a `none` shuffle that rules read (`Shape::guards`), and `--timeless on` without a
-//! time context (`Shape::timeless`, which an exit shuffle needs). With a shuffle, every
+//! time context (`Shape::timeless`, which an exit shuffle needs). `--confined on` confines
+//! every player's `p0` copies to a group of locations (`Shape::confined`). With a shuffle, every
 //! player's world is staged before the fill ([`data_fill::shuffle::room`]) and the row's
 //! `shuffle` holds, as medians of `reps`: `stage_ms` (the shuffles, the fold, the whole-world
 //! check and resolving the instances, every player, one thread), `plans_ms` (resolving the
@@ -446,6 +447,7 @@ fn main() -> Result<(), String> {
         doors: vanilla || flag("--entrances", d.doors)?,
         guards: flag("--guards", d.guards)?,
         timeless: flag("--timeless", d.timeless)?,
+        confined: flag("--confined", d.confined)?,
         ..d
     };
     // `mixed`: chain, light, keys and heavy worlds in turn, at their own sizes (piles of

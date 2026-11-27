@@ -70,6 +70,9 @@ pub struct Shape {
     /// A `none` shuffle ([`crate::shuffle`]): eight guards over eight halls, each guard
     /// beaten with one kind of progression item, and one check in eight behind a hall's guard.
     pub guards: bool,
+    /// Confined items: every copy of `p0` may only go to the group `home`, two locations in
+    /// five ([`confine`]`(_, 5, 2)`).
+    pub confined: bool,
 }
 
 /// Worlds where taking one item out of what is held changes much of what is reached, or where
@@ -114,6 +117,7 @@ impl Default for Shape {
             doors: false,
             timeless: false,
             guards: false,
+            confined: false,
         }
     }
 }
@@ -309,6 +313,22 @@ fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance
 /// One player's world and instance. The same `seed` and `player` give the same bytes.
 #[must_use]
 pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
+    let (manifest, mut inst) = drawn(shape, seed, player);
+    if shape.confined {
+        confine(&mut inst, 5, 2);
+    }
+    (manifest, inst)
+}
+
+/// Confine `p0` to the group `home`: the locations `l` with `l % every < most`.
+pub fn confine(inst: &mut Instance, every: usize, most: usize) {
+    inst.item_groups.insert("p0".to_owned(), "home".to_owned());
+    for l in (0..inst.locations.len()).filter(|l| l % every < most) {
+        inst.location_groups.insert(format!("l{l}"), "home".to_owned());
+    }
+}
+
+fn drawn(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     let mut rng = SpecRng::from_u64_tagged(seed, b"synthrm\0", player);
     let mut pick = |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
     if shape.wide {
@@ -609,14 +629,6 @@ mod tests {
         change: impl Fn(u64, &mut Instance),
     ) -> Result<Compiled, String> {
         mixed_with(std::slice::from_ref(shape), seed, usize::try_from(players).unwrap(), change)
-    }
-
-    /// Confine `p0` to the group `home`: the locations `l` with `l % every < most`.
-    fn confine(inst: &mut Instance, every: usize, most: usize) {
-        inst.item_groups.insert("p0".to_owned(), "home".to_owned());
-        for l in (0..inst.locations.len()).filter(|l| l % every < most) {
-            inst.location_groups.insert(format!("l{l}"), "home".to_owned());
-        }
     }
 
     /// The pinned fills as text: rooms of three (with `fresh`, by the cross-check), and player 1

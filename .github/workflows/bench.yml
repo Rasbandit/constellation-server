@@ -3,7 +3,8 @@ name: bench
 # thread, on one runner: light and heavy at 1, 10 and 100 players, a world each and every player
 # on one world (the rooms the server generates, with the seed's encode), rooms built to need
 # repair (chain, keys, mixed, tight), the bit rules against plain bytecode (a gate: same
-# placements), and the seed-shape report. Base against head in turns, and shuffled worlds, in
+# placements), and the seed-shape report. Base against head in turns (also on rooms with
+# confined items, a gate: same placements), and shuffled worlds, in
 # jobs of their own. Runs only on PRs labelled `perf` and on manual dispatch, never on every PR.
 # Tables go to the job summary, the JSON lines to an artifact. With `full` set to `on`, a
 # dispatch also runs where a generation's time goes through the server
@@ -197,6 +198,10 @@ jobs:
         env: { BASE: "${{ github.base_ref || 'main' }}" }
         run: |
           git worktree add ../base "origin/$BASE"
+          # shortcut: a base from before `Shape::confined` gets it from this patch (the synthetic
+          # world only, no fill code), so the confined rows run on both sides; delete the patch
+          # and this line once main has the flag.
+          grep -q 'pub confined: bool' ../base/crates/data-fill/src/synth.rs || git -C ../base apply "$PWD/.github/bench/base-confined.patch"
           cargo build --release --locked -p data-fill --features memory-harness --example synth_room
           (cd ../base && cargo build --release --locked -p data-fill --features memory-harness --example synth_room)
       - name: in turns
@@ -222,6 +227,17 @@ jobs:
                 | tee -a bench-ab-seed.jsonl
             done
           done; done
+          # Rooms with confined items (`Shape::confined`): placed before the rounds, a path of
+          # its own. Six runs a side, in turns.
+          for pair in $(seq 6); do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --confined on --players 1,10 --checks 1000 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab-confined.jsonl
+            done
+          done; done
       - name: summary
         run: |
           {
@@ -243,13 +259,32 @@ jobs:
               | ("encode_ms", "validate_ms", "hash_whole_ms") as $k
               | ($g | map(select(.side == "base").seed_file[$k])) as $b | ($g | map(select(.side == "head").seed_file[$k])) as $h
               | "| \($g[0].profile) | \($g[0].players) | \($k) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \(if ($b | med) > 0 then (($h | med) / ($b | med) * 1000 | round) / 1000 else "n/a" end) | \($g | map([.placements_hash, .seed_file.seed_bytes]) | unique | length == 1) |"' bench-ab-seed.jsonl
+            echo
+            echo "### Base against head, rooms with confined items (measured on this runner, release build, 6 runs a side in turns; each run's fill ms is its own median)"
+            echo
+            echo "| profile | players | base fill ms median | base range | head fill ms median | head range | head / base | base rule evals | head rule evals | same placements |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[]
+              | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
+              | "| \(.[0].profile) | \(.[0].players) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(select(.side == "base").rule_evals) | unique) | \(map(select(.side == "head").rule_evals) | unique) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab-confined.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
+      # Fails the job when base and head place differently on any row, or the seed's bytes
+      # differ. A PR that means to change placements (D-140 allows it) says so, and this step
+      # is red on it.
+      - name: base and head place the same
+        run: |
+          for f in bench-ab.jsonl bench-ab-confined.jsonl; do
+            jq -s -e 'group_by([.profile, .players]) | all(map(.placements_hash) | unique | length == 1)' "$f"
+          done
+          jq -s -e 'group_by([.profile, .players]) | all(map([.placements_hash, .seed_file.seed_bytes]) | unique | length == 1)' bench-ab-seed.jsonl
       - uses: actions/upload-artifact@v4
         with:
           name: bench-ab
           path: |
             bench-ab.jsonl
             bench-ab-seed.jsonl
+            bench-ab-confined.jsonl
   # Shuffles (`data_fill::shuffle`), heavy worlds, one thread. The same doors-shaped worlds (no time context, which an exit shuffle needs) filled
   # with their doors shuffled and with every door where the manifest has it, seed by seed:
   # what a shuffled layout costs the fill, apart from what the shape costs. A `none` shuffle
