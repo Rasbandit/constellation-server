@@ -163,6 +163,8 @@ pub(crate) struct Model {
     pub options: Vec<OptM>,
     /// Key, class, count; in key order.
     pub items: Vec<(String, String, i64)>,
+    /// Copies an options-only number sets, by item, in place of the count in `items`.
+    pub copies: BTreeMap<String, Value>,
     /// The fill and its weights, in key order.
     pub fill_with: Vec<(String, i64)>,
     pub checks: Vec<CheckM>,
@@ -526,6 +528,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
                 continue;
             }
+            None if it.count_rule.is_some() => 0,
             None => i64::from(!fill.contains(it.key.v.as_str())),
         };
         items.push((it.key.v.clone(), class, count));
@@ -697,6 +700,15 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
 
     let mut lw = Lower::new(&names, errs);
     lw.all_defs();
+    // Copies that read options, settled per seed.
+    let mut copies: BTreeMap<String, Value> = BTreeMap::new();
+    for it in &w.items {
+        if let Some(r) = &it.count_rule
+            && let Some(v) = lw.number(r, "a number of copies")
+        {
+            copies.insert(it.key.v.clone(), v);
+        }
+    }
 
     // Regions to the manifest.
     let mut regions = Vec::new();
@@ -907,7 +919,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         list.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
     }
     let counts: HashMap<&str, i64> = items.iter().map(|i| (i.0.as_str(), i.2)).collect();
-    for (item, places) in &held_by {
+    for (item, places) in held_by.iter().filter(|(i, _)| !copies.contains_key(*i)) {
         let count = counts.get(item.as_str()).copied().unwrap_or(0);
         if let Some(p) = places.get(usize::try_from(count).unwrap_or(0)) {
             lw.errs().err(
@@ -1061,6 +1073,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let model = Model {
         options,
         items: ordered,
+        copies,
         fill_with,
         checks: checks_m,
         start_items,

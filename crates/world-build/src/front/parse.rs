@@ -50,8 +50,9 @@ pub struct Table {
 pub enum Over {
     /// Every row of a table.
     Table(At<String>),
-    /// Whole numbers from and to, both included.
-    Range(i64, i64),
+    /// Whole numbers from and to, both included (number expressions, folded when the family
+    /// expands).
+    Range(Expr, Expr),
     /// Names.
     List(Vec<At<String>>),
 }
@@ -111,7 +112,7 @@ pub struct RegionD {
 pub struct ItemD {
     pub name: Tn,
     pub class: At<String>,
-    pub count: Option<At<i64>>,
+    pub count: Option<Expr>,
     pub when: Option<Expr>,
     pub key: Option<At<String>>,
     pub was: Option<At<String>>,
@@ -167,11 +168,11 @@ pub enum Decl {
         default: Option<At<Lit>>,
     },
     Item(ItemD),
-    Pool(Vec<(At<String>, At<i64>)>),
+    Pool(Vec<(At<String>, Expr)>),
     Grant {
         assumed: bool,
         item: Tn,
-        n: Option<At<i64>>,
+        n: Option<Expr>,
         when: Option<Expr>,
     },
     Def {
@@ -390,6 +391,28 @@ impl P<'_> {
             }
             _ => Err((self.here(), format!("expected {what}, found {}", self.got()))),
         }
+    }
+
+    /// A number: a whole number with its sign, or a number expression (`d.keys - 1`,
+    /// `opt.k + 1`, `2 * n`), folded where it is used. A rule here is an error.
+    fn num(&mut self, depth: usize, what: &str) -> R<Expr> {
+        let from = self.k;
+        if matches!(self.peek(), Some(Tok::Minus)) {
+            let n = self.int(what)?;
+            return Ok(Expr { e: E::Int(n.v), at: n.pos, paren: false, span: (from, self.k) });
+        }
+        let pos = self.here();
+        if !matches!(self.peek(), Some(Tok::Int(_) | Tok::Name(_) | Tok::Open)) {
+            return Err((pos, format!("expected {what}, found {}", self.got())));
+        }
+        let e = self.rule(depth)?;
+        if matches!(
+            e.e,
+            E::Bool(_) | E::Not(_) | E::And(_) | E::Or(_) | E::Cmp(..) | E::In(..) | E::Match(..)
+        ) {
+            return Err((pos, format!("expected {what}, found a rule")));
+        }
+        Ok(e)
     }
 
     fn string(&mut self, what: &str) -> R<At<String>> {
@@ -625,7 +648,7 @@ impl P<'_> {
                 let mut fill = Vec::new();
                 loop {
                     let n = self.name("an item")?;
-                    fill.push((n, self.int("its weight")?));
+                    fill.push((n, self.num(depth, "its weight")?));
                     if self.peek() != Some(&Tok::Comma) {
                         break;
                     }
@@ -638,7 +661,7 @@ impl P<'_> {
                 let item = self.tname("an item")?;
                 let n = if self.ctx("x") {
                     self.k += 1;
-                    Some(self.int("a number of copies")?)
+                    Some(self.num(depth, "a number of copies")?)
                 } else {
                     None
                 };
@@ -795,7 +818,7 @@ impl P<'_> {
         loop {
             if self.ctx("x") {
                 self.k += 1;
-                d.count = Some(self.int("a number of copies")?);
+                d.count = Some(self.num(depth, "a number of copies")?);
             } else if self.word("when") {
                 self.k += 1;
                 d.when = Some(self.rule(depth)?);
@@ -991,11 +1014,17 @@ impl P<'_> {
                 return Err((self.here(), format!("expected `in`, found {}", self.got())));
             }
             self.k += 1;
+            // A table is one name alone; anything else before `..` is a range's first number.
+            let table = matches!(self.peek(), Some(Tok::Name(_)))
+                && !matches!(
+                    self.toks.get(self.k + 1).map(|t| &t.t),
+                    Some(Tok::DotDot | Tok::Plus | Tok::Minus | Tok::Star | Tok::Kw("div" | "mod"))
+                );
             let over = match self.peek().cloned() {
-                Some(Tok::Int(lo)) => {
-                    self.k += 1;
+                Some(_) if !table && !matches!(self.peek(), Some(Tok::LBrack)) => {
+                    let lo = self.num(depth, "the first number")?;
                     self.expect(&Tok::DotDot, "`..`")?;
-                    Over::Range(lo, self.int("the last number")?.v)
+                    Over::Range(lo, self.num(depth, "the last number")?)
                 }
                 Some(Tok::LBrack) => {
                     self.k += 1;

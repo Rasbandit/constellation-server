@@ -102,6 +102,8 @@ struct Settled<'m> {
     taken: HashMap<&'m str, i64>,
     placed: i64,
     slots: i64,
+    /// Each item's copies this seed.
+    counts: HashMap<&'m str, i64>,
 }
 
 /// Settle `m` for `given` option values.
@@ -149,8 +151,27 @@ fn settle<'m>(m: &'m Model, given: &HashMap<String, i64>) -> Result<Settled<'m>,
             }
         }
     }
-    let mut placed = 0i64;
+    let mut counts: HashMap<&str, i64> = HashMap::new();
     for (key, _, count) in &m.items {
+        let count = match m.copies.get(key) {
+            None => *count,
+            Some(v) => {
+                let n = int(v, &o)
+                    .ok_or_else(|| format!("item {key:?}: its copies read more than options"))?;
+                if !(0..=config::WORLD_ITEM_COPIES_MAX).contains(&n) {
+                    return Err(format!(
+                        "item {key:?} has {n} copies, outside 0 to {}",
+                        config::WORLD_ITEM_COPIES_MAX
+                    ));
+                }
+                n
+            }
+        };
+        counts.insert(key, count);
+    }
+    let mut placed = 0i64;
+    for (key, _, _) in &m.items {
+        let count = &counts[key.as_str()];
         let n = count - taken.get(key.as_str()).copied().unwrap_or(0);
         if n < 0 {
             return Err(format!(
@@ -170,7 +191,7 @@ fn settle<'m>(m: &'m Model, given: &HashMap<String, i64>) -> Result<Settled<'m>,
     if start > i64::try_from(most).unwrap_or(i64::MAX) {
         return Err(format!("{start} start item copies, at most {most}"));
     }
-    Ok(Settled { o, included, excluded, granted, assumed, taken, placed, slots })
+    Ok(Settled { o, included, excluded, granted, assumed, taken, placed, slots, counts })
 }
 
 /// The per-seed instance of `m` for `given` option values, in the engine's instance shape
@@ -195,8 +216,8 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Value, Strin
     }
     let mut pool: Vec<&str> = Vec::new();
     let mut classes: BTreeMap<&str, &str> = BTreeMap::new();
-    for (key, class, count) in &m.items {
-        let n = count - s.taken.get(key.as_str()).copied().unwrap_or(0);
+    for (key, class, _) in &m.items {
+        let n = s.counts[key.as_str()] - s.taken.get(key.as_str()).copied().unwrap_or(0);
         pool.extend((0..n).map(|_| key.as_str()));
         classes.insert(key, class);
     }
@@ -226,6 +247,7 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Value, Strin
 fn read_options(m: &Model) -> Vec<String> {
     let mut todo: Vec<&Value> = m.checks.iter().map(|c| &c.when).collect();
     todo.extend(m.start_items.iter().chain(&m.assumed).map(|g| &g.when));
+    todo.extend(m.copies.values());
     options_read(todo, &m.defs)
 }
 

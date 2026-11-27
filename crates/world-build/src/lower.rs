@@ -153,6 +153,22 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A number settled before the fill (`what`, such as a number of copies): options and
+    /// numbers only.
+    pub(crate) fn number(&mut self, n: &RuleAt, what: &str) -> Option<Value> {
+        let e = self.tree(n)?;
+        let (v, state) = self.i(&e)?;
+        if state {
+            self.err(
+                n.pos,
+                format!("{what} reads options and numbers only"),
+                "it is settled before the fill; what the player holds is not known then",
+            );
+            return None;
+        }
+        Some(v)
+    }
+
     /// A rule as a tree: parsed from its text when it has one.
     fn tree(&mut self, n: &RuleAt) -> Option<Expr> {
         match &n.v {
@@ -569,6 +585,9 @@ impl<'a> Lower<'a> {
                     _ => return self.err(at, "`has` takes an item and an optional count", "`has(x)` or `has(x, 3)`"),
                 };
                 let item = self.item(x)?;
+                // A count that folds (a def's parameter, a family field, arithmetic) is a number.
+                let folded = n.and_then(fold).map(|k| Expr { e: E::Int(k), ..n.cloned().unwrap_or_else(|| x.clone()) });
+                let n = folded.as_ref().or(n);
                 match n.map(|n| &n.e) {
                     None | Some(E::Int(1)) => Some((json!({"has": item}), true)),
                     Some(E::Int(k)) if usize::try_from(*k).is_ok_and(|k| k <= config::RULE_MAX_PARTS) => Some((json!({"has": item, "n": k}), true)),
@@ -577,11 +596,15 @@ impl<'a> Lower<'a> {
                         format!("`has` counts 0 to {} copies, not {k} (the engine's limit)", config::RULE_MAX_PARTS),
                         "for more, write `count(x) >= n`",
                     ),
-                    Some(_) => self.err(
-                        n.map_or(at, |n| n.at),
-                        "the count in `has` is a number as written",
-                        "for a count set by an option, write `count(x) >= opt.k`",
-                    ),
+                    // A count that reads options: the engine compares the item's count with it.
+                    Some(_) => {
+                        let n = n?;
+                        let (v, state) = self.i(n)?;
+                        if state {
+                            return self.err(n.at, "the count in `has` reads options and numbers only", &format!("to compare two counts, write `count({item}) >= ...`"));
+                        }
+                        Some((json!({"ge": [{"count": item}, v]}), true))
+                    }
                 }
             }
             "has_all" | "has_any" => {

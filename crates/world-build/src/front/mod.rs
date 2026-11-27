@@ -559,8 +559,13 @@ impl X {
             }
             let values: Vec<Val> = match &b.over {
                 Over::Range(lo, hi) => {
+                    let (Some(lo), Some(hi)) = (self.constant(lo, env), self.constant(hi, env))
+                    else {
+                        return Vec::new();
+                    };
+                    let (lo, hi) = (lo.v, hi.v);
                     if hi
-                        .checked_sub(*lo)
+                        .checked_sub(lo)
                         .is_none_or(|d| d < 0 || d >= config::WORLD_FAMILY_MAX as i64)
                     {
                         self.errs.err(
@@ -570,7 +575,7 @@ impl X {
                         );
                         return Vec::new();
                     }
-                    (*lo..=*hi).map(Val::Int).collect()
+                    (lo..=hi).map(Val::Int).collect()
                 }
                 Over::List(names) => names.iter().map(|n| Val::Name(n.v.clone())).collect(),
                 Over::Table(t) => match self.tables.get(&t.v) {
@@ -740,6 +745,40 @@ impl X {
         Ok(out)
     }
 
+    /// A number expression with the family put in: its value when it folds, or the
+    /// expression (which may read options) for the checks; `None` after an error.
+    fn number(&mut self, f: u32, e: &Expr, env: &Env) -> Option<Result<At<i64>, RuleAt>> {
+        match self.subst(e, env) {
+            Ok(x) => Some(match fold(&x) {
+                Some(n) => Ok(At::new(n, e.at)),
+                None => {
+                    self.note_refs(f, &x);
+                    Err(At::new(Rule::Parsed(x), e.at))
+                }
+            }),
+            Err((p, m)) => {
+                self.errs.err(p, m, "");
+                None
+            }
+        }
+    }
+
+    /// A number that must be known when the world is built: written numbers, family fields and
+    /// arithmetic over them.
+    fn constant(&mut self, e: &Expr, env: &Env) -> Option<At<i64>> {
+        match self.number(0, e, env)? {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.errs.err(
+                    e.at,
+                    "this number must be known when the world is built",
+                    "use written numbers, family fields and `+ - * div mod`; options are read only by item copies and rules",
+                );
+                None
+            }
+        }
+    }
+
     /// A rule with the family put in, as the model holds it; the names it reads noted.
     fn rule(&mut self, f: u32, e: &Expr, env: &Env) -> Option<RuleAt> {
         self.rule_and(f, e, env, None)
@@ -890,24 +929,45 @@ impl X {
                 if !self.grow(env, name.pos) {
                     return;
                 }
+                // Copies fold to a number here, or stay an options-only expression the
+                // checks lower and each seed settles.
+                let (mut count, mut count_rule) = (None, None);
+                if let Some(c) = &i.count {
+                    match self.number(f, c, env) {
+                        Some(Ok(n)) => count = Some(n),
+                        Some(Err(r)) => count_rule = Some(r),
+                        None => return,
+                    }
+                }
                 self.ident(false, &name, i.key.as_ref(), i.was.as_ref(), env);
                 let class = (i.class.v != "match").then(|| i.class.clone());
                 self.world.items.push(Item {
                     key: name,
                     id: None,
                     class,
-                    count: i.count.clone(),
+                    count,
+                    count_rule,
                     later,
                 });
             }
-            Decl::Pool(fill) => self.world.fill_with.extend(fill.iter().cloned()),
+            Decl::Pool(fill) => {
+                for (item, w) in fill {
+                    if let Some(w) = self.constant(w, env) {
+                        self.world.fill_with.push((item.clone(), w));
+                    }
+                }
+            }
             Decl::Grant { assumed, item, n, when } => {
                 let Some(item) = self.tn(item, env) else { return };
                 if !self.grow(env, item.pos) {
                     return;
                 }
+                let n = n.as_ref().map(|n| self.constant(n, env));
+                if n.as_ref().is_some_and(Option::is_none) {
+                    return;
+                }
                 let when = self.opt_rule(f, when.as_ref(), env, cond);
-                let g = Grant { item, n: n.clone(), when };
+                let g = Grant { item, n: n.flatten(), when };
                 if *assumed { self.world.assumed.push(g) } else { self.world.start_items.push(g) }
             }
             Decl::Def { name, params, rule } => {

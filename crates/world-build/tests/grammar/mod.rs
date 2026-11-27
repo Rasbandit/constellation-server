@@ -245,3 +245,63 @@ fn events_and_regions_need_no_use() {
     ]);
     ok(&files);
 }
+
+/// A number may be computed wherever one goes: copies from a table field, a family range's
+/// ends, a `has` count from a def parameter or an option, item copies read from an option
+/// (settled per seed), with `+`, `-`, `*`, `div` and `mod` folded at build time.
+#[test]
+fn numbers_are_computed_wherever_a_number_goes() {
+    let b = ok(&world(
+        "option extra: range 1..3 = 2
+table dungeon(key: name, keys: int) {
+  mire 2
+  ember 3
+}
+for d in dungeon {
+  item {d.key}_key progression x d.keys
+  item {d.key}_map useful x d.keys - 1
+}
+item gem progression x opt.extra + 1
+def need(n) = has(k, n - 1)
+region a {
+  for i in 1..2 * 6 {
+    check c{i}
+  }
+  check x: need(3)
+  check y: has(k, opt.extra + 1)
+}",
+    ));
+    let pool = |extra: i64| {
+        let inst = b.instance_json(&HashMap::from([("extra".to_owned(), extra)])).unwrap();
+        let pool: Vec<String> = inst["pool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        move |k: &str| pool.iter().filter(|p| *p == k).count()
+    };
+    let at2 = pool(2);
+    assert_eq!(
+        (at2("mire_key"), at2("ember_key"), at2("mire_map"), at2("ember_map")),
+        (2, 3, 1, 2)
+    );
+    assert_eq!((at2("gem"), pool(3)("gem")), (3, 4));
+    let checks = &region(&b, "a")["checks"];
+    let rule = |loc: &str| {
+        checks.as_array().unwrap().iter().find(|c| c["loc"] == loc).unwrap()["rule"].clone()
+    };
+    assert_eq!(rule("x"), serde_json::json!({"ref": "need__1_3"}));
+    assert_eq!(b.manifest["defs"]["need__1_3"], serde_json::json!({"has": "k", "n": 2}));
+    assert_eq!(
+        rule("y"),
+        serde_json::json!({"ge": [{"count": "k"}, {"int": ["+", {"opt": "extra"}, 1]}]})
+    );
+    assert_eq!(checks.as_array().unwrap().len(), 14);
+    // What reads the player's state is still not a number of copies.
+    fails(
+        &world("item gem progression x count(k)\nregion a {\n  check c\n}"),
+        &format!("world.rando:{}:24", line(1)),
+        "a number of copies reads options and numbers only",
+    );
+}

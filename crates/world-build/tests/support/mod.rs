@@ -45,6 +45,7 @@ impl F {
             id: None,
             class: Some(self.s(class)),
             count: count.map(|c| self.at(c)),
+            count_rule: None,
             later: vec![],
         }
     }
