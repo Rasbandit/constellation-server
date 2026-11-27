@@ -23,7 +23,8 @@
 
 use crate::accounts::{self, Authenticator, Identity, PasswordAuth};
 use crate::host::{RoomsFolder, Waker};
-use crate::manifests::{self, Manifests};
+use crate::manifests::{self, Manifests, PreparedWorld};
+use crate::pool::Pool;
 use crate::rooms::RoomKey;
 use crate::sandbox::{AP, Failure, JOB, Mount, Sandbox, run_job};
 use crate::store;
@@ -44,7 +45,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// The API's shared state.
@@ -64,9 +65,15 @@ pub(crate) struct Worlds {
     store: store::Db,
     /// How a manifest fill or check runs.
     jobs: JobRunner,
+    /// The fill workers that stay up (`fill_pool_workers`); without them each fill is a job of
+    /// its own through `jobs`.
+    pool: Option<Pool>,
     /// The jobs run so far, in order.
     #[cfg(test)]
     ran: std::sync::Mutex<Vec<String>>,
+    /// The phase timings of the last data-only generation (the server only logs them).
+    #[cfg(test)]
+    laps: std::sync::Mutex<serde_json::Map<String, Value>>,
     /// Uploads and generation requests per client address (`admin_write_burst`).
     write_rate: edge_compat::RateTable<IpAddr>,
     /// Room view streams open at once (`view_streams`).
@@ -253,6 +260,7 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
             "no __version__ in the checkout's Utils.py: catalogue versions will fail their checks"
         );
     }
+    let exe = crate::sandbox::exe_path()?;
     Ok(Worlds {
         dir: dir.to_owned(),
         sandbox: Sandbox::new(paths, limits, dir)?,
@@ -263,7 +271,10 @@ pub(crate) fn open(dir: &Path, paths: Generation, limits: Limits) -> Result<Worl
         // Until [`Worlds::router`] gives it the host's store.
         manifests: Manifests::new(store::Db::Mem(Arc::clone(&mem)), &limits),
         store: store::Db::Mem(mem),
-        jobs: JobRunner::Child(crate::sandbox::exe_path()?),
+        pool: Pool::new(exe.clone(), limits),
+        #[cfg(test)]
+        laps: std::sync::Mutex::default(),
+        jobs: JobRunner::Child(exe),
         #[cfg(test)]
         ran: std::sync::Mutex::default(),
         write_rate: edge_compat::RateTable::new(
@@ -399,6 +410,23 @@ impl Worlds {
         let before = self.queued.fetch_add(1, Ordering::AcqRel);
         let slot = JobSlot(Arc::clone(&self.queued));
         (before < self.limits.gen_queue_max).then_some(slot)
+    }
+
+    /// Fill the request `head` on the prepared world: on a pooled worker that stays up and may
+    /// hold the world loaded, or without a pool as a `fill` job in a process of its own. The
+    /// same seed either way, under the same caps and the same `fill_timeout_ms` kill.
+    async fn fill(&self, head: &[u8], world: &PreparedWorld) -> Result<Vec<u8>, Failure> {
+        if let Some(pool) = &self.pool {
+            let job = crate::pool::Job {
+                head,
+                threads: fill_threads(),
+                key: &world.key,
+                file: &world.file,
+            };
+            return pool.fill(job).await;
+        }
+        let input = data_fill::job::frame(head, &world.file).map_err(Failure::Broken)?;
+        self.run_job("fill", &input, Duration::from_millis(self.limits.fill_timeout_ms)).await
     }
 
     /// Run a data-only job (`prepare` or `fill`) on `input`; see [`JobRunner`].
@@ -993,7 +1021,7 @@ async fn prepare_manifest(w: &Worlds, manifest: &[u8]) -> Result<(Value, Vec<u8>
 /// Manifest `id`'s prepared world: the stored one, or, when that is stale or lost (prepared by
 /// another build or layout, or its blob is missing or torn), prepared again from the stored
 /// manifest and stored.
-async fn prepared_world(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+async fn prepared_world(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
     match w.manifests.prepared(id).await.map_err(|e| format!("{e:?}"))? {
         Some(stored) => Ok(stored),
         None => prepare_again(w, id).await,
@@ -1002,7 +1030,7 @@ async fn prepared_world(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
 
 /// Prepare manifest `id`'s world from the stored manifest and store it in place of what was
 /// stored for this engine.
-async fn prepare_again(w: &Worlds, id: &str) -> Result<Arc<Vec<u8>>, String> {
+async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
     let manifest = w.manifests.bytes(id).await.map_err(|e| format!("{e:?}"))?;
     let manifest = manifest.ok_or("the manifest is gone")?;
     tracing::info!(id, engine = w.manifests.engine, "preparing a world again");
@@ -1466,6 +1494,12 @@ fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String
         .collect()
 }
 
+/// Threads a generation asks its fill for: written into the request ([`fill_head`]) and told
+/// to the pool, which bounds a worker's CPU time by it. The one place both read.
+const fn fill_threads() -> usize {
+    config::GENERATION_WORKERS
+}
+
 /// The head of a generation's fill request (`data_fill::job::Fill`, JSON), which the prepared
 /// world follows: on `config::GENERATION_WORKERS` threads, for a seed of at most
 /// `seed_max_bytes`.
@@ -1478,7 +1512,7 @@ fn fill_head(
         seed_name: seed_name.to_owned(),
         players: player_requests(files)?,
         rng_seed,
-        workers: config::GENERATION_WORKERS,
+        workers: fill_threads(),
         algorithm: data_fill::room::Algorithm::Exact,
         seed_max_bytes,
     };
@@ -1500,6 +1534,7 @@ async fn player_files(w: &Worlds, yamls: &[String]) -> Result<Vec<(String, Vec<u
 /// CPU time, wall clock; a child past its time is killed), under the same `gen_concurrency`
 /// permit, status file and publish path as a legacy world.
 async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value), String> {
+    let mut laps = Laps::start();
     let id = status["id"].as_str().unwrap_or("");
     let manifest = status["manifest"].as_str().unwrap_or("");
     let mut prepared = prepared_world(w, manifest).await?;
@@ -1514,6 +1549,7 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
         u64::from_le_bytes(Sha256::digest(id.as_bytes())[..8].try_into().unwrap_or([0; 8]));
     let seed_name = format!("data-only-{}", id.get(..12).unwrap_or(id));
     let files = player_files(w, &yamls).await?;
+    laps.lap("store");
     let players = yamls.len();
     // Building the request is blocking work.
     let limits = w.limits;
@@ -1522,12 +1558,12 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
-    let timeout = Duration::from_millis(w.limits.fill_timeout_ms);
-    // The child prints the seed file itself; it names the game's package of the prepared world.
+    laps.lap("request");
+    // The job answers with the seed file itself; it names the game's package of the prepared
+    // world.
     let mut first = true;
     let seed = loop {
-        let input = data_fill::job::frame(&head, &prepared)?;
-        match w.run_job("fill", &input, timeout).await {
+        match w.fill(&head, &prepared).await {
             // A stored world this engine cannot load (it hashes to its key, so the store gave
             // it back) would fail every generation of its manifest: prepare it again, once.
             Err(Failure::Refused(why)) if first && why.contains(data_fill::job::UNLOADABLE) => {
@@ -1538,15 +1574,47 @@ async fn generate_data_only(w: &Worlds, status: &Value) -> Result<(Loaded, Value
             done => break done.map_err(|e| e.to_string())?,
         }
     };
+    laps.lap("job");
     let loaded = tokio::task::spawn_blocking(move || {
         let game = data_fill::prepared::seed_game(&prepared)?.to_vec();
         crate::parse_seed(seed, vec![game], &limits)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))?;
+    laps.lap("open");
     publish_loaded(w, loaded.clone()).await?;
+    laps.lap("publish");
+    // For the operator only. A requester is told no timings: how long the job took says whether
+    // its world was already loaded in a pooled worker, that is, whether someone filled it lately.
+    let ms = Value::Object(laps.ms.clone()).to_string();
+    tracing::info!(world = %id, ms, "data-only generation timed");
+    #[cfg(test)]
+    {
+        *w.laps.lock().unwrap_or_else(PoisonError::into_inner) = laps.ms;
+    }
     let report = json!({"engine": ENGINE_DATA_ONLY, "rng_seed": rng_seed, "players": players});
     Ok((loaded, report))
+}
+
+/// Where a generation's wall time went: the milliseconds of each phase, for the server's log.
+struct Laps {
+    at: Instant,
+    ms: serde_json::Map<String, Value>,
+}
+
+impl Laps {
+    fn start() -> Self {
+        Self { at: Instant::now(), ms: serde_json::Map::new() }
+    }
+
+    /// The phase since the last lap (or the start) ends now.
+    fn lap(&mut self, phase: &str) {
+        let now = Instant::now();
+        // To a thousandth of a millisecond.
+        let ms = ((now - self.at).as_secs_f64() * 1e6).round() / 1e3;
+        self.ms.insert(phase.to_owned(), json!(ms));
+        self.at = now;
+    }
 }
 
 /// Import the sidecar's v1 bundle (encoded to v2 off the runtime) into the host's store: its
@@ -1760,6 +1828,13 @@ async fn access_lost(w: Arc<Worlds>, headers: HeaderMap, id: String) {
 mod tests {
     use super::*;
 
+    /// Where a generation's time goes, on a release build (CI's `bench` job).
+    #[cfg(feature = "gen-bench")]
+    mod gen_bench;
+    /// Whole generations through real fill processes, with and without the pool.
+    #[cfg(feature = "pool-tests")]
+    mod pool_path;
+
     #[test]
     fn only_64_lowercase_hex_digits_are_an_id() {
         let good = "a".repeat(64);
@@ -1835,6 +1910,7 @@ mod tests {
         let mut w = open(&root.join("data"), paths, limits).unwrap();
         // The unit tests are not the server's executable: the jobs run in this process.
         w.jobs = JobRunner::InProcess;
+        w.pool = None;
         w.accounts = Some(Arc::new(PasswordAuth::new(w.store.clone(), limits, None)));
         w
     }
@@ -2599,6 +2675,16 @@ mod tests {
     }
 
     async fn hosting_with(root: &Path, limits: Limits) -> Arc<Worlds> {
+        hosting_on(root, limits, JobRunner::InProcess, None).await
+    }
+
+    /// [`hosting_with`], its data-only jobs run by `jobs` and its fills by `pool` when given.
+    async fn hosting_on(
+        root: &Path,
+        limits: Limits,
+        jobs: JobRunner,
+        pool: Option<Pool>,
+    ) -> Arc<Worlds> {
         let rooms = root.join("rooms");
         std::fs::create_dir_all(&rooms).unwrap();
         let (_, mut host) =
@@ -2606,6 +2692,8 @@ mod tests {
         let (waker, folder, db) = (host.waker(), host.folder().unwrap(), host.db());
         tokio::spawn(async move { host.supervise().await });
         let mut w = worlds(root, limits);
+        w.jobs = jobs;
+        w.pool = pool;
         w.importer = Some(waker);
         w.rooms = Some((folder, "host:1".to_owned()));
         w.store = db.clone();
@@ -2701,6 +2789,46 @@ mod tests {
         let file = w.manifests.prepared(&content_id(&manifest(|_| {}))).await.unwrap().unwrap();
         let world = data_fill::prepared::Prepared::open(&file).unwrap();
         assert_eq!(world.game(), "Fixture Game");
+    }
+
+    /// No pool unless config asks for one: by default a generation's fill is a job in a
+    /// process of its own, and `fill_pool_workers` turns the pool on.
+    #[tokio::test]
+    async fn fills_go_to_a_pool_only_when_config_asks_for_workers() {
+        let root = temp("pool-choice");
+        let paths = || crate::sandbox::tests::layout(&root);
+        assert_eq!(Limits::DESIGN.fill_pool_workers, 0);
+        assert!(open(&root.join("data"), paths(), Limits::DESIGN).unwrap().pool.is_none());
+        let on = Limits { fill_pool_workers: 1, ..Limits::DESIGN };
+        assert!(open(&root.join("data"), paths(), on).unwrap().pool.is_some());
+    }
+
+    /// The pool is told the threads the request itself asks for: its CPU bound for a worker
+    /// rests on that number.
+    #[test]
+    fn the_pool_is_told_the_threads_the_fill_request_asks_for() {
+        let head = fill_head("s", &[], (1, 64)).unwrap();
+        let req: Value = serde_json::from_slice(&head).unwrap();
+        assert_eq!(req["workers"], fill_threads());
+    }
+
+    /// A finished generation's status tells its requester no timings (how long the fill job
+    /// took would say whether its world was already loaded in a worker, that is, whether
+    /// someone filled it lately). The server keeps the phase timings for its own log.
+    #[tokio::test]
+    async fn a_generations_timings_go_to_the_log_and_not_into_its_status() {
+        let root = temp("laps");
+        let w = hosting(&root).await;
+        let id = finished_world(&w, &me()).await;
+        let status = read_status(&w, &id).await.unwrap();
+        let told: Vec<&str> =
+            status["generation"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(told, ["engine", "players", "rng_seed"], "{status}");
+        assert!(!status.to_string().contains("\"ms\""), "{status}");
+        let laps = w.laps.lock().unwrap().clone();
+        let phases: Vec<&str> = laps.keys().map(String::as_str).collect();
+        assert_eq!(phases, ["job", "open", "publish", "request", "store"]);
+        assert!(laps.values().all(|v| v.as_f64().is_some_and(|ms| ms >= 0.0)), "{laps:?}");
     }
 
     /// The seed a generation stores is, byte for byte, the seed the path before stored for the

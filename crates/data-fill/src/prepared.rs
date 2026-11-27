@@ -100,6 +100,18 @@ impl Prepared {
         &self.game
     }
 
+    /// Bytes this prepared world holds in memory: the loaded world, the game's name, both
+    /// tables and the games' JSON. What a cache of prepared worlds counts against its cap;
+    /// checked against a counting allocator in `tests/memory.rs` (CI runs it).
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.world.held_bytes()
+            + self.game.capacity()
+            + self.data.held_bytes()
+            + self.table.held_bytes()
+            + self.games_json.capacity()
+    }
+
     /// The game's names, ids and checksum.
     #[must_use]
     pub const fn data(&self) -> &GameData {

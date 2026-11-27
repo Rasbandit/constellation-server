@@ -24,6 +24,10 @@ name = "worlds"
 required-features = ["sandbox-tests"]
 
 [[test]]
+name = "pool"
+required-features = ["pool-tests"]
+
+[[test]]
 name = "memory"
 required-features = ["memory-harness"]
 
@@ -40,6 +44,15 @@ pg-tests = ["log/pg-tests"]
 sandbox-tests = []
 # The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
 memory-harness = ["dep:allocation-counter"]
+# The fill pool through real worker processes: `tests/pool.rs` (the pool alone) and
+# `src/worlds/tests/pool_path.rs` (whole generations), which start the server binary of the
+# same profile as workers. `cargo test -p server --features pool-tests` builds it with them;
+# CI's `check` job runs them on every PR. The feature also makes `server::pool` public for
+# `tests/pool.rs`.
+pool-tests = []
+# The generation bench (`src/worlds/tests/gen_bench.rs`): timings of a data-only generation,
+# through the real server binary of the same profile (build it first). CI's `bench` job runs it.
+gen-bench = ["pool-tests"]
 
 [dependencies]
 # Counts allocations per thread for the memory harness only (feature `memory-harness`).

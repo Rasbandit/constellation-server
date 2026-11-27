@@ -1,7 +1,7 @@
 name: ci
 # One job: fmt, the unit tests, the data-fill integration tests, the Python tools, the web app,
-# the version check and the Postgres tests. Sandbox (bwrap) and mutation tests are not run in
-# CI for now (see #185). Docs-only PRs still run `check` (it is a required check) but skip every
+# the version check, the Postgres tests and the fill pool tests. Sandbox (bwrap) and mutation
+# tests are not run in CI for now (see #185). Docs-only PRs still run `check` (it is a required check) but skip every
 # step after the scope test.
 # The push to main keeps the build cache warm; PRs only restore it.
 on:
@@ -56,6 +56,10 @@ jobs:
       # The data-only fill engine's integration tests (damaged sections, fixtures, fairness).
       - if: steps.scope.outputs.code != 'false'
         run: cargo test -p data-fill --tests --locked
+      # What a loaded world counts itself as holding, against a counting allocator (the cap
+      # of a fill worker's kept worlds rests on it).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p data-fill --features memory-harness --test memory --locked
       # The generation sidecar's checks (zip traversal, bombs, yaml) and the bundle converter.
       - if: steps.scope.outputs.code != 'false'
         uses: actions/setup-python@v5
@@ -78,5 +82,7 @@ jobs:
       # Postgres (the restart scenarios). `--manifest-path`: `-p log` also names the crates.io crate.
       - if: steps.scope.outputs.code != 'false'
         run: cargo test --manifest-path crates/log/Cargo.toml --features pg-tests --lib --locked
+      # `pool-tests`: the fill pool through real worker processes (the server binary this same
+      # command builds), alone and under whole generations.
       - if: steps.scope.outputs.code != 'false'
-        run: cargo test -p server --features pg-tests --locked
+        run: cargo test -p server --features pg-tests,pool-tests --locked

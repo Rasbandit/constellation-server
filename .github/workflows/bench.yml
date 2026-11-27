@@ -8,6 +8,8 @@ name: bench
 # and the seed-shape report runs, at small sizes. The opt-in fill modes at every size, four
 # threads, rooms on one world and the seed-shape report at full size run only on a dispatch
 # with `full` set to `on`.
+# First, apart from the fills: where a generation's time goes through the server
+# (crates/server/src/worlds/tests/gen_bench.rs).
 # A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
 # through its concurrency group, cancel the run already in progress.
 on:
@@ -39,6 +41,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
+      # Where a generation's time goes through the server and what the fill pool changes
+      # (crates/server/src/worlds/tests/gen_bench.rs), for a room of 1 and of 10 players. Three
+      # runs of the whole bench, so the summary can show how far a number moves between runs; in
+      # each run the paths are timed in turn on the same seeds. First, so the fills below do not
+      # share its runner time.
+      - name: gen_bench
+        run: |
+          set -o pipefail
+          cargo build --release --locked -p server --bin constellation-server
+          cargo test --release --locked -p server --lib --features gen-bench --no-run
+          for run in 1 2 3; do
+            cargo test --release --locked -p server --lib --features gen-bench gen_bench -- --nocapture \
+              | tee gen-bench.log
+            grep '^{"bench":"gen' gen-bench.log | jq -c --argjson run "$run" '. + {run: $run}' >> gen-bench.jsonl
+          done
       # Compiled apart from the rows, so the summary can say where the job's time goes.
       - name: build
         run: |
@@ -237,6 +254,42 @@ jobs:
       - name: summary
         run: |
           {
+            echo "### Where a generation's time goes through the server (measured on this runner, release build)"
+            echo
+            echo "One synthetic world per room, every player on it, one fill thread, in-memory store, no HTTP. The whole bench ran three times; each row names its run."
+            echo
+            echo "#### The parts of a fill job in a process of its own (median of the reps, one seed)"
+            echo
+            echo "Start: a job process that does nothing, from start to exit. Pipe in: the fill's input on its stdin, by difference. Load, fill and encode: the job's own steps, timed in the bench process. Rest: what the parts leave of the job (inferred by subtraction)."
+            echo
+            echo "| run | profile | players | start ms | pipe in ms | load ms | fill ms | encode ms | rest ms | job ms | start plus load, share of job | prepared bytes | request bytes | seed bytes | reps |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.bench == "gen") | .split as $s | "| \(.run) | \(.profile) | \(.players) | \($s.start_ms) | \($s.pipe_in_ms) | \($s.load_ms) | \($s.fill_ms) | \($s.encode_ms) | \($s.rest_ms) | \($s.job_ms) | \((($s.start_ms + $s.load_ms) / $s.job_ms * 1000 | round) / 10)% | \($s.prepared_bytes) | \($s.request_bytes) | \($s.seed_bytes) | \(.reps) |"' gen-bench.jsonl
+            echo
+            echo "#### The fill job: a process of its own against the fill pool, timed in turn"
+            echo
+            echo "In each rep, on a seed of its own, the job runs in a process of its own, then on a pool with no worker yet (cold), on a worker that is up and does not hold the world (miss), and on a worker that holds it (warm), so runner noise falls on all four alike. A cell is the median of the three runs' medians, and in brackets the least and the greatest single sample of all runs. Saved: own median less pool median, the least and the greatest of the three runs. Clear of the noise: runs in which the slowest warm sample was faster than the fastest own-process sample. Every pooled seed was compared with the own-process seed, byte for byte."
+            echo
+            echo "| profile | players | own process ms | pool cold ms | pool miss ms | pool warm ms | saved on a miss ms | saved warm ms | warm clear of the noise |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -r -s 'def mid: sort | .[(length / 2 | floor)]; def cell(f): "\([.[] | f.med] | mid) [\([.[] | f.min] | min) to \([.[] | f.max] | max)]"; def saved(f): [.[] | ((f) * 100 | round) / 100] | "\(min) to \(max)"; [.[] | select(.bench == "gen")] | group_by([.profile, .players])[] | "| \(.[0].profile) | \(.[0].players) | \(cell(.job.own)) | \(cell(.job.cold)) | \(cell(.job.miss)) | \(cell(.job.warm)) | \(saved(.job.own.med - .job.miss.med)) | \(saved(.job.own.med - .job.warm.med)) | \([.[] | select(.job.warm.max < .job.own.min)] | length) of \(length) runs |"' gen-bench.jsonl
+            echo
+            echo "#### A whole request: a server without a pool against one with a pool, in turn"
+            echo
+            echo "From the world being asked for to its status reading done. The pooled server's worker holds the world after its first request, and nothing else uses it: this is the best case; a server whose worker was just replaced, or is busy with other worlds, sits between the miss and the warm column above. Cells as above. Clear of the noise: runs in which the slowest pooled request was faster than the fastest request without a pool."
+            echo
+            echo "| profile | players | without a pool ms | with a pool ms | saved ms | share of the request | clear of the noise | idle worker RSS bytes | idle worker address space bytes |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -r -s 'def mid: sort | .[(length / 2 | floor)]; def cell(f): "\([.[] | f.med] | mid) [\([.[] | f.min] | min) to \([.[] | f.max] | max)]"; [.[] | select(.bench == "gen")] | group_by([.profile, .players])[] | "| \(.[0].profile) | \(.[0].players) | \(cell(.request.own)) | \(cell(.request.pool)) | \([.[] | ((.request.own.med - .request.pool.med) * 100 | round) / 100] | "\(min) to \(max)") | \([.[] | ((.request.own.med - .request.pool.med) / .request.own.med * 1000 | round) / 10] | "\(min)% to \(max)%") | \([.[] | select(.request.pool.max < .request.own.min)] | length) of \(length) runs | \([.[] | .rss_idle_bytes] | "\(min) to \(max)") | \([.[] | .vm_idle_bytes] | "\(min) to \(max)") |"' gen-bench.jsonl
+            echo
+            echo "#### A worker's memory as its cache fills"
+            echo
+            echo "One worker, never replaced, one player on a new world per job, until what the cache counts for the worlds sent is a tenth past its cap. Counted: what a kept world says it holds (checked against a counting allocator in CI). The bench fails if resident memory grew by more than twice the cap."
+            echo
+            echo "| run | profile | file bytes a world | counted bytes a world | worlds sent | worlds kept (about) | cap bytes | RSS with one world | RSS with the cache full | grown per kept world | address space with one world | with the cache full |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.bench == "gen-memory") | "| \(.run) | \(.profile) | \(.file_bytes) | \(.held_bytes_per_world) | \(.worlds) | \(.worlds_kept) | \(.cache_cap_bytes) | \(.rss_one_world_bytes) | \(.rss_full_cache_bytes) | \(((.rss_full_cache_bytes - .rss_one_world_bytes) / ([.worlds_kept - 1, 1] | max)) | round) | \(.vm_one_world_bytes) | \(.vm_full_cache_bytes) |"' gen-bench.jsonl
+            echo
             echo "### Where the job's time went (measured: wall seconds on this runner)"
             echo
             echo "Compile of the bench example, release: $(cat build_s) s. Rows: $(jq -s '[.[] | select(.players != null) | .row_s] | add | round' bench-room.jsonl) s over $(jq -s '[.[] | select(.players != null)] | length' bench-room.jsonl) rows (a row draws and prepares its worlds, fills once for the heap figure and then \`fill reps\` times for the median)."
@@ -399,6 +452,7 @@ jobs:
         with:
           name: bench-room
           path: |
+            gen-bench.jsonl
             bench-room.jsonl
             bench-seeds.jsonl
             bench-212.jsonl

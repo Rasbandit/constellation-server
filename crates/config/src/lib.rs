@@ -227,6 +227,25 @@ pub struct Limits {
     pub fill_cpu_secs: u64,
     /// Wall-clock limit of one fill child process, after which it is killed (design value).
     pub fill_timeout_ms: u64,
+    /// Fill worker processes that stay up and take one fill job after another
+    /// (`server::pool`). 0, the default, is no pool: each fill runs in a process of its own.
+    /// With a pool, a fill needs a worker, so there must be one for every generation that may
+    /// run at once: the valid settings are 0, or `gen_concurrency` and up
+    /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
+    /// one core ([`GENERATION_WORKERS`] thread per fill). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// Each worker runs under the same caps as a fill child process, and a job past
+    /// `fill_timeout_ms` ends its worker.
+    pub fill_pool_workers: usize,
+    /// Fill jobs a pooled worker takes before it is replaced by a fresh process (design
+    /// value, not measured).
+    pub fill_worker_jobs: usize,
+    /// Most memory the loaded worlds one pooled worker keeps between jobs may hold
+    /// ([`PREPARED_CACHE_BYTES`]).
+    pub fill_worker_cache_bytes: usize,
+    /// A pooled worker whose address space after a job is over this share of
+    /// `fill_memory_bytes`, in percent, is replaced by a fresh process: what earlier fills
+    /// left allocated must leave the next job at least the rest of the cap (design value).
+    pub fill_worker_recycle_percent: u64,
     /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
     pub gen_concurrency: usize,
     /// Most generations queued or running at once; a new one past it is refused as busy
@@ -358,6 +377,17 @@ pub const SHUFFLE_MAX_READ_THINGS: usize = 255;
 /// Longest error text the shuffle checks give back, bytes: a message may quote names from the
 /// manifest, and a name's length is not known to be small when it is quoted (a design value).
 pub const SHUFFLE_ERROR_MAX_BYTES: usize = 4096;
+
+/// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
+/// (`server::pool`; the design value of `Limits::fill_worker_cache_bytes`), the least recently
+/// used going first. A kept world counts what it holds (`data_fill::prepared::Prepared::
+/// held_bytes`, checked against a counting allocator in CI). From issue 200.
+pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// CPU time kept in hand when a pooled fill worker is judged fit for one more job: its
+/// process CPU cap (`fill_cpu_secs`) must cover what its jobs so far may have used, one more
+/// whole job, and this much for its start and what it does between jobs (design value).
+pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
 /// generation costs one core and many run side by side. A room's fill runs on one thread on
@@ -530,6 +560,10 @@ impl Limits {
         fill_cpu_secs: 120,
         fill_max_processes: 8192,
         fill_timeout_ms: 60_000,
+        fill_pool_workers: 0,
+        fill_worker_jobs: 256,
+        fill_worker_cache_bytes: PREPARED_CACHE_BYTES,
+        fill_worker_recycle_percent: 50,
         gen_concurrency: 1,
         gen_queue_max: 64,
         admin_write_burst: 30,
@@ -581,6 +615,18 @@ impl Limits {
         if self.catalogue_check_seeds == 0 {
             return Err("catalogue_check_seeds must be at least 1");
         }
+        if self.fill_worker_jobs == 0 {
+            return Err("fill_worker_jobs must be at least 1");
+        }
+        // Generation treats a gen_concurrency of 0 as 1.
+        let generations = if self.gen_concurrency == 0 { 1 } else { self.gen_concurrency };
+        if self.fill_pool_workers != 0 && self.fill_pool_workers < generations {
+            return Err("fill_pool_workers must be 0 (no pool) or at least gen_concurrency: \
+                 with fewer, generations that could fill side by side would wait for a worker");
+        }
+        if self.fill_worker_recycle_percent == 0 || self.fill_worker_recycle_percent > 100 {
+            return Err("fill_worker_recycle_percent must be 1 to 100");
+        }
         if self.password_hash_parallel == 0 {
             return Err("password_hash_parallel must be at least 1");
         }
@@ -621,6 +667,7 @@ pub fn load() -> Result<Limits, String> {
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
         ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
         ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
+        ("CONSTELLATION_FILL_POOL_WORKERS", &mut l.fill_pool_workers),
         ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
         ("CONSTELLATION_CATALOGUE_CHECK_SEEDS", &mut l.catalogue_check_seeds),
         ("CONSTELLATION_CATALOGUE_CHECK_CONCURRENCY", &mut l.catalogue_check_concurrency),
@@ -1134,6 +1181,35 @@ mod tests {
             (262_144, 4_096_000)
         );
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
+    }
+
+    /// The fill worker pool is off unless asked for (zero workers: each fill in a process of
+    /// its own). Asked for, it must have a worker for every generation that may run at once,
+    /// or fills that ran side by side would wait in line for a worker.
+    #[test]
+    fn the_fill_pool_is_off_by_default_and_never_smaller_than_gen_concurrency() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (0, 256));
+        assert_eq!((PREPARED_CACHE_BYTES, l.fill_worker_cache_bytes), (32 << 20, 32 << 20));
+        assert_eq!((l.fill_worker_recycle_percent, FILL_WORKER_CPU_MARGIN_MS), (50, 1000));
+        assert!(l.check().is_ok(), "off");
+        // On: 1 worker for 1 generation at a time, 4 or 6 for 4; never 1, 2 or 3 for 4.
+        let with = |fill_pool_workers, gen_concurrency| {
+            Limits { fill_pool_workers, gen_concurrency, ..l }.check()
+        };
+        for (workers, generations) in [(1, 1), (1, 0), (4, 4), (6, 4), (0, 4)] {
+            assert!(with(workers, generations).is_ok(), "{workers} for {generations}");
+        }
+        for (workers, generations) in [(1, 4), (3, 4), (1, 2)] {
+            let e = with(workers, generations).unwrap_err();
+            assert!(e.contains("fill_pool_workers"), "{workers} for {generations}: {e}");
+        }
+        let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
+        assert!(e.contains("fill_worker_jobs"), "{e}");
+        for percent in [0, 101] {
+            let e = Limits { fill_worker_recycle_percent: percent, ..l }.check().unwrap_err();
+            assert!(e.contains("fill_worker_recycle_percent"), "{e}");
+        }
     }
 
     #[test]
