@@ -27,7 +27,7 @@
 //! The store is the in-memory one and no HTTP is parsed. Only CI's numbers count (the `bench`
 //! workflow runs this three times); a debug build runs a small room, to show the bench works.
 
-use super::pool_path::server_binary;
+use super::pool_path::{ON as POOLED, server_binary};
 use super::*;
 use crate::pool::{Job, status_bytes};
 use crate::sandbox::run_job;
@@ -44,8 +44,6 @@ mod fills;
 const REPS: usize = if cfg!(debug_assertions) { 3 } else { 21 };
 const CHECKS: usize = if cfg!(debug_assertions) { 100 } else { 1000 };
 const PLAYERS: [usize; 2] = [1, 10];
-/// The limits of the pooled side: the design's, with one worker.
-const POOLED: Limits = Limits { fill_pool_workers: 1, ..Limits::DESIGN };
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1e3
