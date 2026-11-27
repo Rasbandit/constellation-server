@@ -14,7 +14,7 @@
 //! of its rank, exactly as for one player. On this carried path no full rescan happens after
 //! the first solve.
 //!
-//! A room of `config::ROOM_FORWARD_MIN_PLAYERS` players or more places its rounds on the
+//! A room places its rounds on the
 //! split path ([`Path::Split`]): one solve, then every round's state by adding to it and
 //! taking the additions back. A third path ([`Path::Forward`]), for a caller that names it,
 //! solves the room afresh for every round instead, forward only. A round's state is the least fixed point
@@ -242,6 +242,12 @@ pub struct RoomFilled {
     /// placed items that gave their location to an item with nowhere to go and were placed
     /// again.
     pub swaps: u32,
+    /// Exact fill: rounds (or parts of one) that did not fit their state and were divided, in
+    /// the attempt that made these placements.
+    pub divided: u32,
+    /// Exact fill: rule evaluations the moves of `swaps` spent in that attempt, tried moves
+    /// included (`config::FILL_REPAIR_EVALS` an attempt, and the solve that crosses it).
+    pub repair_evals: u64,
     /// Rule evaluations of the opt-in mode's own solves, out of `stats.evals` (the rest are
     /// the confined items' steps and the final solve that checks and reports the seed).
     pub mode_evals: u64,
@@ -300,14 +306,14 @@ pub enum Path {
 }
 
 impl Path {
-    /// The path a room of `players` takes: one removal retracts more the larger the room, so
-    /// a room of `config::ROOM_FORWARD_MIN_PLAYERS` or more takes the split path, on one
-    /// thread whatever `workers` is (measured on the `bench-room` job: 100 players fill 5 to
-    /// 10 times faster than on the forward path, which four threads do not make up). The
-    /// forward path stays for a caller that names it.
+    /// The path a room takes, whatever its size and whatever `workers` is: the split path, on
+    /// one thread (measured on the `bench-room` job: 100 players fill 5 to 10 times faster
+    /// than on the forward path, which four threads do not make up, and one heavy player in
+    /// 2.8 ms against 11.6 ms carried, run 45924343167). The other paths stay for a caller
+    /// that names them.
     #[must_use]
-    pub fn of(players: usize, _workers: usize) -> Self {
-        if players < config::ROOM_FORWARD_MIN_PLAYERS { Path::Carry } else { Path::Split }
+    pub fn of(_players: usize, _workers: usize) -> Self {
+        Path::Split
     }
 }
 
@@ -378,15 +384,38 @@ pub enum Algorithm {
     /// move to, the attempt falls back to [`Algorithm::Exact`].
     Shuffle(Dials),
     /// For measurements only (tests and feature `memory-harness`): the exact fill as it formed
-    /// its rounds before issue 212, every player's items in the order drawn and a round never
-    /// divided. What [`Algorithm::Exact`] is held against in the bench and the quality report.
+    /// its rounds before issue 212, a round never divided and no item moved; a stuck attempt
+    /// starts over in the same way. What [`Algorithm::Exact`] is held against in the bench and
+    /// the quality report.
     #[cfg(any(test, feature = "memory-harness"))]
     #[serde(skip)]
     Drawn,
+    /// For measurements only: [`Algorithm::Exact`] with every attempt deepest first, the
+    /// first one too (what the exact fill does only after a stuck attempt).
+    #[cfg(any(test, feature = "memory-harness"))]
+    #[serde(skip)]
+    Deepest,
+    /// For measurements only: [`Algorithm::Exact`] with every attempt in the order drawn, the
+    /// restarts too (the exact fill goes deepest first after a stuck attempt).
+    #[cfg(any(test, feature = "memory-harness"))]
+    #[serde(skip)]
+    Repaired,
     /// For measurements only: [`Algorithm::Drawn`] with rounds of one item.
     #[cfg(any(test, feature = "memory-harness"))]
     #[serde(skip)]
     OneItem,
+}
+
+/// How an exact fill forms its rounds in one attempt.
+#[derive(Debug, Clone, Copy)]
+struct Rule {
+    /// Each player's items go deepest first (`depth.rs`) instead of in the order drawn.
+    deepest: bool,
+    /// A round that does not fit its state is divided, and an item with nowhere to go takes
+    /// the place of a seated one ([`Steps::displace`]).
+    repair: bool,
+    /// A round takes one item from every player; `false`: one item.
+    per_player: bool,
 }
 
 impl Algorithm {
@@ -395,27 +424,39 @@ impl Algorithm {
     pub fn dials(self) -> Option<Dials> {
         match self {
             Algorithm::Level(d) | Algorithm::Shuffle(d) => Some(d),
-            _ => None,
+            Algorithm::Exact => None,
+            #[cfg(any(test, feature = "memory-harness"))]
+            Algorithm::Drawn | Algorithm::Deepest | Algorithm::Repaired | Algorithm::OneItem => {
+                None
+            }
         }
     }
 
-    /// How an exact fill forms its rounds: whether each player's items go deepest first and a
-    /// round that does not fit is divided (the rule), and whether a round takes one item from
-    /// every player.
-    fn rounds(self) -> (bool, bool) {
+    /// The rounds of attempt `attempt` (from 1) of an exact fill, or of an opt-in mode's
+    /// fallback to it: the order drawn, repaired in place; after a stuck attempt, deepest
+    /// first, which gives up some depth of the item chains for a room that does not collapse.
+    fn rule(self, attempt: u32) -> Rule {
+        let rule = |deepest, repair, per_player| Rule { deepest, repair, per_player };
         match self {
+            Algorithm::Exact | Algorithm::Level(_) | Algorithm::Shuffle(_) => {
+                rule(attempt > 1, true, true)
+            }
             #[cfg(any(test, feature = "memory-harness"))]
-            Algorithm::Drawn => (false, true),
+            Algorithm::Drawn => rule(false, false, true),
             #[cfg(any(test, feature = "memory-harness"))]
-            Algorithm::OneItem => (false, false),
-            _ => (true, true),
+            Algorithm::Deepest => rule(true, true, true),
+            #[cfg(any(test, feature = "memory-harness"))]
+            Algorithm::Repaired => rule(false, true, true),
+            #[cfg(any(test, feature = "memory-harness"))]
+            Algorithm::OneItem => rule(false, false, false),
         }
     }
 }
 
 /// A mode as command lines name it: `exact`, `level` or `shuffle`, then any of `,depth=N`,
 /// `,goal` (goal only) and `,noskip` (evaluate every check as the solve meets it). In
-/// measurement builds also `drawn` and `single` ([`Algorithm::Drawn`], [`Algorithm::OneItem`]).
+/// measurement builds also `drawn`, `deepest`, `repaired` and `single` ([`Algorithm::Drawn`],
+/// [`Algorithm::Deepest`], [`Algorithm::Repaired`], [`Algorithm::OneItem`]).
 impl std::str::FromStr for Algorithm {
     type Err = String;
 
@@ -436,6 +477,10 @@ impl std::str::FromStr for Algorithm {
             "exact" if d == Dials::default() => Ok(Algorithm::Exact),
             #[cfg(any(test, feature = "memory-harness"))]
             "drawn" if d == Dials::default() => Ok(Algorithm::Drawn),
+            #[cfg(any(test, feature = "memory-harness"))]
+            "deepest" if d == Dials::default() => Ok(Algorithm::Deepest),
+            #[cfg(any(test, feature = "memory-harness"))]
+            "repaired" if d == Dials::default() => Ok(Algorithm::Repaired),
             #[cfg(any(test, feature = "memory-harness"))]
             "single" if d == Dials::default() => Ok(Algorithm::OneItem),
             "level" => Ok(Algorithm::Level(d)),
@@ -501,7 +546,8 @@ pub fn fill_room_by(
     path: Path,
     algorithm: Algorithm,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    let (f, s) = fill_by(seats, rng, max_attempts, (true, path, algorithm), true)?;
+    let budget = config::FILL_REPAIR_EVALS;
+    let (f, s) = fill_by(seats, rng, (max_attempts, budget), (true, path, algorithm), true)?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -723,13 +769,26 @@ fn fill_on(
     path: Path,
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
-    fill_by(seats, rng, max_attempts, (extend, path, Algorithm::Exact), want_spheres)
+    let tries = (max_attempts, config::FILL_REPAIR_EVALS);
+    fill_by(seats, rng, tries, (extend, path, Algorithm::Exact), want_spheres)
+}
+
+/// [`fill_room_on`] with a budget of repair work of its own instead of
+/// `config::FILL_REPAIR_EVALS`.
+#[cfg(test)]
+pub(crate) fn fill_room_budget(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    (max_attempts, budget): (u32, u64),
+    path: Path,
+) -> Result<RoomFilled, FillError> {
+    fill_by(seats, rng, (max_attempts, budget), (true, path, Algorithm::Exact), false).map(|x| x.0)
 }
 
 fn fill_by(
     seats: &[Seat<'_>],
     rng: &mut SpecRng,
-    max_attempts: u32,
+    (max_attempts, repair_budget): (u32, u64),
     (extend, path, algorithm): (bool, Path, Algorithm),
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
@@ -750,6 +809,10 @@ fn fill_by(
         divide: false,
         seated: Vec::new(),
         moved: 0,
+        repair_evals: 0,
+        repair_budget,
+        attempt: 0,
+        divided: 0,
         depth: Vec::new(),
         spheres: want_spheres,
         fast: false,
@@ -761,6 +824,7 @@ fn fill_by(
         last: vec![Vec::new(); seats.len()],
     };
     for attempt in 1..=max_attempts {
+        s.attempt = attempt;
         match s.try_fill(rng) {
             Ok(placed) => {
                 let (beatable, reached) = s.room.report();
@@ -778,6 +842,8 @@ fn fill_by(
                     repairs: s.repairs,
                     fallbacks: s.fallbacks,
                     swaps: s.swaps,
+                    divided: s.divided,
+                    repair_evals: s.repair_evals,
                     mode_evals: s.mode_evals,
                     profile: Rounds {
                         nanos: [s.room.nanos[0], s.room.nanos[1], s.profile.nanos[2]],
@@ -1215,8 +1281,15 @@ struct Steps<'a, 'w> {
     /// items placed again by [`Steps::displace`].
     seated: Vec<((u16, u32), Given)>,
     moved: usize,
+    /// Rule evaluations the solves of [`Steps::displace`] made in this attempt, and the most
+    /// they may (`config::FILL_REPAIR_EVALS`).
+    repair_evals: u64,
+    repair_budget: u64,
+    /// The attempt being made (from 1), and the groups it divided.
+    attempt: u32,
+    divided: u32,
     /// Per player, per item: how deep each copy first matters ([`depth::waves`]); filled by
-    /// the first exact attempt.
+    /// the first attempt that goes deepest first.
     depth: Vec<Vec<Vec<u32>>>,
     /// The caller wants the spheres: every check has to be evaluated by the end.
     spheres: bool,
@@ -1264,7 +1337,7 @@ impl Proof {
 impl Steps<'_, '_> {
     fn try_fill(&mut self, rng: &mut SpecRng) -> Result<Vec<Vec<Option<Given>>>, FillError> {
         let seats = self.room.seats;
-        self.rounds = 0;
+        (self.rounds, self.divided) = (0, 0);
         // What the seed returned was built with: an abandoned attempt's moves are not in it.
         (self.swaps, self.repairs) = (0, 0);
         // Confined items are carried on either path: their first solve is in rank order.
@@ -1327,7 +1400,11 @@ impl Steps<'_, '_> {
                     proof
                 })
             }
-            _ => None,
+            Algorithm::Exact => None,
+            #[cfg(any(test, feature = "memory-harness"))]
+            Algorithm::Drawn | Algorithm::Deepest | Algorithm::Repaired | Algorithm::OneItem => {
+                None
+            }
         };
         if self.algorithm.dials().is_some() {
             // The mode solved the room for itself: nothing is carried past it.
@@ -1339,9 +1416,8 @@ impl Steps<'_, '_> {
             }
             self.mode_evals += self.stats.evals - before;
         }
-        let (deepest, per_player) = self.algorithm.rounds();
-        // A measurement variant's placements are its own, as an opt-in mode's are.
-        self.fast = proof.is_some() || !deepest;
+        let Rule { deepest, repair, per_player } = self.algorithm.rule(self.attempt);
+        self.fast = proof.is_some();
         if proof.is_none() {
             if deepest {
                 if self.depth.is_empty() {
@@ -1350,9 +1426,9 @@ impl Steps<'_, '_> {
                 }
                 depth::deepest_last(&mut prog, &self.depth);
             }
-            self.divide = deepest;
+            self.divide = repair;
             self.seated.clear();
-            self.moved = 0;
+            (self.moved, self.repair_evals) = (0, 0);
             let groups = groups(prog, per_player);
             let mut groups: Vec<&[Given]> = groups.iter().map(Vec::as_slice).collect();
             loop {
@@ -1364,7 +1440,7 @@ impl Steps<'_, '_> {
                 };
                 let stuck = match done {
                     Ok(()) => break,
-                    Err(e @ FillError::Stuck { .. }) if deepest => e,
+                    Err(e @ FillError::Stuck { .. }) if repair => e,
                     Err(e) => return Err(e),
                 };
                 // Groups are placed in order and a divided group first half first, so what
@@ -1711,6 +1787,7 @@ impl Steps<'_, '_> {
             }
             halved = !self.fits(group, locs);
             if halved {
+                self.divided += 1;
                 let (first, second) = group.split_at(group.len() / 2);
                 todo.extend([second, first]);
                 continue;
@@ -1726,11 +1803,15 @@ impl Steps<'_, '_> {
     /// of an item of the rounds whose location is reached without it, and that item is placed
     /// again, against the state that has `item` there and holds neither (the items of `later`
     /// held): the assumed fill's own step, so the seed is beatable for the same reason. The
-    /// seated items are tried oldest first (the deepest: least lies behind them), at most
-    /// `config::FILL_DISPLACE_TRIES` of them, each one fresh solve.
+    /// candidates are the seated items reached without `item`, at most
+    /// `config::FILL_DISPLACE_TRIES` of them spread evenly over the order they were seated in,
+    /// each one fresh solve; an attempt's solves here stop once they have evaluated
+    /// `config::FILL_REPAIR_EVALS` rules. They run in rank order on every path, so that count is
+    /// the same on every path.
     ///
     /// # Errors
-    /// [`FillError::Stuck`] when no seated item tried can be placed again.
+    /// [`FillError::Stuck`] when no seated item tried can be placed again, or the attempt's
+    /// budget of repair work is spent.
     fn displace(
         &mut self,
         item: Given,
@@ -1738,44 +1819,84 @@ impl Steps<'_, '_> {
         locs: &mut Live<(u16, u32)>,
         placed: &mut [Vec<Option<Given>>],
     ) -> Result<(), FillError> {
-        let seats = self.room.seats;
         self.held.iter_mut().for_each(Vec::clear);
         for g in later.iter().copied().flatten() {
             self.held[usize::from(g.to)].push(g.item);
         }
-        self.room.solve(&self.held, placed);
-        self.solves += 1;
-        let models = &self.room.models;
-        let reached: Vec<usize> = (0..self.seated.len())
-            .filter(|i| {
-                let ((p, l), _) = self.seated[*i];
-                models[usize::from(p)].reached(l)
-            })
-            .take(config::FILL_DISPLACE_TRIES)
-            .collect();
-        for i in reached {
-            let ((p, l), out) = self.seated[i];
-            placed[usize::from(p)][l as usize] = Some(item);
+        // A fresh solve's counters depend on how it settles, not on what came before it: in
+        // rank order here whatever the path, the budget below is spent alike on all of them.
+        let forward = self.room.forward.take();
+        let done = self.repair(item, placed, locs);
+        self.room.forward = forward;
+        done
+    }
+
+    /// The tries of [`Steps::displace`], against `self.held`.
+    fn repair(
+        &mut self,
+        item: Given,
+        placed: &mut [Vec<Option<Given>>],
+        locs: &mut Live<(u16, u32)>,
+    ) -> Result<(), FillError> {
+        let seats = self.room.seats;
+        let w = seats[usize::from(item.to)].w;
+        let stuck = || FillError::Stuck { item: w.item_key(item.item).to_owned(), attempts: 1 };
+        let mut tried = Vec::new();
+        for k in 0..=config::FILL_DISPLACE_TRIES {
+            // A budget of work, not of time: a room that needs more repair than this is stuck.
+            if self.repair_evals >= self.repair_budget {
+                break;
+            }
             self.room.solve(&self.held, placed);
             self.solves += 1;
+            // Each solve starts its states' counters over: take them in before the next.
+            let before = self.stats.evals;
+            self.room.absorb(&mut self.stats);
+            self.repair_evals += self.stats.evals - before;
             let models = &self.room.models;
-            let free = locs.take_first(|(q, m)| {
-                models[usize::from(q)].reached(m) && permits(seats, out, q, m)
-            });
-            if let Some((q, m)) = free {
-                placed[usize::from(q)][m as usize] = Some(out);
-                self.seated[i].1 = item;
-                self.seated.push(((q, m), out));
-                self.moved += 1;
-                self.swaps += 1;
-                self.room.absorb(&mut self.stats);
-                return Ok(());
+            if k == 0 {
+                // The seated items reached without `item`, spread evenly over the order they
+                // were seated in (the oldest are the deepest: least lies behind them).
+                let reached: Vec<usize> = (0..self.seated.len())
+                    .filter(|i| {
+                        let ((p, l), _) = self.seated[*i];
+                        models[usize::from(p)].reached(l) && permits(seats, item, p, l)
+                    })
+                    .collect();
+                let step = reached.len().div_ceil(config::FILL_DISPLACE_TRIES).max(1);
+                tried = reached.into_iter().step_by(step).collect();
+                tried.reverse();
+            } else {
+                // `item` sits at the candidate's location and the candidate is out: place it.
+                let (i, (p, l), out) = tried.pop().map_or_else(
+                    || unreachable!("a try without a candidate"),
+                    |i| (i, self.seated[i].0, self.seated[i].1),
+                );
+                let free = locs.take_first(|(q, m)| {
+                    models[usize::from(q)].reached(m) && permits(seats, out, q, m)
+                });
+                if let Some((q, m)) = free {
+                    placed[usize::from(q)][m as usize] = Some(out);
+                    self.seated[i].1 = item;
+                    self.seated.push(((q, m), out));
+                    self.moved += 1;
+                    self.swaps += 1;
+                    return Ok(());
+                }
+                placed[usize::from(p)][l as usize] = Some(out);
             }
-            placed[usize::from(p)][l as usize] = Some(out);
+            let Some(&i) = tried.last() else { break };
+            let ((p, l), _) = self.seated[i];
+            placed[usize::from(p)][l as usize] = Some(item);
         }
-        self.room.absorb(&mut self.stats);
-        let w = seats[usize::from(item.to)].w;
-        Err(FillError::Stuck { item: w.item_key(item.item).to_owned(), attempts: 1 })
+        // Out of budget with a candidate tentatively moved out: put it back.
+        if let Some(&i) = tried.last() {
+            let ((p, l), out) = self.seated[i];
+            if placed[usize::from(p)][l as usize] == Some(item) && out != item {
+                placed[usize::from(p)][l as usize] = Some(out);
+            }
+        }
+        Err(stuck())
     }
 
     /// Whether `group` is placed against the room's state as one: it is one item, or groups
@@ -1893,6 +2014,7 @@ impl Steps<'_, '_> {
     ) -> Result<(), FillError> {
         if let [group] = groups {
             if !self.fits(group, locs) {
+                self.divided += 1;
                 let (first, second) = group.split_at(group.len() / 2);
                 return self.halve(&[first, second], locs, placed, put);
             }

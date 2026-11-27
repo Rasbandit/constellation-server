@@ -1,12 +1,18 @@
 //! How deep in its own world an item first matters: the order the exact fill places a
-//! player's progression in (`room.rs`).
+//! player's progression in on an attempt after a stuck one (`room.rs`; the first attempt keeps
+//! the order drawn).
 //!
 //! An assumed fill places an item against a state that holds everything not yet placed. What
 //! is placed can be lost again when an item it lies behind is taken out, and with it what
-//! lies behind that, in other worlds too. So the items a world needs first are placed last:
-//! while a player's round item is one first needed at depth `d`, every item of theirs needed
-//! before `d` is still held, nothing placed can take those away, and the player still reaches
-//! all of their world that those items open, however many players the room has.
+//! lies behind that, in other worlds too. Placing the items a world needs first last keeps
+//! that from growing with the room: while a player's round item is one first needed at depth
+//! `d`, every item of theirs needed before `d` is still held, so what those open stays
+//! reached. It says nothing about whether that part of the world has a free location left,
+//! and it makes the last rounds the tightest, so it relies on the same dividing of rounds and
+//! moves in place as the order drawn. Copies of one depth get no protection from each other.
+//! It also changes the seeds: a player's first items can no longer lie late in another world,
+//! and the item chains are shorter (counted on the bench: 22 against 55 spheres in a room of 16
+//! chain worlds), which is why it is the recovery, not the rule.
 //!
 //! The depth is read off one forward solve of the world alone ([`waves`]): step by step, every
 //! copy that would open something right now (an exit, an event, a check, a half-day) is added.

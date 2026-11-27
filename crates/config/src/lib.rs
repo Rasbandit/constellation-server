@@ -331,9 +331,11 @@ pub const RULE_BITS_MAX_TERM_TESTS: usize = 32;
 /// checks holds under a tenth of it).
 pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
 
-/// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
-/// the next draws of the seed's random stream; a design value).
-pub const FILL_MAX_ATTEMPTS: u32 = 20;
+/// Full fills a seed may start before the data-only fill gives up as stuck: a net for what the
+/// exact fill's repairs in place cannot mend, not its way of coping (each retry takes the next
+/// draws of the seed's random stream and goes deepest first; how often it is entered is in the
+/// fill report, `attempts`). A design value.
+pub const FILL_MAX_ATTEMPTS: u32 = 3;
 
 /// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
 /// sections the file holds and what is in them. Raise it with any change to that. A world is
@@ -400,13 +402,6 @@ pub const GENERATION_WORKERS: usize = 1;
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
-/// Players from which a room's fill takes the split path: one solve, then every round's state
-/// by adding to it and undoing (`data_fill::room::Path`; every path gives the same
-/// placements). 1: every room. On the `bench-room` CI job the split path was 4.1 times faster
-/// than the carried one for one heavy player (11.6 against 2.8 ms, measured, run 45924343167);
-/// the carried path stays for a caller that names it and for confined items.
-pub const ROOM_FORWARD_MIN_PLAYERS: usize = 1;
-
 /// Most threads the players' states of a room run on while a round is solved forward: a fill
 /// takes the worker count of its request, at most this many and at most the cores the process
 /// may use (a design value; results never depend on the number).
@@ -450,6 +445,22 @@ pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
 /// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
 /// (a design value).
 pub const FILL_DISPLACE_TRIES: usize = 32;
+
+/// Rule evaluations the solves of such moves may spend in one attempt of an exact fill (the
+/// solve that crosses it finishes); past it the attempt is stuck, and the next one, if any,
+/// goes deepest first. A budget of work, not of time, so a seed is the same on every machine
+/// and every path, and no world can drive a fill to its time limit (`fill_timeout_ms`, 60 s)
+/// by needing repair after repair. A design value: at about 186 ns an evaluation (the heavy
+/// profile at 100 players, 458.8 ms for 2,471,572 evaluations, bench runs 45935649561,
+/// 45936573286 and 45937474625) it is about 9 s of repair in an attempt, 27 s over
+/// `FILL_MAX_ATTEMPTS` (estimated). Counted on the bench worlds, seed 1: a room of 100 chain
+/// worlds spent 6.6 million, one of 100 key worlds 33 million.
+pub const FILL_REPAIR_EVALS: u64 = 48_000_000;
+
+/// Random orders of a world's progression the early capacity ratio is the mean over
+/// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
+/// (as many orders as the measurement that found the ratio used; a design value).
+pub const FILL_CAPACITY_ORDERS: u32 = 30;
 
 /// Random reached-location draws a shuffle fill (`data_fill::room::Algorithm::Shuffle`) makes
 /// for one freed item before it checks every candidate in turn (a design value).
