@@ -184,3 +184,36 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
         }
     }
 }
+
+/// The fill report says what the round procedure did, and for a fill that needed repairs which
+/// worlds leave fewer places early on than progression to seat (early capacity ratio under 1):
+/// rooms of tight synthetic worlds (as much progression as locations that take it) that were
+/// repaired flag every player, the others are not read; light rooms need no repair.
+#[test]
+fn the_fill_report_flags_worlds_with_little_room_early_on() {
+    use data_fill::room::Algorithm;
+    use data_fill::seed::{FillReport, generate_by};
+    use data_fill::synth::{Hostile, Shape, world};
+    let report = |shape: &Shape, n: u32, seed: u64| -> FillReport {
+        let (mut m, inst) = world(shape, 23, 0);
+        (m["game"], m["version"]) = (json!("Synth"), json!("1"));
+        let players: Vec<Player> =
+            (0..n).map(|p| Player { name: format!("P{p}"), instance: inst.clone() }).collect();
+        generate_by(&m, "s", &players, seed, 1, Algorithm::Exact).unwrap().1
+    };
+    let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
+    let mut repaired = 0;
+    for (n, seed) in [(1, 1), (1, 2), (1, 3), (3, 1), (3, 2), (8, 1), (8, 2)] {
+        let r = report(&tight, n, seed);
+        if r.divided > 0 || r.swaps > 0 || r.attempts > 1 {
+            repaired += 1;
+            assert_eq!(r.tight_players, n, "{r:?}");
+            assert!(r.capacity_milli < 1000, "{r:?}");
+        } else {
+            assert_eq!((r.tight_players, r.capacity_milli), (0, u32::MAX), "{r:?}");
+        }
+    }
+    assert!(repaired > 0, "no tight room needed a repair");
+    let light = report(&Shape { checks: 200, ..Shape::default() }, 3, 1);
+    assert_eq!((light.tight_players, light.capacity_milli, light.attempts), (0, u32::MAX, 1));
+}

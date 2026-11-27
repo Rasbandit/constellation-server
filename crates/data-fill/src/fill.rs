@@ -17,7 +17,7 @@ use crate::world::World;
 
 /// One seed's instance: what generation decided before the fill (see the proposal doc for
 /// which of these could become data primitives).
-#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(default)]
 pub struct Instance {
     /// Option values.
@@ -558,6 +558,12 @@ pub struct Filled {
 }
 
 /// Fill one seed. Retries the whole fill with the next draws from `rng` when stuck.
+///
+/// Not the product's fill: a generation fills a room ([`crate::room`]), one player too, which
+/// places the same seed as this one except where this one starts over and the room moves an
+/// item in place instead. Kept for the command line tool and the measurements. With no
+/// repair, it is stuck more often on tight worlds than the room fill at the same
+/// `max_attempts`.
 ///
 /// # Errors
 /// [`FillError`] when every attempt is stuck or the counts do not match.

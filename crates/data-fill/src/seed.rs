@@ -85,12 +85,25 @@ pub struct FillReport {
     pub placed_by_the_mode: bool,
     /// Attempts the mode gave up on.
     pub fallbacks: u32,
-    /// Full fills started.
+    /// Full fills started: above 1, the exact fill restarted (a net for what its repairs
+    /// could not mend, at most `config::FILL_MAX_ATTEMPTS`).
     pub attempts: u32,
-    /// Items a shuffle fill moved, and orders a level fill repaired, in the seed.
+    /// Items moved in the seed: by a shuffle fill into reach, or by the exact fill out of a
+    /// location an item with nowhere else to go took. Orders a level fill repaired: `repairs`.
     pub swaps: u32,
     /// See `swaps`.
     pub repairs: u32,
+    /// Exact fill: rounds (or parts of one) divided because they did not fit their state.
+    pub divided: u32,
+    /// Players whose world leaves less room early on than it has progression to seat (early
+    /// capacity ratio under 1, `crate::capacity`). Read only for a fill that divided a round,
+    /// moved an item or restarted, to say which worlds leaned on that: reading it costs more
+    /// than a fill of the room (measured, 242 ms against 61 ms for one heavy player, debug
+    /// build), so a fill that needed none of it does not pay. 0 then.
+    pub tight_players: u32,
+    /// The lowest early capacity ratio in the room, in thousandths (`u32::MAX`: not read, or no
+    /// world with progression).
+    pub capacity_milli: u32,
 }
 
 /// [`generate`] with the mode that places the progression items ([`room::Algorithm`]). The
@@ -221,12 +234,18 @@ fn fill_on(
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
+    let repaired = filled.divided > 0 || filled.repair_evals > 0 || filled.attempts > 1;
+    let (tight_players, capacity_milli) =
+        if repaired { capacity(&seats, &insts) } else { (0, u32::MAX) };
     let report = FillReport {
         placed_by_the_mode: algorithm == room::Algorithm::Exact || filled.fast,
         fallbacks: filled.fallbacks,
         attempts: filled.attempts,
         swaps: filled.swaps,
         repairs: filled.repairs,
+        divided: filled.divided,
+        tight_players,
+        capacity_milli,
     };
     let mut bundle = assemble(on, seed_name, players, &seats, &filled.placed, &spheres)?;
     // Each world's shuffle results, slot to thing by name: `slot_data` reaches the game client
@@ -235,6 +254,30 @@ fn fill_on(
         slot.slot_data["shuffles"] = json!(table);
     }
     Ok((bundle, report))
+}
+
+/// The room's early capacity ([`crate::capacity::early`]): players under 1, and the lowest
+/// ratio in thousandths. Once per world and instance: players with the same pair share it.
+fn capacity(seats: &[Seat<'_>], insts: &[&Instance]) -> (u32, u32) {
+    let mut seen: Vec<(usize, Option<f64>)> = Vec::new();
+    let (mut tight, mut lowest) = (0u32, u32::MAX);
+    for (p, s) in seats.iter().enumerate() {
+        let same = |q: usize| std::ptr::eq(seats[q].w, s.w) && insts[q] == insts[p];
+        let ratio = match seen.iter().find(|(q, _)| same(*q)) {
+            Some((_, r)) => *r,
+            None => {
+                let r = crate::capacity::early(s.w, s.plan);
+                seen.push((p, r));
+                r
+            }
+        };
+        if let Some(r) = ratio {
+            tight += u32::from(r < 1.0);
+            // A ratio is at most the locations of a world: far below `u32::MAX` thousandths.
+            lowest = lowest.min((r * 1000.0) as u32);
+        }
+    }
+    (tight, lowest)
 }
 
 /// The bundle for filled `placed` (one row per seat) and the `spheres` that reached them.
@@ -316,4 +359,25 @@ pub(crate) fn game_data(w: &World) -> Result<GameData, String> {
         checksum,
         ..GameData::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::room::Compiled;
+    use crate::synth::{Hostile, Shape, world};
+    use crate::world::World;
+
+    /// Two instances of one world are judged apart: a player whose instance excludes every other
+    /// location (as much progression as locations that take it) is flagged, one whose instance
+    /// excludes none is not, and players with the same instance share one reading.
+    #[test]
+    fn capacity_is_read_once_per_world_and_instance() {
+        let (m, tight) = world(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 0);
+        let open = crate::Instance { excluded: Vec::new(), ..tight.clone() };
+        let insts = [&tight, &open, &tight, &open];
+        let c = Compiled::shared(World::load(&m).unwrap(), &insts, 1).unwrap();
+        let (flagged, lowest) = super::capacity(&c.seats(), &insts);
+        assert_eq!(flagged, 2);
+        assert!(lowest < 1000, "{lowest}");
+    }
 }

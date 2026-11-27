@@ -331,9 +331,14 @@ pub const RULE_BITS_MAX_TERM_TESTS: usize = 32;
 /// checks holds under a tenth of it).
 pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
 
-/// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
-/// the next draws of the seed's random stream; a design value).
-pub const FILL_MAX_ATTEMPTS: u32 = 20;
+/// Full fills a seed may start before the data-only fill gives up as stuck: a net for what the
+/// exact fill's repairs in place cannot mend, not its way of coping (each retry takes the next
+/// draws of the seed's random stream and goes deepest first; how often it is entered is in the
+/// fill report, `attempts`). A design value. Counted on 9,926 rooms with 20 allowed (tight
+/// synthetic worlds of 60 to 1,000 checks at 1, 3, 10 and 100 players, both fixture worlds,
+/// 3,000 seeds each): none needed more than 3, one needed 3, and none that drawn order fills in
+/// 20 attempts is stuck here in 3.
+pub const FILL_MAX_ATTEMPTS: u32 = 3;
 
 /// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
 /// sections the file holds and what is in them. Raise it with any change to that. A world is
@@ -400,13 +405,6 @@ pub const GENERATION_WORKERS: usize = 1;
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
 
-/// Players from which a room's fill stops taking a round's items back by truth maintenance
-/// (the carried path) and takes the split path instead: one solve, then every round's state by
-/// adding to it and undoing (`data_fill::room::Path`; every path gives the same placements).
-/// On the synthetic rooms of the `bench-room` CI job the split path is faster than the carried
-/// one at 1 and at 10 players too; smaller rooms stay carried until a real world is timed.
-pub const ROOM_FORWARD_MIN_PLAYERS: usize = 8;
-
 /// Most threads the players' states of a room run on while a round is solved forward: a fill
 /// takes the worker count of its request, at most this many and at most the cores the process
 /// may use (a design value; results never depend on the number).
@@ -445,6 +443,38 @@ pub const FILL_GOAL_ONLY: bool = false;
 /// pass at the end): reaching such a location changes nothing. The result is the same either
 /// way; `false` is the reference the saving is measured against (a design value).
 pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
+
+/// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
+/// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
+/// (a design value).
+pub const FILL_DISPLACE_TRIES: usize = 32;
+
+/// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
+/// of moves, one solve's worth more per move for the pass over the rounds after it, and per
+/// divided round the evaluations of the attempt's first solve in rank order with none of the
+/// rounds' items (`data_fill::room`, `charge_division`), all counted the same on every path.
+/// Within the budget means at most this much spent: once more is spent, checked before each
+/// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
+/// it), and so is any later one that needs a move or a division. A budget of work, not of
+/// time: a seed is the same on every machine and path. A design value with a margin over the
+/// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
+/// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
+/// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about
+/// 120 players and chain rooms up to about 200 fill without a restart (estimated). Time is
+/// not bounded by it: on that run keys at 100 players took 4.3 to 4.4 s for 78 to 83 million
+/// evaluations in all (measured), about 55 ns an evaluation; at that rate the budget is about
+/// 3.5 s of repair, and at the heavy profile's 186 ns about 12 s (both estimated).
+pub const FILL_REPAIR_EVALS: u64 = 64_000_000;
+
+/// The least p value the product's fill may show against uniform beatable placements on the
+/// one-player fixture world (`data-fill` `tests/fairness.rs`; a design value: drawn order gives
+/// 0.39 there, each player's items deepest first gave 0.00008, counted over 300 seeds).
+pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
+
+/// Random orders of a world's progression the early capacity ratio is the mean over
+/// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
+/// (as many orders as the measurement that found the ratio used; a design value).
+pub const FILL_CAPACITY_ORDERS: u32 = 30;
 
 /// Random reached-location draws a shuffle fill (`data_fill::room::Algorithm::Shuffle`) makes
 /// for one freed item before it checks every candidate in turn (a design value).

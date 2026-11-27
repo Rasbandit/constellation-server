@@ -90,8 +90,9 @@ pub fn unframe(framed: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// Fill a room on a prepared world: the input is a [`frame`] of the request ([`Fill`] as
 /// JSON) and the prepared world's file ([`prepare`]). Nothing is compiled. The output is the
 /// seed file itself (v2), which names the game's package in the prepared world
-/// (`crate::prepared::seed_game`) by key. When the asked mode fell back to the exact fill, one
-/// line on stderr says so (stdout is the seed and nothing else).
+/// (`crate::prepared::seed_game`) by key. When the asked mode fell back to the exact fill, when
+/// a fill that needed repairs has a world with an early capacity ratio under 1, and when the
+/// exact fill restarted, one line on stderr says so each (stdout is the seed and nothing else).
 ///
 /// # Errors
 /// A message for a frame or request that does not parse, a prepared world that does not load
@@ -101,6 +102,17 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     let (seed, report) = fill_reported(input)?;
     if report.fallbacks > 0 {
         eprintln!("fill: the asked mode fell back to the exact fill: {report:?}");
+    }
+    if report.tight_players > 0 {
+        eprintln!(
+            "fill: the fill needed repairs, and {} players' worlds have an early capacity ratio \
+             under 1 (lowest {:.3}), a likely cause: {report:?}",
+            report.tight_players,
+            f64::from(report.capacity_milli) / 1000.0
+        );
+    }
+    if report.attempts > 1 {
+        eprintln!("fill: the exact fill restarted {} times: {report:?}", report.attempts - 1);
     }
     Ok(seed)
 }

@@ -222,10 +222,11 @@ pub struct Sampled {
     pub failed: u64,
 }
 
-/// Run `seeds` fills (fill seeds `1..=seeds`), and draw up to `baseline` accepted uniform
-/// placements: the pool shuffled onto the free locations, kept only if the placement rules
-/// hold, the goal is reachable and every progression item can be collected. Gives up on the
-/// baseline after `max_attempts` candidates.
+/// Run `seeds` fills (fill seeds `1..=seeds`) of the product's fill, a room of this one player
+/// ([`fill_room_by`], exact), and draw up to `baseline` accepted uniform placements: the pool
+/// shuffled onto the free locations, kept only if the placement rules hold, the goal is
+/// reachable and every progression item can be collected. Gives up on the baseline after
+/// `max_attempts` candidates.
 #[must_use]
 pub fn sample(
     w: &crate::World,
@@ -237,11 +238,14 @@ pub fn sample(
     max_attempts: u64,
 ) -> Sampled {
     let mut out = Sampled::default();
+    let seat = [crate::Seat { w, plan, progression }];
     for s in 1..=seeds {
-        match crate::fill(w, plan, &mut seeded(s, b"fill\0\0\0\0"), config::FILL_MAX_ATTEMPTS) {
-            Ok(filled) => {
-                out.fill.add(&filled.placed, |_| true);
-                out.fills.push(filled.placed);
+        match one_fill(&seat, s, Algorithm::Exact, FILLS) {
+            Ok((filled, _)) => {
+                let placed: Vec<Option<u16>> =
+                    filled.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
+                out.fill.add(&placed, |_| true);
+                out.fills.push(placed);
             }
             Err(_) => out.failed += 1,
         }
@@ -580,7 +584,9 @@ pub fn shape(
         };
         out.ms.push(t.elapsed().as_secs_f64() * 1e3);
         out.fallbacks += u64::from(filled.fallbacks);
-        if mode != Algorithm::Exact && !filled.fast {
+        // An opt-in mode that gave up: the exact fill placed the seed. The exact fill and its
+        // measurement variants place their own.
+        if mode.dials().is_some() && !filled.fast {
             out.fell_back += 1;
             continue;
         }

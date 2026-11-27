@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: fill-fairness (--world <world.json> | --manifest <m.json> --instance <i.json>)
     [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]
   or, to compare fill modes on one room (the exact fill is always the reference):
-    fill-fairness (--world <world.json> | --synth light|heavy [--players N] [--checks N] [--room-seed S])
-    --modes \"exact level level,depth=100 shuffle,goal\" [--seeds N] [--required N] [--baseline N]";
+    fill-fairness (--world <world.json> | --synth light|heavy|mixed [--players N] [--checks N] [--room-seed S])
+    --modes \"exact level level,depth=100 shuffle,goal\" [--reference MODE] [--seeds N] [--required N] [--baseline N]";
 
 fn read(p: &str) -> Result<Value, String> {
     serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?)
@@ -109,15 +109,24 @@ fn modes_report(
             room::Compiled::shared(World::load(&v["manifest"])?, &insts, 1)?
         }
         (None, Some(profile)) => {
-            let d = match *profile {
-                "light" => data_fill::synth::Shape::default(),
-                "heavy" => data_fill::synth::Shape::heavy(),
-                x => return Err(format!("--synth: light or heavy, got {x}")),
-            };
+            use data_fill::synth::{Hostile, Shape};
             let checks = usize::try_from(num("--checks", 1000)?).map_err(|e| e.to_string())?;
+            let sized = |d: Shape| Shape { checks, ..d };
+            // `mixed`: chain, light, keys and heavy worlds in turn (piles of different
+            // lengths and shapes in one room).
+            let shapes = match *profile {
+                "light" => vec![sized(Shape::default())],
+                "heavy" => vec![sized(Shape::heavy())],
+                "mixed" => vec![
+                    Shape::hostile(Hostile::Chain),
+                    sized(Shape::default()),
+                    Shape::hostile(Hostile::Keys),
+                    sized(Shape::heavy()),
+                ],
+                x => return Err(format!("--synth: light, heavy or mixed, got {x}")),
+            };
             let players = usize::try_from(num("--players", 1)?).map_err(|e| e.to_string())?;
-            let shape = data_fill::synth::Shape { checks, ..d };
-            data_fill::synth::room(&shape, num("--room-seed", 1)?, players, 1)?
+            data_fill::synth::mixed(&shapes, num("--room-seed", 1)?, players, 1)?
         }
         _ => return Err(USAGE.into()),
     };
@@ -128,10 +137,11 @@ fn modes_report(
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
     let t = Instant::now();
     let err = |e| format!("{e:?}");
-    // The reference is the exact fill on one stream of seeds; every row, an `exact` one too,
-    // is filled on another, so its distance from the reference is between independent samples
-    // and the `exact` row is the noise floor.
-    let exact = shape(&seats, (seeds, FILLS), Algorithm::Exact, 0).map_err(err)?;
+    // The reference is the exact fill (or `--reference`) on one stream of seeds; every row, a
+    // row of the reference's own mode too, is filled on another, so its distance from the
+    // reference is between independent samples and that row is the noise floor.
+    let reference: Algorithm = m.get("--reference").map_or(Ok(Algorithm::Exact), |r| r.parse())?;
+    let exact = shape(&seats, (seeds, FILLS), reference, 0).map_err(err)?;
     let mut rows = Vec::new();
     for name in modes.split_whitespace() {
         let mode: Algorithm = name.parse()?;
@@ -146,7 +156,10 @@ fn modes_report(
         }
         rows.push(row);
     }
-    finish(json!({"players": seats.len(), "seeds": seeds, "modes": rows}), true, t, m)
+    let reference = m.get("--reference").copied().unwrap_or("exact");
+    let out =
+        json!({"players": seats.len(), "seeds": seeds, "reference": reference, "modes": rows});
+    finish(out, true, t, m)
 }
 
 /// Add timing and the gates, write `--out`.

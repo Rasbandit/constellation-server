@@ -923,9 +923,10 @@ impl<'w> Reach<'w> {
     }
 
     /// Whether one more copy of `item` would make a rule on the frontier hold right now: one of
-    /// the rules [`Reach::wants`] names, evaluated with the copy counted. Call on a fixed
-    /// point; nothing is changed but the work counter.
-    pub(crate) fn opens(&mut self, item: u16) -> bool {
+    /// the rules [`Reach::wants`] names, evaluated with the copy counted; with `empty`, also the
+    /// check of a location that holds nothing (reaching it is a place more for an item). Call
+    /// on a fixed point; nothing is changed but the work counter.
+    pub(crate) fn opens(&mut self, item: u16, empty: bool) -> bool {
         let w = self.w;
         let sc = w.site_count();
         // A def found true is cached as true for good (rules are monotone): what the extra
@@ -942,7 +943,7 @@ impl<'w> Reach<'w> {
             }
             let (r, g) = w.site_place(s);
             let l = w.site_target(s) as usize;
-            let counts = g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
+            let counts = empty || g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
             if !counts || g == STAYS || self.masks[r] == 0 || self.done.contains(s) {
                 return false;
             }

@@ -2,8 +2,10 @@
 //! generation time. See `docs/data-only-world-experiment.md` for the format extensions it reads.
 
 mod bitrules;
+pub mod capacity;
 pub mod check;
 pub mod decode;
+mod depth;
 pub mod fairness;
 pub mod fill;
 mod fold;
