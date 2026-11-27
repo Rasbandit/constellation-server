@@ -238,17 +238,26 @@ fn one(
             (0..players).map(|p| (c.world(p), insts[p])).collect();
         let (plans_ms, _) =
             median(reps, || plans(&pairs, 1).map(drop).map_err(|e| format!("{e:?}")))?;
-        let mut restarts = 0;
+        let (mut restarts, mut steps) = (0, [0u64; data_fill::shuffle::STEPS.len()]);
         for (p, inst) in insts.iter().enumerate() {
             let player = u32::try_from(p).map_err(|e| e.to_string())?;
-            let staged = data_fill::shuffle::stage(base[p % count], inst, seed, player)?;
-            restarts += staged.map_or(0, |s| s.attempts.saturating_sub(1));
+            if let Some(s) = data_fill::shuffle::stage(base[p % count], inst, seed, player)? {
+                restarts += s.attempts.saturating_sub(1);
+                steps.iter_mut().zip(s.nanos).for_each(|(sum, ns)| *sum += ns);
+            }
         }
+        // The passing attempts' steps over the room, ms (one more pass, timed inside).
+        let steps: serde_json::Map<String, Value> = data_fill::shuffle::STEPS
+            .iter()
+            .zip(steps)
+            .map(|(name, ns)| ((*name).to_owned(), json!(fine(ns as f64 / 1e6))))
+            .collect();
         let shuffle_ms = stage_ms - plans_ms;
         shuffle_row = json!({
             "stage_ms": fine(stage_ms), "plans_ms": fine(plans_ms), "shuffle_ms": fine(shuffle_ms),
             "per_world_ms": (shuffle_ms / players as f64 * 1e3).round() / 1e3,
             "restarts": restarts,
+            "steps_ms": steps,
             "exits": drawn[0].0["shuffles"]["entrances"]["slots"]["names"].as_array().map(Vec::len),
         });
     }

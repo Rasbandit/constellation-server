@@ -41,6 +41,7 @@ mod layout;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
 
 use serde_json::Value;
 use spec_rng::SpecRng;
@@ -163,6 +164,13 @@ impl Bound {
         stream: &dyn Fn(&str) -> R<SpecRng>,
     ) -> Result<Staged, Fail> {
         let mut table = Table::new();
+        // Wall time of each step, for the bench: five clock reads an attempt.
+        let (mut nanos, mut at) = ([0u64; STEPS.len()], Instant::now());
+        let mut lap = |step: usize| {
+            let now = Instant::now();
+            nanos[step] += u64::try_from((now - at).as_nanos()).unwrap_or(u64::MAX);
+            at = now;
+        };
         for sh in self.decl.order.iter().filter_map(|i| self.decl.shuffles.get(*i)) {
             let mut rng = stream(&sh.name).map_err(Fail::Hard)?;
             let allows = |slot: usize, thing: usize| sh.allows(slot, thing);
@@ -175,21 +183,30 @@ impl Bound {
                 inst.to_mut().options.insert(option.clone(), i64::try_from(t).unwrap_or(0));
             }
         }
+        lap(0);
         let hard = |e| Fail::Hard(format!("{e:?}"));
         let Some(layout) = &self.layout else {
             let world = w.staged(&[]);
+            lap(2);
             let plan = Plan::new(&world, inst).map_err(hard)?;
+            lap(3);
             whole_world(&world, &plan).map_err(|why| Fail::Attempt(self.names(false), why))?;
-            return Ok(Staged { world, plan, table, attempts: 1 });
+            lap(4);
+            return Ok(Staged { world, plan, table, attempts: 1, nanos });
         };
         let mut rng = stream(LAYOUT).map_err(Fail::Hard)?;
         let exits = layout
             .grow(&self.decl, &mut rng, w.start as usize, &mut table)
             .map_err(|why| Fail::Attempt(self.names(true), why))?;
+        lap(1);
         let world = w.staged(&exits);
+        lap(2);
         let plan = Plan::new(&world, inst).map_err(hard)?;
-        let Err(why) = whole_world(&world, &plan) else {
-            return Ok(Staged { world, plan, table, attempts: 1 });
+        lap(3);
+        let checked = whole_world(&world, &plan);
+        lap(4);
+        let Err(why) = checked else {
+            return Ok(Staged { world, plan, table, attempts: 1, nanos });
         };
         // Is the layout at fault? The same seed with every exit where the manifest has it.
         let plain = w.staged(&[]);
@@ -250,7 +267,14 @@ pub struct Staged {
     pub table: Table,
     /// Attempts taken (1: no restart).
     pub attempts: u32,
+    /// Wall time of the attempt that passed, nanoseconds per step of [`STEPS`].
+    pub nanos: [u64; STEPS.len()],
 }
+
+/// The steps of one attempt, as [`Staged::nanos`] times them: the `none` draws, the joint
+/// layout solve, making the seed's world, resolving the instance on it (which a world without
+/// shuffles pays too), and the whole-world check.
+pub const STEPS: [&str; 5] = ["draws", "layout", "world", "plan", "check"];
 
 /// Run the shuffles of `w` for `player` (from 0) of the room seeded `seed`. `None` for a world
 /// that declares no shuffle: nothing is drawn and the caller fills it as before. The same
@@ -301,7 +325,7 @@ pub fn unshuffled(w: &World, inst: &Instance) -> R<Option<Staged>> {
     }
     let world = w.staged(&[]);
     let plan = Plan::new(&world, inst).map_err(|e| format!("{e:?}"))?;
-    Ok(Some(Staged { world, plan, table: Table::new(), attempts: 0 }))
+    Ok(Some(Staged { world, plan, table: Table::new(), attempts: 0, nanos: [0; STEPS.len()] }))
 }
 
 /// A room staged, on up to `workers` threads: per player their world (player `p` plays
@@ -331,6 +355,7 @@ pub fn room(
                 world: (*w).clone(),
                 table: Table::new(),
                 attempts: 0,
+                nanos: [0; STEPS.len()],
             },
         })
     });
