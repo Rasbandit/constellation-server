@@ -308,7 +308,7 @@ jobs:
               echo
               echo "| players | path | prepare ms | load ms | setup ms | fill ms (median) | assemble ms | encode ms | of it: check ms | hash with the names written again ms (not paid) | open ms (server) | v1 import ms (before: encode and open) | prepared file bytes | seed bytes | peak heap bytes (fill) | peak RSS bytes after the fill | after the encode | at the end (with the comparison import) |"
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.open_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
+              jq -r --arg p "$profile" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed_file.assemble_ms) | \(.seed_file.encode_ms) | \(.seed_file.validate_ms) | \(.seed_file.hash_whole_ms) | \(.seed_file.open_ms) | \(.seed_file.import_v1_ms) | \(.prepared_bytes) | \(.seed_file.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed_file.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
             done
             fi
             echo
@@ -476,6 +476,11 @@ jobs:
         env: { BASE: "${{ github.base_ref || 'main' }}" }
         run: |
           git worktree add ../base "origin/$BASE"
+          # A base whose bench does not print the seed's timings (`seed_file`: main before the
+          # PR of #202, where the room's seed number overwrote them) is measured with this
+          # branch's bench source on the base's library; later bases print them themselves.
+          grep -q '"seed_file"' ../base/crates/data-fill/examples/synth_room.rs \
+            || cp crates/data-fill/examples/synth_room.rs ../base/crates/data-fill/examples/synth_room.rs
           cargo build --release --locked -p data-fill --features memory-harness --example synth_room
           (cd ../base && cargo build --release --locked -p data-fill --features memory-harness --example synth_room)
       - name: in turns
@@ -490,6 +495,17 @@ jobs:
                 | tee -a bench-ab.jsonl
             done
           done; done
+          # The seed of a room on one world (the rooms the server generates), which is where
+          # the bench times the seed's check, hash and encode: three runs a side, in turns.
+          for pair in 1 2 3; do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --path auto --workers 1 --worlds one --players 1,10,100 --checks 1000 --reps 3 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab-seed.jsonl
+            done
+          done; done
       - name: summary
         run: |
           {
@@ -501,11 +517,23 @@ jobs:
               group_by([.profile, .players]) | .[]
               | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
               | "| \(.[0].profile) | \(.[0].players) | \(.[0].path) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab.jsonl
+            echo
+            echo "### Base against head, the seed of a room on one world: ms to encode it (check, hash and write the seed file), and its check and whole hash alone (measured on this runner, release build, 3 runs a side in turns; each run's number is its own median of 3; median and range of the runs)"
+            echo
+            echo "| profile | players | what | base ms | base range | head ms | head range | head / base | same placements and seed size |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[] | . as $g
+              | ("encode_ms", "validate_ms", "hash_whole_ms") as $k
+              | ($g | map(select(.side == "base").seed_file[$k])) as $b | ($g | map(select(.side == "head").seed_file[$k])) as $h
+              | "| \($g[0].profile) | \($g[0].players) | \($k) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \(if ($b | med) > 0 then (($h | med) / ($b | med) * 1000 | round) / 1000 else "n/a" end) | \($g | map([.placements_hash, .seed_file.seed_bytes]) | unique | length == 1) |"' bench-ab-seed.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-ab
-          path: bench-ab.jsonl
+          path: |
+            bench-ab.jsonl
+            bench-ab-seed.jsonl
   # Shuffles (`data_fill::shuffle`), heavy worlds, one thread, the path a room of that size
   # takes. The same doors-shaped worlds (no time context, which an exit shuffle needs) filled
   # with their doors shuffled and with every door where the manifest has it, seed by seed:
