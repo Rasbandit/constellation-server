@@ -78,12 +78,12 @@ pub fn plans(players: &[(&World, &Instance)]) -> Result<Vec<Plan>, FillError> {
 /// # Errors
 /// The first failing player's message, by player index.
 pub fn worlds(manifests: &[&serde_json::Value]) -> Result<Vec<World>, String> {
-    too_many(manifests.len()).map_err(|e| format!("{e:?}"))?;
+    too_many(manifests.len())?;
     manifests
         .iter()
         .map(|m| World::load(m))
         .enumerate()
-        .map(|(p, r)| r.map_err(|e| format!("player {}: {e}", p + 1)))
+        .map(|(p, r)| r.map_err(|e| player(p, e)))
         .collect()
 }
 
@@ -92,13 +92,23 @@ pub fn worlds(manifests: &[&serde_json::Value]) -> Result<Vec<World>, String> {
 /// # Errors
 /// A value that is not an instance, naming the player.
 pub fn instances(raw: &[serde_json::Value]) -> Result<Vec<Instance>, String> {
-    too_many(raw.len()).map_err(|e| format!("{e:?}"))?;
+    too_many(raw.len())?;
     raw.iter()
         .enumerate()
-        .map(|(p, v)| {
-            Instance::deserialize(v).map_err(|e| format!("player {}: instance: {e}", p + 1))
-        })
+        .map(|(p, v)| Instance::deserialize(v).map_err(|e| player(p, format!("instance: {e}"))))
         .collect()
+}
+
+/// A world document as the fixtures and tools keep one: `{"manifest", "instances": [...]}`, one
+/// world played by several players, or `{"manifest", "instance"}`, one player. Its manifest
+/// and every player's instance: the one reading of that shape.
+///
+/// # Errors
+/// An instance that does not parse, or no or too many players.
+pub fn from_doc(doc: &serde_json::Value) -> Result<(&serde_json::Value, Vec<Instance>), String> {
+    let one = std::slice::from_ref(&doc["instance"]);
+    let list = doc["instances"].as_array().map_or(one, Vec::as_slice);
+    Ok((&doc["manifest"], instances(list)?))
 }
 
 /// Every player's compiled world, resolved plan and progression flags, in player order: what
@@ -126,6 +136,16 @@ impl Compiled {
         Self::resolve(worlds(manifests)?, insts)
     }
 
+    /// A world document ([`from_doc`]) as a room: its one world, compiled once, and every
+    /// player's instance on it.
+    ///
+    /// # Errors
+    /// As [`from_doc`], [`World::load`] and [`plans`].
+    pub fn from_doc(doc: &serde_json::Value) -> Result<Self, String> {
+        let (manifest, insts) = from_doc(doc)?;
+        Self::shared(World::load(manifest)?, &insts.iter().collect::<Vec<_>>())
+    }
+
     /// One compiled `world` that every player plays, each with their own instance: the world
     /// is held once however many players there are.
     ///
@@ -144,7 +164,7 @@ impl Compiled {
         let world = |p: usize| &worlds[p % worlds.len().max(1)];
         let pairs: Vec<(&World, &Instance)> =
             insts.iter().enumerate().map(|(p, i)| (world(p), *i)).collect();
-        let plans = plans(&pairs).map_err(|e| format!("{e:?}"))?;
+        let plans = plans(&pairs)?;
         let progression = pairs.iter().map(|(w, i)| i.progression(w)).collect();
         Ok(Compiled { worlds, plans, progression })
     }
@@ -182,9 +202,14 @@ pub fn too_many(players: usize) -> Result<(), FillError> {
     Ok(())
 }
 
+/// `e` as said of player `p` (from 0): the one form of that prefix.
+pub(crate) fn player(p: usize, e: impl std::fmt::Display) -> String {
+    format!("player {}: {e}", p + 1)
+}
+
 fn prefix(p: usize, e: FillError) -> FillError {
     match e {
-        FillError::Instance(m) => FillError::Instance(format!("player {}: {m}", p + 1)),
+        FillError::Instance(m) => FillError::Instance(player(p, m)),
         other => other,
     }
 }
@@ -353,8 +378,8 @@ pub fn permits(seats: &[Seat<'_>], g: Given, player: u16, loc: u32) -> bool {
     else {
         return false;
     };
-    let Some(excluded) = here.plan.excluded.get(loc as usize) else { return false };
-    confined_ok(seats, g, player, loc) && !(is_progression(seats, g) && *excluded)
+    let exists = (loc as usize) < here.plan.excluded.len();
+    exists && confined_ok(seats, g, player, loc) && here.plan.takes(loc, is_progression(seats, g))
 }
 
 /// Whether `g` counts as held: a progression item of its owner (`false` for an owner or item
@@ -467,7 +492,7 @@ pub fn cross_world_share(
 pub(crate) fn check(seats: &[Seat<'_>]) -> Result<(), FillError> {
     too_many(seats.len())?;
     let bad = |p: usize, what: &str| {
-        Err(FillError::Instance(format!("player {}: {what} does not fit the world", p + 1)))
+        Err(FillError::Instance(player(p, format!("{what} does not fit the world"))))
     };
     for (p, s) in seats.iter().enumerate() {
         let (items, locs) = (s.w.items(), s.w.locations());

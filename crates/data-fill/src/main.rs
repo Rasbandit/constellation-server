@@ -114,7 +114,7 @@ fn run(args: &[String]) -> Result<Value, String> {
     let parse_ms = ms(t);
     let t = Instant::now();
     let w = load(manifest)?;
-    let plan = Plan::new(&w, &inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(&w, &inst)?;
     let compile_ms = ms(t);
 
     let mut oracle = json!(null);
@@ -158,14 +158,13 @@ fn run(args: &[String]) -> Result<Value, String> {
     let seat = [Seat { w: &w, plan: &plan, progression: &progression }];
     let mut rng = SpecRng::from_u64(seed);
     let t = Instant::now();
-    let filled =
-        fill_room(&seat, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;
+    let filled = fill_room(&seat, &mut rng, config::FILL_MAX_ATTEMPTS)?;
     let fill_ms = ms(t);
     let t = Instant::now();
-    let (beatable, reached) = validate_room(&seat, &filled.placed).map_err(|e| format!("{e:?}"))?;
+    let (beatable, reached) = validate_room(&seat, &filled.placed)?;
     let (beatable, reached) = (beatable[0], reached[0]);
     let validate_ms = ms(t);
-    let placed = room::placements(&seat, &filled.placed, None).map_err(|e| format!("{e:?}"))?;
+    let placed = room::placements(&seat, &filled.placed, None)?;
     let placed = &placed[0];
     if let Some(out) = rest.get(1) {
         std::fs::write(out, serde_json::to_string(&placed).map_err(|e| e.to_string())?)

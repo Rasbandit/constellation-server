@@ -130,9 +130,7 @@ impl Room {
         let root = temp(&format!("gen-bench-{name}-{players}"));
         let pool = Pool::new(exe.to_owned(), limits);
         let w = hosting_on(&root, limits, JobRunner::Child(exe.to_owned()), pool).await;
-        let (mut manifest, instance) = world(shape, 1, 0);
-        manifest["game"] = json!("Synth");
-        manifest["version"] = json!("1");
+        let (manifest, instance) = data_fill::synth::uploaded(shape, 1, 0);
         let body = manifest.to_string();
         let up = upload_manifest(&w, Some("name=m.json"), body.as_bytes()).await.unwrap();
         let manifest_id = json_of(up).await["id"].as_str().unwrap().to_owned();

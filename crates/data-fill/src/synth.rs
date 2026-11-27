@@ -499,6 +499,23 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
     (manifest, inst)
 }
 
+/// [`world`] as an upload carries it: the manifest named, game `Synth` and version `1` (what an
+/// upload's check asks for).
+#[must_use]
+pub fn uploaded(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
+    let (mut manifest, instance) = world(shape, seed, player);
+    (manifest["game"], manifest["version"]) = (json!("Synth"), json!("1"));
+    (manifest, instance)
+}
+
+/// `n` players of one `instance`, named `P0`, `P1` and so on.
+#[must_use]
+pub fn players(instance: &Instance, n: usize) -> Vec<crate::seed::Player> {
+    (0..n)
+        .map(|p| crate::seed::Player { name: format!("P{p}"), instance: instance.clone() })
+        .collect()
+}
+
 /// A room of `players` synthetic worlds (player `p` drawn as [`world`]`(shape, seed, p)`),
 /// compiled and resolved.
 ///
@@ -515,8 +532,27 @@ pub fn room(shape: &Shape, seed: u64, players: usize) -> Result<Compiled, String
 /// # Errors
 /// As [`Compiled::new`].
 pub fn mixed(shapes: &[Shape], seed: u64, players: usize) -> Result<Compiled, String> {
-    let built: Vec<(Value, Instance)> =
-        (0..players).map(|p| world(&shapes[p % shapes.len()], seed, p as u64)).collect();
+    mixed_with(shapes, seed, players, |_, _| {})
+}
+
+/// [`mixed`] with each player's instance changed by `change` (by player) before it is
+/// resolved.
+///
+/// # Errors
+/// As [`Compiled::new`].
+pub fn mixed_with(
+    shapes: &[Shape],
+    seed: u64,
+    players: usize,
+    change: impl Fn(u64, &mut Instance),
+) -> Result<Compiled, String> {
+    let built: Vec<(Value, Instance)> = (0..players as u64)
+        .map(|p| {
+            let (m, mut inst) = world(&shapes[p as usize % shapes.len()], seed, p);
+            change(p, &mut inst);
+            (m, inst)
+        })
+        .collect();
     let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
     let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
     Compiled::new(&manifests, &insts)
@@ -572,16 +608,7 @@ mod tests {
         players: u64,
         change: impl Fn(u64, &mut Instance),
     ) -> Result<Compiled, String> {
-        let built: Vec<(Value, Instance)> = (0..players)
-            .map(|p| {
-                let (m, mut inst) = world(shape, seed, p);
-                change(p, &mut inst);
-                (m, inst)
-            })
-            .collect();
-        let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
-        let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
-        Compiled::new(&manifests, &insts)
+        mixed_with(std::slice::from_ref(shape), seed, usize::try_from(players).unwrap(), change)
     }
 
     /// Confine `p0` to the group `home`: the locations `l` with `l % every < most`.
@@ -626,7 +653,7 @@ mod tests {
         let out = pinned(false);
         let p0 = |row: &str| row.matches("item: 0 }").count();
         assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
-        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+        assert_eq!(crate::check::fnv1a(out.as_bytes()), "036064f5ec95175d");
     }
 
     /// The same pin with the rooms filled by a fresh solve of every group's state: two live
@@ -634,7 +661,7 @@ mod tests {
     #[test]
     fn the_pinned_placements_are_the_same_by_a_solve_per_round() {
         let out = pinned(true);
-        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+        assert_eq!(crate::check::fnv1a(out.as_bytes()), "036064f5ec95175d");
     }
 
     /// A snapshot of the repaired rounds: a room of 22 chain worlds, where rounds are divided
@@ -646,8 +673,7 @@ mod tests {
         for fresh in [false, true] {
             let f = once(&c, 1, fresh).unwrap();
             let counts = (f.attempts, f.rounds, f.divided, f.swaps);
-            let hash =
-                format!("{:016x}", crate::check::fnv1a(format!("{:?}", f.placed).as_bytes()));
+            let hash = crate::check::placements_hash(&f.placed);
             assert_eq!(
                 (counts, hash.as_str()),
                 ((1, 139, 46, 8), "92838999e01ee2cb"),
@@ -794,12 +820,12 @@ mod tests {
     fn one_pass(c: &Compiled, seed: u64, fresh: bool) -> Outcome {
         filled(c, seed, 1, fresh)
             .map(|(f, sp)| (f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached))
-            .map_err(|e| format!("{e:?}"))
+            .map_err(String::from)
     }
 
     /// One attempt (with `fresh`, of the cross-check), as filled, or its error.
     fn once(c: &Compiled, seed: u64, fresh: bool) -> Result<crate::RoomFilled, String> {
-        filled(c, seed, 1, fresh).map(|(f, _)| f).map_err(|e| format!("{e:?}"))
+        filled(c, seed, 1, fresh).map(|(f, _)| f).map_err(String::from)
     }
 
     /// One attempt whose rounds are formed by `rule` (a baseline), or its error.
@@ -811,7 +837,7 @@ mod tests {
         let mut rng = SpecRng::from_u64(seed);
         fill_room_test(&c.seats(), &mut rng, 1, (config::FILL_REPAIR_EVALS, rule, false))
             .map(|(f, _)| f)
-            .map_err(|e| format!("{e:?}"))
+            .map_err(String::from)
     }
 
     /// The rounds before issue 212: drawn order, never divided, no item moved.

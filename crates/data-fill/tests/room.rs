@@ -10,13 +10,13 @@ use data_fill::{Instance, Plan, World};
 use serde_json::Value;
 use spec_rng::SpecRng;
 
-const FIXTURE: &str = include_str!("fixtures/room_world.json");
+mod support;
 
 /// The fixture's world and one instance per player.
 fn load() -> (Value, Vec<Instance>) {
-    let doc: Value = serde_json::from_str(FIXTURE).unwrap();
-    let insts = room::instances(doc["instances"].as_array().unwrap()).unwrap();
-    (doc["manifest"].clone(), insts)
+    let doc = support::fixture("room_world");
+    let (manifest, insts) = room::from_doc(&doc).unwrap();
+    (manifest.clone(), insts)
 }
 
 /// Compiled worlds, plans and progression flags for `n` players (the fixture's three, repeated).

@@ -500,10 +500,17 @@ fn a_prepared_world_carries_its_shuffles_through_the_child_jobs() {
     let direct = generate(&m, "s", &p, 9).unwrap();
     let out = prepare(m.to_string().as_bytes()).unwrap();
     let (_, file) = unframe(&out).unwrap();
-    let head = Fill { seed_name: "s".to_owned(), players: p, rng_seed: 9, seed_max_bytes: 1 << 24 };
+    let head = Fill {
+        seed_name: "s".to_owned(),
+        players: p,
+        rng_seed: 9,
+        seed_max_bytes: data_fill::prepared::SEED_MAX_BYTES,
+    };
     let seed = fill(&frame(&serde_json::to_vec(&head).unwrap(), file).unwrap()).unwrap();
     let game = data_fill::prepared::seed_game(file).unwrap().to_vec();
-    let back = seed_bundle::v2::decode(seed, |_| Ok(game.clone()), 1 << 24).unwrap();
+    let back =
+        seed_bundle::v2::decode(seed, |_| Ok(game.clone()), data_fill::prepared::SEED_MAX_BYTES)
+            .unwrap();
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
     assert!(back.slots[0].slot_data["shuffles"]["entrances"].is_object());
     // The loaded world stages as the compiled one does.
@@ -791,7 +798,7 @@ fn the_results_of_fixed_seeds_are_pinned() {
         let w = World::load(&m).unwrap();
         let out: String =
             (1..=8).map(|seed| format!("{:?}\n", staged(&w, &inst, seed).table)).collect();
-        format!("{:016x}", data_fill::check::fnv1a(out.as_bytes()))
+        data_fill::check::fnv1a(out.as_bytes())
     };
     // The entrance shuffle, the guardian shuffle, and a layout that restarts.
     let got = [pin(doors()), pin(halls(guardians())), pin(bell(&["b", "c"], json!([])))];
@@ -814,7 +821,7 @@ fn layouts_that_fail_the_check_are_rejected_on_the_same_attempts_as_before() {
             restarted += u32::from(s.as_ref().is_ok_and(|s| s.as_ref().unwrap().0 > 1));
             out += &format!("{s:?}\n");
         }
-        (format!("{:016x}", data_fill::check::fnv1a(out.as_bytes())), restarted)
+        (data_fill::check::fnv1a(out.as_bytes()), restarted)
     };
     let wide = Shape { checks: 400, doors: true, timeless: true, ..Shape::heavy() };
     let (synth, inst) = synth_world(&wide, 7, 0);

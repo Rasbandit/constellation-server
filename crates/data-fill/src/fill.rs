@@ -137,6 +137,14 @@ pub enum FillError {
     },
 }
 
+/// A fill error as the text a caller reports: its debug form (what every message of a failed
+/// fill has always read). The one conversion, so a call site needs only `?`.
+impl From<FillError> for String {
+    fn from(e: FillError) -> Self {
+        format!("{e:?}")
+    }
+}
+
 /// Folded rule offsets that are a constant (0 true, 1 false).
 fn constant(sites: &[u32]) -> usize {
     sites.iter().filter(|at| **at <= 1).count()
@@ -483,7 +491,13 @@ impl Plan {
     /// progression on an excluded location). Logic is not consulted.
     #[must_use]
     pub fn permits(&self, item: u16, loc: u32, progression: bool) -> bool {
-        self.allowed(item, loc) && !(progression && self.excluded[loc as usize])
+        self.allowed(item, loc) && self.takes(loc, progression)
+    }
+
+    /// Whether location `loc` may hold an item that is (`progression`) or is not progression:
+    /// no progression goes on an excluded location. The one reading of that rule.
+    pub(crate) fn takes(&self, loc: u32, progression: bool) -> bool {
+        !(progression && self.excluded[loc as usize])
     }
 
     /// Per world location: the locked item, `None` elsewhere.

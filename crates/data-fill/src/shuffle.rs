@@ -336,7 +336,7 @@ pub fn unshuffled(w: &World, inst: &Instance) -> R<Option<Staged>> {
         ));
     }
     let world = w.staged(&[]);
-    let plan = Plan::new(&world, inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(&world, inst)?;
     Ok(Some(Staged { world, plan, table: Table::new(), attempts: 0, nanos: [0; STEPS.len()] }))
 }
 
@@ -348,10 +348,10 @@ pub fn unshuffled(w: &World, inst: &Instance) -> R<Option<Staged>> {
 /// # Errors
 /// As [`stage`] and [`Plan::new`], naming the player.
 pub fn room(worlds: &[&World], insts: &[&Instance], seed: u64) -> R<(Compiled, Vec<Table>)> {
-    too_many(insts.len()).map_err(|e| format!("{e:?}"))?;
+    too_many(insts.len())?;
     let players: Vec<usize> = (0..insts.len()).collect();
     let staged = players.iter().map(|p| -> R<Staged> {
-        let who = |e: String| format!("player {}: {e}", p + 1);
+        let who = |e: String| crate::room::player(*p, e);
         let w = worlds.get(p % worlds.len().max(1)).ok_or("a room needs a world")?;
         let player = u32::try_from(*p).map_err(|e| e.to_string())?;
         Ok(match stage(w, insts[*p], seed, player).map_err(who)? {

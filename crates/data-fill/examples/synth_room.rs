@@ -73,7 +73,7 @@ use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{Compiled, Seat, cross_world_share, fill_room_spheres, plans};
-use data_fill::seed::{Player, assemble_on, encode_on};
+use data_fill::seed::{assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
@@ -229,7 +229,7 @@ fn one(
         let (stage_ms, _) = median(reps, || setup().map(drop))?;
         let pairs: Vec<(&World, &Instance)> =
             (0..players).map(|p| (c.world(p), insts[p])).collect();
-        let (plans_ms, _) = median(reps, || plans(&pairs).map(drop).map_err(|e| format!("{e:?}")))?;
+        let (plans_ms, _) = median(reps, || plans(&pairs).map(drop).map_err(String::from))?;
         let (mut restarts, mut steps) = (0, [0u64; data_fill::shuffle::STEPS.len()]);
         for (p, inst) in insts.iter().enumerate() {
             let player = u32::try_from(p).map_err(|e| e.to_string())?;
@@ -278,9 +278,7 @@ fn one(
     let rss_after_fill = peak_rss();
     let mut seed_row = json!({});
     if let (true, Some(on)) = (one_world, loaded.first()) {
-        let named: Vec<Player> = (0..players)
-            .map(|p| Player { name: format!("P{p}"), instance: drawn[0].1.clone() })
-            .collect();
+        let named = data_fill::synth::players(&drawn[0].1, players);
         let assemble = || assemble_on(on, "bench", &named, &seats, &f.placed, &sp);
         let mut bundle = assemble()?;
         let seed_file = encode_on(on, &mut bundle, SEED_MAX_BYTES)?;
@@ -309,10 +307,8 @@ fn one(
                           "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len(),
                           "peak_rss_after_encode_bytes": rss_after_encode});
     }
-    let (crossed, all) = cross_world_share(&seats, &f.placed)
-        .map_err(|e| format!("{e:?}"))?
-        .iter()
-        .fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
+    let (crossed, all) =
+        cross_world_share(&seats, &f.placed)?.iter().fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
     let s = &f.stats;
     let pool: Vec<u16> = insts[0]
         .pool
@@ -350,7 +346,7 @@ fn one(
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
         // The same hash in two rows means the same placements.
-        "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
+        "placements_hash": data_fill::check::placements_hash(&f.placed),
         "swaps": f.swaps,
         "peak_heap_bytes": heap,
         "peak_rss_after_fill_bytes": rss_after_fill,

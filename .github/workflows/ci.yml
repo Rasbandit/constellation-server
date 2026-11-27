@@ -51,9 +51,11 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - if: steps.scope.outputs.code != 'false'
         run: cargo fmt --all --check
+      # Every library's unit tests but the fill engine's: the next step runs those.
       - if: steps.scope.outputs.code != 'false'
-        run: cargo test --workspace --lib --locked
-      # The data-only fill engine's integration tests (damaged sections, fixtures, fairness).
+        run: cargo test --workspace --exclude data-fill --lib --locked
+      # The data-only fill engine's unit, integration and binary tests (damaged sections,
+      # fixtures, fairness), once.
       - if: steps.scope.outputs.code != 'false'
         run: cargo test -p data-fill --tests --locked
       # What a loaded world counts itself as holding, against a counting allocator (the cap

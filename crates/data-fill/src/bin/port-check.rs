@@ -329,7 +329,7 @@ fn load_seed<'w>(
     player: Option<u64>,
 ) -> R<Seed<'w>> {
     let inst = fetch_instance(legacy, out, seed, player)?;
-    let plan = Plan::new(w, &inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(w, &inst)?;
     let progression = inst.progression(w);
     Ok(Seed { seed, inst, w, plan, progression })
 }
@@ -578,8 +578,8 @@ fn run(a: &Args) -> R<Value> {
                 files.push(serde_json::to_vec_pretty(&file).unwrap_or_default());
             }
             let same = files.windows(2).all(|p| p[0] == p[1]);
-            let hash = format!("{:016x}", fnv1a(&files[0]));
-            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| format!("{:016x}", fnv1a(f))).collect::<Vec<_>>()}));
+            let hash = fnv1a(&files[0]);
+            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| fnv1a(f)).collect::<Vec<_>>()}));
             hashes.push(json!([fill_seed, hash]));
             write(&a.out.join(format!("ours/placements_{seed}.json")), &files[0])?;
             let lsph = legacy.call(&json!({"op": "spheres", "seed": seed, "placements": ours}))?;

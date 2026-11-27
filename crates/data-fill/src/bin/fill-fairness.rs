@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use data_fill::fairness::{Flat, report, report_named, sample, sample_room, shape, shape_report};
 use data_fill::room;
-use data_fill::{Instance, Plan, World};
+use data_fill::{Plan, World};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: fill-fairness (--world <world.json> | --manifest <m.json> --instance <i.json>)
@@ -37,30 +37,22 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     if m.get("--shape") == Some(&"on") {
         return shape_of(&m, &num);
     }
-    // A room: `--world` with an `instances` list is one world played by several players.
-    if let Some(w) = m.get("--world") {
-        let v = read(w)?;
-        if let Some(list) = v["instances"].as_array() {
-            let (seeds, baseline) =
-                (num("--seeds", 2000)?, num("--baseline", num("--seeds", 2000)?)?);
-            let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
-            return room_report(&v["manifest"], list, (seeds, baseline, max_attempts), &m);
-        }
-    }
-    let (manifest, inst_raw) = match (m.get("--world"), m.get("--manifest"), m.get("--instance")) {
-        (Some(w), _, _) => {
-            let v = read(w)?;
-            (v["manifest"].clone(), v["instance"].clone())
-        }
-        (None, Some(a), Some(b)) => (read(a)?, read(b)?),
-        _ => return Err(USAGE.into()),
-    };
     let seeds = num("--seeds", 2000)?;
     let baseline = num("--baseline", seeds)?;
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
-    let inst: Instance = serde_json::from_value(inst_raw).map_err(|e| format!("instance: {e}"))?;
-    let w = World::load(&manifest)?;
-    let plan = Plan::new(&w, &inst).map_err(|e| format!("{e:?}"))?;
+    let doc = match (m.get("--world"), m.get("--manifest"), m.get("--instance")) {
+        (Some(w), _, _) => read(w)?,
+        (None, Some(a), Some(b)) => json!({"manifest": read(a)?, "instance": read(b)?}),
+        _ => return Err(USAGE.into()),
+    };
+    // A room: `--world` with an `instances` list is one world played by several players.
+    if doc["instances"].is_array() {
+        return room_report(&doc, (seeds, baseline, max_attempts), &m);
+    }
+    let (manifest, mut insts) = room::from_doc(&doc)?;
+    let inst = insts.remove(0);
+    let w = World::load(manifest)?;
+    let plan = Plan::new(&w, &inst)?;
     let pool = inst.pool.iter().map(|k| w.item(k)).collect::<Result<Vec<_>, _>>()?;
     let prog = inst.progression(&w);
     let t = Instant::now();
@@ -70,19 +62,15 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
 
 /// The fairness run of one room: the same report, over every player's world.
 fn room_report(
-    manifest: &Value,
-    list: &[Value],
+    doc: &Value,
     (seeds, baseline, max_attempts): (u64, u64, u64),
     m: &HashMap<&str, &str>,
 ) -> Result<(Value, bool), String> {
-    let insts = room::instances(list)?;
-    let insts: Vec<&Instance> = insts.iter().collect();
-    let room = room::Compiled::shared(World::load(manifest)?, &insts)?;
+    let room = room::Compiled::from_doc(doc)?;
     let seats = room.seats();
     let flat = Flat::new(&seats)?;
     let t = Instant::now();
-    let s =
-        sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(|e| format!("{e:?}"))?;
+    let s = sample_room(&seats, &flat, seeds, baseline, max_attempts)?;
     let mut r = report_named(&|i| flat.item(i), &|l| flat.loc(l), &s);
     r["players"] = json!(seats.len());
     finish(r, s.failed == 0, t, m)
@@ -96,13 +84,7 @@ fn shape_of(
     num: &dyn Fn(&str, u64) -> Result<u64, String>,
 ) -> Result<(Value, bool), String> {
     let c = match (m.get("--world"), m.get("--synth")) {
-        (Some(w), _) => {
-            let v = read(w)?;
-            let one = [v["instance"].clone()];
-            let insts = room::instances(v["instances"].as_array().map_or(&one[..], Vec::as_slice))?;
-            let insts: Vec<&Instance> = insts.iter().collect();
-            room::Compiled::shared(World::load(&v["manifest"])?, &insts)?
-        }
+        (Some(w), _) => room::Compiled::from_doc(&read(w)?)?,
         (None, Some(profile)) => {
             use data_fill::synth::{Hostile, Shape};
             let checks = usize::try_from(num("--checks", 1000)?).map_err(|e| e.to_string())?;

@@ -7,23 +7,19 @@
 use data_fill::job::{self, Fill};
 use data_fill::prepared::{self, Prepared};
 use data_fill::seed::{Player, encode_on, generate, generate_on};
-use data_fill::synth::{Shape, world};
+use data_fill::synth::{Shape, players, uploaded};
 use seed_bundle::package::key_of;
 use serde_json::{Value, json};
 
-/// The seed cap of the imports here.
-const MAX: u64 = 1 << 24;
+/// The seed cap of the imports here: the product's.
+const MAX: u64 = data_fill::prepared::SEED_MAX_BYTES;
 /// SHA-256 of every seed file and package file of [`rooms`], in order.
 const PINNED: &str = "d004200e1b3c59171fe9ccf5f2cd797aa1e780ba4fe741ab8ea143c126a204e7";
 
 /// One small synthetic world as an uploaded manifest, and `n` players on it.
 fn room(n: usize) -> (Value, Vec<Player>) {
-    let (mut manifest, instance) = world(&Shape { checks: 200, ..Shape::default() }, 1, 0);
-    manifest["game"] = json!("Synth");
-    manifest["version"] = json!("1");
-    let players =
-        (0..n).map(|p| Player { name: format!("P{p}"), instance: instance.clone() }).collect();
-    (manifest, players)
+    let (manifest, instance) = uploaded(&Shape { checks: 200, ..Shape::default() }, 1, 0);
+    (manifest, players(&instance, n))
 }
 
 /// The seed file and package files the manifest path stores: `generate`, then the v1 import.
@@ -235,9 +231,7 @@ fn varied(shape: &Shape, what: &str) -> (Value, Vec<Player>) {
 
 /// [`varied`] with `n` players.
 fn varied_of(shape: &Shape, what: &str, n: usize) -> (Value, Vec<Player>) {
-    let (mut manifest, instance) = world(shape, 1, 0);
-    manifest["game"] = json!("Synth");
-    manifest["version"] = json!("1");
+    let (manifest, instance) = uploaded(shape, 1, 0);
     let players = (0..n)
         .map(|p| {
             let mut i = instance.clone();

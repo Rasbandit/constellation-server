@@ -7,6 +7,8 @@ use data_fill::fairness::{
 use data_fill::{Instance, Plan, World};
 use serde_json::Value;
 
+mod support;
+
 fn freq(rows: &[(u16, u32, u64)], samples: u64) -> Freq {
     let mut f = Freq { samples, ..Freq::default() };
     for (i, l, n) in rows {
@@ -82,10 +84,10 @@ fn uniform_distinct_saturates_at_the_location_count() {
 }
 
 fn fixture() -> (World, Instance, Vec<u16>, Vec<bool>) {
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/fairness_world.json")).expect("fixture parses");
-    let inst: Instance = serde_json::from_value(v["instance"].clone()).expect("instance");
-    let w = World::load(&v["manifest"]).expect("world");
+    let v = support::fixture("fairness_world");
+    let (manifest, mut insts) = data_fill::room::from_doc(&v).expect("instance");
+    let inst = insts.remove(0);
+    let w = World::load(manifest).expect("world");
     let pool = inst.pool.iter().map(|k| w.item(k).expect("item")).collect();
     let prog = inst.progression(&w);
     (w, inst, pool, prog)
@@ -125,11 +127,7 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
 fn a_room_is_measured_against_the_same_baseline() {
     use data_fill::fairness::{Flat, report_named, sample_room};
     use data_fill::room;
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
-    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts).expect("room");
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
     let (worlds, seats) = (&c.worlds, c.seats());
     let flat = Flat::new(&seats).expect("flat");
     let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
@@ -156,8 +154,7 @@ fn a_room_is_measured_against_the_same_baseline() {
 fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     use data_fill::fairness::{Flat, sample_room};
     use data_fill::room::{self, Seat};
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
+    let v = support::fixture("room_world");
     let w = World::load(&v["manifest"]).expect("world");
     let mut inst: Instance = serde_json::from_value(v["instances"][0].clone()).expect("instance");
     inst.locked.insert("l6".to_owned(), "coin".to_owned());
@@ -186,11 +183,7 @@ fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
 fn the_shape_of_the_fills_seeds_is_reported_on_the_small_room() {
     use data_fill::fairness::{shape, shape_report};
     use data_fill::room;
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
-    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts).expect("room");
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
     let seats = c.seats();
     let exact = shape(&seats, 300, 20).expect("exact");
     let own = shape_report(&exact);

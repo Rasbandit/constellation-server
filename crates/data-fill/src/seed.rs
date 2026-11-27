@@ -195,8 +195,7 @@ fn fill_on(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
         config::FILL_MAX_ATTEMPTS,
-    )
-    .map_err(|e| format!("{e:?}"))?;
+    )?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(format!("player {} cannot reach their goal", p + 1));
     }
@@ -253,8 +252,7 @@ fn assemble(
     spheres: &RoomSpheres,
 ) -> Result<SeedBundle, String> {
     let flags: Vec<Vec<u8>> = players.iter().map(|p| p.instance.flags(w)).collect();
-    let rows = room::placements_flagged(seats, placed, Some(spheres), &flags)
-        .map_err(|e| format!("{e:?}"))?;
+    let rows = room::placements_flagged(seats, placed, Some(spheres), &flags)?;
     let mut slots = Vec::with_capacity(players.len());
     for (k, (p, locations)) in players.iter().zip(rows).enumerate() {
         let start_inventory = p
@@ -263,7 +261,7 @@ fn assemble(
             .iter()
             .map(|key| w.item(key).map(|i| w.item_id(i)))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("player {}: {e}", k + 1))?;
+            .map_err(|e| room::player(k, e))?;
         slots.push(Slot {
             id: u32::try_from(k + 1).map_err(|e| e.to_string())?,
             team: 0,
