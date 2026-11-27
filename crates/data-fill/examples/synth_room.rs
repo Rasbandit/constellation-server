@@ -19,7 +19,7 @@
 //!
 //! `--worlds each` (the default) draws a world per player, the scaling measurement; `--worlds
 //! one` is a room as the server generates it, every player on one world, loaded once. Only
-//! then is a seed assembled: `assemble_ms` builds the bundle on the prepared tables
+//! then is a seed assembled (the row's `seed_file`): `assemble_ms` builds the bundle on the prepared tables
 //! ([`data_fill::seed::assemble_on`]), `encode_ms` checks, hashes and encodes it as the seed
 //! file ([`data_fill::seed::encode_on`]), `open_ms` opens that file on the world's package as
 //! the server does (`seed_bundle::Seed::read`), and `import_v1_ms` is what the path before did
@@ -351,7 +351,8 @@ fn one(
         "prepare_ms": fine(prepare_ms),
         "load_ms": fine(load_ms),
         "prepared_bytes": files.iter().map(Vec::len).sum::<usize>(),
-        "seed": seed_row,
+        // Not `seed`: that key is the room's seed number, set below.
+        "seed_file": seed_row,
         "setup_ms": (setup_ms * 10.0).round() / 10.0,
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
