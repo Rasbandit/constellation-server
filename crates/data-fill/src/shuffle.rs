@@ -50,7 +50,6 @@ pub(crate) use self::decl::Decl;
 use self::draw::assign;
 use self::layout::Layout;
 use crate::fill::{Instance, Plan};
-use crate::par::map_ordered;
 use crate::room::{Compiled, too_many};
 use crate::section::EXITS;
 use crate::world::World;
@@ -337,28 +336,22 @@ pub fn unshuffled(w: &World, inst: &Instance) -> R<Option<Staged>> {
         ));
     }
     let world = w.staged(&[]);
-    let plan = Plan::new(&world, inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(&world, inst)?;
     Ok(Some(Staged { world, plan, table: Table::new(), attempts: 0, nanos: [0; STEPS.len()] }))
 }
 
-/// A room staged, on up to `workers` threads: per player their world (player `p` plays
+/// A room staged: per player their world (player `p` plays
 /// `worlds[p % worlds.len()]`, one each or one for all, as [`Compiled`] holds them) with its
 /// shuffles run and its plan, and each player's table. A world without shuffles is resolved
-/// as it is. The result does not depend on `workers`: every player has their own streams, and
-/// the first error by player wins.
+/// as it is. Every player has their own streams, and the first error by player wins.
 ///
 /// # Errors
 /// As [`stage`] and [`Plan::new`], naming the player.
-pub fn room(
-    worlds: &[&World],
-    insts: &[&Instance],
-    seed: u64,
-    workers: usize,
-) -> R<(Compiled, Vec<Table>)> {
-    too_many(insts.len()).map_err(|e| format!("{e:?}"))?;
+pub fn room(worlds: &[&World], insts: &[&Instance], seed: u64) -> R<(Compiled, Vec<Table>)> {
+    too_many(insts.len())?;
     let players: Vec<usize> = (0..insts.len()).collect();
-    let staged = map_ordered(&players, workers, |p| -> R<Staged> {
-        let who = |e: String| format!("player {}: {e}", p + 1);
+    let staged = players.iter().map(|p| -> R<Staged> {
+        let who = |e: String| crate::room::player(*p, e);
         let w = worlds.get(p % worlds.len().max(1)).ok_or("a room needs a world")?;
         let player = u32::try_from(*p).map_err(|e| e.to_string())?;
         Ok(match stage(w, insts[*p], seed, player).map_err(who)? {

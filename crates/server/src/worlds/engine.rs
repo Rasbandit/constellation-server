@@ -29,12 +29,7 @@ impl Worlds {
         world: &PreparedWorld,
     ) -> Result<Vec<u8>, Failure> {
         if let Some(pool) = &self.pool {
-            let job = crate::pool::Job {
-                head,
-                threads: fill_threads(),
-                key: &world.key,
-                file: &world.file,
-            };
+            let job = crate::pool::Job { head, key: &world.key, file: &world.file };
             return pool.fill(job).await;
         }
         let input = data_fill::job::frame(head, &world.file).map_err(Failure::Broken)?;
@@ -216,15 +211,8 @@ fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String
         .collect()
 }
 
-/// Threads a generation asks its fill for: written into the request ([`fill_head`]) and told
-/// to the pool, which bounds a worker's CPU time by it. The one place both read.
-pub(super) const fn fill_threads() -> usize {
-    config::GENERATION_WORKERS
-}
-
 /// The head of a generation's fill request (`data_fill::job::Fill`, JSON), which the prepared
-/// world follows: on `config::GENERATION_WORKERS` threads, for a seed of at most
-/// `seed_max_bytes`.
+/// world follows: for a seed of at most `seed_max_bytes`.
 pub(super) fn fill_head(
     seed_name: &str,
     files: &[(String, Vec<u8>)],
@@ -234,8 +222,6 @@ pub(super) fn fill_head(
         seed_name: seed_name.to_owned(),
         players: player_requests(files)?,
         rng_seed,
-        workers: fill_threads(),
-        algorithm: data_fill::room::Algorithm::Exact,
         seed_max_bytes,
     };
     serde_json::to_vec(&head).map_err(|e| e.to_string())

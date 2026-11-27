@@ -32,7 +32,6 @@ use super::*;
 use crate::pool::{Job, status_bytes};
 use crate::sandbox::run_job;
 use data_fill::prepared::Prepared;
-use data_fill::room::Algorithm;
 use data_fill::seed::{encode_on, generate_on};
 use data_fill::synth::{Shape, world};
 use std::collections::BTreeMap;
@@ -131,9 +130,7 @@ impl Room {
         let root = temp(&format!("gen-bench-{name}-{players}"));
         let pool = Pool::new(exe.to_owned(), limits);
         let w = hosting_on(&root, limits, JobRunner::Child(exe.to_owned()), pool).await;
-        let (mut manifest, instance) = world(shape, 1, 0);
-        manifest["game"] = json!("Synth");
-        manifest["version"] = json!("1");
+        let (manifest, instance) = data_fill::synth::uploaded(shape, 1, 0);
         let body = manifest.to_string();
         let up = upload_manifest(&w, Some("name=m.json"), body.as_bytes()).await.unwrap();
         let manifest_id = json_of(up).await["id"].as_str().unwrap().to_owned();
@@ -166,8 +163,7 @@ async fn split(exe: &Path, room: &Room) -> Value {
 
     let f = data_fill::job::request(&head).unwrap();
     let (load_ms, loaded) = timed(|| Prepared::open(&room.prepared).unwrap());
-    let fill =
-        || generate_on(&loaded, &f.seed_name, &f.players, f.rng_seed, f.workers, f.algorithm);
+    let fill = || generate_on(&loaded, &f.seed_name, &f.players, f.rng_seed);
     let (fill_ms, filled) = timed(|| fill().unwrap());
     let mut bundle = filled.0;
     let (encode_ms, encoded) = timed(|| encode_on(&loaded, &mut bundle, f.seed_max_bytes).unwrap());
@@ -193,8 +189,8 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
     let pool = || Pool::new(exe.to_owned(), POOLED).expect("one worker");
     // Another world, to have a worker up that does not hold this room's.
     let (other_key, other_file, instance) = fills::prepared(&fills::small(), 2);
-    let other = fills::head(&["P0"], &instance, 1, Algorithm::Exact);
-    let other = Job { head: &other, threads: 1, key: &other_key, file: &other_file };
+    let other = fills::head(&["P0"], &instance, 1);
+    let other = Job { head: &other, key: &other_key, file: &other_file };
 
     let kept = pool();
     let mut jobs: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
@@ -208,7 +204,7 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
         let input = data_fill::job::frame(&head, file).unwrap();
         // A seed the fill refuses (a synthetic world can be stuck) would end every worker.
         let (own_ms, Ok(seed)) = child(exe, "fill", &input).await else { continue };
-        let job = Job { head: &head, threads: fill_threads(), key, file };
+        let job = Job { head: &head, key, file };
         if done == 0 {
             assert_eq!(fills::alone(&head, file).unwrap(), seed);
             kept.fill(job).await.unwrap();
@@ -274,7 +270,7 @@ async fn memory(exe: &Path, profile: &str, shape: &Shape) -> Value {
     manifest["game"] = json!("Synth");
     let first = prepare(&manifest);
     let head = (1..=40)
-        .map(|rng| fills::head(&["P0"], &instance, rng, Algorithm::Exact))
+        .map(|rng| fills::head(&["P0"], &instance, rng))
         .find(|head| fills::alone(head, &first).is_ok())
         .expect("a seed this world fills on");
     let held = Prepared::open(&first).unwrap().held_bytes();
@@ -285,7 +281,7 @@ async fn memory(exe: &Path, profile: &str, shape: &Shape) -> Value {
     while worlds * held <= full + full / 10 && worlds < most {
         manifest["game"] = json!(format!("Synth {worlds}"));
         let file = prepare(&manifest);
-        let job = Job { head: &head, threads: 1, key: &log::blob_key(&file), file: &file };
+        let job = Job { head: &head, key: &log::blob_key(&file), file: &file };
         pool.fill(job).await.unwrap();
         let pids = pool.idle_pids();
         if worlds == 0 {

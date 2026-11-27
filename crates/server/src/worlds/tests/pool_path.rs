@@ -63,8 +63,7 @@ async fn stored_and_reference(
         .map(|(n, instance)| serde_json::from_value(json!({"name": n, "instance": instance})))
         .collect::<Result<_, _>>()
         .unwrap();
-    let bundle =
-        data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap(), 1).unwrap();
+    let bundle = data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap()).unwrap();
     let reference = parse_bundle(&serde_json::to_vec(&bundle).unwrap(), &Limits::DESIGN).unwrap();
     (stored, reference.bundle.bytes().to_vec())
 }

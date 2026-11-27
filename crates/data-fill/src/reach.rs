@@ -7,14 +7,11 @@
 //! where time can pass expands its mask forward until a stay rule fails. All of it is monotone
 //! in items, counters and masks, so the fixed point does not depend on evaluation order.
 //!
-//! Taking an item back is truth maintenance: every fact (a site that held, a half-day, a slice
-//! of a region) carries the rank it was derived at, and its support is checked against the
-//! state as of that rank (only facts of lower rank), so support that runs through the fact
-//! itself never counts.
+//! What is added to a fixed point can be taken back exactly: a state keeps a journal of every
+//! step since a mark ([`Reach::undo_to`]), which is how a fill reaches the state of each group
+//! it places (`crate::room`).
 
 use std::cell::Cell;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 
 use bits::BitSet;
 
@@ -52,31 +49,6 @@ impl View for Now<'_> {
     }
     fn region(&self, r: u16) -> bool {
         self.masks.get(usize::from(r)).is_some_and(|m| *m != 0)
-    }
-}
-
-/// A solve state as of a rank: only the facts derived before it.
-struct At<'a, 'w> {
-    r: &'a Reach<'w>,
-    rank: u32,
-}
-
-impl View for At<'_, '_> {
-    fn count(&self, i: u16) -> i64 {
-        let i = usize::from(i);
-        let got = self.r.copies[i].partition_point(|k| *k < self.rank);
-        self.r.adjust[i] + i64::try_from(got).unwrap_or(i64::MAX)
-    }
-    fn counter(&self, c: u16) -> i64 {
-        let got = self.r.lit[usize::from(c)].partition_point(|k| *k < self.rank);
-        i64::try_from(got).unwrap_or(i64::MAX)
-    }
-    fn group(&self, g: u16) -> i64 {
-        let members = self.r.w.group_members(usize::from(g));
-        members.map(|(i, cap)| self.count(i).min(cap.map_or(i64::MAX, i64::from))).sum()
-    }
-    fn region(&self, r: u16) -> bool {
-        self.r.mask_at(usize::from(r), self.rank) != 0
     }
 }
 
@@ -283,160 +255,11 @@ pub(crate) fn eval_statics(
     rules.into_iter().map(|rule| env.eval(rule as usize, 0)).collect()
 }
 
-/// The held count of `item` from which no rule this seed reads more copies: with at least that
-/// many held, every test that reads it (a `has`, or a comparison over its count) is already true
-/// whatever else is held, so more copies change no rule. 0 when no rule reads it, `i64::MAX`
-/// when no count up to `max` gets there. Rules are monotone, so "true with nothing else held"
-/// means true in every state.
-pub(crate) fn saturation(w: &World, plan: &Plan, item: u16, max: i64) -> i64 {
-    let f = &plan.folded;
-    let mut s = Sat {
-        w,
-        plan,
-        x: item,
-        max,
-        defs: vec![None; w.defs()],
-        counts: vec![0; w.items()],
-        memo: DefMemo::new(w.defs()),
-    };
-    let sites = w.site_count();
-    w.item_sites(item as usize)
-        .iter()
-        .map(|&id| {
-            let id = id as usize;
-            let rule = if id < sites { f.sites[id] } else { f.halves[id - sites] };
-            s.b(rule as usize).0
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// Walks folded rules for [`saturation`]; unknown shapes count as never saturated.
-struct Sat<'a> {
-    w: &'a World,
-    plan: &'a Plan,
-    x: u16,
-    max: i64,
-    defs: Vec<Option<i64>>,
-    counts: Vec<i64>,
-    memo: DefMemo,
-}
-
-impl Sat<'_> {
-    /// Count of `x` past which the boolean node at `pc` no longer reads it, and its end.
-    fn b(&mut self, pc: usize) -> (i64, usize) {
-        let code = &self.plan.folded.code;
-        let Some((n, at)) = node(code, pc, self.w.widths) else { return (i64::MAX, pc + 1) };
-        match n {
-            Node::Const(_) | Node::TimeAny(_) | Node::Reach(_) => (0, at),
-            Node::All(k, len) | Node::Any(k, len) => {
-                let (mut need, mut pc) = (0, at);
-                for _ in 0..k {
-                    let (v, e) = self.b(pc);
-                    need = need.max(v);
-                    pc = e;
-                }
-                (need, at + usize::from(len))
-            }
-            Node::Has(i, c) => (if i == self.x { i64::from(c) } else { 0 }, at),
-            Node::HasAny(k) => {
-                let iw = self.w.widths.item;
-                let hit = (0..usize::from(k))
-                    .any(|j| operand(code, at + j * usize::from(iw), iw) == Some(self.x));
-                (i64::from(hit), at + usize::from(k) * usize::from(iw))
-            }
-            Node::Cmp(_) => {
-                let (ra, e) = self.i(at);
-                let (rb, e) = self.i(e);
-                (if ra || rb { self.first_true(pc) } else { 0 }, e)
-            }
-            Node::Ref(d) => {
-                let d = usize::from(d);
-                let need = match self.defs.get(d).copied().flatten() {
-                    Some(v) => v,
-                    None => {
-                        let v = match self.plan.folded.defs.get(d) {
-                            Some(at) => self.b(*at as usize).0,
-                            None => i64::MAX,
-                        };
-                        if let Some(slot) = self.defs.get_mut(d) {
-                            *slot = Some(v);
-                        }
-                        v
-                    }
-                };
-                (need, at)
-            }
-            Node::Not => {
-                let (v, e) = self.b(at);
-                (if v > 0 { i64::MAX } else { 0 }, e)
-            }
-            _ => (i64::MAX, at),
-        }
-    }
-
-    /// Whether the integer node at `pc` reads `x` (unknown shapes say yes), and its end.
-    fn i(&self, pc: usize) -> (bool, usize) {
-        let Some((n, at)) = node(&self.plan.folded.code, pc, self.w.widths) else {
-            return (true, pc + 1);
-        };
-        match n {
-            Node::Int(_) | Node::Counter(_) | Node::Opt(_) | Node::Roll(_) => (false, at),
-            Node::Count(i) => (i == self.x, at),
-            Node::Group(g) => (self.w.item_groups(self.x as usize).iter().any(|m| m.0 == g), at),
-            Node::Fold(_, k) => self.children(at, usize::from(k)),
-            Node::Pair(_) => self.children(at, 2),
-            _ => (true, at),
-        }
-    }
-
-    fn children(&self, mut pc: usize, k: usize) -> (bool, usize) {
-        let mut reads = false;
-        for _ in 0..k {
-            let (r, e) = self.i(pc);
-            reads |= r;
-            pc = e;
-        }
-        (reads, pc)
-    }
-
-    /// Fewest copies of `x` that make the comparison at `pc` true with nothing else held.
-    fn first_true(&mut self, pc: usize) -> i64 {
-        let x = self.x as usize;
-        let mut groups = vec![0; self.w.groups()];
-        for k in 0..=self.max {
-            self.counts[x] = k;
-            for &(g, cap) in self.w.item_groups(x) {
-                groups[usize::from(g)] = k.min(i64::from(cap));
-            }
-            let env = Env {
-                w: self.w,
-                code: &self.plan.folded.code,
-                defs: &self.plan.folded.defs,
-                opts: &self.plan.opts,
-                rolls: &self.plan.rolls,
-                v: Now { counts: &self.counts, counters: &[], groups: &groups, masks: &[] },
-                cache: &[],
-                epoch: 1,
-                memo: &self.memo,
-            };
-            if env.eval(pc, 0) {
-                self.counts[x] = 0;
-                return k;
-            }
-        }
-        self.counts[x] = 0;
-        i64::MAX
-    }
-}
-
 /// Work counters of one or more solves (the complexity contract in the rules section doc).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Rule evaluations (sites whose rule was run; stay and clock rules not counted).
     pub evals: u64,
-    /// Of `evals`: a removal's support checks, against the state as of a rank.
-    pub ranked: u64,
     /// Of `evals`: answered by a bit rule, not by the bytecode.
     pub bits: u64,
     /// Worklist pushes: regions queued plus sites queued.
@@ -447,15 +270,6 @@ pub struct Stats {
     pub rechecks: u64,
     /// The most dependency entries one collected item walked.
     pub max_recheck: u64,
-    /// Items taken back that some rule still read (each a truth maintenance pass).
-    pub removals: u64,
-    /// Facts retracted by those removals, summed.
-    pub retractions: u64,
-    /// The most facts one removal retracted.
-    pub max_retractions: u64,
-    /// Retracted facts that hold again once the same removal re-derived (churn); the rest of
-    /// `retractions` are facts the removal lost for good.
-    pub churn: u64,
 }
 
 impl Stats {
@@ -472,28 +286,17 @@ impl Stats {
             "items_collected": self.collected,
             "sites_rechecked_per_collected_item": {"mean": per(self.rechecks, self.collected),
                                                     "max": self.max_recheck},
-            "removals": self.removals,
-            "retractions_per_removal": {"mean": per(self.retractions, self.removals),
-                                        "max": self.max_retractions},
-            "churn": {"rederived": self.churn, "net_lost": self.retractions - self.churn,
-                      "share": (self.churn as f64 / self.retractions.max(1) as f64 * 1e3).round()
-                          / 1e3},
         })
     }
 
     /// Add another run's counters.
     pub fn absorb(&mut self, o: &Stats) {
         self.evals += o.evals;
-        self.ranked += o.ranked;
         self.bits += o.bits;
         self.pushes += o.pushes;
         self.collected += o.collected;
         self.rechecks += o.rechecks;
         self.max_recheck = self.max_recheck.max(o.max_recheck);
-        self.removals += o.removals;
-        self.retractions += o.retractions;
-        self.max_retractions = self.max_retractions.max(o.max_retractions);
-        self.churn += o.churn;
     }
 }
 
@@ -504,29 +307,20 @@ const NONE: u32 = u32::MAX;
 /// an item that belongs to the other player.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Msg {
-    /// The location was reached at `rank`: its item is a new copy for `to`, found at that rank.
-    Give { to: u16, item: u16, rank: u32 },
-    /// The copy found at rank `from` was found at `rank` instead (`NONE`: not found any more).
-    Move { to: u16, item: u16, from: u32, rank: u32 },
+    /// The location was reached: its item is a new copy for `to`.
+    Give { to: u16, item: u16 },
 }
-/// Support of a slice of the start region: the start mask (with clocks, the owned clocks).
-const BY_START: u32 = u32::MAX;
-/// Support of a slice reached by waiting from the slice before it.
-const BY_WAIT: u32 = u32::MAX - 1;
 /// Growths per region the state reserves room for.
 const GROWS: usize = 4;
 
-/// One reachability state, with the derivation of everything it holds. Items are added with
-/// [`Reach::add`] and [`Reach::hold`]; a start copy is taken back exactly with
-/// [`Reach::remove`]. Reset it to reuse its buffers for another solve of the same world and plan.
+/// One reachability state. Items are added with [`Reach::add`] and [`Reach::hold`]; what was
+/// added since a mark is taken back with [`Reach::undo_to`]. Reset it to reuse its buffers for
+/// another solve of the same world and plan.
 ///
 /// Every fact has a rank, unique and increasing in derivation order: a site that held (an
 /// exit, event or check), a half-day rule that held, a growth of a region's mask (the slices
-/// one support added at once: the start, an exit passing its source's slices, or waiting
-/// forward). A collected copy has the rank of the check that reached its location. The state
-/// as of rank `k` is every fact of rank below `k`; each fact holds in the state as of its own
-/// rank (a waited slice may also start from the slice before it in the same growth), so the
-/// ranks are a derivation and every fact is in the least fixed point.
+/// added at once: the start, an exit passing its source's slices, or waiting forward). A
+/// collected copy has the rank of the check that reached its location.
 #[derive(Debug, Clone)]
 pub struct Reach<'w> {
     w: &'w World,
@@ -581,19 +375,10 @@ pub struct Reach<'w> {
     half_rank: Vec<u32>,
     /// Per region: its mask growths, ascending by rank; their slices are disjoint and make up
     /// the mask.
-    grows: Vec<Vec<Grow>>,
-    /// Per region: the lowest slice of each growth waiting for a support check.
-    queued_grows: Vec<u64>,
+    grows: Vec<Vec<u64>>,
     /// Per location: rank it was reached at (the first check that held).
     loc_rank: Vec<u32>,
-    /// Per item: ranks of the copies collected, ascending.
-    copies: Vec<Vec<u32>>,
-    /// Per counter: ranks of the events that fired, ascending (the counter as of a rank is a
-    /// binary search, not a scan of its events).
-    lit: Vec<Vec<u32>>,
-    /// Per item: copies held from the start (before any run, less what was removed).
-    adjust: Vec<i64>,
-    tm: Tms,
+    gate: Gate,
     /// Every step since [`Reach::keep_journal`], in order, for [`Reach::undo_to`].
     journal: Vec<Step>,
     journaling: bool,
@@ -627,38 +412,21 @@ enum Step {
     Seen(u32),
     /// The half-day rule held and took a rank.
     Half(u32),
-    /// A copy of the item was collected at the rank.
-    Copy(u16, u32),
+    /// A copy of the item was collected.
+    Copy(u16),
     /// The location, which held nothing, was given something to hold.
     Hold(u32),
     /// The location was given another player's item to hold.
     Away(u32),
 }
 
-/// Slices a region's mask gained at one rank, from one support.
-#[derive(Debug, Clone, Copy)]
-struct Grow {
-    rank: u32,
-    bits: u64,
-    /// `BY_START`, `BY_WAIT`, or the exit that passed them.
-    why: u32,
-}
-
-/// Scratch state of a removal (sized once, reused).
+/// What later runs may derive while [`Reach::only_what_holds`] is on (sized once, reused).
 #[derive(Debug, Clone)]
-struct Tms {
-    /// Facts whose support may be gone, lowest rank first.
-    heap: BinaryHeap<Reverse<(u32, u32)>>,
-    queued: BitSet,
-    /// Sites and half-days retracted: the only ones that can hold again.
+struct Gate {
+    /// Sites and half-days that may hold: as a set, and in order.
     out: BitSet,
     out_list: Vec<u32>,
-    /// Regions that lost a slice.
-    lost: Vec<u32>,
-    /// Growths retracted by this removal: region and the slices it lost.
-    lost_grows: Vec<(u32, u64)>,
-    lost_flag: BitSet,
-    /// Re-deriving after a removal: only retracted sites are evaluated.
+    /// Runs derive only what `out` holds.
     active: bool,
 }
 
@@ -674,10 +442,6 @@ impl<'w> Reach<'w> {
             plan,
             counts: vec![0; w.items()],
             counters: vec![0; w.counters()],
-            // At most one rank per event, so these never grow.
-            lit: (0..w.counters())
-                .map(|c| Vec::with_capacity(w.sites_into(EVENTS, c).len()))
-                .collect(),
             groups: vec![0; w.groups()],
             rules: plan.rules(w),
             atoms: plan.atoms.clone(),
@@ -709,21 +473,8 @@ impl<'w> Reach<'w> {
             // A few growths per region; a region that needs more grows its list once and the
             // reused state keeps the capacity.
             grows: (0..n).map(|_| Vec::with_capacity(GROWS)).collect(),
-            queued_grows: vec![0; n],
             loc_rank: vec![NONE; w.locations()],
-            // At most one copy per existing copy of the seed, so these never grow.
-            copies: (0..w.items()).map(|i| Vec::with_capacity(plan.copies(i))).collect(),
-            adjust: vec![0; w.items()],
-            tm: Tms {
-                heap: BinaryHeap::new(),
-                queued: BitSet::new(sites + halves),
-                out: BitSet::new(sites + halves),
-                out_list: Vec::new(),
-                lost: Vec::new(),
-                lost_grows: Vec::new(),
-                lost_flag: BitSet::new(n),
-                active: false,
-            },
+            gate: Gate { out: BitSet::new(sites + halves), out_list: Vec::new(), active: false },
             journal: Vec::new(),
             journaling: false,
         };
@@ -742,7 +493,7 @@ impl<'w> Reach<'w> {
         self
     }
 
-    /// Mark the absent locations' checks done: done without a rank, as a sleeping check is.
+    /// Mark the absent locations' checks done: done without a rank.
     fn skip_absent(&mut self) {
         for &s in &self.plan.absent {
             self.done.insert(s as usize);
@@ -783,9 +534,6 @@ impl<'w> Reach<'w> {
         self.half_rank.fill(NONE);
         self.grows.iter_mut().for_each(Vec::clear);
         self.loc_rank.fill(NONE);
-        self.copies.iter_mut().for_each(Vec::clear);
-        self.lit.iter_mut().for_each(Vec::clear);
-        self.adjust.fill(0);
         self.journal.clear();
         self.journaling = false;
         self.start();
@@ -803,14 +551,13 @@ impl<'w> Reach<'w> {
         } else {
             self.w.time.start_mask
         };
-        self.grow(self.w.start, start_mask, BY_START);
+        self.grow(self.w.start, start_mask);
     }
 
     fn next(&mut self) -> u32 {
         let k = self.seq;
-        // The two ranks above stand for supports (`BY_WAIT`, `BY_START`) and for "none": a
-        // rank must never reach them, whatever the build.
-        assert!(k < BY_WAIT, "the ranks of a solve ran out");
+        // The rank `NONE` stands for "none": a rank must never reach it, whatever the build.
+        assert!(k < NONE, "the ranks of a solve ran out");
         self.seq += 1;
         k
     }
@@ -826,86 +573,9 @@ impl<'w> Reach<'w> {
         self.reached.words()
     }
 
-    /// The rank location `l` was reached at (`u32::MAX`: not reached). Ranks grow with every
-    /// fact a forward run derives, so they tell what was reached before what.
-    pub(crate) fn loc_rank(&self, l: u32) -> u32 {
-        self.loc_rank[l as usize]
-    }
-
-    /// Put to sleep the checks of every location that holds nothing, is not reached and that
-    /// `awake` does not ask for: reaching such a location changes nothing, so its rule is not
-    /// evaluated until [`Reach::probe`] or [`Reach::wake`]. Forward runs only: a sleeping check
-    /// is marked done without a rank, which truth maintenance must never see. Call after the
-    /// holds are set.
-    pub(crate) fn sleep(&mut self, awake: impl Fn(u32) -> bool) {
-        for l in 0..self.holds.len() {
-            let empty = self.holds[l].is_none() && self.away[l].is_none();
-            if empty && !self.reached.contains(l) && !awake(u32::try_from(l).unwrap_or(0)) {
-                self.doze(l);
-            }
-        }
-    }
-
-    /// Location `l`'s checks that have not held go to sleep.
-    fn doze(&mut self, l: usize) {
-        for &s in self.w.sites_into(CHECKS, l) {
-            if self.fired[s as usize] == NONE {
-                self.done.insert(s as usize);
-            }
-        }
-    }
-
-    /// Whether location `l` is reached, evaluating now every check of it that has not held:
-    /// the sleeping ones, and the awake ones too, which may be waiting in the queue for an item
-    /// counted since the last run (the answer must not depend on which they are). A location
-    /// that was asleep and is not reached sleeps on.
-    pub(crate) fn probe(&mut self, l: u32) -> bool {
-        let (w, mut slept) = (self.w, false);
-        for &s in w.sites_into(CHECKS, l as usize) {
-            let s = s as usize;
-            if !self.reached(l) && self.fired[s] == NONE {
-                if self.done.contains(s) {
-                    self.done.remove(s);
-                    slept = true;
-                }
-                self.site(s);
-            }
-        }
-        if slept && !self.reached(l) {
-            self.doze(l as usize);
-        }
-        self.reached(l)
-    }
-
-    /// Wake every sleeping check: those of a reached region are queued for the next run.
-    pub(crate) fn wake(&mut self) {
-        let w = self.w;
-        let skipped =
-            |s: usize| self.plan.absent.binary_search(&u32::try_from(s).unwrap_or(0)).is_ok();
-        for s in 0..w.site_count() {
-            if self.done.contains(s) && self.fired[s] == NONE && !(self.lean && skipped(s)) {
-                self.done.remove(s);
-                if self.masks[w.site_place(s).0] != 0 {
-                    self.push_site(u32::try_from(s).unwrap_or(0));
-                }
-            }
-        }
-    }
-
-    /// Location `loc`, not reached, holds nothing any more (its item moved elsewhere); with
-    /// `sleep` its checks go to sleep.
-    pub(crate) fn unhold(&mut self, loc: u32, sleep: bool) {
-        debug_assert!(!self.reached(loc), "a collected item cannot be taken out of a forward run");
-        self.holds[loc as usize] = None;
-        self.away[loc as usize] = None;
-        if sleep {
-            self.doze(loc as usize);
-        }
-    }
-
     /// Whether a rule that is one step from open reads `item`: an exit, event or check of a
     /// reached region that does not hold yet (the check of a location that holds nothing does
-    /// not count, asleep or not: reaching it changes nothing), or a half-day not yet owned.
+    /// not count: reaching it changes nothing), or a half-day not yet owned.
     /// Stay rules are left out: they have no state of their own to ask.
     pub(crate) fn wants(&self, item: u16) -> bool {
         let w = self.w;
@@ -923,10 +593,10 @@ impl<'w> Reach<'w> {
     }
 
     /// Whether one more copy of `item` would make a rule on the frontier hold right now: one of
-    /// the rules [`Reach::wants`] names, evaluated with the copy counted; with `empty`, also the
-    /// check of a location that holds nothing (reaching it is a place more for an item). Call
-    /// on a fixed point; nothing is changed but the work counter.
-    pub(crate) fn opens(&mut self, item: u16, empty: bool) -> bool {
+    /// the rules [`Reach::wants`] names, evaluated with the copy counted, and also the check of
+    /// a location that holds nothing (reaching it is a place more for an item). Call on a fixed
+    /// point; nothing is changed but the work counter.
+    pub(crate) fn opens(&mut self, item: u16) -> bool {
         let w = self.w;
         let sc = w.site_count();
         // A def found true is cached as true for good (rules are monotone): what the extra
@@ -942,9 +612,7 @@ impl<'w> Reach<'w> {
                     .any(|h| self.half_rank[h] == NONE && self.now(sc + h, 0));
             }
             let (r, g) = w.site_place(s);
-            let l = w.site_target(s) as usize;
-            let counts = empty || g != CHECKS || self.holds[l].is_some() || self.away[l].is_some();
-            if !counts || g == STAYS || self.masks[r] == 0 || self.done.contains(s) {
+            if g == STAYS || self.masks[r] == 0 || self.done.contains(s) {
                 return false;
             }
             evals += 1;
@@ -968,7 +636,7 @@ impl<'w> Reach<'w> {
         assert!(before.is_none() || !self.journaling, "a journaled location held an item");
         self.log(Step::Hold(loc));
         if self.reached.contains(l) {
-            self.collect(item, self.loc_rank[l]);
+            self.collect(item);
         }
     }
 
@@ -992,7 +660,7 @@ impl<'w> Reach<'w> {
         self.away[l] = Some((to, item));
         self.log(Step::Away(loc));
         if self.reached.contains(l) {
-            self.outbox.push(Msg::Give { to, item, rank: self.loc_rank[l] });
+            self.outbox.push(Msg::Give { to, item });
         }
     }
 
@@ -1017,20 +685,9 @@ impl<'w> Reach<'w> {
         self.regions_q.len() + self.sites_q.len()
     }
 
-    /// A copy of `item` for this player, found elsewhere at rank `rank`.
-    pub(crate) fn give(&mut self, item: u16, rank: u32) {
-        self.collect(item, rank);
-    }
-
-    /// The copy of `item` found at rank `from` was found at `rank` (`NONE`: not found any more):
-    /// the facts that read it between the two ranks are checked in the next cascade.
-    pub(crate) fn shift(&mut self, item: u16, from: u32, rank: u32) {
-        self.uncollect(item, from);
-        if rank != NONE {
-            self.collect_quiet(item, rank);
-        }
-        let w = self.w;
-        self.suspect_readers(w.item_sites(usize::from(item)), from, rank);
+    /// A copy of `item` for this player, found elsewhere.
+    pub(crate) fn give(&mut self, item: u16) {
+        self.collect(item);
     }
 
     fn log(&mut self, step: Step) {
@@ -1081,19 +738,19 @@ impl<'w> Reach<'w> {
         while self.journal.len() > mark {
             let Some(step) = self.journal.pop() else { break };
             match step {
-                Step::Copy(item, k) => self.uncollect(item, k),
+                Step::Copy(item) => self.count_change(item, -1),
                 Step::Hold(l) => self.holds[l as usize] = None,
                 Step::Away(l) => self.away[l as usize] = None,
                 Step::Seen(r) => self.seen.remove(r as usize),
                 Step::Half(h) => {
                     // The owned clocks are what the half-days that hold give (`clocks`).
                     self.half_rank[h as usize] = NONE;
-                    self.owned = self.owned_at(NONE);
+                    self.owned = self.owned();
                 }
                 Step::Grow(r) => {
                     let r = r as usize;
-                    if let Some(g) = self.grows[r].pop() {
-                        self.masks[r] &= !g.bits;
+                    if let Some(bits) = self.grows[r].pop() {
+                        self.masks[r] &= !bits;
                         self.rules.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
                     }
                 }
@@ -1106,9 +763,6 @@ impl<'w> Reach<'w> {
                         EVENTS => {
                             self.counters[t] -= 1;
                             self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
-                            if let Ok(at) = self.lit[t].binary_search(&k) {
-                                self.lit[t].remove(at);
-                            }
                         }
                         CHECKS if self.loc_rank[t] == k => {
                             self.loc_rank[t] = NONE;
@@ -1134,8 +788,7 @@ impl<'w> Reach<'w> {
             return;
         }
         for _ in 0..n {
-            let k = self.next();
-            self.collect(item, k);
+            self.collect(item);
         }
     }
 
@@ -1174,14 +827,10 @@ impl<'w> Reach<'w> {
         })
     }
 
-    /// A copy of `item` collected at rank `k`; after the first run the rules reading it are
-    /// rechecked.
-    fn collect(&mut self, item: u16, k: u32) {
-        self.log(Step::Copy(item, k));
+    /// A copy of `item` collected; after the first run the rules reading it are rechecked.
+    fn collect(&mut self, item: u16) {
+        self.log(Step::Copy(item));
         self.count_change(item, 1);
-        let v = &mut self.copies[usize::from(item)];
-        let at = v.partition_point(|x| *x < k);
-        v.insert(at, k);
         if !self.ran {
             return;
         }
@@ -1194,15 +843,6 @@ impl<'w> Reach<'w> {
         self.stats.collected += 1;
         self.stats.rechecks += walked;
         self.stats.max_recheck = self.stats.max_recheck.max(walked);
-    }
-
-    /// Drop the copy of `item` collected at rank `k`.
-    fn uncollect(&mut self, item: u16, k: u32) {
-        let v = &mut self.copies[usize::from(item)];
-        if let Ok(at) = v.binary_search(&k) {
-            v.remove(at);
-            self.count_change(item, -1);
-        }
     }
 
     /// Run to the fixed point.
@@ -1226,7 +866,6 @@ impl<'w> Reach<'w> {
     pub(crate) fn begin(&mut self) {
         if !self.ran {
             self.ran = true;
-            self.adjust.copy_from_slice(&self.counts);
             // Items added before the first run skipped their rechecks; the clock rules are the
             // one place that reads them before any region is visited.
             if self.plan.clocks {
@@ -1235,352 +874,18 @@ impl<'w> Reach<'w> {
         }
     }
 
-    /// Take one start copy of `item` back and bring the fixed point down to that of the smaller
-    /// inventory, after a [`Reach::run`]. With as many copies left as the plan's saturation
-    /// count, no rule changes. Otherwise the facts that read the item are checked, lowest rank
-    /// first, against the state as of their own rank; one that still holds there keeps its
-    /// place, one that does not is retracted and the facts that read it are checked in turn.
-    /// Retracted facts are then derived again where the smaller state still supports them (they
-    /// get new ranks); nothing that did not hold before is evaluated, since the new fixed point
-    /// is inside the old one.
-    pub fn remove(&mut self, item: u16) {
-        let before = self.stats.retractions;
-        if !self.start_removal(item) {
-            return;
-        }
-        self.cascade();
-        self.end_cascade(self.stats.retractions - before);
-        self.rederive();
-    }
-
-    /// The first half of [`Reach::remove`]: the copy goes and its readers are queued for a
-    /// support check. `false` when nothing can change (saturated).
-    pub(crate) fn start_removal(&mut self, item: u16) -> bool {
-        let i = usize::from(item);
-        self.adjust[i] -= 1;
-        // The fold answered every `has` the start items meet for good: they are never taken back.
-        debug_assert!(self.adjust[i] >= self.plan.start_copies(item), "a start item taken back");
-        self.count_change(item, -1);
-        if self.adjust[i] >= self.plan.saturated_at(item) {
-            return false;
-        }
-        self.forget_defs();
-        self.stats.removals += 1;
-        let w = self.w;
-        self.suspect_readers(w.item_sites(i), 0, NONE);
-        true
-    }
-
-    /// A removal's cascade is over: it retracted `n` facts, over every state it reached.
-    pub(crate) fn end_cascade(&mut self, n: u64) {
-        self.stats.max_retractions = self.stats.max_retractions.max(n);
-    }
-
-    /// The lowest rank among the facts waiting for a support check.
-    pub(crate) fn next_suspect(&self) -> Option<u32> {
-        self.tm.heap.peek().map(|Reverse((k, _))| *k)
-    }
-
     fn forget_defs(&mut self) {
         self.def_cache.iter().for_each(|c| c.set(0));
         self.epoch += 1;
     }
 
-    fn rank_of(&self, f: usize) -> u32 {
-        let sc = self.w.site_count();
-        if f < sc { self.fired[f] } else { self.half_rank[f - sc] }
-    }
-
-    /// Queue site or half-day `f` (of rank `k`) for a support check if `lo < k <= hi`.
-    fn suspect(&mut self, f: usize, k: u32, lo: u32, hi: u32) {
-        if k != NONE && k > lo && k <= hi && !self.tm.queued.contains(f) {
-            self.tm.queued.insert(f);
-            self.tm.heap.push(Reverse((k, u32::try_from(f).unwrap_or(0))));
-        }
-    }
-
-    /// Queue the growths of region `r` with rank in `lo < k <= hi` whose support `pick`
-    /// selects, when they have a slice in the mask it gives.
-    fn suspect_grows(&mut self, r: usize, lo: u32, hi: u32, pick: impl Fn(u32) -> Option<u64>) {
-        let id = u32::try_from(self.w.site_count() + self.half_rank.len() + r).unwrap_or(0);
-        let from = self.grows[r].partition_point(|g| g.rank <= lo);
-        for g in &self.grows[r][from..] {
-            let head = g.bits & g.bits.wrapping_neg();
-            if g.rank > hi || self.queued_grows[r] & head != 0 {
-                continue;
-            }
-            if pick(g.why).is_some_and(|need| g.bits & need != 0) {
-                self.queued_grows[r] |= head;
-                self.tm.heap.push(Reverse((g.rank, id)));
-            }
-        }
-    }
-
-    /// Queue the facts that read through `list` (a dependency list: sites, half-days past the
-    /// sites, and stays, whose reader is the waited slice) with rank in `lo < k <= hi`.
-    fn suspect_readers(&mut self, list: &[u32], lo: u32, hi: u32) {
-        let w = self.w;
-        let sc = w.site_count();
-        for &s in list {
-            let s = s as usize;
-            if s >= sc {
-                self.suspect(s, self.half_rank[s - sc], lo, hi);
-                continue;
-            }
-            let (r, g) = w.site_place(s);
-            if g == STAYS {
-                let bit = 1u64 << w.site_target(s);
-                self.suspect_grows(r, lo, hi, |y| (y == BY_WAIT).then_some(bit));
-            } else {
-                self.suspect(s, self.fired[s], lo, hi);
-            }
-        }
-    }
-
-    fn cascade(&mut self) {
-        while self.cascade_one() {}
-    }
-
-    /// Check the lowest-ranked suspect; `false` when there is none.
-    pub(crate) fn cascade_one(&mut self) -> bool {
-        let hb = self.w.site_count() + self.half_rank.len();
-        let Some(Reverse((k, f))) = self.tm.heap.pop() else { return false };
-        let f = f as usize;
-        if f >= hb {
-            self.check_grow(f - hb, k);
-            return true;
-        }
-        self.tm.queued.remove(f);
-        if self.rank_of(f) == k && !self.supported(f, k) {
-            self.retract(f, k);
-        }
-        true
-    }
-
-    /// Check the growth of region `r` at rank `k`: keep the slices still supported, retract
-    /// the rest.
-    fn check_grow(&mut self, r: usize, k: u32) {
-        let Ok(i) = self.grows[r].binary_search_by_key(&k, |g| g.rank) else { return };
-        let g = self.grows[r][i];
-        let head = g.bits & g.bits.wrapping_neg();
-        if self.queued_grows[r] & head == 0 {
-            return;
-        }
-        self.queued_grows[r] &= !head;
-        let kept = self.grow_support(r, &g);
-        let lost = g.bits & !kept;
-        if lost == 0 {
-            return;
-        }
-        self.stats.retractions += 1;
-        self.tm.lost_grows.push((u32::try_from(r).unwrap_or(0), lost));
-        if kept == 0 {
-            self.grows[r].remove(i);
-        } else {
-            self.grows[r][i].bits = kept;
-        }
-        self.retract_bits(r, lost, k);
-    }
-
-    /// Whether fact `f` holds in the state as of its rank `k`.
-    fn supported(&mut self, f: usize, k: u32) -> bool {
-        let sc = self.w.site_count();
-        let hb = sc + self.half_rank.len();
-        if f < sc {
-            let (r, _) = self.w.site_place(f);
-            let t = self.mask_at(r, k);
-            self.stats.evals += 1;
-            self.stats.ranked += 1;
-            return t != 0 && self.eval_at(self.plan.folded.sites[f], t, k);
-        }
-        debug_assert!(f < hb, "a growth is checked by `check_grow`");
-        self.eval_at(self.plan.folded.halves[f - sc], 0, k)
-    }
-
-    fn eval_at(&self, rule: u32, t: u64, k: u32) -> bool {
-        let env = Env {
-            w: self.w,
-            code: &self.plan.folded.code,
-            defs: &self.plan.folded.defs,
-            opts: &self.plan.opts,
-            rolls: &self.plan.rolls,
-            v: At { r: self, rank: k },
-            cache: &[],
-            epoch: 1,
-            memo: &self.def_memo,
-        };
-        env.eval(rule as usize, t)
-    }
-
-    /// Region `r`'s mask as of rank `k`.
-    fn mask_at(&self, r: usize, k: u32) -> u64 {
-        self.grows[r].iter().take_while(|g| g.rank < k).fold(0, |m, g| m | g.bits)
-    }
-
-    /// Owned clocks as of rank `k`.
-    fn owned_at(&self, k: u32) -> u64 {
+    /// Owned clocks: what the half-days that hold give.
+    fn owned(&self) -> u64 {
         if !self.plan.clocks {
             return self.w.time.all;
         }
-        let held = (0..self.half_rank.len()).filter(|h| self.half_rank[*h] < k);
+        let held = (0..self.half_rank.len()).filter(|h| self.half_rank[*h] != NONE);
         held.fold(self.owned0, |a, h| a | self.w.half(h).0)
-    }
-
-    /// The slices of growth `g` of region `r` its support still gives in the state as of its
-    /// rank.
-    fn grow_support(&self, r: usize, g: &Grow) -> u64 {
-        let (w, k) = (self.w, g.rank);
-        match g.why {
-            BY_START if r == w.start as usize => {
-                g.bits & if self.plan.clocks { self.owned_at(k) } else { w.time.start_mask }
-            }
-            BY_START => 0,
-            BY_WAIT => {
-                if !self.can_stay[r] {
-                    return 0;
-                }
-                let before = self.mask_at(r, k);
-                let owned = if self.plan.clocks { self.owned_at(k) } else { w.time.all };
-                let (mut x, mut kept) = (g.bits, 0u64);
-                // Waiting starts from an owned slice and passes only owned ones (`expand`),
-                // slice by slice: the one before may be in this growth.
-                while x != 0 {
-                    let b = x.trailing_zeros() as usize;
-                    x &= x - 1;
-                    let ok = b > 0
-                        && ((before | kept) & owned) >> (b - 1) & 1 == 1
-                        && owned >> b & 1 == 1
-                        && w.stays(r)
-                            .find(|s| w.site_target(*s) as usize == b)
-                            .is_none_or(|s| self.eval_at(self.plan.folded.sites[s], before, k));
-                    if ok {
-                        kept |= 1 << b;
-                    }
-                }
-                kept
-            }
-            e => {
-                let e = e as usize;
-                if self.fired.get(e).is_some_and(|f| *f < k) {
-                    g.bits & self.mask_at(w.site_place(e).0, k)
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    fn retract(&mut self, f: usize, k: u32) {
-        self.stats.retractions += 1;
-        let w = self.w;
-        let sc = w.site_count();
-        self.tm.out.insert(f);
-        self.tm.out_list.push(u32::try_from(f).unwrap_or(0));
-        if f >= sc {
-            self.retract_half(f - sc);
-            return;
-        }
-        let was = std::mem::replace(&mut self.fired[f], NONE);
-        self.done.remove(f);
-        let (_, g) = w.site_place(f);
-        let t = w.site_target(f) as usize;
-        match g {
-            EXITS => {
-                let e = u32::try_from(f).unwrap_or(NONE);
-                self.suspect_grows(t, k, NONE, |y| (y == e).then_some(u64::MAX));
-            }
-            EVENTS => {
-                self.counters[t] -= 1;
-                self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
-                if let Ok(at) = self.lit[t].binary_search(&was) {
-                    self.lit[t].remove(at);
-                }
-                if w.def_reads_counter(t) {
-                    self.epoch += 1;
-                }
-                self.suspect_readers(w.counter_sites(t), k, NONE);
-            }
-            _ => {
-                if self.loc_rank[t] != k {
-                    return;
-                }
-                let checks = w.sites_into(CHECKS, t).iter();
-                let next = checks.map(|c| self.fired[*c as usize]).min().unwrap_or(NONE);
-                self.loc_rank[t] = next;
-                if next == NONE {
-                    self.reached.remove(t);
-                }
-                if let Some((to, item)) = self.away[t] {
-                    self.outbox.push(Msg::Move { to, item, from: k, rank: next });
-                }
-                if let Some(z) = self.holds[t] {
-                    self.uncollect(z, k);
-                    if next != NONE {
-                        self.collect_quiet(z, next);
-                    }
-                    self.suspect_readers(w.item_sites(usize::from(z)), k, next);
-                }
-            }
-        }
-    }
-
-    /// [`Reach::collect`] without rechecks (a copy moved to a later rank).
-    fn collect_quiet(&mut self, item: u16, k: u32) {
-        self.count_change(item, 1);
-        let v = &mut self.copies[usize::from(item)];
-        let at = v.partition_point(|x| *x < k);
-        v.insert(at, k);
-    }
-
-    fn retract_half(&mut self, h: usize) {
-        let w = self.w;
-        let k = self.half_rank[h];
-        self.half_rank[h] = NONE;
-        self.owned = self.owned_at(NONE);
-        let lost = w.half(h).0 & !self.owned0;
-        if lost == 0 {
-            return;
-        }
-        let start = w.start as usize;
-        for r in 0..self.masks.len() {
-            self.suspect_grows(r, k, NONE, |y| match y {
-                BY_WAIT => Some(lost | lost << 1),
-                BY_START if r == start => Some(lost),
-                _ => None,
-            });
-        }
-    }
-
-    /// Slices `lost` of region `r` went with its growth at rank `k`.
-    fn retract_bits(&mut self, r: usize, lost: u64, k: u32) {
-        let w = self.w;
-        self.masks[r] &= !lost;
-        self.rules.set(&mut self.atoms, REGION, r, i64::from(self.masks[r] != 0));
-        if !self.tm.lost_flag.contains(r) {
-            self.tm.lost_flag.insert(r);
-            self.tm.lost.push(u32::try_from(r).unwrap_or(0));
-        }
-        let first = self.grows[r].first().map_or(NONE, |g| g.rank);
-        if first == NONE {
-            self.seen.remove(r);
-        }
-        // Sites of the region: those reading time, and all of them once the region was not yet
-        // reached as of their rank.
-        for g in [EXITS, EVENTS, CHECKS] {
-            for s in w.group(r, g) {
-                let ks = self.fired[s];
-                if w.time_dep(s) || first >= ks {
-                    self.suspect(s, ks, k, NONE);
-                }
-            }
-        }
-        for e in w.group(r, EXITS) {
-            if self.fired[e] != NONE {
-                let (t, e) = (w.site_target(e) as usize, u32::try_from(e).unwrap_or(NONE));
-                self.suspect_grows(t, k, NONE, |y| (y == e).then_some(lost));
-            }
-        }
-        self.suspect_grows(r, k, NONE, |y| (y == BY_WAIT).then_some(u64::MAX));
     }
 
     /// Let later runs derive only the sites and half-days that hold now, until
@@ -1591,81 +896,17 @@ impl<'w> Reach<'w> {
         let holding = (0..sc).filter(|s| self.done.contains(*s));
         let halves = (0..self.half_rank.len()).filter(|h| self.half_rank[*h] != NONE);
         for f in holding.chain(halves.map(|h| sc + h)) {
-            self.tm.out.insert(f);
-            self.tm.out_list.push(u32::try_from(f).unwrap_or(0));
+            self.gate.out.insert(f);
+            self.gate.out_list.push(u32::try_from(f).unwrap_or(0));
         }
-        self.tm.active = true;
+        self.gate.active = true;
     }
 
     /// End [`Reach::only_what_holds`].
     pub(crate) fn release(&mut self) {
-        self.tm.active = false;
-        for s in self.tm.out_list.drain(..) {
-            self.tm.out.remove(s as usize);
-        }
-    }
-
-    /// After the retractions of a removal: derive again what the smaller state supports.
-    fn rederive(&mut self) {
-        self.begin_rederive();
-        self.run();
-        self.end_rederive();
-    }
-
-    /// Gate [`Reach::run`] to the retracted sites and queue them.
-    pub(crate) fn begin_rederive(&mut self) {
-        self.forget_defs();
-        self.tm.active = true;
-        for k in 0..self.tm.out_list.len() {
-            let s = self.tm.out_list[k];
-            self.push_site(s);
-        }
-        for k in 0..self.tm.lost.len() {
-            let r = self.tm.lost[k] as usize;
-            self.pull(r);
-        }
-    }
-
-    /// Gate to the sites that were retracted by earlier removals only, without queueing
-    /// anything (a state that lost nothing itself but is handed copies back).
-    pub(crate) fn gate(&mut self) {
-        self.tm.active = true;
-    }
-
-    pub(crate) fn end_rederive(&mut self) {
-        self.tm.active = false;
-        // Churn: retracted facts that hold again now (each retraction pushed one entry).
-        let sc = self.w.site_count();
-        for s in self.tm.out_list.drain(..) {
-            let s = s as usize;
-            self.tm.out.remove(s);
-            let back = if s < sc { self.fired[s] } else { self.half_rank[s - sc] };
-            self.stats.churn += u64::from(back != NONE);
-        }
-        for (r, lost) in self.tm.lost_grows.drain(..) {
-            self.stats.churn += u64::from(self.masks[r as usize] & lost == lost);
-        }
-        for r in self.tm.lost.drain(..) {
-            self.tm.lost_flag.remove(r as usize);
-        }
-    }
-
-    /// Region `r` lost slices: pass it again what the start and its done exits give.
-    fn pull(&mut self, r: usize) {
-        let w = self.w;
-        let ri = u32::try_from(r).unwrap_or(0);
-        if r == w.start as usize {
-            let m = if self.plan.clocks { self.owned } else { w.time.start_mask };
-            self.grow(ri, m, BY_START);
-        }
-        for &e in w.sites_into(EXITS, r) {
-            if self.done.contains(e as usize) {
-                let m = self.masks[w.site_place(e as usize).0];
-                self.grow(ri, m, e);
-            }
-        }
-        if self.masks[r] != 0 {
-            self.requeue(r);
+        self.gate.active = false;
+        for s in self.gate.out_list.drain(..) {
+            self.gate.out.remove(s as usize);
         }
     }
 
@@ -1771,23 +1012,23 @@ impl<'w> Reach<'w> {
         }
     }
 
-    /// New slices `new` of region `r`, one growth supported by `why`.
-    fn set_bits(&mut self, r: usize, new: u64, why: u32) {
+    /// New slices `new` of region `r`, one growth (it takes a rank, as every fact does).
+    fn set_bits(&mut self, r: usize, new: u64) {
         if new == 0 {
             return;
         }
-        let rank = self.next();
+        self.next();
         self.log(Step::Grow(u32::try_from(r).unwrap_or(0)));
-        self.grows[r].push(Grow { rank, bits: new, why });
+        self.grows[r].push(new);
         self.masks[r] |= new;
         self.rules.set(&mut self.atoms, REGION, r, 1);
     }
 
-    fn grow(&mut self, r: u32, m: u64, why: u32) {
+    fn grow(&mut self, r: u32, m: u64) {
         let i = r as usize;
         let new = m & !self.masks[i];
         if new != 0 {
-            self.set_bits(i, new, why);
+            self.set_bits(i, new);
             self.requeue(i);
         }
     }
@@ -1801,12 +1042,12 @@ impl<'w> Reach<'w> {
         self.seen.insert(r);
         if self.can_stay[r] {
             let m = self.expand(r, self.masks[r]);
-            self.set_bits(r, m & !self.masks[r], BY_WAIT);
+            self.set_bits(r, m & !self.masks[r]);
         }
         let m = self.masks[r];
         for s in w.group(r, EXITS) {
             if self.done.contains(s) {
-                self.grow(w.site_target(s), m, u32::try_from(s).unwrap_or(0));
+                self.grow(w.site_target(s), m);
             } else if first || w.time_dep(s) {
                 self.site(s);
             }
@@ -1834,7 +1075,7 @@ impl<'w> Reach<'w> {
             return;
         }
         let m = self.masks[r];
-        if m == 0 || self.done.contains(s) || (self.tm.active && !self.tm.out.contains(s)) {
+        if m == 0 || self.done.contains(s) || (self.gate.active && !self.gate.out.contains(s)) {
             return;
         }
         let target = w.site_target(s);
@@ -1846,13 +1087,11 @@ impl<'w> Reach<'w> {
         self.fired[s] = k;
         self.log(Step::Fired(u32::try_from(s).unwrap_or(0)));
         match g {
-            EXITS => self.grow(target, m, u32::try_from(s).unwrap_or(0)),
+            EXITS => self.grow(target, m),
             EVENTS => {
                 let c = target as usize;
                 self.counters[c] += 1;
                 self.rules.set(&mut self.atoms, COUNTER, c, self.counters[c]);
-                let at = self.lit[c].partition_point(|x| *x < k);
-                self.lit[c].insert(at, k);
                 if w.def_reads_counter(c) {
                     self.epoch += 1;
                 }
@@ -1866,9 +1105,9 @@ impl<'w> Reach<'w> {
                     self.reached.insert(l);
                     self.loc_rank[l] = k;
                     if let Some(item) = self.holds[l] {
-                        self.collect(item, k);
+                        self.collect(item);
                     } else if let Some((to, item)) = self.away[l] {
-                        self.outbox.push(Msg::Give { to, item, rank: k });
+                        self.outbox.push(Msg::Give { to, item });
                     }
                 }
             }
@@ -1881,18 +1120,18 @@ impl<'w> Reach<'w> {
         let w = self.w;
         let sc = w.site_count();
         for h in 0..self.half_rank.len() {
-            let blocked = self.tm.active && !self.tm.out.contains(sc + h);
+            let blocked = self.gate.active && !self.gate.out.contains(sc + h);
             if self.half_rank[h] == NONE && !blocked && self.now(sc + h, 0) {
                 self.half_rank[h] = self.next();
                 self.log(Step::Half(u32::try_from(h).unwrap_or(0)));
             }
         }
-        let owned = self.owned_at(NONE);
+        let owned = self.owned();
         if owned == self.owned {
             return;
         }
         self.owned = owned;
-        self.grow(w.start, owned, BY_START);
+        self.grow(w.start, owned);
         for i in 0..self.masks.len() {
             if self.masks[i] != 0 && self.can_stay[i] {
                 self.requeue(i);
@@ -1953,11 +1192,8 @@ impl<'w> Reach<'w> {
 #[cfg(test)]
 impl Reach<'_> {
     /// The first difference between two states of one world and plan, value for value and
-    /// rank for rank (not only the fixed point), or `None`.
+    /// growth for growth in order (not only the fixed point), or `None`.
     pub(crate) fn differs(&self, o: &Self) -> Option<&'static str> {
-        let grows = |r: &Self| -> Vec<Vec<(u32, u64, u32)>> {
-            r.grows.iter().map(|g| g.iter().map(|g| (g.rank, g.bits, g.why)).collect()).collect()
-        };
         [
             (self.counts != o.counts, "counts"),
             (self.counters != o.counters, "counters"),
@@ -1972,12 +1208,9 @@ impl Reach<'_> {
             (self.fired != o.fired, "fired"),
             (self.half_rank != o.half_rank, "half_rank"),
             (self.loc_rank != o.loc_rank, "loc_rank"),
-            (self.copies != o.copies, "copies"),
-            (self.lit != o.lit, "lit"),
-            (self.adjust != o.adjust, "adjust"),
             (self.owned != o.owned, "owned"),
             (self.seq != o.seq, "seq"),
-            (grows(self) != grows(o), "grows"),
+            (self.grows != o.grows, "grows"),
             (!self.idle() || !o.idle(), "queues"),
         ]
         .into_iter()
@@ -2024,15 +1257,15 @@ mod tests {
         assert!(r.undo_to(mark) >= 1);
     }
 
-    /// A rank never reaches the values that stand for a support or for "none": a state that
-    /// would hand one out stops, in every build, instead of wrapping.
+    /// A rank never reaches the value that stands for "none": a state that would hand it out
+    /// stops, in every build, instead of wrapping.
     #[test]
     #[should_panic(expected = "the ranks of a solve ran out")]
     fn running_out_of_ranks_stops_the_solve() {
         let (w, inst) = clock_world(&[]);
         let plan = Plan::new(&w, &inst).unwrap();
         let mut r = Reach::new(&w, &plan);
-        r.set_seq(BY_WAIT);
+        r.set_seq(NONE);
         r.run();
     }
 
@@ -2121,35 +1354,6 @@ mod tests {
         (World::load(&m).unwrap(), inst)
     }
 
-    #[test]
-    fn removal_does_not_keep_support_that_runs_through_itself() {
-        let (w, inst) = cyclic();
-        let plan = Plan::new(&w, &inst).unwrap();
-        let item = |k: &str| w.item(k).unwrap();
-        let mut placed = vec![None; w.locations()];
-        placed[w.loc("lb").unwrap() as usize] = Some(item("gem"));
-        for (extra, take) in [
-            (vec!["key", "boot"], "key"),
-            (vec!["key", "boot"], "boot"),
-            (vec!["key", "boot", "boot"], "boot"),
-        ] {
-            let extra: Vec<u16> = extra.into_iter().map(item).collect();
-            let mut r = plan.state(&w, &extra, &placed);
-            assert!(r.reached(w.loc("lc").unwrap()), "the full inventory reaches everything");
-            r.remove(item(take));
-            let mut less = extra.clone();
-            less.remove(less.iter().position(|i| *i == item(take)).unwrap());
-            assert_same(&w, &r, &plan.state(&w, &less, &placed), &format!("without {take}"));
-        }
-        let r = {
-            let mut r = plan.state(&w, &[item("key"), item("boot")], &placed);
-            r.remove(item("key"));
-            r
-        };
-        assert!(!r.reached(w.loc("la").unwrap()), "a gem behind `a` does not open `a`");
-        assert_eq!(r.masks[w.region("a").unwrap() as usize], 0);
-    }
-
     /// Defs `d0` to `d{n}`, each reading the next twice (`all`, so both are evaluated while
     /// they hold), and the last reading an item and time, so no def is cached per solve.
     fn doubling(n: usize) -> (World, Instance) {
@@ -2180,27 +1384,20 @@ mod tests {
         assert!(!w.def_timeless(0), "time-dependent, so not cached per solve");
         let plan = Plan::new(&w, &inst).unwrap();
         let key = w.item("key").unwrap();
-        let mut r = plan.state(&w, &[key], &[]);
+        let r = plan.state(&w, &[key], &[]);
         assert!(r.reached(w.loc("la").unwrap()));
         let solve = r.def_memo.bodies.get();
         assert!(solve <= 41 * r.stats.evals.max(1), "solve: {solve} def bodies");
-        // Taking the key back checks the site as of its rank (the take-back path).
-        r.remove(key);
-        assert!(!r.reached(w.loc("la").unwrap()));
-        let back = r.def_memo.bodies.get() - solve;
-        assert!((1..=41 * 4).contains(&back), "take-back: {back} def bodies");
     }
 
-    /// A forward solve checks nothing as of a rank, a removal does; and a replay of the fixed
-    /// point evaluates every exit, event and check of the reached regions, finding the ones
-    /// that are done.
+    /// A replay of the fixed point evaluates every exit, event and check of the reached
+    /// regions, finding the ones that are done.
     #[test]
-    fn support_checks_and_a_replay_are_counted() {
+    fn a_replay_is_counted() {
         let (w, inst) = cyclic();
         let plan = Plan::new(&w, &inst).unwrap();
         let item = |k: &str| w.item(k).unwrap();
-        let mut r = plan.state(&w, &[item("key"), item("boot")], &[]);
-        assert_eq!(r.stats.ranked, 0, "{:?}", r.stats);
+        let r = plan.state(&w, &[item("key"), item("boot")], &[]);
         // Every region is reached: 5 exits, 1 event and 4 checks, all holding; every rule of
         // this world is a bit rule, so only the plan left as bytecode reads nodes.
         assert_eq!(r.replay(), [10, 10, 0, 0]);
@@ -2209,79 +1406,7 @@ mod tests {
             plain.state(&w, &[item("key"), item("boot")], &[]).replay();
         assert_eq!((evals, held, bodies), (10, 10, 0));
         assert!(nodes >= evals, "{nodes} nodes");
-        let before = r.stats;
-        r.remove(item("boot"));
-        assert!(r.stats.ranked > 0 && r.stats.ranked <= r.stats.evals - before.evals);
         // Without the boot the late check does not hold.
-        assert_eq!(r.replay()[..2], [10, 9]);
-    }
-
-    #[test]
-    fn removal_retracts_only_what_depended_on_the_item() {
-        let (w, inst) = cyclic();
-        let plan = Plan::new(&w, &inst).unwrap();
-        let item = |k: &str| w.item(k).unwrap();
-        let mut r = plan.state(&w, &[item("key"), item("boot")], &[]);
-        r.stats = Stats::default();
-        r.remove(item("boot"));
-        // The waited slice of `a`, the copies of it `b` and `c` got, and the check reading it.
-        assert_eq!(r.stats.retractions, 4, "{:?}", r.stats);
-        assert_eq!(r.stats.churn, 0, "nothing retracted holds again: {:?}", r.stats);
-        assert!(r.reached(w.loc("lc").unwrap()));
-        assert!(!r.reached(w.loc("late").unwrap()));
-    }
-
-    /// `a` opens with `key`, or with the `gem` lying in `b` (open from the start, but its gem is
-    /// found after `a` opened); `la` in `a` is free and `lk` needs `key`.
-    fn two_ways() -> (World, Instance) {
-        let t = json!({"true": {}});
-        let m = json!({
-            "options": [],
-            "items": [{"key": "key", "id": 1}, {"key": "gem", "id": 2}],
-            "locations": [{"key": "la", "id": 1}, {"key": "lk", "id": 2}, {"key": "lb", "id": 3}],
-            "start": "s",
-            "x.time": {"slices": 1, "start_mask": 1},
-            "defs": {},
-            "regions": [
-                {"key": "s", "can_stay": false, "checks": [], "events": [], "stays": [],
-                 "exits": [{"to": "a", "rule": {"any": [{"has": "key"}, {"has": "gem"}]}},
-                           {"to": "b", "rule": t}]},
-                {"key": "a", "can_stay": false, "events": [], "stays": [], "exits": [],
-                 "checks": [{"loc": "la", "rule": t}, {"loc": "lk", "rule": {"has": "key"}}]},
-                {"key": "b", "can_stay": false, "checks": [{"loc": "lb", "rule": t}],
-                 "events": [], "stays": [], "exits": []}
-            ],
-            "goal": {"true": {}}
-        });
-        let inst = Instance {
-            locations: ["la", "lk", "lb"].map(str::to_owned).to_vec(),
-            pool: ["key", "gem"].map(str::to_owned).to_vec(),
-            pool_class: ["key", "gem"]
-                .iter()
-                .map(|k| ((*k).to_owned(), "progression".to_owned()))
-                .collect(),
-            ..Instance::default()
-        };
-        (World::load(&m).unwrap(), inst)
-    }
-
-    #[test]
-    fn churn_counts_retracted_facts_that_the_same_removal_derives_again() {
-        let (w, inst) = two_ways();
-        let plan = Plan::new(&w, &inst).unwrap();
-        let item = |k: &str| w.item(k).unwrap();
-        let mut placed = vec![None; w.locations()];
-        placed[w.loc("lb").unwrap() as usize] = Some(item("gem"));
-        let mut r = plan.state(&w, &[item("key")], &placed);
-        r.stats = Stats::default();
-        r.remove(item("key"));
-        // The exit into `a` (derived with `key`, before the gem was found), `a`'s growth, `la`
-        // and `lk` go; the gem derives the exit, the growth and `la` again, `lk` stays lost.
-        assert_eq!(r.stats.retractions, 4, "{:?}", r.stats);
-        assert_eq!(r.stats.churn, 3, "{:?}", r.stats);
-        assert!(r.reached(w.loc("la").unwrap()));
-        assert!(!r.reached(w.loc("lk").unwrap()));
-        let s = r.stats.summary(1, 1);
-        assert_eq!(s["churn"], serde_json::json!({"rederived": 3, "net_lost": 1, "share": 0.75}));
+        assert_eq!(plan.state(&w, &[item("key")], &[]).replay()[..2], [10, 9]);
     }
 }

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use crate::room::{Algorithm, Path, RoomFilled, fill_room_by};
+use crate::room::{RoomFilled, fill_room_spheres};
 use crate::spheres::RoomSpheres;
 
 #[allow(clippy::cast_precision_loss)] // counts here are far below 2^53
@@ -223,7 +223,7 @@ pub struct Sampled {
 }
 
 /// Run `seeds` fills (fill seeds `1..=seeds`) of the product's fill, a room of this one player
-/// ([`fill_room_by`], exact), and draw up to `baseline` accepted uniform placements: the pool
+/// ([`fill_room_spheres`]), and draw up to `baseline` accepted uniform placements: the pool
 /// shuffled onto the free locations, kept only if the placement rules hold, the goal is
 /// reachable and every progression item can be collected. Gives up on the baseline after
 /// `max_attempts` candidates.
@@ -240,7 +240,7 @@ pub fn sample(
     let mut out = Sampled::default();
     let seat = [crate::Seat { w, plan, progression }];
     for s in 1..=seeds {
-        match one_fill(&seat, s, Algorithm::Exact, FILLS) {
+        match one_fill(&seat, s) {
             Ok((filled, _)) => {
                 let placed: Vec<Option<u16>> =
                     filled.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
@@ -414,28 +414,12 @@ pub fn sample_room(
     baseline: u64,
     max_attempts: u64,
 ) -> Result<Sampled, crate::FillError> {
-    sample_room_by(seats, flat, (seeds, baseline, max_attempts), Algorithm::Exact)
-}
-
-/// [`sample_room`] of the fill mode `mode`, against the same uniform baseline (the baseline's
-/// draws do not depend on the mode).
-///
-/// # Errors
-/// As [`sample_room`].
-pub fn sample_room_by(
-    seats: &[crate::Seat<'_>],
-    flat: &Flat,
-    (seeds, baseline, max_attempts): (u64, u64, u64),
-    mode: Algorithm,
-) -> Result<Sampled, crate::FillError> {
     use crate::room::{Given, check_placed, locked_placed, permits};
     let mut out = Sampled::default();
     crate::room::check(seats)?;
     check_placed(seats, &locked_placed(seats))?;
     for s in 1..=seeds {
-        match one_fill(seats, s, mode, FILLS).map(|x| x.0) {
-            // A mode's own check failed: a bug to stop on, not a seed to count as failed.
-            Err(e @ crate::FillError::Invalid(_)) => return Err(e),
+        match one_fill(seats, s).map(|x| x.0) {
             Ok(filled) => {
                 let f = flat.placed(&filled.placed);
                 out.fill.add(&f, |_| true);
@@ -485,46 +469,26 @@ pub fn sample_room_by(
     Ok(out)
 }
 
-/// The stream of the fairness runs' fills (also the reference of a mode comparison).
+/// The stream of the fairness runs' fills.
 pub const FILLS: &[u8; 8] = b"fill\0\0\0\0";
-/// A stream that shares no draw with [`FILLS`]: a mode compared with the reference on the same
-/// stream gets the same shuffled lists, which makes the two samples look closer than they are.
-pub const OTHER_FILLS: &[u8; 8] = b"fill2\0\0\0";
 
-/// Fill seed `s` of stream `tag` with `mode`, on one thread.
+/// Fill seed `s` of stream [`FILLS`].
 fn one_fill(
     seats: &[crate::Seat<'_>],
     s: u64,
-    mode: Algorithm,
-    tag: &[u8; 8],
 ) -> Result<(RoomFilled, RoomSpheres), crate::FillError> {
-    let path = Path::of(seats.len(), 1);
-    fill_room_by(seats, &mut seeded(s, tag), config::FILL_MAX_ATTEMPTS, path, mode)
+    fill_room_spheres(seats, &mut seeded(s, FILLS), config::FILL_MAX_ATTEMPTS)
 }
 
-/// What one fill mode's seeds look like over a room: the numbers the modes are compared on.
-/// Sphere 0 is what is reachable from the start; "progression" is every progression item at a
+/// What the fill's seeds look like over a room. Sphere 0 is what is reachable from the start; "progression" is every progression item at a
 /// filled location.
 #[derive(Debug, Clone, Default)]
 pub struct Shape {
     /// Seeds filled, and seeds that failed.
     pub seeds: u64,
-    /// Fills that failed (every attempt stuck).
+    /// Fills that failed (every attempt stuck). Every number below is over the seeds filled.
     pub failed: u64,
-    /// Seeds the asked mode placed itself (all of them for the exact fill). Every number
-    /// below but `ms` is over these seeds only: a seed that fell back is the exact fill's.
-    pub own: u64,
-    /// Seeds that fell back to the exact fill (filled, and left out of the shape).
-    pub fell_back: u64,
-    /// Seeds placed by the mode itself without moving anything (shuffle fill: the uniform
-    /// shuffle as drawn).
-    pub untouched: u64,
-    /// Attempts given up on (a seed can fall back, be stuck, and be placed by the mode on the
-    /// next attempt), and the order repairs and swaps in the seeds the mode placed, summed.
-    pub fallbacks: u64,
-    /// See `fallbacks`.
-    pub repairs: u64,
-    /// See `fallbacks`.
+    /// Items moved in place by the fill's repair, summed.
     pub swaps: u64,
     /// Rule evaluations, summed.
     pub evals: u64,
@@ -543,22 +507,19 @@ pub struct Shape {
     pub stuck: Vec<f64>,
     /// Per seed looked at: spheres that hold an item no goal can be reached without.
     pub required: Vec<usize>,
-    /// Fill time per filled seed, fallbacks included, ms (not comparable across machines).
+    /// Fill time per filled seed, ms (not comparable across machines).
     pub ms: Vec<f64>,
 }
 
-/// [`Shape`] of `mode` over fill seeds `1..=seeds` of stream `tag` ([`FILLS`] for a reference,
-/// [`OTHER_FILLS`] for what is compared with it). For the first `required` seeds each
+/// [`Shape`] of the fill over fill seeds `1..=seeds` of stream [`FILLS`]. For the first `required` seeds each
 /// progression item is taken out in turn and the room solved again, to count the spheres that
 /// hold a required item (one solve per item: keep it small).
 ///
 /// # Errors
-/// [`crate::FillError::Instance`] when the seats do not fit the room, and
-/// [`crate::FillError::Invalid`] as soon as a mode's own check fails.
+/// [`crate::FillError::Instance`] when the seats do not fit the room.
 pub fn shape(
     seats: &[crate::Seat<'_>],
-    (seeds, tag): (u64, &[u8; 8]),
-    mode: Algorithm,
+    seeds: u64,
     required: u64,
 ) -> Result<Shape, crate::FillError> {
     crate::room::check(seats)?;
@@ -574,25 +535,14 @@ pub fn shape(
         .collect();
     for s in 1..=seeds {
         let t = std::time::Instant::now();
-        let (filled, sp) = match one_fill(seats, s, mode, tag) {
+        let (filled, sp) = match one_fill(seats, s) {
             Ok(x) => x,
-            Err(e @ crate::FillError::Invalid(_)) => return Err(e),
             Err(_) => {
                 out.failed += 1;
                 continue;
             }
         };
         out.ms.push(t.elapsed().as_secs_f64() * 1e3);
-        out.fallbacks += u64::from(filled.fallbacks);
-        // An opt-in mode that gave up: the exact fill placed the seed. The exact fill and its
-        // measurement variants place their own.
-        if mode.dials().is_some() && !filled.fast {
-            out.fell_back += 1;
-            continue;
-        }
-        out.own += 1;
-        out.untouched += u64::from(filled.swaps == 0 && filled.repairs == 0);
-        out.repairs += u64::from(filled.repairs);
         out.swaps += u64::from(filled.swaps);
         out.evals += filled.stats.evals;
         out.at.samples += 1;
@@ -660,17 +610,12 @@ fn quantile(v: &[f64], share: f64) -> Option<f64> {
     at.and_then(|i| v.get(i).copied())
 }
 
-/// A [`Shape`] as a report, over the seeds the mode placed itself; with `exact` (the exact
-/// fill's shape on the same room, on another stream of seeds so that the two samples are
-/// independent: the exact fill itself, measured that way, is the noise floor of every
-/// distance) also the distances from it: the total variation distance between the two distributions of
-/// progression over spheres (0 the same, 1 disjoint), and the two-sample chi-square and the
-/// mean absolute gap of how often each location holds progression.
+/// A [`Shape`] as a report.
 #[must_use]
-pub fn shape_report(s: &Shape, exact: Option<&Shape>) -> Value {
+pub fn shape_report(s: &Shape) -> Value {
     let share =
         |v: &[u64], upto: usize| f(v.iter().take(upto).sum()) / f(v.iter().sum::<u64>().max(1));
-    let filled = s.own;
+    let filled = s.seeds - s.failed;
     let total = f(s.at.counts.values().sum());
     let entropy: f64 =
         s.at.counts
@@ -679,11 +624,8 @@ pub fn shape_report(s: &Shape, exact: Option<&Shape>) -> Value {
             .map(|p| if p > 0.0 { -p * p.log2() } else { 0.0 })
             .sum();
     let places = f(s.open.iter().sum::<u64>() / filled.max(1)).max(2.0);
-    let mut v = json!({
-        "seeds": s.seeds, "failed": s.failed, "placed_by_the_mode": s.own,
-        "fell_back_seeds": s.fell_back, "fallback_attempts": s.fallbacks,
-        "untouched_share": f(s.untouched) / f(filled.max(1)),
-        "repairs": s.repairs, "swaps": s.swaps,
+    json!({
+        "seeds": s.seeds, "failed": s.failed, "swaps": s.swaps,
         "swaps_per_seed": f(s.swaps) / f(filled.max(1)),
         "rule_evals_per_seed": f(s.evals) / f(filled.max(1)),
         "spheres_mean": mean(s.spheres.iter().map(|n| f(*n as u64))),
@@ -698,25 +640,5 @@ pub fn shape_report(s: &Shape, exact: Option<&Shape>) -> Value {
         "required_spheres_mean": mean(s.required.iter().map(|n| f(*n as u64))),
         "required_spheres_seeds": s.required.len(),
         "fill_ms_median": quantile(&s.ms, 0.5), "fill_ms_worst_1_percent": quantile(&s.ms, 0.99),
-    });
-    if let Some(e) = exact {
-        let norm = |d: &[u64], k: usize| {
-            f(d.get(k).copied().unwrap_or(0)) / f(d.iter().sum::<u64>().max(1))
-        };
-        let tv: f64 = (0..s.depth.len().max(e.depth.len()))
-            .map(|k| (norm(&s.depth, k) - norm(&e.depth, k)).abs())
-            .sum::<f64>()
-            / 2.0;
-        let (x, dof, p) = chi2(&s.at, &e.at);
-        let keys: BTreeSet<&(u16, u32)> = s.at.counts.keys().chain(e.at.counts.keys()).collect();
-        let gap = mean(keys.iter().map(|(i, l)| (s.at.p(*i, *l) - e.at.p(*i, *l)).abs()));
-        v["against_exact"] = json!({
-            "sphere_distribution_distance": tv,
-            "location_chi2": x, "location_chi2_dof": dof, "location_chi2_p": p,
-            "location_chi2_per_dof": x / dof.max(1.0),
-            "location_frequency_mean_gap": gap,
-            "location_frequency_max_gap": max_deviation(&s.at, &e.at).0,
-        });
-    }
-    v
+    })
 }

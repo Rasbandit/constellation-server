@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn a_world_with_no_spare_locations_is_under_one_and_an_ordinary_one_is_not() {
         let ratio = |shape: &Shape| {
-            let c = room(shape, 1, 1, 1).unwrap();
+            let c = room(shape, 1, 1).unwrap();
             super::early(&c.worlds[0], &c.plans[0]).unwrap()
         };
         let tight = ratio(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) });

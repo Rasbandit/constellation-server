@@ -881,16 +881,6 @@ async fn finished_world(w: &Arc<Worlds>, who: &Identity) -> String {
     panic!("the world never finished and listed");
 }
 
-/// A generation asks for one thread: the product's default (a caller of the fill job may
-/// still ask for more). Fails with the old four.
-#[test]
-fn a_generation_asks_the_fill_for_one_worker() {
-    let head = fill_head("s", &[], (1, 64)).unwrap();
-    let req: Value = serde_json::from_slice(&head).unwrap();
-    assert_eq!(req["workers"], 1);
-    assert_eq!(config::GENERATION_WORKERS, 1);
-}
-
 /// The wiring: an uploaded manifest and two player files, a queued world, the engine's fill
 /// in a child (here in process), the seed stored in the host and its room listed and loaded.
 /// Fails without `generate_data_only` (the world fails: it would run the legacy path).
@@ -962,15 +952,6 @@ async fn fills_go_to_a_pool_only_when_config_asks_for_workers() {
     assert!(open(&root.join("data"), paths(), on).unwrap().pool.is_some());
 }
 
-/// The pool is told the threads the request itself asks for: its CPU bound for a worker
-/// rests on that number.
-#[test]
-fn the_pool_is_told_the_threads_the_fill_request_asks_for() {
-    let head = fill_head("s", &[], (1, 64)).unwrap();
-    let req: Value = serde_json::from_slice(&head).unwrap();
-    assert_eq!(req["workers"], fill_threads());
-}
-
 /// A finished generation's status tells its requester no timings (how long the fill job
 /// took would say whether its world was already loaded in a worker, that is, whether
 /// someone filled it lately). The server keeps the phase timings for its own log.
@@ -1006,8 +987,7 @@ async fn the_stored_seed_is_the_one_the_json_import_path_stored() {
     let world: Value = serde_json::from_slice(&manifest(|_| {})).unwrap();
     let ann = json!({"name": "Ann", "instance": fixture_instances()[0]});
     let players = [serde_json::from_value(ann).unwrap()];
-    let bundle =
-        data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap(), 1).unwrap();
+    let bundle = data_fill::seed::generate(&world, name, &players, rng.as_u64().unwrap()).unwrap();
     let old = parse_bundle(&serde_json::to_vec(&bundle).unwrap(), &Limits::DESIGN).unwrap();
     assert_eq!(stored, old.bundle.bytes());
     assert_eq!(status["bundle_hash"], crate::hex(&old.hash), "{status}");

@@ -609,11 +609,12 @@ mod tests {
         }
     }
 
-    /// Random rule trees, and random sequences of taking a start copy back and adding a copy:
-    /// after every step the state with bit rules holds what the state of the bytecode holds
-    /// (thresholds above one, sums losing a copy and the counter going down included).
+    /// Random rule trees, and random sequences of adding a copy and taking additions back
+    /// (`Reach::undo_to`): after every step the state with bit rules holds what the state of
+    /// the bytecode holds (thresholds above one, sums losing a copy and the counter going down
+    /// included).
     #[test]
-    fn random_rules_under_random_adds_and_removals_decide_as_their_bytecode_does() {
+    fn random_rules_under_random_adds_and_undos_decide_as_their_bytecode_does() {
         let (mut by_bits, mut lost) = (0, 0);
         for seed in 1..=60u64 {
             let mut rng = SpecRng::from_u64(seed);
@@ -624,12 +625,15 @@ mod tests {
             let plain = plan.clone().interpreted();
             let mut pick =
                 |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
-            let mut start: Vec<u16> =
-                (0..10 + pick(20)).map(|_| u16::try_from(pick(10)).unwrap()).collect();
+            let start: Vec<u16> = (0..pick(10)).map(|_| u16::try_from(pick(10)).unwrap()).collect();
             let (mut a, mut b) = (plan.solve(&w, &start), plain.solve(&w, &start));
             crate::reach::assert_same(&w, &a, &b, &format!("seed {seed}, start {start:?}"));
+            a.keep_journal();
+            b.keep_journal();
+            let mut marks = Vec::new();
             for step in 0..40 {
-                let what = if start.is_empty() || pick(4) == 0 {
+                let what = if marks.is_empty() || pick(2) == 0 {
+                    marks.push((a.mark(), b.mark()));
                     let i = u16::try_from(pick(10)).unwrap();
                     for r in [&mut a, &mut b] {
                         r.add(i, 1);
@@ -637,20 +641,19 @@ mod tests {
                     }
                     format!("added {i}")
                 } else {
-                    let i = start.swap_remove(pick(start.len()));
+                    let back = pick(marks.len());
+                    let (ma, mb) = marks[back];
+                    marks.truncate(back);
                     let before = (0..12).filter(|l| a.reached(*l)).count();
-                    a.remove(i);
-                    b.remove(i);
+                    a.undo_to(ma);
+                    b.undo_to(mb);
                     lost += usize::from((0..12).filter(|l| a.reached(*l)).count() < before);
-                    format!("removed {i}")
+                    format!("undone to mark {back}")
                 };
                 crate::reach::assert_same(&w, &a, &b, &format!("seed {seed}, step {step}: {what}"));
             }
         }
-        assert!(
-            by_bits > 300 && lost > 50,
-            "{by_bits} bit rules, {lost} removals that lost a check"
-        );
+        assert!(by_bits > 300 && lost > 50, "{by_bits} bit rules, {lost} undos that lost a check");
     }
 
     /// Every class of rule, and the term cap: an AND of four ORs of two is 16 terms and

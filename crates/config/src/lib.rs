@@ -232,7 +232,7 @@ pub struct Limits {
     /// With a pool, a fill needs a worker, so there must be one for every generation that may
     /// run at once: the valid settings are 0, or `gen_concurrency` and up
     /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
-    /// one core ([`GENERATION_WORKERS`] thread per fill). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// one core (a fill runs on one thread). `CONSTELLATION_FILL_POOL_WORKERS`.
     /// Each worker runs under the same caps as a fill child process, and a job past
     /// `fill_timeout_ms` ends its worker.
     pub fill_pool_workers: usize,
@@ -394,56 +394,6 @@ pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// whole job, and this much for its start and what it does between jobs (design value).
 pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
 
-/// Threads one generation asks its fill for (`workers` of the fill request): one, so a
-/// generation costs one core and many run side by side. A room's fill runs on one thread on
-/// the path a room takes by itself (`data_fill::room::Path::of`). The forward path, which can
-/// use threads, stays for a caller that names it, up to [`ROOM_FORWARD_WORKERS`] (results
-/// never depend on the number).
-pub const GENERATION_WORKERS: usize = 1;
-
-/// Worker threads that compile worlds and resolve instances of a room's players in parallel
-/// before a multiworld fill (a design value; results never depend on this number).
-pub const FILL_SETUP_WORKERS: usize = 4;
-
-/// Most threads the players' states of a room run on while a round is solved forward: a fill
-/// takes the worker count of its request, at most this many and at most the cores the process
-/// may use (a design value; results never depend on the number).
-pub const ROOM_FORWARD_WORKERS: usize = 4;
-
-/// Rule evaluations ahead of one step of a forward solve (queued regions and sites over the
-/// room's states; every rule site of the room for the first step of a solve) from which the
-/// step starts threads; below it the states run on the caller's thread, since starting threads
-/// would cost more than the step (a design value, not measured).
-pub const ROOM_FORWARD_MIN_PENDING: usize = 2048;
-
-/// Times a level fill (`data_fill::room::Algorithm::Level`) reorders its drawn item order and
-/// solves again when the order leaves too few open locations, before the seed falls back to
-/// the exact fill (each costs one forward solve; a design value).
-pub const LEVEL_FILL_MAX_REPAIRS: u32 = 8;
-
-/// Depth dial of the opt-in fill modes (`data_fill::room::Dials`), percent: where a progression
-/// item goes among the locations it may take. 0 is uniform. Above 0 favours locations opened
-/// later (longer chains): one more draw per 100, the remainder as a chance of one more, and the
-/// deepest drawn wins. Below 0 the same towards locations opened earlier. A design value; the
-/// exact fill does not read it.
-pub const FILL_DEPTH_PERCENT: i32 = 0;
-
-/// The furthest the depth dial goes, either way (percent: at most ten further draws for every
-/// pick). A fill request carries the dial, so it is refused beyond this instead of being
-/// allowed to buy unbounded work (a design value).
-pub const FILL_DEPTH_MAX_PERCENT: i32 = 1000;
-
-/// Accessibility dial of the opt-in fill modes: `false` asks that every progression item can
-/// be collected, `true` only that every player's goal can be reached (items the goal does not
-/// need may then lie out of reach). A design value; the exact fill does not read it.
-pub const FILL_GOAL_ONLY: bool = false;
-
-/// Whether the opt-in fill modes leave the check of a location that holds no progression item
-/// unevaluated until it is needed (as a place to move an item to, for its level, or in one
-/// pass at the end): reaching such a location changes nothing. The result is the same either
-/// way; `false` is the reference the saving is measured against (a design value).
-pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
-
 /// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
 /// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
 /// (a design value).
@@ -451,12 +401,12 @@ pub const FILL_DISPLACE_TRIES: usize = 32;
 
 /// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
 /// of moves, one solve's worth more per move for the pass over the rounds after it, and per
-/// divided round the evaluations of the attempt's first solve in rank order with none of the
-/// rounds' items (`data_fill::room`, `charge_division`), all counted the same on every path.
+/// divided round the evaluations of the attempt's first solve with none of the rounds' items
+/// (`data_fill::room`, `charge_division`), counted the same by the fill and its cross-check.
 /// Within the budget means at most this much spent: once more is spent, checked before each
 /// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
 /// it), and so is any later one that needs a move or a division. A budget of work, not of
-/// time: a seed is the same on every machine and path. A design value with a margin over the
+/// time: a seed is the same on every machine. A design value with a margin over the
 /// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
 /// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
 /// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about
@@ -475,14 +425,6 @@ pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
 /// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
 /// (as many orders as the measurement that found the ratio used; a design value).
 pub const FILL_CAPACITY_ORDERS: u32 = 30;
-
-/// Random reached-location draws a shuffle fill (`data_fill::room::Algorithm::Shuffle`) makes
-/// for one freed item before it checks every candidate in turn (a design value).
-pub const SHUFFLE_FILL_MAX_PROBES: u32 = 32;
-
-/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
-/// value).
-pub const FILL_MAX_WORKERS: usize = 64;
 
 /// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
 /// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a

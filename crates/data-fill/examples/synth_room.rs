@@ -1,10 +1,8 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
-//! [--path auto|carry|forward|split] [--workers 4]
-//! [--mode exact|level|shuffle[,depth=N][,goal][,noskip]|drawn|deepest|repaired|single] [--players 1,10,20,50,100]
+//! [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
-//! heavy profile has clocks on). `--path` forces one way of placing rounds
-//! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off] [--confined on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! heavy profile has clocks on). One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
 //! What is done once per world version is timed apart from what every seed pays. Once per
@@ -13,7 +11,7 @@
 //! ([`Prepared::open`]); `bit_rules_ms` is the part of it that builds the worlds' bit rules,
 //! measured by building them once more, so `load_ms - bit_rules_ms` is the load without them.
 //! Per seed: `setup_ms` resolves every player's instance against their
-//! loaded world (on `--workers` threads; drawing the synthetic manifests is not timed), and
+//! loaded world (drawing the synthetic manifests is not timed), and
 //! `fill_ms` is the median of `reps` fills of the same seed (the work is identical, so the
 //! spread is timing noise only).
 //!
@@ -28,17 +26,16 @@
 //! parts of the encode are also timed alone: `validate_ms` (the check), and `hash_whole_ms`,
 //! the hash with the game's names and ids written again, which the encode does not pay.
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
-//! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
-//! is left out: read it from a `--workers 1` run); without the feature, `null`.
+//! the calling thread (`allocation-counter` counts per thread; the fill runs on one); without
+//! the feature, `null`.
 //! `peak_rss_bytes` is the whole process's resident high-water mark when the row is printed
 //! (`VmHWM` of `/proc/self/status`, Linux only): it never falls, so it covers setup and every
 //! smaller room before the row; `null` where the file is not there. The same mark is also read
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
-//! `rule_evals` are counted by the solver, `rule_evals_ranked` the removals' support checks among
-//! them, and `ns_per_eval` is the fill's wall time over that count, so it carries the solver's
-//! bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
+//! `rule_evals` are counted by the solver, and `ns_per_eval` is the fill's wall time over that
+//! count, so it carries the solver's bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
 //! every exit, event and check rule of the reached regions, timed over `REPLAYS` passes), with
 //! nothing held and with every progression item held, and the bytecode nodes and def bodies an
 //! evaluation reads (counted).
@@ -55,7 +52,8 @@
 //!
 //! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`), `--guards
 //! on` with a `none` shuffle that rules read (`Shape::guards`), and `--timeless on` without a
-//! time context (`Shape::timeless`, which an exit shuffle needs). With a shuffle, every
+//! time context (`Shape::timeless`, which an exit shuffle needs). `--confined on` confines
+//! every player's `p0` copies to a group of locations (`Shape::confined`). With a shuffle, every
 //! player's world is staged before the fill ([`data_fill::shuffle::room`]) and the row's
 //! `shuffle` holds, as medians of `reps`: `stage_ms` (the shuffles, the fold, the whole-world
 //! check and resolving the instances, every player, one thread), `plans_ms` (resolving the
@@ -71,16 +69,12 @@
 //!
 //! `--failed-row`: a room whose fill ends in an error (stuck on every attempt) prints
 //! `{"room": players, "failed": error, ...}` instead of ending the run with that error.
-//!
-//! `--mode` picks how progression is placed ([`data_fill::room::Algorithm`]): the row then
-//! also says how many of the reps' seed the mode placed itself, its repairs, swaps and
-//! fallbacks, and the rule evaluations of the mode's own solves.
 
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Algorithm, Compiled, Path, Seat, cross_world_share, fill_room_by, plans};
-use data_fill::seed::{Player, assemble_on, encode_on};
+use data_fill::room::{Compiled, Seat, cross_world_share, fill_room_spheres, plans};
+use data_fill::seed::{assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
@@ -176,13 +170,12 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers, mode, one_world): (Option<Path>, usize, Algorithm, bool),
+    one_world: bool,
     (bits, skip, vanilla): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
     // A mixed room's switches are its first shape's (no mixed shape has doors or guards).
     let shape = &shapes[0];
-    let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
     let drawn: Vec<(Value, Instance)> = (0..count as u64)
         .map(|p| {
@@ -223,11 +216,11 @@ fn one(
             }
             Ok(c)
         } else if shape.doors || shape.guards {
-            data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
+            data_fill::shuffle::room(&base, &insts, seed).map(|x| x.0)
         } else {
             // Several worlds are copied side by side; one is shared as loaded.
             let own = |w: &&World| if count > 1 { w.packed() } else { (*w).clone() };
-            Compiled::resolve(base.iter().map(own).collect(), &insts, workers)
+            Compiled::resolve(base.iter().map(own).collect(), &insts)
         }
     };
     let (c, room_bytes) = kept(setup);
@@ -237,8 +230,7 @@ fn one(
         let (stage_ms, _) = median(reps, || setup().map(drop))?;
         let pairs: Vec<(&World, &Instance)> =
             (0..players).map(|p| (c.world(p), insts[p])).collect();
-        let (plans_ms, _) =
-            median(reps, || plans(&pairs, 1).map(drop).map_err(|e| format!("{e:?}")))?;
+        let (plans_ms, _) = median(reps, || plans(&pairs).map(drop).map_err(String::from))?;
         let (mut restarts, mut steps) = (0, [0u64; data_fill::shuffle::STEPS.len()]);
         for (p, inst) in insts.iter().enumerate() {
             let player = u32::try_from(p).map_err(|e| e.to_string())?;
@@ -268,7 +260,7 @@ fn one(
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_by(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path, mode)
+        fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS)
     };
     let t = Instant::now();
     let (first, heap) = peak(fill);
@@ -287,9 +279,7 @@ fn one(
     let rss_after_fill = peak_rss();
     let mut seed_row = json!({});
     if let (true, Some(on)) = (one_world, loaded.first()) {
-        let named: Vec<Player> = (0..players)
-            .map(|p| Player { name: format!("P{p}"), instance: drawn[0].1.clone() })
-            .collect();
+        let named = data_fill::synth::players(&drawn[0].1, players);
         let assemble = || assemble_on(on, "bench", &named, &seats, &f.placed, &sp);
         let mut bundle = assemble()?;
         let seed_file = encode_on(on, &mut bundle, SEED_MAX_BYTES)?;
@@ -318,10 +308,8 @@ fn one(
                           "import_v1_ms": fine(import_v1_ms), "seed_bytes": seed_file.len(),
                           "peak_rss_after_encode_bytes": rss_after_encode});
     }
-    let (crossed, all) = cross_world_share(&seats, &f.placed)
-        .map_err(|e| format!("{e:?}"))?
-        .iter()
-        .fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
+    let (crossed, all) =
+        cross_world_share(&seats, &f.placed)?.iter().fold((0, 0), |(x, a), (c, n)| (x + c, a + n));
     let s = &f.stats;
     let pool: Vec<u16> = insts[0]
         .pool
@@ -331,18 +319,8 @@ fn one(
         .collect();
     let replay = json!({"nothing_held": eval_only(&seats[0], &[]),
                         "all_held": eval_only(&seats[0], &pool)});
-    let work = s.summary(1, u64::from(f.solves));
     let mut out = json!({
         "players": players,
-        "path": match path {
-            Path::Carry => "carry",
-            Path::Forward { .. } => "forward",
-            Path::Split => "split",
-        },
-        "workers": match path {
-            Path::Carry | Path::Split => 1,
-            Path::Forward { workers } => workers,
-        },
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks && !shape.timeless,
@@ -357,29 +335,20 @@ fn one(
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
         "rule_evals": s.evals,
-        "rule_evals_ranked": s.ranked,
         "rule_evals_bits": s.bits,
         "rules": if bits { "bits" } else { "bytecode" },
         "absent": if skip { "skip" } else { "check" },
         "rules_report": seats[0].plan.rules_report(seats[0].w),
         "eval_only": replay,
         "ns_per_eval": (fill_ms * 1e6 / s.evals.max(1) as f64 * 10.0).round() / 10.0,
-        "removals": s.removals,
-        "retractions": s.retractions,
-        "retractions_per_removal": work["retractions_per_removal"],
-        "churn": work["churn"],
         "rounds": f.rounds,
         "spheres": sp.spheres.len(),
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
         "attempts": f.attempts,
         "beatable": f.all_beatable(),
-        "placed_by_the_mode": mode.dials().is_none() || f.fast,
-        // The same hash in two rows means the same placements (the `noskip` rows against theirs).
-        "placements_hash": format!("{:016x}", data_fill::check::fnv1a(format!("{:?}", f.placed).as_bytes())),
-        "repairs": f.repairs,
+        // The same hash in two rows means the same placements.
+        "placements_hash": data_fill::check::placements_hash(&f.placed),
         "swaps": f.swaps,
-        "fallbacks": f.fallbacks,
-        "mode_rule_evals": f.mode_evals,
         "peak_heap_bytes": heap,
         "peak_rss_after_fill_bytes": rss_after_fill,
         "peak_rss_bytes": peak_rss(),
@@ -400,7 +369,7 @@ fn one(
         seats.iter().map(|s| data_fill::capacity::early(s.w, s.plan)).collect();
     out["capacity_ms"] = json!(fine(t.elapsed().as_secs_f64() * 1e3));
     out["capacity_lowest"] = json!(ratios.into_iter().flatten().reduce(f64::min));
-    // The exact fill's repairs in the attempt that placed the seed, and the restarts before it.
+    // The fill's repairs in the attempt that placed the seed, and the restarts before it.
     out["divided"] = json!(f.divided);
     out["repair_evals"] = json!(f.repair_evals);
     out["restarts"] = json!(f.attempts - 1);
@@ -478,6 +447,7 @@ fn main() -> Result<(), String> {
         doors: vanilla || flag("--entrances", d.doors)?,
         guards: flag("--guards", d.guards)?,
         timeless: flag("--timeless", d.timeless)?,
+        confined: flag("--confined", d.confined)?,
         ..d
     };
     // `mixed`: chain, light, keys and heavy worlds in turn, at their own sizes (piles of
@@ -488,17 +458,6 @@ fn main() -> Result<(), String> {
     } else {
         vec![shape]
     };
-    let workers: usize = arg(&args, "--workers", config::ROOM_FORWARD_WORKERS)?;
-    let path_arg = arg(&args, "--path", "auto".to_owned())?;
-    let path = match path_arg.as_str() {
-        "auto" => None,
-        "carry" => Some(Path::Carry),
-        "forward" => Some(Path::Forward { workers }),
-        "split" => Some(Path::Split),
-        x => return Err(format!("--path: auto, carry, forward or split, got {x}")),
-    };
-    let mode_arg = arg(&args, "--mode", "exact".to_owned())?;
-    let mode: Algorithm = mode_arg.parse()?;
     let one_world = match arg(&args, "--worlds", "each".to_owned())?.as_str() {
         "each" => false,
         "one" => true,
@@ -521,27 +480,26 @@ fn main() -> Result<(), String> {
     // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
     let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let row = one(&shapes, seed, n, reps, (path, workers, mode, one_world), engine);
+        let row = one(&shapes, seed, n, reps, one_world, engine);
         let mut row = match row {
             Err(e) if failed_row => {
                 println!(
                     "{}",
-                    json!({"room": n, "profile": profile, "path": path_arg, "seed": seed,
-                           "mode": mode_arg, "failed": e})
+                    json!({"room": n, "profile": profile, "seed": seed,
+                           "failed": e})
                 );
                 continue;
             }
             row => row?,
         };
         row["profile"] = json!(profile);
-        row["mode"] = json!(mode_arg);
         points.push((n as f64, row["fill_ms"].as_f64().unwrap_or(0.0)));
         println!("{row}");
     }
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "path": path_arg, "workers": workers, "mode": mode_arg,
+        json!({"profile": profile,
                "rules": if engine.0 { "bits" } else { "bytecode" },
                "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },

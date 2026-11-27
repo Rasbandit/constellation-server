@@ -4,23 +4,17 @@
 use data_fill::Instance;
 use data_fill::seed::{Player, generate};
 use seed_bundle::{SeedBundle, bundle_hash, package, v2};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const FIXTURE: &str = include_str!("fixtures/room_world.json");
+mod support;
 
 fn fixture() -> (Value, Vec<Instance>) {
-    let doc: Value = serde_json::from_str(FIXTURE).unwrap();
-    let mut manifest = doc["manifest"].clone();
+    let doc = support::fixture("room_world");
+    let (manifest, insts) = data_fill::room::from_doc(&doc).unwrap();
+    let mut manifest = manifest.clone();
     manifest["game"] = json!("Fixture");
     manifest["version"] = json!("1");
-    let insts = doc["instances"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| Instance::deserialize(v).unwrap())
-        .collect();
     (manifest, insts)
 }
 
@@ -36,14 +30,14 @@ fn players() -> (Value, Vec<Player>) {
     (m, vec![Player { name: "Ann".into(), instance: a }, Player { name: "Bo".into(), instance: b }])
 }
 
-fn make(rng: u64, workers: usize) -> SeedBundle {
+fn make(rng: u64) -> SeedBundle {
     let (m, p) = players();
-    generate(&m, "seed-one", &p, rng, workers).unwrap()
+    generate(&m, "seed-one", &p, rng).unwrap()
 }
 
 #[test]
 fn the_bundle_names_slots_games_spheres_and_every_item_class() {
-    let b = make(7, 1);
+    let b = make(7);
     assert_eq!((b.seed_name.as_str(), b.slots.len()), ("seed-one", 2));
     assert_eq!(b.slots[1].name, "Bo");
     assert_eq!(b.connect_names["Ann"], (0, 1));
@@ -63,39 +57,41 @@ fn the_bundle_names_slots_games_spheres_and_every_item_class() {
 
 #[test]
 fn the_v2_round_trip_is_byte_equal_on_canonical_json() {
-    let b = make(7, 1);
+    let b = make(7);
     let text = serde_json::to_string(&b).unwrap();
     let hash: [u8; 32] = bundle_hash(&text).unwrap().try_into().unwrap();
-    let enc = v2::encode(&b, &hash, 1 << 24).unwrap();
+    let enc = v2::encode(&b, &hash, data_fill::prepared::SEED_MAX_BYTES).unwrap();
     assert!(v2::is_v2(&enc.seed));
     let files: BTreeMap<_, _> =
         enc.packages.iter().map(|f| (package::key_of(f), f.clone())).collect();
-    let back = v2::decode(enc.seed.clone(), |k| Ok(files[k].clone()), 1 << 24).unwrap();
+    let back =
+        v2::decode(enc.seed.clone(), |k| Ok(files[k].clone()), data_fill::prepared::SEED_MAX_BYTES)
+            .unwrap();
     let canon = |b: &SeedBundle| package::canonical(serde_json::to_value(b).unwrap());
     assert_eq!(canon(&back), canon(&b));
     assert_eq!(bundle_hash(&serde_json::to_string(&back).unwrap()).unwrap(), hash);
 }
 
 #[test]
-fn the_same_seed_gives_the_same_bundle_with_any_worker_count_and_others_differ() {
+fn the_same_seed_gives_the_same_bundle_and_others_differ() {
     let canon = |b: &SeedBundle| package::canonical(serde_json::to_value(b).unwrap());
-    assert_eq!(canon(&make(7, 1)), canon(&make(7, 8)));
-    assert!((0..8).any(|r| canon(&make(r, 1)) != canon(&make(7, 1))));
+    assert_eq!(canon(&make(7)), canon(&make(7)));
+    assert!((0..8).any(|r| canon(&make(r)) != canon(&make(7))));
 }
 
 #[test]
 fn a_manifest_without_a_game_or_players_without_names_are_refused() {
     let (mut m, p) = players();
-    let e = generate(&m, "s", &p, 1, 1).map(|_| ());
+    let e = generate(&m, "s", &p, 1).map(|_| ());
     assert!(e.is_ok());
     m.as_object_mut().unwrap().remove("game");
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("game"));
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("game"));
     let (m, mut p) = players();
     p[1].name = "Ann".into();
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("repeats"));
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("repeats"));
     p[1].name = String::new();
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("name"));
-    assert!(generate(&m, "s", &[], 1, 1).is_err());
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("name"));
+    assert!(generate(&m, "s", &[], 1).is_err());
 }
 
 /// The found record and the prepared world file of a manifest's bytes, as `job::prepare`
@@ -110,17 +106,17 @@ fn prepare(manifest: &[u8]) -> Result<(Value, Vec<u8>), String> {
 fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     use data_fill::job::{Fill, fill, fill_reported, frame};
     let (m, p) = players();
-    let direct = generate(&m, "seed-one", &p, 7, 1).unwrap();
+    let direct = generate(&m, "seed-one", &p, 7).unwrap();
     let (found, file) = prepare(m.to_string().as_bytes()).unwrap();
     let game = data_fill::prepared::seed_game(&file).unwrap().to_vec();
-    let bundle = |seed: Vec<u8>| v2::decode(seed, |_| Ok(game.clone()), 1 << 24).unwrap();
+    let bundle = |seed: Vec<u8>| {
+        v2::decode(seed, |_| Ok(game.clone()), data_fill::prepared::SEED_MAX_BYTES).unwrap()
+    };
     let head = Fill {
         seed_name: "seed-one".to_owned(),
         players: p.clone(),
         rng_seed: 7,
-        workers: 1,
-        algorithm: data_fill::room::Algorithm::Exact,
-        seed_max_bytes: 1 << 24,
+        seed_max_bytes: data_fill::prepared::SEED_MAX_BYTES,
     };
     let req = serde_json::to_value(&head).unwrap();
     let framed = |head: &Value| frame(head.to_string().as_bytes(), &file).unwrap();
@@ -128,29 +124,14 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     let back: SeedBundle = bundle(out.clone());
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&direct).unwrap());
     assert!(fill(&frame(b"{", &file).unwrap()).unwrap_err().contains("bad fill request"));
-    // The mode is a field of the request: without it, and with "exact", the exact fill.
+    // A field the request does not know is refused: the fill mode it once named too.
     let mut asked = req.clone();
-    asked.as_object_mut().unwrap().remove("algorithm");
-    assert_eq!(fill(&framed(&asked)).unwrap(), out);
     asked["algorithm"] = json!("exact");
-    assert_eq!(fill(&framed(&asked)).unwrap(), out);
-    asked["algorithm"] = json!({"level": {"depth": 100}});
-    let level = fill(&framed(&asked)).unwrap();
-    let level: SeedBundle = bundle(level);
-    let dials = data_fill::room::Dials { depth: 100, ..Default::default() };
-    let mode = data_fill::room::Algorithm::Level(dials);
-    let (same, report) = data_fill::seed::generate_by(&m, "seed-one", &p, 7, 1, mode).unwrap();
-    // The job says how the seed was placed, since the bundle cannot.
-    let said = fill_reported(&framed(&asked)).unwrap().1;
-    assert_eq!(said, report);
-    assert_eq!(report.placed_by_the_mode, report.fallbacks == 0, "one attempt: {report:?}");
-    assert_eq!(serde_json::to_value(&level).unwrap(), serde_json::to_value(&same).unwrap());
-    assert_eq!(level.slots.len(), direct.slots.len());
-    // The depth dial is bounded where the request comes in.
-    asked["algorithm"] = json!({"shuffle": {"depth": i32::MAX}});
-    assert!(fill(&framed(&asked)).unwrap_err().contains("depth"));
-    asked["algorithm"] = json!("fastest");
-    assert!(fill(&framed(&asked)).unwrap_err().contains("bad"));
+    assert!(fill(&framed(&asked)).unwrap_err().contains("bad fill request"));
+    // The job says how the fill went, since the bundle cannot: what the library says.
+    let on = data_fill::prepared::Prepared::open(&file).unwrap();
+    let (_, report) = data_fill::seed::generate_on(&on, "seed-one", &p, 7).unwrap();
+    assert_eq!(fill_reported(&framed(&req)).unwrap().1, report);
 
     assert_eq!(
         (&found["game"], &found["version"], &found["items"]),
@@ -191,15 +172,14 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
 /// repaired flag every player, the others are not read; light rooms need no repair.
 #[test]
 fn the_fill_report_flags_worlds_with_little_room_early_on() {
-    use data_fill::room::Algorithm;
-    use data_fill::seed::{FillReport, generate_by};
-    use data_fill::synth::{Hostile, Shape, world};
+    use data_fill::prepared::{Prepared, build};
+    use data_fill::seed::{FillReport, generate_on};
+    use data_fill::synth::{Hostile, Shape, players, uploaded};
     let report = |shape: &Shape, n: u32, seed: u64| -> FillReport {
-        let (mut m, inst) = world(shape, 23, 0);
-        (m["game"], m["version"]) = (json!("Synth"), json!("1"));
-        let players: Vec<Player> =
-            (0..n).map(|p| Player { name: format!("P{p}"), instance: inst.clone() }).collect();
-        generate_by(&m, "s", &players, seed, 1, Algorithm::Exact).unwrap().1
+        let (m, inst) = uploaded(shape, 23, 0);
+        let players = players(&inst, n as usize);
+        let on = Prepared::open(&build(&m).unwrap().0).unwrap();
+        generate_on(&on, "s", &players, seed).unwrap().1
     };
     let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
     let mut repaired = 0;

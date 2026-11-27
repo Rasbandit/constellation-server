@@ -4,7 +4,6 @@
 
 use data_fill::Instance;
 use data_fill::job::{self, Fill};
-use data_fill::room::Algorithm;
 use data_fill::seed::Player;
 use data_fill::synth::Shape;
 use log::BlobKey;
@@ -26,7 +25,7 @@ pub fn small() -> Shape {
 }
 
 /// A fill request for `names` on one instance.
-pub fn head(names: &[&str], instance: &Instance, rng: u64, algorithm: Algorithm) -> Vec<u8> {
+pub fn head(names: &[&str], instance: &Instance, rng: u64) -> Vec<u8> {
     let players = names
         .iter()
         .map(|n| Player { name: (*n).to_owned(), instance: instance.clone() })
@@ -35,8 +34,6 @@ pub fn head(names: &[&str], instance: &Instance, rng: u64, algorithm: Algorithm)
         seed_name: format!("s{rng}"),
         players,
         rng_seed: rng,
-        workers: config::GENERATION_WORKERS,
-        algorithm,
         seed_max_bytes: config::Limits::DESIGN.bundle_max_bytes,
     };
     serde_json::to_vec(&fill).unwrap()

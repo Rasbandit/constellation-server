@@ -163,6 +163,8 @@ Two things this run found. The start inventory of the player with shuffled clock
 
 ### Scaling with players
 
+As of 2026-11-26 the fill has one path, the split path (one solve, then every group's state by adding to it and taking the additions back), at every room size and for confined items too. The carried path (truth maintenance) and the forward path (a fresh solve per round, on threads) described below were removed; the tables are history. A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`).
+
 `measure_room` (feature `memory-harness`) fills a room of N players of the test world (the two instances in turn, so the 10 and 20 player rooms repeat settings), release build, one fill of seed 1, `systemd-run -p CPUQuota=200%`; the world is loaded once and shared; fill time is the median of five fills; engine peak heap is the counting allocator's peak, world load included.
 
 | Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
@@ -174,7 +176,7 @@ Two things this run found. The start inventory of the player with shuffled clock
 | 20 (extra) | 386.6 | 3 597 | 180 | 10.6 | 1 551 | 77 | 0.92 | 7.37 |
 
 - **Memory per added player: about 350 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.37 MB, linear: 291 KB for the second player, then 346 to 351 KB each.
-- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and a generation in the product runs it on `config::GENERATION_WORKERS` threads (one; the tools use `config::FILL_SETUP_WORKERS`).
+- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and a generation in the product runs it on `config::GENERATION_WORKERS` threads (one; the tools use `config::FILL_SETUP_WORKERS`). (History: since 2026-11-26 setup runs on one thread in every caller, and the worker count is gone.)
 - **Fill time per added player grows with the room on the carried path** (rooms under 8 players since the forward path below): 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
 - The cheap changes (a min-heap of suspects over players, a worklist of players with something to run, piles indexed by owner) are in: placements are byte-identical to before them (61 fills over 1, 2, 3 and 10 players, clock on and off, and the three-player fixture) and the time dropped 10 to 12 percent at 10 and 20 players. What is left is rule evaluation (the evaluations column is unchanged), not bookkeeping.
 - Every fill in this table is one full solve, then incremental steps (`solves` 1 in all rows). That holds on the carried path; the forward path solves once per round (next section).
@@ -206,99 +208,9 @@ Fitted exponent of fill time over players: carried 1.52 (light) and 1.59 (heavy)
 - **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
 - The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
 
-## Opt-in fill modes: level fill and shuffle fill
+## Opt-in fill modes (removed)
 
-The fill described above (the exact fill, `room::Algorithm::Exact`) stays the default and the reference; nothing in it changed (the pinned placements test still holds). Two further modes place the progression items that have no placement group, each with about one forward solve instead of one per item or round. They are asked for by name (`fill_room_by`, or `"algorithm"` in a fill request: `"exact"`, `{"level": {}}`, `{"shuffle": {}}`); confined items before them and everything else after them are placed as always. Neither mode is presented as a new idea. Which existing fills they resemble is not stated here: the paragraph that says so, with sources, waits for the review and sign-off `CONTRIBUTING.md` asks for.
-
-**Level fill** (`Algorithm::Level`, `level.rs`). The shuffled progression list is read as the order a player finds the items. One forward solve adds them one at a time and labels every location with its level: the number of order items held when it is first reached. Item `k` may sit only at a level below `k`, so the seed is beatable by construction. Placing all items is possible exactly when, for every `k`, at least `k` free locations have a level below `k`; items are placed last first, each among the levels that keep that true for the items before it. An order that fails the count is reordered without drawing (the first later item that opened a location in the last solve moves forward) and solved again, at most `config::LEVEL_FILL_MAX_REPAIRS` times; then the attempt is the exact fill's, on the same draws, so a fallback seed is byte for byte the exact fill's seed.
-
-**Shuffle fill** (`Algorithm::Shuffle`, shuffle then unstick). Every item goes to a uniformly random permitted location. One forward solve holds progression only. While progression is out of reach, each player with an unreached item that would open a rule on their frontier right now (an exit, event or check of a reached region that does not hold yet, evaluated with one more copy; failing that an item such a rule reads; any unreached item when no frontier names one) has one such item change places with a non-progression item at a reached location, and the same solve goes on: rules are monotone and what moves out is not held, so nothing reached is lost, and nothing is retracted or restarted. A first shuffle that is beatable is the seed as drawn (test `a_shuffle_that_is_beatable_as_drawn_is_kept_as_drawn`). With no reached location left to move to, the attempt is the exact fill's, on the same draws. It runs on one thread.
-
-Both end with a fresh solve of the finished room; a seed whose progression that solve does not reach is `FillError::Invalid`, in release builds too, and is not retried (test `a_seed_whose_progression_the_final_solve_misses_is_invalid`). That solve holds progression items only, as the sphere sweep does; `validate_room` and the exact fill's last solve hold every placed item. The two agree as long as no rule reads an item that is not progression, which nothing enforces and no fixture exercises: where one did, a mode would report less reached than `validate_room`, never more.
-
-**Dials** (`room::Dials`; the defaults in `crates/config` change nothing): `depth` (`FILL_DEPTH_PERCENT`, 0 uniform; above 0 more draws per pick and the location opened latest wins, below 0 the earliest; refused beyond `FILL_DEPTH_MAX_PERCENT` either way, since a fill request carries it), `goal_only` (`FILL_GOAL_ONLY`: only every goal has to be reachable; the engine had no accessibility setting before, see #92), and `skip_empty` (`FILL_SKIP_EMPTY_CHECKS`, a work switch, not a feel dial).
-
-**Checks of empty locations.** Before this, a solve evaluated every check of a reached region when the region was first visited and again whenever an item or counter its rule reads changed, until it held (the dependency index, `World::item_sites`); a check that holds is never evaluated again. So an empty location cost at least one evaluation per solve. With `skip_empty`, the opt-in modes' solves leave the check of a location that holds no progression asleep: it is evaluated when a shuffle fill needs it as a place to move an item to, in level fill's labelling solve when an item may take it (the level is the product there, so those stay awake), and otherwise in one pass at the end. Under `goal_only` the last pass is skipped only for a caller that asks for no spheres; the product always asks, since a seed records a sphere per location. Placements, reports and spheres are the same with and without (tests `skipping_empty_checks_gives_the_same_seed_with_fewer_evaluations` and, for rooms where a round moves several items, `skipping_empty_checks_places_the_same_in_rooms_of_several_moves_a_round`; the bench job compares a placements hash).
-
-### The modes, measured
-
-Measured by the `bench-room` job on one GitHub-hosted `ubuntu-latest` runner (release build, commit 20d879c, 2026-11-25; one room seed per size, fill ms is the median of 5). This runner was slower than the one behind the table further up (the exact fill's heavy 100 took 4,603 ms here against 3,428 to 4,138 ms on other runs), so compare rows of this table with each other only. The modes ran on one thread; "exact" is the exact fill on the forward path on one thread, with its carried path in brackets. Rule evaluations and counts do not depend on the machine. Peak heap is the counting allocator's peak for one fill on the calling thread; peak RSS is the whole process's high-water mark when the row was printed (setup and the smaller rooms included).
-
-| Profile | Players | Mode | Fill ms | Rule evaluations | Solves | Swaps | Fell back | Peak heap MB | Peak RSS MB |
-|---|---|---|---|---|---|---|---|---|---|
-| light | 1 | exact | 8.9 (carried 4.4) | 253,458 (43,855) | 190 | | | 0.09 | 10.6 |
-| light | 1 | level | 0.4 | 3,244 | 2 | | no | 0.10 | 10.6 |
-| light | 1 | shuffle | 0.3 | 2,323 | 2 | 3 | no | 0.12 | 10.6 |
-| light | 100 | exact | 1,329.6 (carried 4,329) | 26,840,369 | 190 | | | 10.7 | 325 |
-| light | 100 | level | 56.3 | 332,538 | 2 | | no | 11.0 | 325 |
-| light | 100 | shuffle | 49.5 | 224,633 | 2 | 1 | no | 13.1 | 325 |
-| heavy | 1 | exact | 33.8 (carried 21.4) | 488,289 (149,132) | 190 | | | 0.13 | 23.7 |
-| heavy | 1 | level | 1.3 | 7,155 | 2 | | no | 0.14 | 23.7 |
-| heavy | 1 | shuffle | 1.5 | 8,030 | 2 | 15 | no | 0.16 | 23.7 |
-| heavy | 10 | exact | 414.1 | 5,364,638 | 190 | | | 1.6 | 97.7 |
-| heavy | 10 | level | 13.3 | 73,893 | 2 | | no | 1.5 | 97.6 |
-| heavy | 10 | shuffle | 14.6 | 64,627 | 2 | 70 | no | 1.7 | 97.6 |
-| heavy | 100 | exact | 4,602.9 (carried 30,113) | 52,251,328 | 190 | | | 15.1 | 822 |
-| heavy | 100 | level | 170.4 | 743,472 | 2 | | no | 15.0 | 822 |
-| heavy | 100 | shuffle | 177.9 | 709,583 | 2 | 800 | no | 17.5 | 822 |
-
-On this runner both modes are 24 to 27 times faster than the exact fill at 100 players on one thread, and 14 to 16 times faster than the carried path for one player of the heavy profile. Per world at 100 players of the heavy profile: 1.7 ms (level) and 1.8 ms (shuffle) against 46 ms. Fill ms includes the final solve that checks the seed and the sphere sweep the seed records; of level fill's evaluations at heavy 100, 443,623 are its own solve.
-
-Skipping the checks of empty locations (the `noskip` rows of the job; the job fails if a `noskip` row's placements hash differs from its skipping row's, and none did): at heavy 100, level fill 1,017,391 to 743,472 evaluations (27 percent fewer, 187.0 to 170.4 ms) and shuffle fill 1,089,781 to 709,583 (35 percent fewer, 200.9 to 177.9 ms); at light 100, 343,670 to 332,538 (3 percent) and 328,495 to 224,633 (32 percent, 51.0 to 49.5 ms).
-
-**Seed shape**, counted by the same job (`fill-fairness --modes`). The reference is the exact fill on fill seeds 1 to N of one stream; every row is filled on seeds 1 to N of another stream, and the `exact` row is therefore the noise floor: what two independent samples of the same fill look like at this sample size. A seed that fell back to the exact fill is counted in its own column and left out of the row's shape. "Distance" is the total variation distance between the row's and the reference's distribution of progression over spheres (0 the same, 1 disjoint). "Location chi2/dof" compares how often each location holds progression with the reference. Required spheres are counted on the first 5 seeds only and show a direction, not a value.
-
-| Room | Mode | Placed by the mode | Fell back (seeds) | Swaps or repairs per seed | Spheres, mean | Progression in first two spheres (locations there) | Required spheres (5 seeds) | Stuck share, mean | Distance | Location chi2/dof |
-|---|---|---|---|---|---|---|---|---|---|---|
-| light, 1 player, 200 seeds | exact (noise floor) | 200 | | | 11.6 | 0.026 (0.021) | 3.8 | | 0.063 | 0.78 |
-| | level | 200 | 0 | 0 | 6.6 | 0.120 (0.045) | 0 | | 0.836 | 3.58 |
-| | level, depth 100 | 200 | 0 | 0 | 9.4 | 0.041 (0.023) | 1.0 | | 0.406 | 1.20 |
-| | level, depth 300 | 200 | 0 | 0 | 14.1 | 0.025 (0.018) | 5.4 | | 0.403 | 1.38 |
-| | level, depth -100 | 200 | 0 | 0 | 5.5 | 0.173 (0.054) | 0 | | 0.877 | 8.62 |
-| | shuffle | 200 (11 percent untouched) | 0 | 2.8 swaps | 11.4 | 0.032 (0.023) | 6.6 | | 0.081 | 0.80 |
-| | shuffle, depth 300 | 200 | 0 | 2.7 swaps | 12.1 | 0.026 (0.019) | 6.0 | | 0.042 | 0.80 |
-| | shuffle, depth -100 | 200 | 0 | 2.9 swaps | 11.1 | 0.034 (0.024) | 4.6 | | 0.125 | 0.81 |
-| heavy, 1 player, 200 seeds | exact (noise floor) | 200 | | | 20.1 | 0.020 (0.006) | 12.4 | | 0.085 | 0.77 |
-| | level | 193 | 7 | 0.56 repairs | 10.8 | 0.034 (0.007) | 4.2 | | 0.830 | 3.44 |
-| | level, depth 300 | 193 | 7 | 0.56 repairs | 19.1 | 0.028 (0.006) | 9.6 | | 0.194 | 1.29 |
-| | level, depth -100 | 193 | 7 | 0.56 repairs | 9.8 | 0.034 (0.007) | 3.0 | | 0.843 | 7.04 |
-| | shuffle | 191 (none untouched) | 9 | 11.4 swaps | 16.7 | 0.029 (0.007) | 9.0 | | 0.488 | 0.86 |
-| | shuffle, depth 300 | 187 | 13 | 11.7 swaps | 18.6 | 0.021 (0.006) | 8.6 | | 0.280 | 0.85 |
-| | shuffle, depth -100 | 189 | 11 | 11.8 swaps | 15.7 | 0.033 (0.008) | 7.8 | | 0.603 | 0.90 |
-| light, 10 players, 20 seeds | exact (noise floor) | 20 | | | 20.5 | 0.013 (0.011) | not counted | 0.311 | 0.267 | 0.85 |
-| | level | 20 | 0 | 0 | 7.2 | 0.086 (0.029) | | 0.008 | 0.962 | 1.06 |
-| | level, depth 300 | 20 | 0 | 0 | 19.4 | 0.009 (0.009) | | 0.227 | 0.356 | 0.87 |
-| | shuffle | 20 (15 percent untouched) | 0 | 8.2 swaps | 17.6 | 0.014 (0.013) | | 0.218 | 0.332 | 0.85 |
-| heavy, 10 players, 20 seeds | exact (noise floor) | 20 | | | 35.1 | 0.013 (0.003) | not counted | 0.396 | 0.274 | 0.84 |
-| | level | 20 | 0 | 0 | 14.1 | 0.019 (0.004) | | 0.165 | 0.922 | 1.04 |
-| | level, depth 300 | 20 | 0 | 0 | 24.1 | 0.014 (0.003) | | 0.196 | 0.819 | 0.86 |
-| | shuffle | 20 (none untouched) | 0 | 79.8 swaps | 25.4 | 0.019 (0.005) | | 0.219 | 0.706 | 0.84 |
-
-The two small fixture worlds, 10,000 seeds a row, where the comparison has power, also against 10,000 uniform beatable placements (rejection sampling; "max gap" is the largest difference between how often the row and the baseline put an item at a location):
-
-| World | Mode | Fell back (seeds) | Spheres, mean | Location chi2/dof against exact | Distance | Chi-square against uniform | Max gap from uniform | Coverage gaps |
-|---|---|---|---|---|---|---|---|---|
-| single player (dof 15 against uniform) | exact (noise floor) | | 3.5 | 0.64 | 0.005 | 278 | 0.074 | 0 |
-| | level | 0 | 3.1 | 460 | 0.161 | 7,620 | 0.220 | 0 |
-| | level, depth 100 | 0 | 3.2 | 261 | 0.114 | 4,550 | 0.165 | 0 |
-| | level, depth 300 | 0 | 3.3 | 126 | 0.058 | 3,373 | 0.222 | 0 |
-| | shuffle | 0 | 3.3 | 63 | 0.064 | 909 | 0.080 | 0 |
-| | shuffle, depth 300 | 0 | 3.3 | 45 | 0.054 | 615 | 0.061 | 0 |
-| room of three (dof 176 against uniform) | exact, rounds (noise floor) | | 4.1 | 0.59 | 0.004 | 9,218 | 0.136 | 6 |
-| | level | 0 | 3.6 | 312 | 0.136 | 27,384 | 0.128 | 0 |
-| | level, depth 100 | 0 | 4.0 | 153 | 0.053 | 10,501 | 0.080 | 0 |
-| | level, depth 300 | 0 | 4.6 | 175 | 0.071 | 3,081 | 0.057 | 0 |
-| | shuffle | 38 | 4.3 | 154 | 0.034 | 4,120 | 0.055 | 0 |
-| | shuffle, depth 300 | 38 | 4.3 | 160 | 0.032 | 3,683 | 0.055 | 0 |
-
-What the numbers say, and what they do not:
-- **Neither mode spreads items like the exact fill.** Where the test has power (the fixtures, 10,000 seeds) both differ from it far beyond the noise floor: location chi2/dof 63 and 154 for shuffle fill, 460 and 312 for level fill, against 0.6 for the exact fill itself. On the synthetic rooms 200 and 20 seeds over about a thousand locations cannot tell: every row's location chi2/dof there is at the noise floor (0.8 to 0.9) except level fill at depth 0 and below (3.4 to 8.6), so those columns show that level fill's location bias is large, and nothing about shuffle fill's.
-- **Sphere counts.** Shuffle fill's are near the exact fill's on the light profile (11.4 against 11.6) and shorter on the heavy one (16.7 against 20.1, 25.4 against 35.1 with 10 players; distance 0.49 and 0.71 against floors of 0.09 and 0.27). Level fill at depth 0 has about half the spheres (6.6 against 11.6, 10.8 against 20.1); depth 300 brings the count near (14.1, 19.1) with a distribution that still differs.
-- **Against uniform** (fixtures only): on the single player world the exact fill is the closest by far (chi-square 278; shuffle 909, level 7,620). On the room of three the exact fill's rounds are not the closest: level fill at depth 300 (3,081) and shuffle fill (4,120) are closer than it (9,218), and level fill at depth 0 is the furthest (27,384). The max gap column agrees on the room and cannot separate the exact fill from shuffle fill on the single world (0.074 against 0.080).
-- **Fallbacks.** On one player of the heavy profile 9 of 200 shuffle seeds and 7 of 200 level seeds fell back to the exact fill (so those cost the exact fill's time: worst 1 percent 25 and 29 ms against medians of 1.6 ms); none on the light profile or with 10 players; 38 of 10,000 shuffle rooms on the room fixture. Before shuffle fill looked one step ahead for an item that opens a rule now (commit cba2df5), 85 of 200 heavy seeds fell back (counted on the run at c744aa6, same stream as the reference).
-- **Dials.** `depth` moves level fill a long way (5.5 to 14.1 spheres on light). It moves shuffle fill a little and only through the items it swaps (11.1 to 12.1 spheres on light, 15.7 to 18.6 on heavy; on the room fixture not at all). `goal_only` changed nothing measurable on these worlds: the goal of a synthetic world is its last layer, which needs nearly everything.
-
-`fill-fairness --modes "exact level level,depth=100 shuffle" (--world w.json | --synth light|heavy --players N)` prints, per mode on the same room (the exact fill reference on one stream of seeds, every row on another, seeds that fell back counted apart): spheres, progression per sphere against locations per sphere, how often each location holds progression (normalized entropy, and a chi-square against the exact fill), the share of rounds a player waits with nothing new, spheres that hold a required item (`--required N` seeds: one solve per progression item, so keep N small), repairs, swaps, fallbacks, and fill time (median and worst 1 percent); with `--baseline N` on a small world also the comparison with uniform beatable placements.
+Two opt-in fill modes, level fill and shuffle then repair, were built and measured here (commit 20d879c, 2026-11-25): about one forward solve each instead of one per round, 24 to 27 times faster than the exact fill at 100 players, at the cost of seeds that spread items measurably unlike the exact fill. Under D-138 the product has one fill method, so both were removed with their dials, constants, bench rows and tests. Their design, tables and seed-shape numbers are in `git` history (this section at that commit). `fill-fairness --shape on` reports the exact fill's seed shape on one room.
 
 ## Fairness
 

@@ -45,7 +45,7 @@ pub(crate) fn waves(w: &World, plan: &Plan, stats: &mut Stats) -> Vec<Vec<u32>> 
         let has = |i: &u16| left[usize::from(*i)] > 0;
         let mut now: Vec<u16> = Vec::new();
         for i in kinds.iter().copied().filter(has) {
-            if r.opens(i, true) {
+            if r.opens(i) {
                 now.push(i);
             }
         }
@@ -94,7 +94,7 @@ mod tests {
     /// In a chain world key `k` opens region `k + 1`: its depth is `k`, whatever the room.
     #[test]
     fn a_chain_key_is_as_deep_as_the_region_it_opens() {
-        let c = room(&Shape { checks: 60, ..Shape::hostile(Hostile::Chain) }, 1, 2, 1).unwrap();
+        let c = room(&Shape { checks: 60, ..Shape::hostile(Hostile::Chain) }, 1, 2).unwrap();
         for s in c.seats() {
             let waves = waves(s.w, s.plan, &mut Stats::default());
             for k in 0..6u32 {
@@ -108,7 +108,7 @@ mod tests {
     /// open nothing and are the deepest. A key in front of most of the world is the shallowest.
     #[test]
     fn copies_that_open_nothing_are_the_deepest() {
-        let c = room(&Shape { checks: 60, ..Shape::hostile(Hostile::Gated) }, 1, 1, 1).unwrap();
+        let c = room(&Shape { checks: 60, ..Shape::hostile(Hostile::Gated) }, 1, 1).unwrap();
         let s = c.seats()[0];
         let waves = waves(s.w, s.plan, &mut Stats::default());
         assert_eq!(waves[usize::from(s.w.item("k0").unwrap())], [0]);

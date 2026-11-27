@@ -4,7 +4,6 @@
 
 use super::*;
 use data_fill::Instance;
-use data_fill::room::{Algorithm, Dials};
 use data_fill::synth::Shape;
 use fills::{alone, head, prepared, small};
 
@@ -54,37 +53,30 @@ fn kept(worlds: &Cache<Loaded>) -> Vec<BlobKey> {
 }
 
 /// Byte identity: one worker takes every request in turn, on two worlds, for one and ten
-/// players and each fill mode, and answers each with the bytes a job child of its own prints
+/// players and six seeds, and answers each with the bytes a job child of its own prints
 /// (or the same refusal), with the world sent the first time (cold) and from its cache after
 /// (warm). Fails if a fill depended on anything a job before it left.
 #[test]
 fn a_worker_answers_job_after_job_with_the_bytes_of_a_job_in_its_own_process() {
-    let modes = [
-        Algorithm::Exact,
-        Algorithm::Level(Dials::default()),
-        Algorithm::Shuffle(Dials::default()),
-    ];
     let worlds = [prepared(&small(), 1), prepared(&Shape { checks: 200, ..Shape::heavy() }, 2)];
     let ten: Vec<String> = (0..10).map(|p| format!("P{p}")).collect();
     let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
     let (mut script, mut expected) = (Vec::new(), Vec::new());
     let mut seen = Vec::new();
-    for rng in 1..=2 {
-        for mode in modes {
-            for names in [&["Ann"][..], &ten] {
-                for (key, file, instance) in &worlds {
-                    let head = head(names, instance, rng, mode);
-                    script.extend(job_message(&head, key));
-                    if !seen.contains(key) {
-                        seen.push(*key);
-                        script.extend(message(Kind::World, file));
-                        expected.push((Kind::Miss, Vec::new()));
-                    }
-                    expected.push(match alone(&head, file) {
-                        Ok(seed) => (Kind::Done, seed),
-                        Err(why) => (Kind::Refused, why.into_bytes()),
-                    });
+    for rng in 1..=6 {
+        for names in [&["Ann"][..], &ten] {
+            for (key, file, instance) in &worlds {
+                let head = head(names, instance, rng);
+                script.extend(job_message(&head, key));
+                if !seen.contains(key) {
+                    seen.push(*key);
+                    script.extend(message(Kind::World, file));
+                    expected.push((Kind::Miss, Vec::new()));
                 }
+                expected.push(match alone(&head, file) {
+                    Ok(seed) => (Kind::Done, seed),
+                    Err(why) => (Kind::Refused, why.into_bytes()),
+                });
             }
         }
     }
@@ -104,9 +96,9 @@ fn a_worker_answers_job_after_job_with_the_bytes_of_a_job_in_its_own_process() {
 #[test]
 fn a_job_gets_nothing_of_the_jobs_before_it() {
     let (x, y) = (prepared(&small(), 1), prepared(&small(), 2));
-    let first = head(&["Ann-of-job-one", "Bo-of-job-one"], &x.2, 5, Algorithm::Exact);
-    let other = head(&["Cy"], &y.2, 5, Algorithm::Exact);
-    let again = head(&["Dee"], &x.2, 9, Algorithm::Exact);
+    let first = head(&["Ann-of-job-one", "Bo-of-job-one"], &x.2, 5);
+    let other = head(&["Cy"], &y.2, 5);
+    let again = head(&["Dee"], &x.2, 9);
     let script = [
         job_message(&first, &x.0),
         message(Kind::World, &x.1),
@@ -138,7 +130,7 @@ fn a_job_gets_nothing_of_the_jobs_before_it() {
 #[test]
 fn a_world_that_does_not_hash_to_its_key_is_never_loaded_or_kept() {
     let (x, y) = (prepared(&small(), 1), prepared(&small(), 2));
-    let head = head(&["Ann"], &x.2, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &x.2, 1);
     let script = [job_message(&head, &x.0), message(Kind::World, &y.1)].concat();
     let mut worlds = roomy();
     let (ended, answers) = scripted(&script, &mut worlds);
@@ -154,7 +146,7 @@ fn a_world_that_does_not_hash_to_its_key_is_never_loaded_or_kept() {
 fn a_world_that_does_not_load_is_refused_as_the_job_child_refuses_it_and_not_kept() {
     let x = prepared(&small(), 1);
     let junk = b"not a prepared world".to_vec();
-    let head = head(&["Ann"], &x.2, 1, Algorithm::Exact);
+    let head = head(&["Ann"], &x.2, 1);
     let script = [
         job_message(&head, &log::blob_key(&junk)),
         message(Kind::World, &junk),
@@ -195,8 +187,7 @@ fn a_bad_request_is_refused_before_its_world_is_asked_for() {
 #[test]
 fn kept_worlds_stay_under_the_cap_and_the_least_recently_used_goes_first() {
     let (x, y) = (prepared(&small(), 1), prepared(&small(), 2));
-    let (hx, hy) =
-        (head(&["Ann"], &x.2, 1, Algorithm::Exact), head(&["Bo"], &y.2, 1, Algorithm::Exact));
+    let (hx, hy) = (head(&["Ann"], &x.2, 1), head(&["Bo"], &y.2, 1));
     let cold = |head: &[u8], w: &(BlobKey, Vec<u8>, Instance)| {
         [job_message(head, &w.0), message(Kind::World, &w.1)].concat()
     };
@@ -220,7 +211,7 @@ fn kept_worlds_stay_under_the_cap_and_the_least_recently_used_goes_first() {
 #[test]
 fn a_worker_stops_on_anything_but_a_whole_message_in_turn() {
     let x = prepared(&small(), 1);
-    let job = job_message(&head(&["Ann"], &x.2, 1, Algorithm::Exact), &x.0);
+    let job = job_message(&head(&["Ann"], &x.2, 1), &x.0);
     let world = message(Kind::World, &x.1);
     let short_key = job_message(b"{}", &[7; 31]);
     let bad: [(&str, Vec<u8>); 10] = [
@@ -300,7 +291,7 @@ async fn the_world_is_sent_on_a_miss_only_and_the_seed_is_the_same_cold_and_warm
     ours.set_nonblocking(true).unwrap();
     let (mut from, mut to) = tokio::net::UnixStream::from_std(ours).unwrap().into_split();
     let (key, file, instance) = prepared(&small(), 1);
-    let head = head(&["Ann"], &instance, 3, Algorithm::Exact);
+    let head = head(&["Ann"], &instance, 3);
     let want = alone(&head, &file).unwrap();
     let l = Limits::DESIGN;
     let cold = ask((&mut to, &mut from), &head, (&key, &file), &l).await;
@@ -321,12 +312,11 @@ fn a_worker_is_replaced_before_its_cpu_cap_could_end_a_job_that_did_nothing_wron
     let l = Limits::DESIGN;
     assert_eq!((l.fill_cpu_secs, l.fill_timeout_ms), (120, 60_000));
     assert_eq!(config::FILL_WORKER_CPU_MARGIN_MS, 1000);
-    assert!(has_cpu_left(0, 1, &l));
-    assert!(has_cpu_left(58_999, 1, &l));
-    assert!(!has_cpu_left(59_000, 1, &l), "a second is kept in hand");
-    assert!(!has_cpu_left(0, 2, &l), "two threads for 60 s may use the whole cap");
-    assert!(!has_cpu_left(0, 1, &Limits { fill_cpu_secs: 61, ..l }));
-    assert!(!has_cpu_left(u128::MAX / 4, 1, &l));
+    assert!(has_cpu_left(0, &l));
+    assert!(has_cpu_left(58_999, &l));
+    assert!(!has_cpu_left(59_000, &l), "a second is kept in hand");
+    assert!(!has_cpu_left(0, &Limits { fill_cpu_secs: 61, ..l }));
+    assert!(!has_cpu_left(u128::MAX / 4, &l));
 }
 
 /// A worker is started as a job child is: the same program under the same caps, in job mode,

@@ -7,6 +7,8 @@ use data_fill::fairness::{
 use data_fill::{Instance, Plan, World};
 use serde_json::Value;
 
+mod support;
+
 fn freq(rows: &[(u16, u32, u64)], samples: u64) -> Freq {
     let mut f = Freq { samples, ..Freq::default() };
     for (i, l, n) in rows {
@@ -82,10 +84,10 @@ fn uniform_distinct_saturates_at_the_location_count() {
 }
 
 fn fixture() -> (World, Instance, Vec<u16>, Vec<bool>) {
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/fairness_world.json")).expect("fixture parses");
-    let inst: Instance = serde_json::from_value(v["instance"].clone()).expect("instance");
-    let w = World::load(&v["manifest"]).expect("world");
+    let v = support::fixture("fairness_world");
+    let (manifest, mut insts) = data_fill::room::from_doc(&v).expect("instance");
+    let inst = insts.remove(0);
+    let w = World::load(manifest).expect("world");
     let pool = inst.pool.iter().map(|k| w.item(k).expect("item")).collect();
     let prog = inst.progression(&w);
     (w, inst, pool, prog)
@@ -125,11 +127,7 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
 fn a_room_is_measured_against_the_same_baseline() {
     use data_fill::fairness::{Flat, report_named, sample_room};
     use data_fill::room;
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
-    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
     let (worlds, seats) = (&c.worlds, c.seats());
     let flat = Flat::new(&seats).expect("flat");
     let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
@@ -156,8 +154,7 @@ fn a_room_is_measured_against_the_same_baseline() {
 fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     use data_fill::fairness::{Flat, sample_room};
     use data_fill::room::{self, Seat};
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
+    let v = support::fixture("room_world");
     let w = World::load(&v["manifest"]).expect("world");
     let mut inst: Instance = serde_json::from_value(v["instances"][0].clone()).expect("instance");
     inst.locked.insert("l6".to_owned(), "coin".to_owned());
@@ -180,45 +177,16 @@ fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     assert!(sample_room(&seats, &flat, 1, 0, 0).is_err());
 }
 
-/// The mode comparison on the small room: every mode is measured on the same seeds, the exact
-/// fill is at distance 0 from itself, and a deeper depth dial moves progression later.
+/// The shape of the fill's seeds on the small room: every seed filled, and the spheres that
+/// hold a required item counted for the first seeds asked.
 #[test]
-fn modes_are_compared_on_the_same_room_and_the_depth_dial_moves_progression() {
-    use data_fill::fairness::{FILLS, OTHER_FILLS, shape, shape_report};
-    use data_fill::room::{self, Algorithm};
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
-    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+fn the_shape_of_the_fills_seeds_is_reported_on_the_small_room() {
+    use data_fill::fairness::{shape, shape_report};
+    use data_fill::room;
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
     let seats = c.seats();
-    let exact = shape(&seats, (300, FILLS), Algorithm::Exact, 20).expect("exact");
-    let own = shape_report(&exact, Some(&exact));
-    assert_eq!(own["against_exact"]["sphere_distribution_distance"], 0.0);
-    assert_eq!(own["against_exact"]["location_chi2"], 0.0);
-    assert_eq!((exact.failed, exact.own, exact.required.len()), (0, 300, 20));
+    let exact = shape(&seats, 300, 20).expect("exact");
+    let own = shape_report(&exact);
+    assert_eq!((exact.failed, exact.seeds, exact.required.len()), (0, 300, 20));
     assert!(own["required_spheres_mean"].as_f64().is_some_and(|x| x >= 1.0), "{own}");
-    let depth = |mode: &str| {
-        let s = shape(&seats, (300, OTHER_FILLS), mode.parse().expect("mode"), 0).expect("shape");
-        assert_eq!(s.own + s.fell_back, 300, "{mode}: a fallback seed is counted apart");
-        assert_eq!(s.failed, 0, "{mode}");
-        let r = shape_report(&s, Some(&exact));
-        assert!(r["against_exact"]["sphere_distribution_distance"].as_f64().is_some(), "{r}");
-        (r["progression_relative_depth_mean"].as_f64().expect("depth"), s.own)
-    };
-    // The exact fill on other seeds is the noise floor: independent samples are not at 0.
-    let other = shape(&seats, (300, OTHER_FILLS), Algorithm::Exact, 0).expect("exact again");
-    let floor = shape_report(&other, Some(&exact));
-    assert!(floor["against_exact"]["location_chi2"].as_f64().is_some_and(|x| x > 0.0), "{floor}");
-    for mode in ["level", "shuffle"] {
-        let (shallow, _) = depth(&format!("{mode},depth=-300"));
-        let (flat, own) = depth(mode);
-        let (deep, _) = depth(&format!("{mode},depth=300"));
-        assert!(own > 150, "{mode} placed {own} of 300 rooms itself");
-        println!("{mode}: relative depth {shallow} {flat} {deep}");
-        // Level fill places every item by the dial. Shuffle fill steers only the few items it
-        // moves (about two a room here), so its dial is held to the two ends, not the middle.
-        assert!(shallow < deep, "{mode}: {shallow} {flat} {deep}");
-        assert!(mode == "shuffle" || (shallow < flat && flat < deep), "{mode}: {flat}");
-    }
 }
