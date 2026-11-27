@@ -48,8 +48,8 @@ impl Worlds {
     /// [`Self::save_status`] for a job's last status, tried again with a growing wait while
     /// the store is down: a finished job left `running` would be failed later by the sweep.
     pub(super) async fn save_final(&self, status: &Value) -> Result<(), String> {
-        let mut wait = FINAL_WRITE_WAIT;
-        for attempt in 1..FINAL_WRITE_TRIES {
+        let mut wait = Duration::from_millis(config::GEN_FINAL_WRITE_WAIT_MS);
+        for attempt in 1..config::GEN_FINAL_WRITE_TRIES {
             let Err(e) = self.save_status(status).await else { return Ok(()) };
             tracing::warn!(attempt, error = %e, "final status write failed; trying again");
             tokio::time::sleep(wait).await;
@@ -83,11 +83,6 @@ pub(super) fn job_row(status: &Value) -> Result<(&str, JobState, String), String
     let state = status["status"].as_str().and_then(JobState::parse);
     Ok((id, state.ok_or("a status with a bad state")?, status.to_string()))
 }
-
-/// Writes of a job's last status: tries, and the wait after the first, doubling (a cost trade:
-/// about 15 s in all, one heartbeat, rides out a store restart).
-pub(super) const FINAL_WRITE_TRIES: u32 = 6;
-pub(super) const FINAL_WRITE_WAIT: Duration = Duration::from_millis(500);
 
 /// What a job folder holds, for its log line: each file under it with its size, in name order,
 /// at most `most` named. Links are named, never followed.
