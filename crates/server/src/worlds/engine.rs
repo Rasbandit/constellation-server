@@ -6,6 +6,9 @@ use super::*;
 /// `status.engine` of a world the data-fill engine generates (a legacy world has none).
 pub(super) const ENGINE_DATA_ONLY: &str = "data-only";
 
+/// A data-only world's seed is named for its engine and this many characters of its world id.
+const SEED_NAME_ID_CHARS: usize = 12;
+
 /// How the data-only jobs (a fill, a manifest check) run: in a capped child process, always but
 /// in the unit tests of this module, whose executable is not the server's.
 #[derive(Debug, Clone)]
@@ -257,7 +260,7 @@ pub(super) async fn player_files(
 
 /// A manifest world: the engine fills it in a child process under the fill caps (address space,
 /// CPU time, wall clock; a child past its time is killed), under the same `gen_concurrency`
-/// permit, status file and publish path as a legacy world.
+/// permit, stored status and publish path as a legacy world.
 pub(super) async fn generate_data_only(
     w: &Worlds,
     status: &Value,
@@ -275,7 +278,7 @@ pub(super) async fn generate_data_only(
     // The seed is the world id's own hash: the same world id gives the same seed.
     let rng_seed =
         u64::from_le_bytes(Sha256::digest(id.as_bytes())[..8].try_into().unwrap_or([0; 8]));
-    let seed_name = format!("data-only-{}", id.get(..12).unwrap_or(id));
+    let seed_name = format!("{ENGINE_DATA_ONLY}-{}", id.get(..SEED_NAME_ID_CHARS).unwrap_or(id));
     let files = player_files(w, &yamls).await?;
     laps.lap("store");
     let players = yamls.len();
