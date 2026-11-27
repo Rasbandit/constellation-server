@@ -107,15 +107,7 @@ pub(super) async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld,
 /// and its prepared world in the database. The same content again returns the stored record
 /// without a check.
 pub(super) async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]) -> Reply {
-    let name = upload_name(query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let cap = w.limits.manifest_max_bytes;
-    if body.len() > cap {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("larger than {cap} bytes")));
-    }
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "empty upload".to_owned()));
-    }
-    let id = content_id(body);
+    let (name, id) = checked_upload(query, body, w.limits.manifest_max_bytes)?;
     if let Some(stored) = w.manifests.record(&id).await.map_err(store_error)? {
         // A stored manifest whose bytes no longer hash to its id (a torn row) is not served as
         // stored: it falls through to the check and is written again, which heals it.

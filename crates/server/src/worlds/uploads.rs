@@ -152,6 +152,23 @@ pub(super) fn content_id(bytes: &[u8]) -> String {
     hex(&log::blob_key(bytes))
 }
 
+/// What every upload starts with: its name from the query, a body that is not empty and
+/// within `cap`, and its content address. Answers `(name, id)`.
+pub(super) fn checked_upload(
+    query: Option<&str>,
+    body: &[u8],
+    cap: usize,
+) -> Result<(String, String), (StatusCode, String)> {
+    let name = upload_name(query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if body.len() > cap {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("larger than {cap} bytes")));
+    }
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty upload".to_owned()));
+    }
+    Ok((name, content_id(body)))
+}
+
 /// The `name` query parameter, percent-decoded, checked to be a plain file name. It is only
 /// shown back (storage uses the content address).
 pub(super) fn upload_name(query: Option<&str>) -> Result<String, String> {

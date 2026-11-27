@@ -91,15 +91,7 @@ pub(super) async fn put_yaml(
 /// Check, inspect in the sandbox, then store an upload. The same content again returns the
 /// stored record.
 pub(super) async fn upload(w: &Worlds, kind: Kind, query: Option<&str>, body: &[u8]) -> Reply {
-    let name = upload_name(query).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let cap = kind.cap(&w.limits);
-    if body.len() > cap {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("larger than {cap} bytes")));
-    }
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "empty upload".to_owned()));
-    }
-    let id = content_id(body);
+    let (name, id) = checked_upload(query, body, kind.cap(&w.limits))?;
     if let Some(meta) = w.intact_upload(kind, &id).await.map_err(internal)? {
         return Ok(json_reply(StatusCode::OK, &meta));
     }
