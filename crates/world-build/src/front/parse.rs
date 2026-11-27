@@ -901,39 +901,34 @@ impl P<'_> {
                         .into_iter()
                         .find(|w| self.word(w))
                         .or_else(|| CHECK_MODIFIERS.into_iter().find(|w| self.ctx(w)));
-                    if let Some(w) = word {
-                        if seen.contains(&w) {
-                            return Err((self.here(), format!("`{w}` is given twice")));
-                        }
-                        seen.push(w);
+                    let Some(w) = word else { return Ok(Member::Check(Box::new(c))) };
+                    if seen.contains(&w) {
+                        return Err((self.here(), format!("`{w}` is given twice")));
                     }
-                    if self.word("when") {
-                        self.k += 1;
-                        c.when = Some(self.rule(depth)?);
-                    } else if self.ctx("vanilla") {
-                        self.k += 1;
-                        c.vanilla = Some(self.tname("an item")?);
-                    } else if self.ctx("holds") {
-                        self.k += 1;
-                        c.holds = Some(self.tname("an item")?);
-                    } else if self.ctx("no_progression") {
-                        let at = self.here();
-                        self.k += 1;
-                        // A modifier word after it starts the next modifier, not a rule: no def
-                        // may take one of these names, and an event is state, which
-                        // `no_progression` never reads.
-                        let next = CHECK_MODIFIERS.iter().any(|w| self.ctx(w));
-                        let r = if self.rule_starts() && !next {
-                            Some(self.rule(depth)?)
-                        } else {
-                            None
-                        };
-                        c.no_progression = Some((at, r));
-                    } else if self.word("placement") {
-                        self.k += 1;
-                        c.placement = Some(self.name("a placement set")?);
-                    } else if !self.ident(&mut c.key, &mut c.was)? {
-                        return Ok(Member::Check(Box::new(c)));
+                    seen.push(w);
+                    let at = self.here();
+                    if matches!(w, "key" | "was") {
+                        self.ident(&mut c.key, &mut c.was)?;
+                        continue;
+                    }
+                    self.k += 1;
+                    match w {
+                        "when" => c.when = Some(self.rule(depth)?),
+                        "vanilla" => c.vanilla = Some(self.tname("an item")?),
+                        "holds" => c.holds = Some(self.tname("an item")?),
+                        "placement" => c.placement = Some(self.name("a placement set")?),
+                        _ => {
+                            // A modifier word after it starts the next modifier, not a rule: no
+                            // def may take one of these names, and an event is state, which
+                            // `no_progression` never reads.
+                            let next = CHECK_MODIFIERS.iter().any(|w| self.ctx(w));
+                            let r = if self.rule_starts() && !next {
+                                Some(self.rule(depth)?)
+                            } else {
+                                None
+                            };
+                            c.no_progression = Some((at, r));
+                        }
                     }
                 }
             }
