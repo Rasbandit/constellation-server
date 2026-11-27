@@ -93,3 +93,52 @@ fn the_goal_and_the_start_cannot_depend_on_an_optional_region() {
     let all = errors(&start);
     assert!(all.iter().any(|e| e.contains("the start region always exists")), "{all:#?}");
 }
+
+/// One missing `}` hides nothing: the region left open is named with the line it opened on,
+/// a misspelt name in another file is still reported, and names the broken file may declare
+/// in the part that did not parse are not reported as unknown (no cascade).
+#[test]
+fn a_syntax_error_does_not_hide_name_errors_in_other_files() {
+    let files = super::lang::mem(&[
+        (
+            "world.rando",
+            "world t\nuse rooms/a\nuse rooms/b\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n",
+        ),
+        (
+            "rooms/a.rando",
+            "region a {\n  check a1\n  exit b\nregion lost {\n  check l1\n}\ndef opened = has(\n",
+        ),
+        ("rooms/b.rando", "region b {\n  check b1: has(kk)\n  check b2: opened\n  exit a\n}\n"),
+    ]);
+    let all = errors(&files);
+    assert!(
+        all.iter().any(|e| e.starts_with("rooms/a.rando:4:1: ")
+            && e.contains("region `a`, opened at line 1, is not closed")),
+        "{all:#?}"
+    );
+    assert!(
+        all.iter()
+            .any(|e| e.starts_with("rooms/b.rando:2:17: ") && e.contains("unknown item `kk`")),
+        "{all:#?}"
+    );
+    assert!(
+        !all.iter().any(|e| e.contains("`opened`") || e.contains("cannot be reached")),
+        "{all:#?}"
+    );
+}
+
+/// An overlay whose target is in a file that did not parse is not reported as missing.
+#[test]
+fn an_overlay_on_a_base_that_did_not_parse_is_not_a_missing_target() {
+    let files = super::lang::mem(&[
+        (
+            "world.rando",
+            "world t\nuse base\nuse fixes\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n",
+        ),
+        ("base.rando", "region a {\n  check a1\n  check gone\nregion z {\n  exit a\n}\n"),
+        ("fixes.rando", "use base\nreplace check a.gone: has(k)\n"),
+    ]);
+    let all = errors(&files);
+    assert!(all.iter().any(|e| e.starts_with("base.rando:4:1: ")), "{all:#?}");
+    assert!(!all.iter().any(|e| e.contains("target_missing")), "{all:#?}");
+}

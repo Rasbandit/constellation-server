@@ -104,6 +104,17 @@ impl Errs {
         self.warnings
     }
 
+    /// The errors ([`Errs::finish`]) and the warnings ([`Errs::warnings_list`]).
+    pub(crate) fn split(mut self) -> (Vec<Error>, Vec<Error>) {
+        let w = Errs {
+            files: self.files.clone(),
+            warnings: std::mem::take(&mut self.warnings),
+            dropped_warnings: self.dropped_warnings,
+            ..Errs::default()
+        };
+        (self.finish(), w.warnings_list())
+    }
+
     /// The errors in file order, and one more line for what the cap dropped.
     pub(crate) fn finish(mut self) -> Vec<Error> {
         self.errors.sort_by_key(|e| e.pos);

@@ -832,22 +832,27 @@ impl P<'_> {
                 break;
             }
         }
-        self.expect(&Tok::LBrace, "`{` and the region's checks and exits")?;
-        r.members = self.members(depth + 1)?;
+        let open = self.expect(&Tok::LBrace, "`{` and the region's checks and exits")?;
+        r.members = self.members(depth + 1, &format!("region `{}`", show_tn(&r.name)), open)?;
         Ok(r)
     }
 
-    /// Members up to the closing `}`, which this consumes.
-    fn members(&mut self, depth: usize) -> R<Vec<Member>> {
+    /// Members up to the closing `}`, which this consumes. `what` names the block, opened at
+    /// `open`, for the error when it is left open.
+    fn members(&mut self, depth: usize, what: &str, open: Pos) -> R<Vec<Member>> {
         let mut out = Vec::new();
         while !matches!(self.peek(), Some(Tok::RBrace) | None) {
             if matches!(self.peek(), Some(Tok::Kw(k)) if DECLS.contains(k) && *k != "for") {
-                // A declaration where a member was expected: the block was left open. Stop at
-                // it, so the declarations after it are read.
-                return Err((
+                // A declaration where a member was expected: the block was left open. The
+                // members read so far are kept, and reading goes on at this declaration.
+                self.errors.push((
                     self.here(),
-                    "a region's `{` is not closed before this declaration".into(),
+                    format!(
+                        "{what}, opened at line {}, is not closed before this declaration",
+                        open.line
+                    ),
                 ));
+                return Ok(out);
             }
             let start = self.k;
             self.brk(start, depth);
@@ -963,8 +968,8 @@ impl P<'_> {
             }
             "for" => {
                 let binders = self.binders(depth)?;
-                self.expect(&Tok::LBrace, "`{`")?;
-                Ok(Member::For(binders, self.members(depth + 1)?))
+                let open = self.expect(&Tok::LBrace, "`{`")?;
+                Ok(Member::For(binders, self.members(depth + 1, "a family's block", open)?))
             }
             "stay" => {
                 Err((pos, "`stay` needs a time context, which this version does not build".into()))
@@ -1285,8 +1290,8 @@ impl P<'_> {
                         "`extend` adds to a region: `extend region NAME { ... }`".into(),
                     ));
                 }
-                self.expect(&Tok::LBrace, "`{`")?;
-                Overlay::Extend(pos, target, self.members(depth + 1)?)
+                let open = self.expect(&Tok::LBrace, "`{`")?;
+                Overlay::Extend(pos, target, self.members(depth + 1, "this `extend`", open)?)
             }
             "replace" => {
                 if !matches!(target, Target::Check(..) | Target::Exit(..) | Target::Def(_)) {
@@ -1301,6 +1306,16 @@ impl P<'_> {
             _ => Overlay::Remove(pos, target),
         })
     }
+}
+
+/// A name as written, its `{var}` pieces included.
+fn show_tn(n: &Tn) -> String {
+    n.v.iter()
+        .map(|p| match p {
+            Piece::Text(t) => t.clone(),
+            Piece::Var(v) => format!("{{{v}}}"),
+        })
+        .collect()
 }
 
 fn col_word(c: Col) -> &'static str {

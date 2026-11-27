@@ -119,8 +119,46 @@ pub struct Read {
 /// # Errors
 /// Every syntax, module, family, overlay, ledger and header error found.
 pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
+    let p = read_partly(files, opts);
+    if !p.errors.is_empty() {
+        return Err(p.errors);
+    }
+    Ok(Read { world: p.world, ledger: p.ledger, warnings: p.warnings })
+}
+
+/// What [`read_partly`] gives: the world as far as it was read, even with errors.
+#[derive(Debug, Clone)]
+pub struct Partial {
+    /// The world model, with whatever parsed.
+    pub world: World,
+    /// The ledger after this build (empty when a file did not parse).
+    pub ledger: String,
+    /// Every error found, in file order.
+    pub errors: Vec<Error>,
+    /// Things worth a look.
+    pub warnings: Vec<Error>,
+    /// Every name written in a file with a syntax error, when one has one: a declaration of
+    /// any of them may be in the part that did not parse, so the checks' errors about them
+    /// are left out as likely cascades.
+    pub broken: Option<HashSet<String>>,
+}
+
+/// [`read`], keeping the world when there are errors, so the checks can still report the
+/// mistakes in the files that parsed.
+#[must_use]
+pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let mut x = X::default();
     x.load(files);
+    let mut broken: Option<HashSet<String>> = None;
+    for ast in x.asts.iter().filter(|a| !a.errors.is_empty()) {
+        let names = broken.get_or_insert_with(HashSet::new);
+        for t in &ast.toks {
+            if let crate::lex::Tok::Name(n) = &t.t {
+                names.extend(n.split('.').map(str::to_owned));
+            }
+        }
+    }
+    x.broken = broken.clone().unwrap_or_default();
     x.tables(files);
     let order = x.order.clone();
     for f in &order {
@@ -133,14 +171,16 @@ pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
     x.apply_overlays();
     x.visibility();
     x.generated(files, opts);
-    let ledger = ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs);
+    // A failed parse would retire or move the ids of what it lost: no ledger then.
+    let ledger = if broken.is_none() {
+        ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs)
+    } else {
+        String::new()
+    };
     x.world.files.clone_from(&x.paths);
-    let (world, errs) = (x.world, x.errs);
-    if !errs.errors.is_empty() {
-        return Err(errs.finish());
-    }
-    let warnings = errs.warnings_list();
-    Ok(Read { world, ledger, warnings })
+    let (errors, warnings) = x.errs.split();
+    let world = x.world;
+    Partial { world, ledger, errors, warnings, broken }
 }
 
 /// Parse and format one file's text.
@@ -269,6 +309,8 @@ struct X {
     grown: usize,
     /// The family limit was passed: expansion stops.
     over: bool,
+    /// Names written in files that did not parse ([`Partial::broken`]).
+    broken: HashSet<String>,
 }
 
 impl X {
@@ -1141,7 +1183,13 @@ impl X {
                 _ => HashSet::new(),
             };
             let found = self.overlay(&o);
-            if !found {
+            let lost = match target {
+                Target::Region(n) | Target::Def(n) | Target::Item(n) => self.broken.contains(&n.v),
+                Target::Check(r, c) | Target::Exit(r, c) => {
+                    self.broken.contains(&r.v) || self.broken.contains(&c.v)
+                }
+            };
+            if !found && !lost {
                 self.errs.err(
                     pos,
                     format!(

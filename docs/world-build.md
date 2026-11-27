@@ -107,7 +107,7 @@ Where doc 18's sketch was ambiguous, did not parse its own examples, or said not
 
 ## What is checked
 
-Each error names the file, line and column and what to do. All errors are collected; the parser recovers at the next keyword.
+Each error names the file, line and column and what to do. All errors are collected; the parser recovers at the next keyword. A block left open (`region x {` with no `}`) is named with the line it opened on, and the members read before the next declaration are kept. A syntax error does not stop the checks: they still run on everything that parsed, in every file, and leave out what may only be a cascade of it (an error about the whole world, a region that cannot be reached, or one naming in backticks a name written anywhere in a file that did not parse, since its declaration may be in the lost part; an overlay whose target is such a name is not reported as missing). No ledger is assigned or written while a file does not parse.
 
 - Syntax, everywhere, with recovery; modules that do not exist; names read without a `use`.
 - Families and tables: unknown tables and variables, a row or name piece of the wrong type, CSV header, types and line numbers, duplicate rows (at their own line), ranges that are empty or too long, at most 100,000 declarations written by families, and blocks at most 32 deep. One mistake a family repeats is reported once.
