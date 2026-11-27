@@ -961,3 +961,134 @@ fn a_seed_file_with_two_slots_of_one_name_is_refused() {
     let e = Seed::from_v1(&b, &[0; 32], 1 << 20).unwrap_err().to_string();
     assert!(e.contains("slot name \"B\" repeats"), "{e}");
 }
+
+/// The seed hash as it was made before the canonical text was written straight into the
+/// hasher: the whole bundle as a JSON tree, sorted and written a top-level key at a time. Kept
+/// here as the oracle of [`SeedBundle::hash_with_games`].
+fn tree_hash_with_games(b: &SeedBundle, games: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut v = serde_json::to_value(b).unwrap();
+    v.sort_all_objects();
+    let mut h = Sha256::new();
+    for (n, (key, value)) in v.as_object().into_iter().flatten().enumerate() {
+        h.update(if n == 0 { b"{" } else { b"," });
+        h.update(Value::from(key.as_str()).to_string());
+        h.update(b":");
+        if key == "games" {
+            h.update(games);
+        } else {
+            h.update(value.to_string());
+        }
+    }
+    h.update(b"}");
+    h.finalize().into()
+}
+
+/// A room of `n` slots in id order (ids with gaps), 40 locations each, across two games.
+/// `rich` fills every optional field: spheres, start items, entrances whose ids sort
+/// otherwise as text than as numbers, start hints, a password, names and `slot_data` that
+/// need escaping, nested objects with keys out of order, and floats.
+fn room_of(n: u32, rich: bool) -> Value {
+    let id = |k: u32| 3 * k + 1;
+    let ids: Vec<i64> = [-5, 9].into_iter().chain(100..137).chain([1000]).collect();
+    let slots: Vec<Value> = (0..n)
+        .map(|k| {
+            let locations: Vec<Value> = ids
+                .iter()
+                .zip(0u32..)
+                .map(|(&l, i)| {
+                    let to = (k + i) % n;
+                    // Slots of H (every third) take only item 7.
+                    let item = if to % 3 == 2 { 7 } else { 7 + (i % 2) };
+                    let mut p = json!({"location": l, "item": item, "receiver": id(to), "flags": (i + k) % 8});
+                    if rich && i % 3 != 0 {
+                        p["sphere"] = json!(i / 4);
+                    }
+                    p
+                })
+                .collect();
+            let mut s = json!({
+                "id": id(k), "team": 0, "name": format!("P{k}"), "kind": "player",
+                "game": if k % 3 == 2 { "H" } else { "G" },
+                "minimum_client_version": {"major": 0, "minor": 5, "build": k},
+                "group_members": [], "locations": locations, "slot_data": {}, "start_inventory": [],
+            });
+            if rich {
+                s["name"] = json!(format!("P{k} \"quoted\" \\ é\n"));
+                s["slot_data"] = json!({"z": 1.5, "a": {"b": null, "a": "q\"é\u{1}"}, "big": 1e300,
+                                        "list": [{"y": -0.25, "x": [true, {}]}], "n": -7});
+                s["start_inventory"] = json!([7, 7]);
+                s["entrances"] = json!({"-5": "Cave \"x\"", "9": "Well", "1000": "Attic", "100": "Cave \"x\""});
+            }
+            s
+        })
+        .collect();
+    let connect: serde_json::Map<String, Value> = slots
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap().to_owned(), json!([0, s["id"]])))
+        .collect();
+    let names: serde_json::Map<String, Value> =
+        ids.iter().map(|l| (format!("L{l}"), json!(l))).collect();
+    let mut v = json!({
+        "format": 1, "seed_name": "s1",
+        "generator_version": {"major": 0, "minor": 6, "build": 8},
+        "server_options": {
+            "password": null, "hint_cost": 10, "location_check_points": 1,
+            "release_mode": "auto", "collect_mode": "auto-enabled", "remaining_mode": "goal"
+        },
+        "slots": slots, "connect_names": connect,
+        "games": {
+            "G": {"item_name_to_id": {"Seven": 7, "Eight": 8}, "location_name_to_id": names,
+                  "checksum": "g", "item_name_groups": {}, "location_name_groups": {}},
+            "H": {"item_name_to_id": {"Seven": 7}, "location_name_to_id": names,
+                  "checksum": "h", "item_name_groups": {}, "location_name_groups": {}},
+        }
+    });
+    if rich {
+        v["race_mode"] = json!(1);
+        v["seed_name"] = json!("s \"1\" é");
+        v["server_options"]["password"] = json!("p\\w");
+        v["start_hints"] = json!([{"finding": id(n - 1), "location": 1000, "status": 30},
+                                  {"finding": 1, "location": -5, "status": 0}]);
+    }
+    v
+}
+
+/// The hash written straight into the hasher is the hash of the JSON tree, and of the JSON
+/// text, at 1, 10 and 100 slots with and without every optional field; and the seed file of a
+/// room is the same bytes whatever order its slots and locations come in, and decodes to the
+/// room. Fails if the streamed canonical form differs from the tree's by one byte.
+#[test]
+fn the_streamed_hash_is_the_tree_hash_and_the_seed_bytes_do_not_depend_on_order() {
+    for (n, rich) in [(1, false), (1, true), (10, false), (10, true), (100, false), (100, true)] {
+        // The text a generation would write: the bundle's own JSON, defaulted fields and all.
+        let mut b = SeedBundle::from_json(&room_of(n, rich).to_string()).unwrap();
+        let text = serde_json::to_string(&b).unwrap();
+        let games = canonical_of(&b.games);
+        let hash = tree_hash_with_games(&b, &games);
+        assert_eq!(hash, hash_of(&text), "{n} slots, rich {rich}: the oracle is the text's hash");
+        assert_eq!(b.hash().unwrap(), hash, "{n} slots, rich {rich}");
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash, "{n} slots, rich {rich}");
+
+        let (seed, data) = opened(&text);
+        assert_eq!(seed.to_v1(&data).unwrap(), b, "{n} slots, rich {rich}");
+        // The same room with slots and locations in reverse: the same file, the hash given.
+        let mut reversed = b.clone();
+        reversed.slots.reverse();
+        for s in &mut reversed.slots {
+            s.locations.reverse();
+        }
+        let file = |b: &SeedBundle| encode(b, &hash, 1 << 26).unwrap();
+        assert_eq!(file(&reversed).seed, seed.bytes(), "{n} slots, rich {rich}");
+        assert_eq!(file(&reversed).packages, file(&b).packages);
+
+        let whole = std::mem::take(&mut b.games);
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash, "its own games are not read");
+        assert_ne!(b.hash_with_games(b"{}").unwrap(), hash);
+        b.games = whole;
+        // One changed placement changes the hash, as it changes the tree's.
+        b.slots[0].locations[0].flags ^= 1;
+        assert_ne!(b.hash().unwrap(), hash);
+        assert_eq!(b.hash().unwrap(), tree_hash_with_games(&b, &games));
+    }
+}
