@@ -51,9 +51,13 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - if: steps.scope.outputs.code != 'false'
         run: cargo fmt --all --check
-      # Every library's unit tests but the fill engine's: the next step runs those.
+      # Every library's unit tests but the fill engine's and the build tool's: the next steps
+      # run those.
       - if: steps.scope.outputs.code != 'false'
-        run: cargo test --workspace --exclude data-fill --lib --locked
+        run: cargo test --workspace --exclude data-fill --exclude world-build --lib --locked
+      # The world build tool's unit and integration tests (the example world filled end to end).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p world-build --tests --locked
       # The data-only fill engine's unit, integration and binary tests (damaged sections,
       # fixtures, fairness), once.
       - if: steps.scope.outputs.code != 'false'
