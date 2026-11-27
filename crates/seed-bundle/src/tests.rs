@@ -219,3 +219,70 @@ fn hint_data_outside_a_world_or_with_a_bad_status_is_refused() {
     let m = refused(|v| v["slots"][0]["entrances"] = json!({"101": "Cave"}));
     assert!(m.contains("entrance"), "{m}");
 }
+
+/// What `validate` reads through its slot index (a receiver, a hint's slot, a connect name, an
+/// entrance, a group member) is refused as a scan of the slots refused it, in the same words.
+#[test]
+fn what_a_slot_or_location_lookup_misses_is_refused_in_the_same_words() {
+    type Edit = fn(&mut Value);
+    let cases: [(&str, Edit); 12] = [
+        ("slot name \"A\" repeats", |v| v["slots"][1]["name"] = json!("A")),
+        ("slot 1 location 100 sends to missing slot 0", |v| {
+            v["slots"][0]["locations"][0]["receiver"] = json!(0);
+        }),
+        ("slot 2 location 101 sends to missing slot 4294967295", |v| {
+            v["slots"][1]["locations"][1]["receiver"] = json!(u32::MAX);
+        }),
+        ("slot 1 location 102 is not in game \"G\"", |v| {
+            v["slots"][0]["locations"][0]["location"] = json!(102);
+        }),
+        ("group 1 names missing slot 3", |v| v["slots"][0]["group_members"] = json!([2, 3])),
+        ("connect name \"C\" points at no slot", |v| v["connect_names"]["C"] = json!([0, 3])),
+        ("connect name \"A\" points at no slot", |v| v["connect_names"]["A"] = json!([1, 1])),
+        ("start hint for slot 3 location 100 is outside that world", |v| {
+            v["start_hints"] = json!([{"finding": 3, "location": 100, "status": 0}]);
+        }),
+        ("slot 2 entrance for location 102, which its world lacks", |v| {
+            v["slots"][1]["entrances"] = json!({"100": "Cave", "102": "Well"});
+        }),
+        // The receiver's game is what decides: item 8 is G's, and slot 2 now plays H.
+        ("slot 1 location 100 places item 8 that slot 2's game lacks", |v| {
+            v["games"]["H"] = json!({"item_name_to_id": {"Seven": 7}, "checksum": "h",
+                                     "location_name_to_id": {"L100": 100, "L101": 101}});
+            v["slots"][1]["game"] = json!("H");
+            v["slots"][0]["locations"][0]["item"] = json!(8);
+        }),
+        // The first broken rule in file order is the one named: a location outside the game
+        // before a later repeat, and a repeat before a later bad receiver.
+        ("slot 2 location 999 is not in game \"G\"", |v| {
+            v["slots"][1]["locations"] = json!([
+                {"location": 999, "item": 7, "receiver": 1, "flags": 0},
+                {"location": 100, "item": 7, "receiver": 1, "flags": 0},
+                {"location": 100, "item": 7, "receiver": 1, "flags": 0}]);
+        }),
+        ("slot 2 location 100 repeats", |v| {
+            v["slots"][1]["locations"] = json!([
+                {"location": 100, "item": 7, "receiver": 1, "flags": 0},
+                {"location": 100, "item": 7, "receiver": 1, "flags": 0},
+                {"location": 101, "item": 7, "receiver": 9, "flags": 0}]);
+        }),
+    ];
+    for (want, edit) in cases {
+        assert_eq!(refused(edit), want);
+    }
+}
+
+/// Slots in any order and with gaps between their ids are found by id.
+#[test]
+fn slots_out_of_order_with_gaps_in_their_ids_are_valid() {
+    let mut v = good();
+    v["slots"].as_array_mut().unwrap().reverse();
+    v["slots"][0]["id"] = json!(40);
+    v["slots"][1]["locations"][0]["receiver"] = json!(40);
+    v["slots"][0]["locations"] = json!([{"location": 101, "item": 8, "receiver": 40, "flags": 0}]);
+    v["connect_names"] = json!({"A": [0, 1], "B": [0, 40]});
+    v["start_hints"] = json!([{"finding": 40, "location": 101, "status": 0}]);
+    let b = parse(&v).unwrap();
+    assert_eq!(b.slot(40).map(|s| s.name.as_str()), Some("B"));
+    assert!(import_v1(v.to_string().as_bytes(), 1 << 26).is_ok());
+}

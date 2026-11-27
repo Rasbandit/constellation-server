@@ -303,6 +303,12 @@ struct Indexed {
     start: Vec<usize>,
 }
 
+/// Where slot `id` is in `slots`, which are in id order: the first of a repeated id.
+fn pos_of(slots: &[&Slot], id: u32) -> Option<usize> {
+    let at = slots.partition_point(|s| s.id < id);
+    slots.get(at).is_some_and(|s| s.id == id).then_some(at)
+}
+
 /// Encode a validated bundle whose v1 canonical hash is `hash` (`crate::bundle_hash`).
 ///
 /// Slots are written in id order and locations in id order, the order `tools/ap-import`
@@ -347,20 +353,21 @@ pub fn encode_on(
     {
         return Err(bad("the packages given are not those of the bundle's games"));
     }
-    let game_of = |name: &str| games.iter().position(|n| n.as_str() == name);
     let mut slots: Vec<&Slot> = b.slots.iter().collect();
     slots.sort_by_key(|s| s.id);
-    let pos_of = |id: u32| slots.iter().position(|s| s.id == id);
     let missing = || bad("the bundle names something it lacks (validate it first)");
+    // Each slot's game, found once (the games are in name order), not once per placement.
+    let slot_games: Vec<Option<usize>> =
+        slots.iter().map(|s| games.binary_search(&&s.game).ok()).collect();
 
     let mut indexed = Vec::with_capacity(slots.len());
-    for s in &slots {
-        let g = game_of(&s.game).ok_or_else(missing)?;
+    for (s, g) in slots.iter().zip(&slot_games) {
+        let g = g.ok_or_else(missing)?;
         let own = tables.get(g).ok_or_else(missing)?;
         let mut placed = Vec::with_capacity(s.locations.len());
         for p in &s.locations {
-            let to = pos_of(p.receiver).ok_or_else(missing)?;
-            let rg = slots.get(to).and_then(|r| game_of(&r.game)).ok_or_else(missing)?;
+            let to = pos_of(&slots, p.receiver).ok_or_else(missing)?;
+            let rg = slot_games.get(to).copied().flatten().ok_or_else(missing)?;
             let item = tables.get(rg).and_then(|t| t.item_index(p.item)).ok_or_else(missing)?;
             let at = own.location_index(p.location).ok_or_else(missing)?;
             placed.push((at, item, to, p.flags));
@@ -567,7 +574,7 @@ fn hint_data(
         out.entrances.push(entrances);
     }
     for h in &b.start_hints {
-        let pos = slots.iter().position(|s| s.id == h.finding).ok_or_else(missing)?;
+        let pos = pos_of(slots, h.finding).ok_or_else(missing)?;
         let own = indexed.get(pos).and_then(|x| tables.get(x.game)).ok_or_else(missing)?;
         let i = own.location_index(h.location).ok_or_else(missing)?;
         let code = STATUSES.iter().position(|&v| v == h.status).ok_or_else(missing)?;
