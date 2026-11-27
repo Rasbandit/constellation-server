@@ -68,7 +68,7 @@ fn checks(b: &Built, region: &str) -> Vec<String> {
 
 /// `generate` refuses a world a player cannot finish, so every seed passing means every seed
 /// is beatable.
-fn fills(b: &Built, options: &HashMap<String, i64>, seeds: u64) {
+pub(crate) fn fills(b: &Built, options: &HashMap<String, i64>, seeds: u64) {
     let m: serde_json::Value = serde_json::from_str(b.json()).unwrap();
     let inst = b.instance(options).unwrap();
     for players in [1usize, 4] {

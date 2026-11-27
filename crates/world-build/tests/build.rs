@@ -1,6 +1,7 @@
 //! The build tool end to end: the example world builds to a manifest the engine prepares and
 //! fills beatable, the canonical bytes are pinned, and every check names its place.
 
+mod grammar;
 mod lang;
 mod seeds;
 mod support;

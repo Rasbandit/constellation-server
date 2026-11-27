@@ -113,7 +113,7 @@ Each error names the file, line and column and what to do. All errors are collec
 - Families and tables: unknown tables and variables, a row or name piece of the wrong type, CSV header, types and line numbers, duplicate rows (at their own line), ranges that are empty or too long, at most 100,000 declarations written by families, and blocks at most 32 deep. One mistake a family repeats is reported once.
 - Files: a path or link that leads out of the world's folder is refused, and `fmt` does not follow links.
 - Names: unknown names, a name used as the wrong kind ("`lamp` is an item; did you mean `has(lamp)`?"), duplicates across the one namespace (events may repeat), reserved words, name shape.
-- Regions: an exit to a missing region, two exits to one region, a region no exit leads to from the start.
+- Regions: an exit to a missing region, two exits to one region, a region no exit leads to from the start, and what a region `when` would leave dangling (see "Choices").
 - Format rule a (D-132): `not` over state, comparisons that can turn false, products and divisions that can.
 - Format rule b (D-133): dotted names that are not options, shuffle reads or family fields.
 - Format rule c (D-134): check and region `when`, `no_progression`, start item and assumed conditions read options only, never state or a shuffle result, through defs too.
@@ -135,7 +135,8 @@ Limits are in `crates/config` (`WORLD_*`, `RULE_MAX_PARTS`). All are design valu
 - **Free slots are split by weight deterministically** (largest remainder, ties by key), since the seeded draw waits on D-47.
 - **A `holds` copy of a check that does not exist this seed stays in the pool.**
 - **`class` is required.**
-- **Exit keys are `region:to`.** A region's `when` joins its exits', events' and checks' conditions.
+- **Exit keys are `region:to`.**
+- **A region's `when` removes the region** for the seeds where it is false: it joins the condition of its checks, its events and every exit into or out of it, so nothing in it exists and no way leads through it. The engine reaches every region of the manifest in a world with a shuffle (engine issue 211), so the build adds, for each region with a `when`, an exit from the start whose rule is the `when`'s negation: it opens only when the region is gone, and the region then holds nothing. `check` tries every setting of the options the region conditions read (the pool test's settings) and reports, naming the setting: a region with no way in from the start through regions that exist, a rule that reads an event only regions that are gone fire, and a `reach` of a region that is gone. The start region cannot have a `when`, and an exit with a `door` or `group` cannot lead into or out of a region with one (a shuffle that changes with the options is not in the engine's first slice).
 - **Number-only arithmetic folds** at build time, `-` and `mod` included. Over options or state they stay refused, because the engine cannot evaluate them.
 - **`count(a, b)`** is a sum of counts over the items in key order, like a group.
 - **Builds run on their own thread** with a stack sized for the depth cap (`WORLD_BUILD_STACK_BYTES`).

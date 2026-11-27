@@ -680,11 +680,28 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         "check",
     );
     let mut check_ids = check_ids.into_iter();
+    // Each region's condition first: an exit into a region carries the region's condition
+    // too, so a region that does not exist this seed has no way in.
+    let mut present: HashMap<&str, Value> = HashMap::new();
     for r in &w.regions {
         let when = match &r.when {
             Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
             None => truth(),
         };
+        if when != truth() && w.start.as_ref().is_some_and(|s| s.v == r.key.v) {
+            lw.errs().err(
+                r.key.pos,
+                format!("the start region always exists; `{}` cannot have a `when`", r.key.v),
+                "move the `when` onto its checks",
+            );
+        }
+        present.entry(r.key.v.as_str()).or_insert(when);
+    }
+    let when_of = |k: &str| present.get(k).cloned().unwrap_or_else(truth);
+    let mut sites: Vec<(Pos, Option<&str>, Value, Value)> = Vec::new();
+    let mut fired: HashMap<&str, Vec<&str>> = HashMap::new();
+    for r in &w.regions {
+        let when = when_of(&r.key.v);
         let set_ok = |lw: &mut Lower<'_>, s: &Option<At<String>>| match s {
             Some(s) if !sets.contains(&s.v) => {
                 lw.errs().err(
@@ -722,6 +739,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             }
             let set = set_ok(&mut lw, &c.placement).or_else(|| region_set.clone());
             locations.push(loc);
+            sites.push((c.rule.pos, Some(r.key.v.as_str()), cwhen.clone(), rule.clone()));
             checks.push(json!({"loc": c.key.v, "rule": rule}));
             checks_m.push(CheckM {
                 key: c.key.v.clone(),
@@ -734,6 +752,8 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         let mut events = Vec::new();
         for (e, rule) in &r.events {
             let rule = lw.rule(rule, Mode::Rule).map_or_else(truth, |v| v.0);
+            sites.push((e.pos, Some(r.key.v.as_str()), truth(), rule.clone()));
+            fired.entry(e.v.as_str()).or_default().push(r.key.v.as_str());
             events.push(json!({"event": e.v, "rule": both(&when, rule)}));
         }
         let mut exits = Vec::new();
@@ -749,7 +769,16 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
             }
             let rule = lw.rule(&x.rule, Mode::Rule).map_or_else(truth, |v| v.0);
-            let mut e = json!({"rule": both(&when, rule), "to": x.to.v});
+            sites.push((x.rule.pos, Some(r.key.v.as_str()), truth(), rule.clone()));
+            let to_when = when_of(&x.to.v);
+            if (when != truth() || to_when != truth()) && (x.door.is_some() || x.group.is_some()) {
+                lw.errs().err(
+                    x.to.pos,
+                    "an exit a shuffle can move cannot lead into or out of a region with a `when` yet",
+                    "a shuffle that changes with the options is not in the engine's first slice; keep the region, and put the `when` on its checks",
+                );
+            }
+            let mut e = json!({"rule": both(&when, both(&to_when, rule)), "to": x.to.v});
             let key = format!("{}:{}", r.key.v, x.to.v);
             for (field, v) in [("door", &x.door), ("group", &x.group)] {
                 if let Some(v) = v {
@@ -778,6 +807,21 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             "can_stay": r.can_stay, "checks": checks, "events": events, "exits": exits,
             "key": r.key.v, "stays": [],
         }));
+    }
+    // The engine reaches every region of the manifest in a world with a shuffle (it has no
+    // way to say a region does not exist this seed): a region that is gone is reached from the
+    // start by an exit that opens only then. Nothing in it exists, and its own exits are shut.
+    if let Some(s) = &w.start
+        && let Some(start) = regions.iter_mut().find(|x| x["key"] == s.v.as_str())
+        && let Some(list) = start["exits"].as_array_mut()
+    {
+        for r in w.regions.iter().filter(|r| r.key.v != s.v) {
+            let when = when_of(&r.key.v);
+            if when != truth() {
+                list.push(json!({"rule": {"not": when}, "to": r.key.v}));
+            }
+        }
+        list.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
     }
     let counts: HashMap<&str, i64> = items.iter().map(|i| (i.0.as_str(), i.2)).collect();
     for (item, places) in &held_by {
@@ -852,6 +896,25 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     reads_cycle(&mut lw, w, &shuffles);
     let defs = std::mem::take(&mut lw.defs);
     drop(lw);
+    if let (Some(start), Some(g)) = (&start, &goal) {
+        sites.push((w.goal.as_ref().map_or(Pos::default(), |g| g.pos), None, truth(), g.clone()));
+        let map = crate::presence::Map {
+            start,
+            regions: w
+                .regions
+                .iter()
+                .map(|r| (r.key.v.as_str(), r.key.pos, when_of(&r.key.v)))
+                .collect(),
+            exits: w
+                .regions
+                .iter()
+                .flat_map(|r| r.exits.iter().map(|x| (r.key.v.as_str(), x.to.v.as_str())))
+                .collect(),
+            fired,
+            sites,
+        };
+        crate::presence::check(&map, &options, &defs, errs);
+    }
 
     // Every region can be reached from the start by some exits (rules aside).
     if let Some(start) = &start {

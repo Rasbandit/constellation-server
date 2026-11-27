@@ -31,16 +31,21 @@ fn int(v: &Value, o: &HashMap<&str, i64>) -> Option<i64> {
 }
 
 /// Options-only rules evaluated for one set of option values, each def once.
-struct Ev<'m> {
+pub(crate) struct Ev<'m> {
     o: &'m HashMap<&'m str, i64>,
     defs: &'m BTreeMap<String, Value>,
     memo: HashMap<&'m str, bool>,
 }
 
 impl<'m> Ev<'m> {
+    /// An evaluator for the option values `o`, with the world's lowered defs.
+    pub(crate) fn new(o: &'m HashMap<&'m str, i64>, defs: &'m BTreeMap<String, Value>) -> Self {
+        Ev { o, defs, memo: HashMap::new() }
+    }
+
     /// An options-only rule's value. Recursion follows the rule's nesting, defs included,
     /// which the build bounds.
-    fn rule(&mut self, v: &'m Value) -> Option<bool> {
+    pub(crate) fn rule(&mut self, v: &'m Value) -> Option<bool> {
         let (k, a) = v.as_object()?.iter().next()?;
         Some(match k.as_str() {
             "true" => true,
@@ -217,11 +222,19 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Value, Strin
     }))
 }
 
-/// Every option key an options-only rule of `m` reads, through the defs it names (each def
-/// walked once).
+/// Every option key an options-only rule of `m` reads, through the defs it names.
 fn read_options(m: &Model) -> Vec<String> {
     let mut todo: Vec<&Value> = m.checks.iter().map(|c| &c.when).collect();
     todo.extend(m.start_items.iter().chain(&m.assumed).map(|g| &g.when));
+    options_read(todo, &m.defs)
+}
+
+/// Every option key the options-only rules `todo` read, through the defs they name (each def
+/// walked once).
+pub(crate) fn options_read<'v>(
+    mut todo: Vec<&'v Value>,
+    defs: &'v BTreeMap<String, Value>,
+) -> Vec<String> {
     let (mut out, mut seen) = (Vec::new(), std::collections::HashSet::new());
     while let Some(v) = todo.pop() {
         match v {
@@ -231,7 +244,7 @@ fn read_options(m: &Model) -> Vec<String> {
                         ("opt", Some(s)) => out.push(s.to_owned()),
                         ("ref", Some(d)) => {
                             if seen.insert(d)
-                                && let Some(body) = m.defs.get(d)
+                                && let Some(body) = defs.get(d)
                             {
                                 todo.push(body);
                             }
@@ -249,14 +262,14 @@ fn read_options(m: &Model) -> Vec<String> {
     out
 }
 
-/// Doc 16 section 3.4: too many items for the checks is an error at build time. Every
-/// combination of the options the counts read is tried; when there are more than
+/// The option settings a build-time test tries for the options `keys` (each a key of
+/// `options`): every combination; when there are more than
 /// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
-/// highest value; when those are still too many, each option alone at its two ends (with a
-/// warning). Generation checks the actual settings again.
-pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
+/// highest value; when those are still too many, each option alone at its two ends, and `true`
+/// for "only partly tried". An option left out of a setting takes its default.
+pub(crate) fn settings(options: &[OptM], keys: &[String]) -> (Vec<Vec<(String, i64)>>, bool) {
     let opts: Vec<&OptM> =
-        read_options(m).iter().filter_map(|k| m.options.iter().find(|o| o.key == *k)).collect();
+        keys.iter().filter_map(|k| options.iter().find(|o| o.key == *k)).collect();
     let most = config::WORLD_POOL_TEST_MAX_COMBINATIONS;
     let ends = |o: &OptM| {
         let (lo, hi) = bounds(&o.ty);
@@ -281,31 +294,67 @@ pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
     } else if fits(&opts.iter().map(|o| ends(o).len() as u128).collect::<Vec<_>>()) {
         opts.iter().map(|o| ends(o)).collect()
     } else {
+        let alone = opts.iter().flat_map(|o| ends(o).into_iter().map(|v| vec![(o.key.clone(), v)]));
+        return (alone.collect(), true);
+    };
+    let mut out = Vec::new();
+    let mut at = vec![0usize; grid.len()];
+    loop {
+        out.push(
+            opts.iter().zip(&at).zip(&grid).map(|((o, i), v)| (o.key.clone(), v[*i])).collect(),
+        );
+        let Some(k) = (0..at.len()).find(|k| at[*k] + 1 < grid[*k].len()) else {
+            return (out, false);
+        };
+        at[k] += 1;
+        at[..k].iter_mut().for_each(|x| *x = 0);
+    }
+}
+
+/// Every option's value for one setting: the setting's, each option's default otherwise.
+pub(crate) fn values<'m>(options: &'m [OptM], given: &[(String, i64)]) -> HashMap<&'m str, i64> {
+    options
+        .iter()
+        .map(|o| {
+            let v = given.iter().find(|(k, _)| *k == o.key).map_or(o.default, |g| g.1);
+            (o.key.as_str(), v)
+        })
+        .collect()
+}
+
+/// A setting as an author reads it: `a = on, b = 3`, keys in order.
+pub(crate) fn setting_text(options: &[OptM], given: &[(String, i64)]) -> String {
+    let mut set: Vec<String> = given
+        .iter()
+        .map(|(k, v)| {
+            let ty = options.iter().find(|o| o.key == *k).map(|o| &o.ty);
+            format!("{k} = {}", ty.map_or_else(|| v.to_string(), |t| value_text(t, *v)))
+        })
+        .collect();
+    set.sort();
+    set.join(", ")
+}
+
+/// Doc 16 section 3.4: too many items for the checks is an error at build time. Every
+/// combination of the options the counts read is tried; when there are more than
+/// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
+/// highest value; when those are still too many, each option alone at its two ends (with a
+/// warning). Generation checks the actual settings again.
+pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
+    let (all, partly) = settings(&m.options, &read_options(m));
+    if partly {
         errs.warn_whole(
             format!(
-                "the pool test tried each option alone at its two ends: over {most} combinations"
+                "the pool test tried each option alone at its two ends: over {} combinations",
+                config::WORLD_POOL_TEST_MAX_COMBINATIONS
             ),
             "generation still checks the pool for the actual settings",
         );
-        for o in &opts {
-            for v in ends(o) {
-                if !fill(m, &[(o.key.clone(), v)], errs) {
-                    return;
-                }
-            }
-        }
-        return;
-    };
-    let mut at = vec![0usize; grid.len()];
-    loop {
-        let given: Vec<(String, i64)> =
-            opts.iter().zip(&at).zip(&grid).map(|((o, i), v)| (o.key.clone(), v[*i])).collect();
-        if !fill(m, &given, errs) {
+    }
+    for given in &all {
+        if !fill(m, given, errs) {
             return;
         }
-        let Some(k) = (0..at.len()).find(|k| at[*k] + 1 < grid[*k].len()) else { return };
-        at[k] += 1;
-        at[..k].iter_mut().for_each(|x| *x = 0);
     }
 }
 
@@ -344,14 +393,19 @@ pub(crate) fn option_value(m: &Model, key: &str, text: &str) -> Result<i64, Stri
 
 /// An option's value as an author writes it: the inverse of [`option_value`].
 pub(crate) fn option_text(m: &Model, key: &str, v: i64) -> String {
-    match m.options.iter().find(|o| o.key == key).map(|o| &o.ty) {
-        Some(OptTy::Toggle) => (if v == 0 { "off" } else { "on" }).to_owned(),
-        Some(OptTy::Choice(vs)) => usize::try_from(v)
+    m.options.iter().find(|o| o.key == key).map_or_else(|| v.to_string(), |o| value_text(&o.ty, v))
+}
+
+/// A value of an option of type `ty` as an author writes it.
+fn value_text(ty: &OptTy, v: i64) -> String {
+    match ty {
+        OptTy::Toggle => (if v == 0 { "off" } else { "on" }).to_owned(),
+        OptTy::Choice(vs) => usize::try_from(v)
             .ok()
             .and_then(|i| vs.get(i))
             .cloned()
             .unwrap_or_else(|| v.to_string()),
-        _ => v.to_string(),
+        OptTy::Range(..) => v.to_string(),
     }
 }
 

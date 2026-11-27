@@ -9,21 +9,21 @@ use data_fill::seed::{Player, generate};
 use world_build::front::{Dir, Mem, Options, format_text, write_generated};
 use world_build::{Built, build, build_model};
 
-fn example() -> Dir {
+pub(crate) fn example() -> Dir {
     Dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tidewell"))
 }
 
-fn mem(files: &[(&str, &str)]) -> Mem {
+pub(crate) fn mem(files: &[(&str, &str)]) -> Mem {
     Mem(files.iter().map(|(p, t)| ((*p).to_owned(), (*t).to_owned())).collect::<BTreeMap<_, _>>())
 }
 
-fn ok(files: &Mem) -> Built {
+pub(crate) fn ok(files: &Mem) -> Built {
     build(files, &Options::default()).unwrap_or_else(|e| {
         panic!("{}", e.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
     })
 }
 
-fn errors(files: &Mem) -> Vec<String> {
+pub(crate) fn errors(files: &Mem) -> Vec<String> {
     build(files, &Options::default())
         .map(|_| ())
         .unwrap_err()
@@ -33,7 +33,7 @@ fn errors(files: &Mem) -> Vec<String> {
 }
 
 /// Some error of `files` starts with `at` (`file:line:col`) and contains `needle`.
-fn fails(files: &Mem, at: &str, needle: &str) {
+pub(crate) fn fails(files: &Mem, at: &str, needle: &str) {
     let all = errors(files);
     assert!(
         all.iter().any(|e| e.starts_with(&format!("{at}: ")) && e.contains(needle)),
@@ -42,20 +42,20 @@ fn fails(files: &Mem, at: &str, needle: &str) {
 }
 
 /// A world: a header, the body given, and enough to build.
-fn world(body: &str) -> Mem {
+pub(crate) fn world(body: &str) -> Mem {
     let text = format!(
         "world t\nstart a\nitem k progression\nitem junk filler\npool fill {{ junk 1 }}\n{body}\ngoal reach(a)\n"
     );
     mem(&[("world.rando", &text)])
 }
 
-const HEAD: usize = 5; // lines before `body` in `world`
+pub(crate) const HEAD: usize = 5; // lines before `body` in `world`
 
-fn line(n: usize) -> usize {
+pub(crate) fn line(n: usize) -> usize {
     HEAD + n
 }
 
-fn region(key: &Built, name: &str) -> serde_json::Value {
+pub(crate) fn region(key: &Built, name: &str) -> serde_json::Value {
     key.manifest["regions"].as_array().unwrap().iter().find(|r| r["key"] == name).unwrap().clone()
 }
 
