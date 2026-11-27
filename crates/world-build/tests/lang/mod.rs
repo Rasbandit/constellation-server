@@ -440,6 +440,14 @@ fn hostile_families_stop_at_their_limits_without_crashing() {
             .iter()
             .any(|e| e.contains("families expand to more than 100000 declarations"))
     );
+    let grants: String = (0..200).map(|_| "  start_item junk\n".to_owned()).collect();
+    let granted = world(&format!("for i in 1..99999 {{\n{grants}}}"));
+    assert!(errors(&granted).iter().any(|e| e.contains("families expand to more than")));
+    let nest = |n: usize| {
+        format!("{}region r {{\n  check q\n}}{}", "for i in 1..1 {\n".repeat(n), "}\n".repeat(n))
+    };
+    assert!(!errors(&world(&nest(31))).iter().any(|e| e.contains("blocks nest")));
+    assert!(errors(&world(&nest(32))).iter().any(|e| e.contains("blocks nest more than 32")));
     let deep = format!(
         "{}region r {{\n  check q\n}}{}",
         "for i in 1..1 {\n".repeat(2000),
@@ -591,5 +599,24 @@ fn a_link_out_of_the_world_folder_is_refused() {
         text.contains("leads outside the world's folder") && !text.contains("SECRET"),
         "{text}"
     );
+    // A link to nothing is refused too, and `build` never writes through a link.
+    std::fs::remove_file(root.join("w/data/t.csv")).unwrap();
+    std::os::unix::fs::symlink(root.join("nothing.csv"), root.join("w/data/t.csv")).unwrap();
+    let e = build(&Dir(root.join("w")), &Options::default()).unwrap_err();
+    assert!(e.iter().any(|x| x.msg.contains("leads nowhere")), "{e:?}");
+    std::fs::remove_file(root.join("w/data/t.csv")).unwrap();
+    std::fs::write(root.join("w/data/t.csv"), "key\nx\n").unwrap();
+    std::os::unix::fs::symlink(root.join("outside.json"), root.join("w/ledger.json")).unwrap();
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_rando"))
+        .args([
+            "build",
+            root.join("w").to_str().unwrap(),
+            "-o",
+            root.join("w/out.json").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!run.status.success(), "{run:?}");
+    assert!(!root.join("outside.json").exists(), "wrote through the ledger link");
     std::fs::remove_dir_all(&root).unwrap();
 }
