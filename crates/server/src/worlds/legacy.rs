@@ -291,11 +291,11 @@ pub(super) async fn generate_sandboxed(
 /// name is claimed.
 pub(super) async fn publish(w: &Worlds, stdout: Vec<u8>) -> Result<(Loaded, Value), String> {
     let limits = w.limits;
-    let parsed = tokio::task::spawn_blocking(move || {
+    let parsed = try_blocking(move || {
         let out = GenOut::parse(&stdout)?;
         parse_bundle(out.bundle.get().as_bytes(), &limits).map(|loaded| (loaded, out.report))
     });
-    let (loaded, report) = parsed.await.unwrap_or_else(|e| Err(e.to_string()))?;
+    let (loaded, report) = parsed.await?;
     publish_loaded(w, loaded.clone()).await?;
     Ok((loaded, report))
 }

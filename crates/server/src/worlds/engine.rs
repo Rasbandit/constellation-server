@@ -281,11 +281,9 @@ pub(super) async fn generate_data_only(
     let players = yamls.len();
     // Building the request is blocking work.
     let limits = w.limits;
-    let head = tokio::task::spawn_blocking(move || {
-        fill_head(&seed_name, &files, (rng_seed, limits.bundle_max_bytes))
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))?;
+    let head =
+        try_blocking(move || fill_head(&seed_name, &files, (rng_seed, limits.bundle_max_bytes)))
+            .await?;
     laps.lap("request");
     // The job answers with the seed file itself; it names the game's package of the prepared
     // world.
@@ -303,12 +301,11 @@ pub(super) async fn generate_data_only(
         }
     };
     laps.lap("job");
-    let loaded = tokio::task::spawn_blocking(move || {
+    let loaded = try_blocking(move || {
         let game = data_fill::prepared::seed_game(&prepared)?.to_vec();
         crate::parse_seed(seed, vec![game], &limits)
     })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))?;
+    .await?;
     laps.lap("open");
     publish_loaded(w, loaded.clone()).await?;
     laps.lap("publish");

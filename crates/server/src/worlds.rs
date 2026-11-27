@@ -129,6 +129,13 @@ fn failure_reply(e: Failure) -> (StatusCode, String) {
     }
 }
 
+/// Run work that blocks and can fail off the runtime's threads; a panic in it is its error.
+async fn try_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(e.to_string()))
+}
+
 /// A failed store call as a 500 that hides its detail (it is in the log).
 fn store_error(e: log::StoreError) -> (StatusCode, String) {
     internal(store_failed(&e))
