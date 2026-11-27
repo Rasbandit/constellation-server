@@ -405,7 +405,7 @@ mod scenarios {
         let (_, connected_a, _) =
             e2e::join_via(server.addr, &room_url(&server, &a), "Alice").await.unwrap();
         assert_eq!(connected_a["checked_locations"], json!([loc]));
-        assert!(server.log().iter().any(|l| l.contains("websocket accepted") && l.contains(&a)));
+        server.wait_for_log(&format!("websocket accepted key={a}")).unwrap();
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -461,7 +461,7 @@ mod scenarios {
             .await
             .unwrap_or_else(|e| panic!("{e}; log:\n{}", server.log().join("\n")));
         assert_eq!(connected["checked_locations"], json!([loc]));
-        let loads = server.log().iter().filter(|l| l.contains("room in memory")).count();
+        let loads = server.wait_for_logs("room in memory", 2).unwrap().len();
         assert_eq!(loads, 2, "loaded on the first connect and again after it idled");
         drop(std::fs::remove_dir_all(&dir));
     }

@@ -129,16 +129,29 @@ impl Server {
     /// # Errors
     /// When no such line appears within the guard timeout.
     pub fn wait_for_log(&self, needle: &str) -> Res<String> {
+        Ok(self.wait_for_logs(needle, 1)?.swap_remove(0))
+    }
+
+    /// Wait until at least `n` log lines contain `needle`, and return every such line.
+    /// [`Server::log`] right after a client sees an event can miss its line: the server wrote
+    /// it to stderr first, but the thread reading stderr may not have pushed it yet.
+    ///
+    /// # Errors
+    /// When fewer lines appear within the guard timeout.
+    pub fn wait_for_logs(&self, needle: &str, n: usize) -> Res<Vec<String>> {
         let (lines, cv) = &*self.log;
         let (guard, _) = cv
             .wait_timeout_while(lines.lock().unwrap_or_else(PoisonError::into_inner), GUARD, |l| {
-                !l.iter().any(|x| x.contains(needle))
+                l.iter().filter(|x| x.contains(needle)).count() < n
             })
             .unwrap_or_else(PoisonError::into_inner);
-        let found = guard.iter().find(|x| x.contains(needle)).cloned();
+        let found: Vec<String> = guard.iter().filter(|x| x.contains(needle)).cloned().collect();
         let all = guard.join("\n");
         drop(guard);
-        found.ok_or_else(|| format!("no log line with {needle:?}; log:\n{all}"))
+        if found.len() < n {
+            return Err(format!("{} of {n} log lines with {needle:?}; log:\n{all}", found.len()));
+        }
+        Ok(found)
     }
 
     /// Send SIGTERM and wait for the exit.
