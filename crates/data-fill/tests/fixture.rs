@@ -341,6 +341,53 @@ fn a_sum_of_copies_over_items_is_one_group_counter() {
     assert!(gift(&["coin", "coin", "coin"]));
 }
 
+/// A manifest whose rules hold weighted group sums: a cap, weight 0, the largest weight, an
+/// item named twice (merged past the largest literal) and a sum that merges into one member.
+fn weighted() -> Value {
+    let mut m = manifest();
+    let times = |c: Value, w: i64| json!({"int": ["*", c, w]});
+    let lamp = json!({"int": ["min", {"count": "lamp"}, 1]});
+    let sum = json!({"int": ["+", times(lamp, 5), times(json!({"count": "rope"}), 0),
+                     times(json!({"count": "coin"}), 32_767), times(json!({"count": "coin"}), 32_767),
+                     {"count": "charm"}]});
+    m["regions"][0]["checks"][0]["rule"] = json!({"ge": [sum, 6]});
+    let one = json!({"int": ["+", {"count": "coin"}, times(json!({"count": "coin"}), 2)]});
+    m["regions"][1]["checks"][0]["rule"] = json!({"ge": [one, 3]});
+    m
+}
+
+/// A weighted group decodes to terms that compile back to the same bytes, and solves as
+/// written: a lamp (capped at one, weight 5) and a charm, or one coin, or three coins alone in
+/// the one-member sum.
+#[test]
+fn a_weighted_group_decodes_to_a_manifest_that_compiles_to_the_same_bytes() {
+    let bytes = data_fill::section::compile(&weighted()).unwrap();
+    let w = World::from_package(&bytes).unwrap();
+    let d = data_fill::decode::manifest(&w);
+    assert_eq!(data_fill::section::compile(&d).unwrap(), bytes);
+    let gift = |items: &[&str]| solve(&w, ALL, items).0.contains(&"gift".to_owned());
+    assert!(!gift(&["lamp", "lamp", "rope"]), "the second lamp is capped, rope weighs 0");
+    assert!(gift(&["lamp", "charm"]));
+    assert!(gift(&["coin"]));
+    assert!(!gift(&["charm", "charm"]));
+}
+
+/// The byte-flip check of [`a_damaged_section_is_rejected_before_any_solve`] on a world with a
+/// weights list, so the loader's weights path is flipped too.
+#[test]
+fn a_damaged_weighted_section_is_rejected_before_any_solve() {
+    let bytes = data_fill::section::compile(&weighted()).unwrap();
+    assert!(World::from_package(&bytes).is_ok());
+    for cut in 1..=8 {
+        assert!(World::from_package(&bytes[..bytes.len() - cut]).is_err(), "cut {cut}");
+    }
+    for k in 0..bytes.len() {
+        let mut b = bytes.clone();
+        b[k] ^= 0xff;
+        let _ = World::from_package(&b);
+    }
+}
+
 #[test]
 fn compile_errors_name_the_manifest_path() {
     let cases = [

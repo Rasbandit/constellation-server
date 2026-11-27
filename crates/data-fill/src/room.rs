@@ -1400,6 +1400,74 @@ mod tests {
         assert!(crossed > 0, "no item crossed worlds");
     }
 
+    /// Rooms of layered worlds whose gates are weighted sums (`Shape::sums`): the fill places
+    /// what a fresh solve of every round places, and every seed is beatable.
+    #[test]
+    fn weighted_sum_gates_fill_as_a_fresh_solve_per_round_and_are_beatable() {
+        use crate::synth::{Shape, Sums, world};
+        let light = Shape { checks: 120, layers: 3, sums: Sums::Weighted, ..Shape::default() };
+        let heavy = Shape { checks: 120, layers: 3, sums: Sums::Weighted, ..Shape::heavy() };
+        for (shape, players) in [(light, 1), (light, 3), (heavy, 2)] {
+            for seed in 1u64..=10 {
+                let built: Vec<_> = (0..players).map(|p| world(&shape, seed, p)).collect();
+
+                let manifests: Vec<_> = built.iter().map(|b| &b.0).collect();
+                let insts: Vec<_> = built.iter().map(|b| &b.1).collect();
+                let c = Compiled::new(&manifests, &insts).unwrap();
+                let seats = c.seats();
+                let (a, sa) =
+                    fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
+                let oracle = (config::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
+                let (b, sb) =
+                    fill_room_test(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, oracle)
+                        .unwrap();
+                assert_eq!((&a.placed, &sa), (&b.placed, &sb), "{players} players, seed {seed}");
+                let (beatable, _) = validate_room(&seats, &a.placed).unwrap();
+                assert!(beatable.iter().all(|x| *x), "{players} players, seed {seed}");
+            }
+        }
+    }
+
+    /// A room nothing of which is reached with nothing held (every check and the one exit
+    /// need the one progression item) has no beatable placement: the fill ends with the clean
+    /// `Stuck` error after its attempts, not a panic or a loop.
+    #[test]
+    fn a_room_with_nothing_reached_at_the_start_is_stuck() {
+        use serde_json::json;
+        let key = json!({"has": "key"});
+        let checks: Vec<_> = (0..4).map(|l| json!({"loc": format!("l{l}"), "rule": key})).collect();
+        let m = json!({
+            "options": [],
+            "items": [{"key": "key", "id": 1}, {"key": "junk", "id": 2}],
+            "locations": (0..4).map(|l| json!({"key": format!("l{l}"), "id": l + 1})).collect::<Vec<_>>(),
+            "start": "a",
+            "x.time": {"slices": 1, "start_mask": 1},
+            "defs": {},
+            "regions": [{"key": "a", "can_stay": false, "checks": checks, "events": [], "stays": [],
+                         "exits": [{"to": "b", "rule": key}]},
+                        {"key": "b", "can_stay": false, "checks": [], "exits": [], "events": [], "stays": []}],
+            "goal": {"reach": "region:b"},
+        });
+        let inst = Instance {
+            locations: (0..4).map(|l| format!("l{l}")).collect(),
+            pool: ["key", "junk", "junk", "junk"].map(String::from).to_vec(),
+            pool_class: [("key", "progression"), ("junk", "filler")]
+                .map(|(k, c)| (k.to_owned(), c.to_owned()))
+                .into_iter()
+                .collect(),
+            ..Instance::default()
+        };
+        let c = Compiled::new(&[&m], &[&inst]).unwrap();
+        for seed in 1..=5 {
+            let got = fill_room_spheres(&c.seats(), &mut rng(seed), config::FILL_MAX_ATTEMPTS);
+            assert!(
+                matches!(got, Err(FillError::Stuck { ref item, attempts }) if item == "key" && attempts == config::FILL_MAX_ATTEMPTS),
+                "seed {seed}: {:?}",
+                got.err()
+            );
+        }
+    }
+
     #[test]
     fn rounds_take_the_last_item_of_each_players_pile() {
         let g = |to, item| Given { to, item };

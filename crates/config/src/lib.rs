@@ -312,6 +312,16 @@ pub struct Limits {
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
 pub const RULES_MAX_DEPTH: u32 = 256;
 
+/// Largest weight of one member of a weighted group sum (`data_fill`'s `GROUP`): the largest
+/// integer a rule's bytecode holds (16 bits signed), so a weighted sum compares against any
+/// threshold a rule can write. With [`RULE_GROUP_MAX_MEMBERS`] it bounds a sum below 2^31 times
+/// the copies of one item, far inside `i64` (a design value).
+pub const RULE_WEIGHT_MAX: i64 = i16::MAX as i64;
+
+/// Most members of one group sum, plain or weighted; compiler and loader refuse more (a design
+/// value: the group index is 16 bits wide, and a group is not meant to be larger).
+pub const RULE_GROUP_MAX_MEMBERS: usize = u16::MAX as usize;
+
 /// Most terms a rule may take as a bit rule (`data_fill`'s fold: an OR of terms, each a set of
 /// atom bits that must all be set). Turning AND over OR into that form multiplies terms, so a
 /// rule that would need more, at any step of the way, stays bytecode (a design value: the real

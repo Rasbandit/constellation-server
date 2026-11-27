@@ -73,6 +73,20 @@ pub struct Shape {
     /// Confined items: every copy of `p0` may only go to the group `home`, two locations in
     /// five ([`confine`]`(_, 5, 2)`).
     pub confined: bool,
+    /// Half the gates of the layered world are a sum of the copies of three kinds ([`Sums`]).
+    pub sums: Sums,
+}
+
+/// The sum gates of [`Shape::sums`]: drawn alike, so the two worlds differ only in weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sums {
+    /// No sum gates: the worlds as before the flag.
+    #[default]
+    Off,
+    /// `count(a) + count(b) + count(c) >= t`.
+    Counts,
+    /// The same three kinds weighted 1 to 4, at least `t` times the first kind's weight.
+    Weighted,
 }
 
 /// Worlds where taking one item out of what is held changes much of what is reached, or where
@@ -118,6 +132,7 @@ impl Default for Shape {
             timeless: false,
             guards: false,
             confined: false,
+            sums: Sums::Off,
         }
     }
 }
@@ -193,6 +208,7 @@ fn keyed(shape: &Shape, how: Hostile, pick: &mut dyn FnMut(usize) -> usize) -> (
         } else {
             json!({"true": {}})
         };
+        let rule = open_first(l, rule);
         region_checks[region(l)].push(json!({"loc": format!("l{l}"), "rule": rule}));
     }
     let regions_json: Vec<Value> = (0..regions)
@@ -277,6 +293,7 @@ fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance
             } else {
                 tree(3 + pick(4) / 3, true, &leaf, pick)
             };
+            let rule = open_first(l, rule);
             json!({"loc": format!("l{l}"), "rule": rule})
         })
         .collect();
@@ -308,6 +325,13 @@ fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance
         ..Instance::default()
     };
     (manifest, inst)
+}
+
+/// The rule of check `l`, drawn as `rule`: the first check, in the start region, is open, so a
+/// fill always has a location for a first item. The draws are made either way, so the rest of
+/// the world is as before.
+fn open_first(l: usize, rule: Value) -> Value {
+    if l == 0 { json!({"true": {}}) } else { rule }
 }
 
 /// One player's world and instance. The same `seed` and `player` give the same bytes.
@@ -397,7 +421,23 @@ fn drawn(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
             events[r].push(json!({"event": format!("c{c}"), "rule": has(&mut pick)}));
         }
     }
+    // `t` copies of the first kind alone meet it, so every gate still holds with the whole pool.
+    let sum = |pick: &mut dyn FnMut(usize) -> usize| {
+        let kinds3 = [pick(kinds), pick(kinds), pick(kinds)];
+        let weights = kinds3.map(|_| 1 + pick(4));
+        let t = 1 + pick(copies(kinds3[0]));
+        let weighted = shape.sums == Sums::Weighted;
+        let mut terms = vec![json!("+")];
+        terms.extend(kinds3.iter().zip(weights).map(|(k, w)| {
+            let c = json!({"count": p(*k)});
+            if weighted { json!({"int": ["*", c, w]}) } else { c }
+        }));
+        json!({"ge": [{"int": terms}, if weighted { t * weights[0] } else { t }]})
+    };
     let gate = |d: usize, pick: &mut dyn FnMut(usize) -> usize| {
+        if shape.sums != Sums::Off && pick(2) == 0 {
+            return sum(pick);
+        }
         let first = match pick(20) {
             0..=7 => has(pick),
             8..=11 => json!({"any": [has(pick), has(pick)]}),
@@ -443,6 +483,7 @@ fn drawn(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
             3..=5 if shape.rich => gate(layer(r), &mut pick),
             _ => json!({"true": {}}),
         };
+        let rule = open_first(l, rule);
         region_checks[r].push(json!({"loc": format!("l{l}"), "rule": rule}));
     }
     let regions_json: Vec<Value> = (0..regions)
@@ -514,7 +555,8 @@ fn drawn(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
         ..Instance::default()
     };
     if shape.hostile == Some(Hostile::Tight) {
-        inst.excluded = (0..checks).step_by(2).map(|l| format!("l{l}")).collect();
+        // The odd ones, so the open first check (`open_first`) can take progression.
+        inst.excluded = (1..checks).step_by(2).map(|l| format!("l{l}")).collect();
     }
     (manifest, inst)
 }
@@ -584,6 +626,45 @@ mod tests {
     use crate::room::{Given, Rule, fill_room, fill_room_spheres, fill_room_test};
     use crate::spheres::RoomSpheres;
     use crate::world::World;
+
+    /// Every drawn world has a location that can take progression and is reached with nothing
+    /// held, so a fill has somewhere to put a first item: without one no placement is beatable
+    /// (the heavy world of 120 checks drew none on seed 8). Every kind of world, at several
+    /// sizes, over many seeds.
+    #[test]
+    fn every_world_reaches_a_location_with_nothing_held() {
+        let hostile = |how| Shape::hostile(how);
+        let kinds = [
+            Shape::default(),
+            Shape::heavy(),
+            Shape { sums: Sums::Counts, ..Shape::heavy() },
+            Shape { sums: Sums::Weighted, ..Shape::default() },
+            Shape { sums: Sums::Weighted, ..Shape::heavy() },
+            Shape::wide(),
+            hostile(Hostile::Chain),
+            hostile(Hostile::Gated),
+            hostile(Hostile::Keys),
+            hostile(Hostile::Brink),
+            hostile(Hostile::Tight),
+        ];
+        let mut worlds = 0;
+        for shape in kinds {
+            for checks in [40, 120, 240, 1000] {
+                let shape = Shape { checks, layers: 3, ..shape };
+                for seed in 1..=if checks == 1000 { 4 } else { 40 } {
+                    let (m, inst) = world(&shape, seed, seed % 3);
+                    let w = World::load(&m).unwrap();
+                    let plan = crate::Plan::new(&w, &inst).unwrap();
+                    let r = plan.solve(&w, &[]);
+                    let open =
+                        plan.included.iter().any(|l| r.reached(*l) && !plan.excluded[*l as usize]);
+                    assert!(open, "{shape:?}, seed {seed}: nothing reached with nothing held");
+                    worlds += 1;
+                }
+            }
+        }
+        assert_eq!(worlds, 11 * (3 * 40 + 4));
+    }
 
     fn small(clocks: bool) -> Shape {
         Shape { checks: 60, layers: 3, clocks, ..Shape::default() }

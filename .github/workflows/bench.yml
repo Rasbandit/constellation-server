@@ -2,7 +2,8 @@ name: bench
 # The fill on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build, one
 # thread, on one runner: light and heavy at 1, 10 and 100 players, a world each and every player
 # on one world (the rooms the server generates, with the seed's encode), rooms built to need
-# repair (chain, keys, mixed, tight), the bit rules against plain bytecode (a gate: same
+# repair (chain, keys, mixed, tight), sum gates weighted and plain (`Shape::sums`), the bit
+# rules against plain bytecode (a gate: same
 # placements), and the seed-shape report. Base against head in turns (also on rooms with
 # confined items, a gate: same placements), and shuffled worlds, in
 # jobs of their own. Runs only on PRs labelled `perf` and on manual dispatch, never on every PR.
@@ -80,6 +81,15 @@ jobs:
           # every check evaluated, at 10 players: the gate below holds their placements equal.
           for profile in light heavy; do
             bench --profile "$profile" --rules bytecode --absent check --players 10 --checks "$CHECKS"
+          done
+          # Half the gates as sums of three kinds' copies (`Shape::sums`): weighted, against the
+          # same worlds with plain-count sums, and weighted as bytecode for the gate below (at 100
+          # players too, which parts the atom's own cost from the world's on the same placements).
+          for sums in counts weighted; do for profile in light heavy; do
+            bench --profile "$profile" --sums "$sums" --players "$PLAYERS" --checks "$CHECKS" --failed-row
+          done; done
+          for profile in light heavy; do
+            bench --profile "$profile" --sums weighted --rules bytecode --absent check --players 10,100 --checks "$CHECKS"
           done
           # Worlds built to need repair (`data_fill::synth::Hostile`): chains, keys, a room of
           # chain, light, key and heavy worlds in turn (`mixed`), and as much progression as
