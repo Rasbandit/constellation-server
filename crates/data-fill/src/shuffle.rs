@@ -148,6 +148,13 @@ impl Bound {
         Ok(Bound { decl, layout })
     }
 
+    /// Bytes the bound shuffles hold, themselves and on the heap (`World::held_bytes`).
+    pub(crate) fn held_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.decl.heap_bytes()
+            + self.layout.as_ref().map_or(0, Layout::heap_bytes)
+    }
+
     /// The shuffles of one level, quoted, for an error.
     fn names(&self, layout: bool) -> String {
         let names = self.decl.shuffles.iter().filter(|sh| sh.layout == layout);

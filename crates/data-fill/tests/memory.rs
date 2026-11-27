@@ -69,6 +69,7 @@ fn a_prepared_world_counts_the_bytes_it_holds() {
         ("wide", synth(Shape::wide())),
         ("keys", synth(Shape::hostile(Hostile::Keys))),
         ("shared definition", shared_definition()),
+        ("doors", synth(Shape { doors: true, timeless: true, ..Shape::heavy() })),
     ];
     let mut ratios = Vec::new();
     for (name, mut manifest) in worlds {

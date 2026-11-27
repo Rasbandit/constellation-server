@@ -10,6 +10,7 @@ use spec_rng::SpecRng;
 
 use super::draw::assign;
 use super::{LAYOUT, R};
+use crate::bitrules::vec_bytes;
 use crate::section::{arr, s};
 
 /// Names no shuffle may take: they key the random streams of the layout solve and of a
@@ -480,6 +481,28 @@ impl Shuffle {
 }
 
 impl Decl {
+    /// Heap bytes a loaded declaration holds (`World::held_bytes`).
+    pub(super) fn heap_bytes(&self) -> usize {
+        let texts = |v: &Vec<String>| vec_bytes(v) + v.iter().map(String::capacity).sum::<usize>();
+        let of_exit = |e: &Exit| {
+            e.key.capacity() + e.region.capacity() + e.door.as_ref().map_or(0, String::capacity)
+        };
+        let of_shuffle = |sh: &Shuffle| {
+            sh.name.capacity()
+                + texts(&sh.slots)
+                + texts(&sh.keys)
+                + vec_bytes(&sh.things)
+                + sh.things.iter().map(|t| t.name.capacity()).sum::<usize>()
+                + vec_bytes(&sh.allowed)
+                + vec_bytes(&sh.exits)
+        };
+        vec_bytes(&self.shuffles)
+            + vec_bytes(&self.order)
+            + vec_bytes(&self.exits)
+            + self.exits.iter().map(of_exit).sum::<usize>()
+            + self.shuffles.iter().map(of_shuffle).sum::<usize>()
+    }
+
     /// The declarations of manifest `m`, checked; `None` when it declares no shuffle.
     pub(crate) fn of(m: &Value) -> R<Option<Decl>> {
         Self::read(m).map_err(clip)

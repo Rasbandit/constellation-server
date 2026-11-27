@@ -8,6 +8,7 @@ use spec_rng::SpecRng;
 use super::decl::Decl;
 use super::draw::pick;
 use super::{R, Table};
+use crate::bitrules::vec_bytes;
 use crate::section::EXITS;
 use crate::world::World;
 
@@ -300,6 +301,22 @@ impl Layout {
             reach(thing.target, &mut placed, &mut open, &mut fresh);
         }
         Ok(out)
+    }
+
+    /// Heap bytes the layout holds (`World::held_bytes`).
+    pub(super) fn heap_bytes(&self) -> usize {
+        fn lists<T>(v: &Vec<Vec<T>>) -> usize {
+            vec_bytes(v) + v.iter().map(vec_bytes).sum::<usize>()
+        }
+        vec_bytes(&self.doors)
+            + lists(&self.fixed)
+            + lists(&self.doors_in)
+            + lists(&self.behind)
+            + lists(&self.into)
+            + vec_bytes(&self.opens)
+            + vec_bytes(&self.doors_at)
+            + vec_bytes(&self.rank)
+            + vec_bytes(&self.live)
     }
 
     /// Write what a growth connected into `table`: per shuffle, slot key to thing key. The
