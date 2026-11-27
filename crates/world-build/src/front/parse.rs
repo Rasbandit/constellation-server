@@ -894,7 +894,19 @@ impl P<'_> {
                     key: None,
                     was: None,
                 };
+                // Each modifier once: a second would silently replace the first.
+                let mut seen: Vec<&str> = Vec::new();
                 loop {
+                    let word = ["when", "placement"]
+                        .into_iter()
+                        .find(|w| self.word(w))
+                        .or_else(|| CHECK_MODIFIERS.into_iter().find(|w| self.ctx(w)));
+                    if let Some(w) = word {
+                        if seen.contains(&w) {
+                            return Err((self.here(), format!("`{w}` is given twice")));
+                        }
+                        seen.push(w);
+                    }
                     if self.word("when") {
                         self.k += 1;
                         c.when = Some(self.rule(depth)?);
@@ -906,9 +918,6 @@ impl P<'_> {
                         c.holds = Some(self.tname("an item")?);
                     } else if self.ctx("no_progression") {
                         let at = self.here();
-                        if c.no_progression.is_some() {
-                            return Err((at, "`no_progression` is given twice".into()));
-                        }
                         self.k += 1;
                         // A modifier word after it starts the next modifier, not a rule: no def
                         // may take one of these names, and an event is state, which

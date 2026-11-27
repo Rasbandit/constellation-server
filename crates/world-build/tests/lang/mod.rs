@@ -225,6 +225,10 @@ fn a_bare_no_progression_ends_before_key_and_was() {
     );
     let all = errors(&world("region a {\n  check c no_progression no_progression\n}")).join("\n");
     assert!(all.contains("`no_progression` is given twice"), "{all}");
+    for twice in ["when true when true", "key \"a\" key \"b\"", "vanilla k vanilla k"] {
+        let all = errors(&world(&format!("region a {{\n  check c {twice}\n}}"))).join("\n");
+        assert!(all.contains("is given twice"), "{twice}: {all}");
+    }
     // So no def may be named a modifier word: a rule could never read it there.
     for (decl, what) in [
         ("def key = true", "a def"),
