@@ -25,7 +25,15 @@ mod web;
 mod worlds;
 
 pub use sandbox::fill_job;
+// The pool and the one-job runner, public only for the tests that drive them through real
+// worker processes (`tests/pool.rs`, feature `pool-tests`): not part of the server's interface.
+#[cfg(feature = "pool-tests")]
+pub use sandbox::{Failure, run_job};
 pub mod host;
+#[cfg(not(feature = "pool-tests"))]
+mod pool;
+#[cfg(feature = "pool-tests")]
+pub mod pool;
 pub mod rooms;
 
 use axum::Router;
