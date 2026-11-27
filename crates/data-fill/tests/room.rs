@@ -6,7 +6,7 @@ use data_fill::room::{
     self, Compiled, Given, Seat, fill_room_spheres, locked_placed, validate_room,
 };
 use data_fill::spheres::room_spheres;
-use data_fill::{Instance, Plan, World};
+use data_fill::{Instance, Plan, World, fill};
 use serde_json::Value;
 use spec_rng::SpecRng;
 
@@ -224,8 +224,7 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
 }
 
 /// The fixture world on both ways of placing rounds: carried, forward on one thread and on
-/// three, and the path a room of that size takes by itself (the split path from
-/// `config::ROOM_FORWARD_MIN_PLAYERS` players). Placements, spheres, attempts and rounds are
+/// three, and the path a room takes by itself (the split path, `room::Path::of`). Placements, spheres, attempts and rounds are
 /// the same, or the error is.
 #[test]
 fn the_fixture_fills_the_same_carried_and_forward() {
@@ -256,10 +255,23 @@ fn the_fixture_fills_the_same_carried_and_forward() {
                 assert_eq!(solves, 1, "{n} players");
             }
             assert_eq!(carried, on(Path::Split).0, "{n} players, seed {seed}");
-            split += u32::from(n >= config::ROOM_FORWARD_MIN_PLAYERS && carried.is_ok());
+            split += u32::from(carried.is_ok());
         }
     }
-    assert!(split > 0, "rooms at and above the threshold filled on the split path");
+    assert!(split > 0, "rooms filled on the split path");
+}
+
+#[test]
+fn a_room_of_one_fills_exactly_like_a_single_player() {
+    let r = players(1, 1);
+    let seats = r.seats();
+    for seed in 1u64..=40 {
+        let one =
+            fill(&r.worlds[0], &r.plans[0], &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
+        let many = room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
+        let flat: Vec<Option<u16>> = many.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
+        assert_eq!(one.placed, flat, "seed {seed}");
+    }
 }
 
 #[test]

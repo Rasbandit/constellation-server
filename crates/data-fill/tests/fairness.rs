@@ -108,7 +108,11 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
         assert_eq!(s.fill.p(key_a, l), 0.0);
     }
     let r = report(&w, &s);
-    assert!(r["baseline"]["p_value"].as_f64().is_some());
+    // The product's fill (a room of this one player) against uniform beatable placements: a
+    // fixed run, so this is no flake. The rounds as they are give p 0.39 here; each player's
+    // items deepest first gave 0.00008 (counted, 300 seeds each).
+    let p = r["baseline"]["p_value"].as_f64().unwrap_or(0.0);
+    assert!(p >= 0.01, "the fill is told apart from uniform placements: p {p}");
     assert!(
         r["baseline"]["max_deviation"]["value"].as_f64().is_some_and(|d| (0.0..=1.0).contains(&d))
     );

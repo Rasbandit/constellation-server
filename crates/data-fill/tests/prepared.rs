@@ -14,10 +14,8 @@ use serde_json::{Value, json};
 
 /// The seed cap of the imports here.
 const MAX: u64 = 1 << 24;
-/// A snapshot: SHA-256 of every seed file and package file of [`rooms`], in order. It catches a
-/// change nobody meant and a difference between machines; when seeds are meant to change,
-/// update it in a commit that says so.
-const PINNED: &str = "40188d2c5400010cee6a732da2943d9370435b8da8dbb3a36e8d46b8a15da3bf";
+/// SHA-256 of every seed file and package file of [`rooms`], in order.
+const PINNED: &str = "d004200e1b3c59171fe9ccf5f2cd797aa1e780ba4fe741ab8ea143c126a204e7";
 
 /// One small synthetic world as an uploaded manifest, and `n` players on it.
 fn room(n: usize) -> (Value, Vec<Player>) {
@@ -94,6 +92,7 @@ fn the_stored_seeds_of_seeds_1_to_20_at_1_and_10_players_are_pinned() {
 /// filled from that stored form is the seed the manifest path makes.
 #[test]
 fn the_prepared_path_stores_the_bytes_the_manifest_path_does() {
+    let mut all = Vec::new();
     for n in [1, 10] {
         let (m, p) = room(n);
         let (_, file) = prepared(&m);
@@ -103,15 +102,19 @@ fn the_prepared_path_stores_the_bytes_the_manifest_path_does() {
                 (&seed, &packages),
                 (&by_manifest(&m, &p, rng).0, &by_manifest(&m, &p, rng).1)
             );
+            all.extend(seed);
+            all.extend(packages.concat());
         }
     }
+    assert_eq!(hex(&key_of(&all)), PINNED);
 }
 
 /// A worker that stays up fills on a world it loaded before (`job::fill_on`): every seed of
 /// [`rooms`] filled on one loaded world, again and again, is the seed a job that loads the file
-/// itself makes. Fails if a fill left anything in the loaded world.
+/// itself makes, so the pin holds for it too. Fails if a fill left anything in the loaded world.
 #[test]
 fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
+    let mut all = Vec::new();
     for n in [1, 10] {
         let (m, p) = room(n);
         let (_, file) = prepared(&m);
@@ -121,11 +124,14 @@ fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
             let (seed, report) = on(rng);
             let alone = job::fill_reported(&request(&file, &p, rng, 1)).unwrap();
             assert_eq!((&seed, format!("{report:?}")), (&alone.0, format!("{:?}", alone.1)));
+            all.extend(seed);
+            all.extend(prepared::seed_game(&file).unwrap());
         }
         // An earlier seed again, after nineteen others on the same loaded world.
         assert_eq!(on(1).0, job::fill(&request(&file, &p, 1, 1)).unwrap());
         assert!(job::request(b"{").unwrap_err().contains("bad fill request"));
     }
+    assert_eq!(hex(&key_of(&all)), PINNED);
 }
 
 /// A fill leaves nothing in the loaded world it ran on: after fills in every mode, for one and

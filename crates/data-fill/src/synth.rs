@@ -505,8 +505,23 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
 /// # Errors
 /// As [`Compiled::new`].
 pub fn room(shape: &Shape, seed: u64, players: usize, workers: usize) -> Result<Compiled, String> {
+    mixed(std::slice::from_ref(shape), seed, players, workers)
+}
+
+/// A room of `players` synthetic worlds of `shapes` in turn: player `p` drawn as
+/// [`world`]`(shapes[p % shapes.len()], seed, p)`. A room whose piles differ in length and
+/// shape.
+///
+/// # Errors
+/// As [`Compiled::new`].
+pub fn mixed(
+    shapes: &[Shape],
+    seed: u64,
+    players: usize,
+    workers: usize,
+) -> Result<Compiled, String> {
     let built: Vec<(Value, Instance)> =
-        (0..players as u64).map(|p| world(shape, seed, p)).collect();
+        (0..players).map(|p| world(&shapes[p % shapes.len()], seed, p as u64)).collect();
     let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
     let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
     Compiled::new(&manifests, &insts, workers)
@@ -595,13 +610,47 @@ mod tests {
     /// A snapshot: the exact placements of fixed seeds, room and single player, with and
     /// without clocks, with `p0` confined to a placement group. It catches a change nobody
     /// meant and a difference between machines. When placements are meant to change, update
-    /// the hash in a commit that says so.
+    /// the hash in a commit that says so. Its rooms never divide a round or move an item, so
+    /// the round procedure of issue 212 places them as before (and deepest first would too:
+    /// a player's round items here are five copies of one kind, `p0` being confined, so any
+    /// order of them is the same placements).
     #[test]
     fn placements_of_fixed_seeds_are_pinned() {
         let out = pinned(None);
         let p0 = |row: &str| row.matches("item: 0 }").count();
         assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
         assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// The same pin with the rooms forced onto the forward path, on one thread and on four.
+    #[test]
+    fn the_pinned_placements_are_the_same_on_the_forward_path() {
+        for workers in [1, 4] {
+            let out = pinned(Some(Path::Forward { workers }));
+            let hash = format!("{:016x}", crate::check::fnv1a(out.as_bytes()));
+            assert_eq!(hash, "036064f5ec95175d", "{workers} workers");
+        }
+    }
+
+    /// The same pin with the rooms forced onto the split path.
+    #[test]
+    fn the_pinned_placements_are_the_same_on_the_split_path() {
+        let out = pinned(Some(Path::Split));
+        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
+    }
+
+    /// A snapshot of the repaired rounds: a room of 22 chain worlds, where rounds are divided
+    /// and items moved in place (issue 212), on every path. Update it in a commit that says so.
+    #[test]
+    fn the_repaired_rounds_of_a_room_of_chains_are_pinned() {
+        let c = room(&Shape::hostile(Hostile::Chain), 1, 22, 1).unwrap();
+        for path in [Path::Split, Path::Forward { workers: 1 }, Path::Carry] {
+            let f = once(&c, 1, path, Algorithm::Exact).unwrap();
+            let counts = (f.attempts, f.rounds, f.divided, f.swaps);
+            let hash =
+                format!("{:016x}", crate::check::fnv1a(format!("{:?}", f.placed).as_bytes()));
+            assert_eq!((counts, hash.as_str()), ((1, 139, 46, 8), "92838999e01ee2cb"), "{path:?}");
+        }
     }
 
     /// A confined progression item never lands on an excluded location of its group (#203):
@@ -789,28 +838,132 @@ mod tests {
             .map_err(|e| format!("{e:?}"))
     }
 
+    /// One attempt of `mode` on `path`, as filled, or its error.
+    fn once(
+        c: &Compiled,
+        seed: u64,
+        path: Path,
+        mode: Algorithm,
+    ) -> Result<crate::RoomFilled, String> {
+        fill_room_by(&c.seats(), &mut SpecRng::from_u64(seed), 1, path, mode)
+            .map(|(f, _)| f)
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// A fill that holds up by itself: every goal reachable, the report a fresh solve's, every
+    /// location that exists holds one item, and every progression item lies where it is reached.
+    fn sound(c: &Compiled, f: &crate::RoomFilled, at: &str) {
+        let seats = c.seats();
+        assert!(f.all_beatable(), "{at}");
+        let fresh = crate::room::validate_room(&seats, &f.placed).unwrap();
+        assert_eq!((f.beatable.clone(), f.reached.clone()), fresh, "{at}");
+        let sp = crate::spheres::room_spheres(&seats, &f.placed).unwrap();
+        for (p, (s, row)) in seats.iter().zip(&f.placed).enumerate() {
+            assert_eq!(row.iter().flatten().count(), s.plan.included.len(), "{at}");
+            for (l, g) in row.iter().enumerate() {
+                if g.is_some_and(|g| crate::room::is_progression(&seats, g)) {
+                    let spot = (u16::try_from(p).unwrap(), u32::try_from(l).unwrap());
+                    assert!(
+                        !sp.unreachable.contains(&spot),
+                        "{at}: progression at {spot:?} out of reach"
+                    );
+                }
+            }
+        }
+    }
+
     /// Issue 212: rooms of worlds where one key hides everything behind it, at sizes the
     /// rounds in drawn order were stuck on at every attempt (chain from 22 players, keys from
-    /// 16). Deepest first they fill in one pass, no round divided, every goal reachable, and
-    /// the report is a fresh solve's. In drawn order the same room and seed is stuck.
+    /// 16). In the order drawn, rounds divided where they do not fit and items moved in place,
+    /// they fill in one pass, sound, and the item chains stay at least as long as deepest first
+    /// gives (counted in spheres). The rounds as they were are stuck on the same room and seed.
     #[test]
-    fn rooms_of_chains_fill_in_one_pass_where_drawn_order_was_stuck() {
+    fn rooms_of_chains_fill_in_one_pass_by_repair_where_drawn_order_was_stuck() {
         for (how, players) in [(Hostile::Chain, 22), (Hostile::Keys, 16)] {
             let c = room(&Shape::hostile(how), 1, players, 1).unwrap();
             let seats = c.seats();
-            let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
             for seed in [1, 2] {
                 let at = format!("{how:?}, {players} players, seed {seed}");
-                let (placed, _, attempts, rounds, beatable, reached) =
-                    one_pass(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
-                assert_eq!(attempts, 1, "{at}");
-                assert_eq!(rounds as usize, piles, "{at}: a round was divided");
-                assert!(beatable.iter().all(|b| *b), "{at}");
-                let fresh = crate::room::validate_room(&seats, &placed).unwrap();
-                assert_eq!((beatable, reached), fresh, "{at}");
-                let drawn = one_pass(&c, seed, Path::Split, Algorithm::Drawn);
+                let f = once(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
+                assert_eq!(f.attempts, 1, "{at}");
+                assert!(
+                    f.divided > 0 && f.swaps > 0,
+                    "{at}: {} divided, {} moved",
+                    f.divided,
+                    f.swaps
+                );
+                sound(&c, &f, &at);
+                let spheres = |f: &crate::RoomFilled| {
+                    crate::spheres::room_spheres(&seats, &f.placed).unwrap().spheres.len()
+                };
+                let deepest = once(&c, seed, Path::Split, Algorithm::Deepest).expect(&at);
+                assert!(
+                    spheres(&f) > spheres(&deepest),
+                    "{at}: {} against {}",
+                    spheres(&f),
+                    spheres(&deepest)
+                );
+                let drawn = once(&c, seed, Path::Split, Algorithm::Drawn);
                 assert!(drawn.is_err_and(|e| e.contains("Stuck")), "{at}: drawn order filled");
             }
+        }
+    }
+
+    /// One player: a round is one item, so nothing is divided, and where the assumed fill has
+    /// nowhere to put an item (no free location reached without it) the item takes a placed
+    /// one's location instead of the fill starting over. Rooms of one tight world (as much
+    /// progression as locations that take it): some seeds fill in one pass only by a move,
+    /// sound, where the rounds as they were needed another attempt.
+    #[test]
+    fn a_player_alone_is_repaired_in_place_instead_of_starting_over() {
+        let c = room(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 1, 1).unwrap();
+        let mut moved = 0;
+        for seed in 1..=24 {
+            let at = format!("seed {seed}");
+            let f = once(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
+            assert_eq!((f.attempts, f.divided), (1, 0), "{at}");
+            sound(&c, &f, &at);
+            if f.swaps > 0 {
+                moved += 1;
+                assert!(once(&c, seed, Path::Split, Algorithm::Drawn).is_err(), "{at}");
+            }
+        }
+        assert!(moved > 2, "{moved} seeds moved an item");
+    }
+
+    /// The work an attempt may spend on moves is bounded (`config::FILL_REPAIR_EVALS`): with no
+    /// budget at all, or one that stops after the first solve, the room of chains that needs
+    /// moves is stuck in one attempt, with the clean error and the item's name; given a second
+    /// attempt, it goes deepest first and fills without a move. With the configured budget it
+    /// fills in one attempt within it, and the work counted is the same on every path.
+    #[test]
+    fn repair_has_a_budget_of_work_and_a_stuck_attempt_goes_deepest_first() {
+        use crate::room::fill_room_budget;
+        let c = room(&Shape::hostile(Hostile::Chain), 1, 22, 1).unwrap();
+        let seats = c.seats();
+        let rng = || SpecRng::from_u64(1);
+        for budget in [0, 1] {
+            match fill_room_budget(&seats, &mut rng(), (1, budget), Path::Split) {
+                Err(crate::FillError::Stuck { item, attempts: 1 }) => {
+                    assert!(item.starts_with('k'));
+                }
+                other => panic!("budget {budget}: {:?}", other.map(|f| f.attempts)),
+            }
+        }
+        let f = fill_room_budget(&seats, &mut rng(), (2, 0), Path::Split).unwrap();
+        assert_eq!((f.attempts, f.swaps, f.repair_evals), (2, 0, 0));
+        sound(&c, &f, "deepest first");
+        let budget = config::FILL_REPAIR_EVALS;
+        let f = fill_room_budget(&seats, &mut rng(), (1, budget), Path::Split).unwrap();
+        assert!(f.swaps > 0 && f.repair_evals > 0, "{} moved", f.swaps);
+        assert!(f.repair_evals < budget, "{} evaluations", f.repair_evals);
+        for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }] {
+            let other = fill_room_budget(&seats, &mut rng(), (1, budget), path).unwrap();
+            assert_eq!(
+                (other.repair_evals, other.placed),
+                (f.repair_evals, f.placed.clone()),
+                "{path:?}"
+            );
         }
     }
 
@@ -831,10 +984,20 @@ mod tests {
             Shape { checks: 200, ..Shape::hostile(Hostile::Tight) },
             Shape::wide(),
         ];
-        let (mut filled, mut stuck, mut divided) = (0, 0, 0);
-        for (n, shape) in shapes.iter().enumerate() {
+        // Mixed rooms: piles of different lengths and shapes side by side.
+        let mixes = [
+            vec![hostile(Hostile::Chain), small(false)],
+            vec![
+                small(true),
+                hostile(Hostile::Keys),
+                Shape { checks: 80, layers: 3, ..Shape::heavy() },
+            ],
+        ];
+        let rooms = shapes.iter().map(std::slice::from_ref).chain(mixes.iter().map(Vec::as_slice));
+        let (mut filled, mut stuck, mut divided, mut moved) = (0, 0, 0, 0);
+        for (n, shapes) in rooms.enumerate() {
             for players in [1usize, 2, 5, 13] {
-                let c = room(shape, 40 + n as u64, players, 1).unwrap();
+                let c = mixed(shapes, 40 + n as u64, players, 1).unwrap();
                 let seats = c.seats();
                 let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
                 for seed in 1..=6 {
@@ -849,6 +1012,8 @@ mod tests {
                     // More groups placed than the longest pile has items: one was divided, or
                     // the rounds went on after an item was moved.
                     divided += u32::from(rounds as usize > piles);
+                    moved +=
+                        u32::from(once(&c, seed, Path::Split, Algorithm::Exact).unwrap().swaps > 0);
                     assert!(beatable.iter().all(|b| *b), "{at}");
                     let fresh = crate::room::validate_room(&seats, &placed).unwrap();
                     assert_eq!((beatable, reached), fresh, "{at}");
@@ -859,7 +1024,10 @@ mod tests {
                 }
             }
         }
-        assert!(filled > 150 && divided > 0, "{filled} filled, {stuck} stuck, {divided} divided");
+        assert!(
+            filled > 200 && divided > 0 && moved > 0,
+            "{filled} filled, {stuck} stuck, {divided} divided, {moved} moved"
+        );
     }
 
     /// A round that does not fit its state is divided, and an item with nowhere to go takes
@@ -869,12 +1037,19 @@ mod tests {
     #[test]
     fn a_repaired_round_places_the_same_on_every_path() {
         let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
-        let mut repaired = 0;
-        for players in [2usize, 3, 8, 12] {
-            let c = room(&tight, 23, players, 1).unwrap();
+        let chain = Shape { checks: 80, ..Shape::hostile(Hostile::Chain) };
+        let (mut repaired, mut moved) = (0, 0);
+        for (shapes, players) in [
+            (vec![tight], 2usize),
+            (vec![tight], 3),
+            (vec![tight], 8),
+            (vec![tight], 12),
+            (vec![tight, chain, small(true)], 9),
+        ] {
+            let c = mixed(&shapes, 23, players, 1).unwrap();
             let piles = c.seats().iter().map(|s| s.plan.progression.len()).max().unwrap();
             for seed in 1..=8 {
-                let at = format!("{players} players, seed {seed}");
+                let at = format!("{shapes:?}, {players} players, seed {seed}");
                 let split = one_pass(&c, seed, Path::Split, Algorithm::Exact);
                 for path in
                     [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }]
@@ -882,9 +1057,12 @@ mod tests {
                     assert_eq!(split, one_pass(&c, seed, path, Algorithm::Exact), "{at}, {path:?}");
                 }
                 repaired += u32::from(split.is_ok_and(|x| x.3 as usize > piles));
+                moved += u32::from(
+                    once(&c, seed, Path::Split, Algorithm::Exact).is_ok_and(|f| f.swaps > 0),
+                );
             }
         }
-        assert!(repaired > 8, "{repaired} repaired");
+        assert!(repaired > 8 && moved > 0, "{repaired} repaired, {moved} moved");
     }
 
     /// A room nothing can fill: every location in front of the last region is excluded, so
@@ -1083,7 +1261,7 @@ mod tests {
     /// placement reads only what that state reaches: so a fresh forward solve per round
     /// (`Path::Forward`, on one thread and on four) must decide everything exactly as truth
     /// maintenance (`Path::Carry`) does: placements, spheres, attempts, rounds, or the error.
-    /// Rooms below, at and above `config::ROOM_FORWARD_MIN_PLAYERS`; both profiles, clocks on
+    /// Rooms of 1 to 12 players; both profiles, clocks on
     /// and off, a high progression share; excluded and locked locations, start items, confined
     /// items (placed one at a time, carried, on both paths); fills that are stuck on every
     /// attempt and fills that need a retry.
@@ -1406,18 +1584,15 @@ mod tests {
         assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
     }
 
-    /// Every room takes the split path (`config::ROOM_FORWARD_MIN_PLAYERS` is 1), whatever
-    /// the workers asked for.
+    /// Every room takes the split path, whatever the workers asked for.
     #[test]
     fn every_room_takes_the_split_path() {
-        let at = config::ROOM_FORWARD_MIN_PLAYERS;
-        assert_eq!(at, 1);
         assert_eq!(Path::of(1, 4), Path::Split);
-        assert_eq!(Path::of(at + 1, 0), Path::Split);
+        assert_eq!(Path::of(2, 0), Path::Split);
         assert_eq!(Path::of(100, usize::MAX), Path::Split);
-        // The room fill takes that path: a room at the threshold solves once, takes nothing
-        // back by truth maintenance, and undoes what it added for its rounds.
-        let c = room(&small(false), 5, at, 1).unwrap();
+        // The room fill takes that path: a room of one solves once, takes nothing back by
+        // truth maintenance, and undoes what it added for its rounds.
+        let c = room(&small(false), 5, 1, 1).unwrap();
         let (f, _) =
             fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
                 .unwrap();
