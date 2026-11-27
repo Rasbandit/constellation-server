@@ -530,7 +530,9 @@ pub fn mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room::{Given, Path, Rule, fill_room_on, fill_room_ruled, fill_room_spheres};
+    use crate::room::{
+        Given, Path, Rule, fill_room, fill_room_on, fill_room_ruled, fill_room_spheres,
+    };
     use crate::spheres::RoomSpheres;
     use crate::world::World;
 
@@ -593,15 +595,14 @@ mod tests {
             let c = room_with(&small(clocks), 11, 3, |_, inst| confine(inst, 7, 2)).unwrap();
             for seed in 1..=4 {
                 out += &format!("{:?}\n", fill_on(&c, seed, path).0);
-                let one = crate::fill(
-                    &c.worlds[0],
-                    &c.plans[0],
-                    &mut SpecRng::from_u64(seed),
-                    config::FILL_MAX_ATTEMPTS,
-                )
-                .unwrap();
-                assert!(one.beatable, "seed {seed}");
-                out += &format!("{:?}\n", one.placed);
+                // Player 1 alone: a room of one, its locations' items as one world's.
+                let one = &c.seats()[..1];
+                let f = fill_room(one, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
+                    .unwrap();
+                assert!(f.all_beatable(), "seed {seed}");
+                let placed: Vec<Option<u16>> =
+                    f.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
+                out += &format!("{placed:?}\n");
             }
         }
         out
@@ -687,10 +688,8 @@ mod tests {
         for seed in 1..=30 {
             let one = room_with(&shape, 23, 1, |_, inst| grouped(inst, 24)).unwrap();
             let mut rng = SpecRng::from_u64(seed);
-            if let Ok(f) = crate::fill(&one.worlds[0], &one.plans[0], &mut rng, 20) {
-                let placed: Vec<Option<Given>> =
-                    f.placed.iter().map(|i| i.map(|item| Given { to: 0, item })).collect();
-                on_excluded(&one, &[placed], &format!("alone, seed {seed}"));
+            if let Ok(f) = fill_room(&one.seats(), &mut rng, 20) {
+                on_excluded(&one, &f.placed, &format!("alone, seed {seed}"));
             }
             let room = room_with(&shape, 23, 3, |_, inst| grouped(inst, 24)).unwrap();
             for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Split] {

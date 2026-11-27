@@ -16,7 +16,7 @@ use data_fill::check::{
 };
 use data_fill::fairness::{histogram, sample, uniform_distinct};
 use data_fill::spheres::{Spheres, spheres};
-use data_fill::{Instance, Plan, Stats, World, fill_spheres};
+use data_fill::{Instance, Plan, Seat, Stats, World, fill_room_spheres};
 
 #[path = "port-check/room.rs"]
 mod room;
@@ -551,27 +551,26 @@ fn run(a: &Args) -> R<Value> {
             for _ in 0..3 {
                 let t = Instant::now();
                 // Spheres come from the fill's own final state, not a fresh sweep.
-                let (filled, sp) = fill_spheres(
-                    s.w,
-                    &s.plan,
+                // A room of this one player: the product's fill.
+                let seat = [Seat { w: s.w, plan: &s.plan, progression: &s.progression }];
+                let (filled, sp) = fill_room_spheres(
+                    &seat,
                     &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
-                    &s.progression,
                 )
                 .map_err(|e| format!("fill {seed}: {e:?}"))?;
-                model = Some(sp);
+                model = Some(Spheres::from(sp));
                 cx.engine_seconds += t.elapsed().as_secs_f64();
                 cx.work.0.absorb(&filled.stats);
                 cx.work.1 += 1;
                 cx.work.2 += u64::from(filled.solves);
-                ours = filled
-                    .placed
+                ours = filled.placed[0]
                     .iter()
                     .enumerate()
-                    .filter_map(|(l, i)| {
+                    .filter_map(|(l, g)| {
                         Some((
                             s.w.loc_key(u32::try_from(l).ok()?).to_owned(),
-                            s.w.item_key((*i)?).to_owned(),
+                            s.w.item_key((*g)?.item).to_owned(),
                         ))
                     })
                     .collect();

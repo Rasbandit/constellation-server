@@ -1,18 +1,14 @@
-//! Assumed fill over a compiled world, in the shape of the legacy generator's restrictive fill:
-//! pop an item, assume every item not yet placed is held, sweep what placed items become
-//! reachable, and put the item in the first shuffled location that is reachable and allows it.
+//! A player's instance resolved against their compiled world ([`Plan`]): what the fill
+//! (`crate::room`) places, where it may go, and the state a solve starts from.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use spec_rng::SpecRng;
 
 use crate::bitrules::{CLASSES, NONE};
 use crate::fold::{Folded, fold};
-use crate::live::Live;
-use crate::reach::{Reach, Stats, eval_static, eval_statics, saturation};
+use crate::reach::{Reach, eval_static, eval_statics, saturation};
 use crate::section::{CHECKS, EXITS};
-use crate::spheres::{Spheres, from_state};
 use crate::world::World;
 
 /// One seed's instance: what generation decided before the fill (see the proposal doc for
@@ -535,230 +531,11 @@ impl Plan {
     }
 }
 
-/// Result of a fill.
-#[derive(Debug, Clone)]
-pub struct Filled {
-    /// Item per world location index (`None` for locations that do not exist this seed).
-    pub placed: Vec<Option<u16>>,
-    /// Full fills started (1 means no retry).
-    pub attempts: u32,
-    /// Reachability solves run from scratch.
-    pub solves: u32,
-    /// Steps whose removal retracted something (and derived it again where still supported).
-    pub rederived: u32,
-    /// Work counters across all solves.
-    pub stats: Stats,
-    /// The goal holds with every placed item collected (what [`validate`] answers, read off
-    /// the fill's own state).
-    pub beatable: bool,
-    /// Existing locations reached with every placed item collected.
-    pub reached: usize,
-}
-
-/// Fill one seed. Retries the whole fill with the next draws from `rng` when stuck.
-///
-/// Not the product's fill: a generation fills a room ([`crate::room`]), one player too, which
-/// places the same seed as this one except where this one starts over and the room moves an
-/// item in place instead. Kept for the command line tool and the measurements. With no
-/// repair, it is stuck more often on tight worlds than the room fill at the same
-/// `max_attempts`.
-///
-/// # Errors
-/// [`FillError`] when every attempt is stuck or the counts do not match.
-pub fn fill(
-    w: &World,
-    plan: &Plan,
-    rng: &mut SpecRng,
-    max_attempts: u32,
-) -> Result<Filled, FillError> {
-    fill_with(w, plan, rng, max_attempts, true, None).map(|x| x.0)
-}
-
-/// [`fill`], and the seed's spheres (see [`crate::spheres::spheres`]) from the fill's own final
-/// state. `progression[item]` says whether an item counts as held.
-///
-/// # Errors
-/// As [`fill`].
-pub fn fill_spheres(
-    w: &World,
-    plan: &Plan,
-    rng: &mut SpecRng,
-    max_attempts: u32,
-    progression: &[bool],
-) -> Result<(Filled, Spheres), FillError> {
-    let (f, s) = fill_with(w, plan, rng, max_attempts, true, Some(progression))?;
-    Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
-}
-
-/// [`fill`], with `extend` off re-solving from scratch at every step (the reference the
-/// extension is tested against), and the spheres when `progression` is given.
-fn fill_with(
-    w: &World,
-    plan: &Plan,
-    rng: &mut SpecRng,
-    max_attempts: u32,
-    extend: bool,
-    progression: Option<&[bool]>,
-) -> Result<(Filled, Option<Spheres>), FillError> {
-    let mut last = None;
-    // One solve state and one held list for the whole fill: each step resets them.
-    let mut s = Steps {
-        w,
-        plan,
-        r: Reach::new(w, plan).lean(),
-        held: Vec::new(),
-        solves: 0,
-        rederived: 0,
-        stats: Stats::default(),
-        extend,
-    };
-    for attempt in 1..=max_attempts {
-        match s.try_fill(rng) {
-            Ok(placed) => {
-                let reached = plan.included.iter().filter(|l| s.r.reached(**l)).count();
-                let beatable = s.r.goal();
-                let sp = progression.map(|p| from_state(w, plan, &mut s.r, &placed, p));
-                let filled = Filled {
-                    attempts: attempt,
-                    solves: s.solves,
-                    rederived: s.rederived,
-                    stats: s.stats,
-                    beatable,
-                    reached,
-                    placed,
-                };
-                return Ok((filled, sp));
-            }
-            Err(FillError::Stuck { item, .. }) => last = Some(item),
-            Err(e) => return Err(e),
-        }
-    }
-    Err(FillError::Stuck { item: last.unwrap_or_default(), attempts: max_attempts })
-}
-
-struct Steps<'w> {
-    w: &'w World,
-    plan: &'w Plan,
-    r: Reach<'w>,
-    held: Vec<u16>,
-    solves: u32,
-    rederived: u32,
-    stats: Stats,
-    extend: bool,
-}
-
-impl Steps<'_> {
-    fn try_fill(&mut self, rng: &mut SpecRng) -> Result<Vec<Option<u16>>, FillError> {
-        let plan = self.plan;
-        let mut placed: Vec<Option<u16>> = vec![None; self.w.locations()];
-        for (l, i) in &plan.locked {
-            placed[*l as usize] = Some(*i);
-        }
-        let free: Vec<u32> =
-            plan.included.iter().copied().filter(|l| placed[*l as usize].is_none()).collect();
-        let items = plan.progression.len() + plan.rest.len();
-        if items != free.len() {
-            return Err(FillError::Count { items, locations: free.len() });
-        }
-        // Confined items first, as the world's pre_fill does, each into its own group.
-        let (mut confined, mut prog): (Vec<u16>, Vec<u16>) =
-            plan.progression.iter().partition(|i| plan.confined(**i));
-        rng.shuffle(&mut confined);
-        rng.shuffle(&mut prog);
-        let mut locs = free.clone();
-        rng.shuffle(&mut locs);
-        let mut locs = Live::new(locs);
-        // The state carries over from one phase to the next: one full solve per fill.
-        let mut prev = None;
-        self.restrictive(&mut confined, &prog, &mut locs, &mut placed, &mut prev)?;
-        locs.retain(|l| !plan.excluded[l as usize]);
-        self.restrictive(&mut prog, &[], &mut locs, &mut placed, &mut prev)?;
-        // Everything else goes anywhere left, excluded locations included.
-        let mut rest = plan.rest.clone();
-        rng.shuffle(&mut rest);
-        let mut left: Vec<u32> =
-            free.into_iter().filter(|l| placed[*l as usize].is_none()).collect();
-        rng.shuffle(&mut left);
-        for (l, i) in left.into_iter().zip(rest) {
-            placed[l as usize] = Some(i);
-        }
-        // The finished seed, for the beatability check: collect the last placed item and the
-        // rest, which only adds to the fixed point.
-        match prev {
-            Some(_) if self.extend => {
-                self.r.stats = Stats::default();
-                self.r.hold_all(&placed);
-                self.r.run();
-                self.stats.absorb(&self.r.stats);
-            }
-            _ => {
-                self.plan.solve_into(&mut self.r, &[], &placed);
-                self.solves += 1;
-            }
-        }
-        Ok(placed)
-    }
-
-    fn restrictive(
-        &mut self,
-        items: &mut Vec<u16>,
-        also_held: &[u16],
-        locs: &mut Live<u32>,
-        placed: &mut [Option<u16>],
-        prev: &mut Option<(u32, u16)>,
-    ) -> Result<(), FillError> {
-        // `prev`: the location the previous item went to, while `r` is a fixed point that only
-        // lacks it.
-        while let Some(item) = items.pop() {
-            // Placing the previous item at a reached location only adds, so carry on from the
-            // last fixed point; then take this item back with truth maintenance.
-            let carried = match *prev {
-                Some((l, i)) if self.extend => {
-                    self.r.stats = Stats::default();
-                    self.r.hold(l, i);
-                    self.r.run();
-                    self.r.remove(item);
-                    self.rederived += u32::from(self.r.stats.retractions > 0);
-                    self.stats.absorb(&self.r.stats);
-                    true
-                }
-                _ => false,
-            };
-            if !carried {
-                self.held.clear();
-                self.held.extend_from_slice(items);
-                self.held.extend_from_slice(also_held);
-                self.plan.solve_into(&mut self.r, &self.held, placed);
-                self.solves += 1;
-                self.stats.absorb(&self.r.stats);
-            }
-            let (r, plan) = (&self.r, self.plan);
-            // Every item placed here is progression: none takes an excluded location.
-            let Some(l) = locs.take_first(|l| r.reached(l) && plan.permits(item, l, true)) else {
-                return Err(FillError::Stuck {
-                    item: self.w.item_key(item).to_owned(),
-                    attempts: 1,
-                });
-            };
-            placed[l as usize] = Some(item);
-            *prev = Some((l, item));
-        }
-        Ok(())
-    }
-}
-
-/// Play the seed from the start items: is the goal reached, and how many existing locations?
-#[must_use]
-pub fn validate(w: &World, plan: &Plan, placed: &[Option<u16>]) -> (bool, usize) {
-    let s = plan.state(w, &[], placed);
-    let reached = plan.included.iter().filter(|l| s.reached(**l)).count();
-    (s.goal(), reached)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+    use spec_rng::SpecRng;
 
     /// Duplicated items read with thresholds (`has n`, a floor division, a capped sum), one
     /// item no rule reads, one item a rule can never be satisfied by alone, a region whose
@@ -884,50 +661,5 @@ pub(crate) mod tests {
             }
             assert!(lit && waited, "the counter and the stay rule were exercised");
         }
-    }
-
-    #[test]
-    fn carrying_the_fixed_point_keeps_every_placement() {
-        for clocks in [false, true] {
-            carry(clocks);
-        }
-    }
-
-    fn carry(clocks: bool) {
-        let (w, inst) = world_with(clocks);
-        let plan = Plan::new(&w, &inst).unwrap();
-        let (mut with, mut without, mut rederived) = (0, 0, 0);
-        for seed in 1u64..=200 {
-            let progression = inst.progression(&w);
-            let (a, sa) = fill_with(
-                &w,
-                &plan,
-                &mut SpecRng::from_u64(seed),
-                config::FILL_MAX_ATTEMPTS,
-                true,
-                Some(&progression),
-            )
-            .unwrap();
-            let (b, _) = fill_with(
-                &w,
-                &plan,
-                &mut SpecRng::from_u64(seed),
-                config::FILL_MAX_ATTEMPTS,
-                false,
-                None,
-            )
-            .unwrap();
-            assert_eq!(a.placed, b.placed, "seed {seed}, clocks {clocks}");
-            // The report read off the fill's state is the fresh sweep's.
-            assert_eq!((a.beatable, a.reached), validate(&w, &plan, &a.placed), "seed {seed}");
-            let fresh = crate::spheres::spheres(&w, &plan, &a.placed, &progression);
-            assert_eq!(sa, Some(fresh), "seed {seed}, clocks {clocks}");
-            assert_eq!(a.attempts, b.attempts, "seed {seed}");
-            with += a.solves;
-            rederived += a.rederived;
-            without += b.solves;
-        }
-        assert!(with < without, "reuse saved no solve: {with} vs {without}");
-        assert!(rederived > 0, "no step kept a prefix of the derivation");
     }
 }

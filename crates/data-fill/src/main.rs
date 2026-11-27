@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::{Instance, Plan, World, decode, fill, placements, section, validate};
+use data_fill::room::{self, Seat, fill_room, validate_room};
+use data_fill::{Instance, Plan, World, decode, section};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -152,16 +153,20 @@ fn run(args: &[String]) -> Result<Value, String> {
         });
     }
 
+    // A room of this one player: the product's fill.
+    let progression = inst.progression(&w);
+    let seat = [Seat { w: &w, plan: &plan, progression: &progression }];
     let mut rng = SpecRng::from_u64(seed);
     let t = Instant::now();
     let filled =
-        fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;
+        fill_room(&seat, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;
     let fill_ms = ms(t);
     let t = Instant::now();
-    let (beatable, reached) = validate(&w, &plan, &filled.placed);
+    let (beatable, reached) = validate_room(&seat, &filled.placed).map_err(|e| format!("{e:?}"))?;
+    let (beatable, reached) = (beatable[0], reached[0]);
     let validate_ms = ms(t);
-    let progression = inst.progression(&w);
-    let placed = placements(&w, &filled, &progression);
+    let placed = room::placements(&seat, &filled.placed, None).map_err(|e| format!("{e:?}"))?;
+    let placed = &placed[0];
     if let Some(out) = rest.get(1) {
         std::fs::write(out, serde_json::to_string(&placed).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;

@@ -14,7 +14,7 @@ The compiler (`section::compile`) runs once per world version and is the only co
 
 ## Why: where a generation spends time and memory today
 
-Measured with `cargo run --release -p data-fill --features memory-harness --example measure -- <manifest> <instance> 1` on the experiment's test world (manifest 830 KB of JSON: 2641 locations of which 1516 exist this seed, 237 items, 318 regions, 45 time slices, 3685 rule sites, 107 defs). "Peak" is live heap above the phase start, "held" what the phase leaves live. Allocator overhead per block is not counted. Two instances (clock shuffle off and on); times vary about 20% run to run on the shared box.
+Measured at the time with the `measure` example (`--example measure -- <manifest> <instance> 1`, feature `memory-harness`; removed since with the separate one-world fill: `measure_room` with one player now times the fill, which is a room of one) on the experiment's test world (manifest 830 KB of JSON: 2641 locations of which 1516 exist this seed, 237 items, 318 regions, 45 time slices, 3685 rule sites, 107 defs). "Peak" is live heap above the phase start, "held" what the phase leaves live. Allocator overhead per block is not counted. Two instances (clock shuffle off and on); times vary about 20% run to run on the shared box.
 
 | Phase | Time | Allocated | Peak | Held |
 |---|---|---|---|---|
