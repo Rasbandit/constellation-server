@@ -1279,9 +1279,10 @@ impl X {
         }
         let mut closures: HashMap<u32, BTreeSet<u32>> = HashMap::new();
         let mut seen = HashSet::new();
-        // A call reads a def (with parameters); any other call is a built-in function, which
-        // a region or item of the same name does not shadow.
-        let defs: HashSet<&str> = w.defs.iter().map(|d| d.name.v.as_str()).collect();
+        // A call reads a def with parameters (as lowering reads it); any other call is a
+        // built-in function, which a plain def, region or item of the same name does not shadow.
+        let defs: HashSet<&str> =
+            w.defs.iter().filter(|d| !d.params.is_empty()).map(|d| d.name.v.as_str()).collect();
         for (f, name, at, call) in std::mem::take(&mut self.refs) {
             if call && !defs.contains(name.as_str()) {
                 continue;

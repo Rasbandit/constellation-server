@@ -314,6 +314,17 @@ fn a_built_in_call_is_not_a_read_of_a_declaration_with_its_name() {
         ("rooms/a.rando", a),
         ("rooms/b.rando", b),
     ]));
+    // A plain def (no parameters) named like the function does not shadow it either.
+    let b2 = "region max {\n  check y\n}\ndef `max` = true\n";
+    ok(&mem(&[
+        ("world.rando", entry),
+        ("items.rando", items),
+        (
+            "rooms/a.rando",
+            "use items\nregion a {\n  check x: max(count(k), 0) >= 1\n  exit max_room\n}\n",
+        ),
+        ("rooms/b.rando", &b2.replace("region max", "region max_room")),
+    ]));
     let a = "use items\nregion a {\n  check x: need(1)\n  exit max\n}\n";
     fails(
         &mem(&[
