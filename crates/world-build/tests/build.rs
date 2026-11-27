@@ -727,7 +727,7 @@ fn a_def_with_parameters_is_written_once_per_argument_list() {
     let b = built(&w);
     assert_eq!(b.manifest["defs"]["enough__2"], serde_json::json!({"ge": [{"count": "pearl"}, 2]}));
     assert_eq!(
-        b.manifest["defs"]["enough__opt_pearls_needed"],
+        b.manifest["defs"]["enough__0opt_pearls_needed"],
         serde_json::json!({"ge": [{"count": "pearl"}, {"opt": "pearls_needed"}]})
     );
     assert!(b.manifest["defs"].get("enough").is_none());

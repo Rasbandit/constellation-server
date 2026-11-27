@@ -58,11 +58,17 @@ impl Files for Dir {
             )));
         }
         let p = self.0.join(path);
-        let meta = std::fs::metadata(&p).ok()?;
+        std::fs::symlink_metadata(&p).ok()?;
+        // A link may not lead out of the folder.
+        let (root, real) = (self.0.canonicalize().ok()?, p.canonicalize().ok()?);
+        if !real.starts_with(&root) {
+            return Some(Err(format!("{path} leads outside the world's folder")));
+        }
+        let meta = std::fs::metadata(&real).ok()?;
         if meta.len() > config::WORLD_SOURCE_MAX_BYTES as u64 {
             return Some(Err(format!("{path} is over {} bytes", config::WORLD_SOURCE_MAX_BYTES)));
         }
-        Some(std::fs::read_to_string(&p).map_err(|e| format!("{path}: {e}")))
+        Some(std::fs::read_to_string(&real).map_err(|e| format!("{path}: {e}")))
     }
 }
 
@@ -143,36 +149,62 @@ pub fn format_text(src: &str, name: &str) -> Result<String, Vec<Error>> {
     Ok(fmt::format(&ast))
 }
 
-/// The SHA-256 of a generated file's content: its text after the `generated` block, formatted.
+/// The SHA-256 of a generated file's content: its tokens after the `generated` block in the
+/// canonical layout (comments left out, so a note does not count as an edit), its header's
+/// `expect` promises, and the bytes of each table file it reads with `from`. `files` is the
+/// world's folder, where those table files are.
 #[must_use]
-pub fn content_hash(ast: &FileAst) -> String {
+pub fn content_hash(ast: &FileAst, files: &dyn Files) -> String {
     let from = ast.generated.as_ref().map_or(0, |g| g.end);
-    hex(&Sha256::digest(fmt::format_from(ast, from).as_bytes()))
+    let mut h = Sha256::new();
+    h.update(fmt::format_tokens(ast, from).as_bytes());
+    for (t, n) in ast.generated.iter().flat_map(|g| &g.expect) {
+        h.update(format!("\0expect {} >= {n}", t.v).as_bytes());
+    }
+    for d in &ast.decls {
+        if let Decl::Table(parse::Table { from: Some(path), .. }) = d {
+            h.update(format!("\0from {}\0", path.v).as_bytes());
+            match files.read(&path.v) {
+                Some(Ok(text)) => h.update(text.as_bytes()),
+                _ => h.update(b"\0missing"),
+            }
+        }
+    }
+    hex(&h.finalize())
 }
 
 /// A generated file's text with a correct header: what a generator writes (doc 18 section
-/// 2.9). `body` is the file without its header; `sources` are path and text of each input.
+/// 2.9). `body` is the file without its header; `sources` are path and text of each input,
+/// `expect` the table sizes it promises, and `files` the world's folder (for table files).
 ///
 /// # Errors
 /// The body's syntax errors.
 pub fn write_generated(
     tool: &str,
     sources: &[(&str, &str)],
+    expect: &[(&str, i64)],
     body: &str,
+    files: &dyn Files,
 ) -> Result<String, Vec<Error>> {
     let body = format_text(body, "generated body")?;
-    let hash = hex(&Sha256::digest(body.as_bytes()));
-    let mut out =
-        format!("generated {{\n  tool {}\n", fmt::text(&crate::lex::Tok::Str(tool.to_owned())));
+    let quoted = |s: &str| fmt::text(&crate::lex::Tok::Str(s.to_owned()));
+    let mut head = format!("generated {{\n  tool {}\n", quoted(tool));
     for (path, text) in sources {
-        let h = hex(&Sha256::digest(text.as_bytes()));
-        out += &format!(
-            "  source {} sha256 \"{h}\"\n",
-            fmt::text(&crate::lex::Tok::Str((*path).to_owned()))
+        head += &format!(
+            "  source {} sha256 \"{}\"\n",
+            quoted(path),
+            hex(&Sha256::digest(text.as_bytes()))
         );
     }
-    out += &format!("  content sha256 \"{hash}\"\n}}\n");
-    Ok(out + &body)
+    for (t, n) in expect {
+        head += &format!("  expect {t} >= {n}\n");
+    }
+    // The hash covers the content and the promises, not itself: computed on the file with a
+    // placeholder of the same length, then put in.
+    let placeholder = "0".repeat(64);
+    let draft = format!("{head}  content sha256 \"{placeholder}\"\n}}\n{body}");
+    let hash = content_hash(&parse::parse(&draft, 0), files);
+    Ok(draft.replacen(&placeholder, &hash, 1))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -222,7 +254,12 @@ struct X {
     overlays: Vec<(u32, Overlay)>,
     /// Names each file reads, with where: checked against the files it uses.
     refs: Vec<(u32, String, Pos)>,
+    /// Family combinations made so far.
     made: usize,
+    /// Declarations families wrote so far.
+    grown: usize,
+    /// The family limit was passed: expansion stops.
+    over: bool,
 }
 
 impl X {
@@ -323,8 +360,11 @@ impl X {
                     );
                     continue;
                 }
-                let rows = match &t.from {
-                    None => t.rows.iter().map(|r| r.v.clone()).collect(),
+                let (rows, places): (Vec<Vec<Cell>>, Vec<Pos>) = match &t.from {
+                    None => (
+                        t.rows.iter().map(|r| r.v.clone()).collect(),
+                        t.rows.iter().map(|r| r.pos).collect(),
+                    ),
                     Some(path) => self.csv(files, path, &t.cols),
                 };
                 let mut keys = HashSet::new();
@@ -332,7 +372,7 @@ impl X {
                     if let Some(Cell::Name(n)) = row.first()
                         && !keys.insert(n.clone())
                     {
-                        let at = t.rows.get(k).map_or(t.name.pos, |r| r.pos);
+                        let at = places.get(k).copied().unwrap_or(t.name.pos);
                         self.errs.err(
                             at,
                             format!("table `{}` has two rows `{n}`", t.name.v),
@@ -352,41 +392,38 @@ impl X {
         files: &dyn Files,
         path: &At<String>,
         cols: &[(String, Col)],
-    ) -> Vec<Vec<Cell>> {
+    ) -> (Vec<Vec<Cell>>, Vec<Pos>) {
         let text = match files.read(&path.v) {
             Some(Ok(t)) => t,
             Some(Err(e)) => {
                 self.errs.err(path.pos, e, "");
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
             None => {
                 self.errs.err(path.pos, format!("`{}` does not exist", path.v), "");
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         };
         let file = self.file_index(&path.v);
         self.errs.files.clone_from(&self.paths);
         let at = |line: usize, col: usize| Pos::in_file(file, line, col);
         let mut lines = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
-        let Some((_, head)) = lines.next() else {
+        let Some((h, head)) = lines.next() else {
             self.errs.err(at(1, 1), "the table file is empty", "its first line names the columns");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let want: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
         let got: Vec<&str> = head.split(',').map(str::trim).collect();
         if got != want {
+            // The line itself is not repeated: it may not be a table at all.
             self.errs.err(
-                at(1, 1),
-                format!(
-                    "the columns are {}, and the table declares {}",
-                    got.join(", "),
-                    want.join(", ")
-                ),
-                "",
+                at(h + 1, 1),
+                format!("the first line does not name the columns {}", want.join(", ")),
+                "a table file starts with its column names, separated by commas",
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
-        let mut rows = Vec::new();
+        let (mut rows, mut places) = (Vec::new(), Vec::new());
         for (n, line) in lines {
             if line.contains('"') {
                 self.errs.err(at(n + 1, 1), "a table file has no quoted fields", "");
@@ -450,9 +487,10 @@ impl X {
             }
             if row.len() == cols.len() {
                 rows.push(row);
+                places.push(at(n + 1, 1));
             }
         }
-        rows
+        (rows, places)
     }
 
     /// Every combination of a family's variables, each with its `where` left over (what does
@@ -470,7 +508,10 @@ impl X {
             }
             let values: Vec<Val> = match &b.over {
                 Over::Range(lo, hi) => {
-                    if hi < lo || hi - lo >= config::WORLD_FAMILY_MAX as i64 {
+                    if hi
+                        .checked_sub(*lo)
+                        .is_none_or(|d| d < 0 || d >= config::WORLD_FAMILY_MAX as i64)
+                    {
                         self.errs.err(
                             b.var.pos,
                             format!("range {lo}..{hi} is empty or too long"),
@@ -643,28 +684,24 @@ impl X {
                 };
                 continue;
             }
-            match &mut x.e {
-                E::Call(_, xs) | E::And(xs) | E::Or(xs) | E::Sum(xs) => todo.extend(xs.iter_mut()),
-                E::In(a, xs) => {
-                    todo.push(a);
-                    todo.extend(xs.iter_mut());
-                }
-                E::Not(a) => todo.push(a),
-                E::Cmp(_, a, b) | E::Arith(_, a, b) => {
-                    todo.push(a);
-                    todo.push(b);
-                }
-                E::Match(_, arms) => todo.extend(arms.iter_mut().map(|a| &mut a.rule)),
-                _ => {}
-            }
+            todo.extend(x.children_mut());
         }
         Ok(out)
     }
 
     /// A rule with the family put in, as the model holds it; the names it reads noted.
     fn rule(&mut self, f: u32, e: &Expr, env: &Env) -> Option<RuleAt> {
+        self.rule_and(f, e, env, None)
+    }
+
+    /// [`X::rule`], joined after `cond` (a family's `where`, already put in) with `and`.
+    fn rule_and(&mut self, f: u32, e: &Expr, env: &Env, cond: Option<&Expr>) -> Option<RuleAt> {
         match self.subst(e, env) {
             Ok(r) => {
+                let r = match cond {
+                    Some(c) => and(Some(c.clone()), r),
+                    None => r,
+                };
                 self.note_refs(f, &r);
                 Some(At::new(Rule::Parsed(r), e.at))
             }
@@ -682,40 +719,26 @@ impl X {
         env: &Env,
         cond: Option<&Expr>,
     ) -> Option<RuleAt> {
-        let joined = match (e, cond) {
-            (None, None) => return None,
-            (Some(e), None) => e.clone(),
-            (None, Some(c)) => c.clone(),
-            (Some(e), Some(c)) => and(Some(c.clone()), e.clone()),
-        };
-        self.rule(f, &joined, env)
+        // The `where` was put in when its family expanded; only the declaration's own rule is.
+        match (e, cond) {
+            (None, None) => None,
+            (Some(e), c) => self.rule_and(f, e, env, c),
+            (None, Some(c)) => {
+                self.note_refs(f, c);
+                Some(At::new(Rule::Parsed(c.clone()), c.at))
+            }
+        }
     }
 
     fn note_refs(&mut self, f: u32, e: &Expr) {
         let mut todo = vec![e];
         while let Some(x) = todo.pop() {
             match &x.e {
-                E::Name(n) => self.refs.push((f, n.clone(), x.at)),
-                E::Call(c, xs) => {
-                    self.refs.push((f, c.clone(), x.at));
-                    todo.extend(xs);
-                }
-                E::And(xs) | E::Or(xs) | E::Sum(xs) => todo.extend(xs),
-                E::In(a, xs) => {
-                    todo.push(a);
-                    todo.extend(xs);
-                }
-                E::Not(a) => todo.push(a),
-                E::Cmp(_, a, b) | E::Arith(_, a, b) => {
-                    todo.push(a);
-                    todo.push(b);
-                }
-                E::Match(k, arms) => {
-                    self.refs.push((f, format!("opt.{k}"), x.at));
-                    todo.extend(arms.iter().map(|a| &a.rule));
-                }
+                E::Name(n) | E::Call(n, _) => self.refs.push((f, n.clone(), x.at)),
+                E::Match(k, _) => self.refs.push((f, format!("opt.{k}"), x.at)),
                 _ => {}
             }
+            todo.extend(x.children());
         }
     }
 
@@ -729,6 +752,13 @@ impl X {
     ) {
         // A family's key is its expanded name (doc 18 section 2.6): a written `key` is for one
         // declaration only.
+        if let (Some(k), false) = (key, env.is_empty()) {
+            self.errs.warn(
+                k.pos,
+                "a `key` inside a family is not used",
+                "a family's ledger key is each expanded name",
+            );
+        }
         let key = key.map(|k| k.v.clone()).filter(|_| env.is_empty());
         self.idents.push(Ident {
             check,
@@ -739,7 +769,25 @@ impl X {
         });
     }
 
+    /// One more declaration written by a family: within [`config::WORLD_FAMILY_MAX`], or the
+    /// error (once) and `false`.
+    fn grow(&mut self, env: &Env, at: Pos) -> bool {
+        if env.is_empty() {
+            return true;
+        }
+        self.grown += 1;
+        if self.grown > config::WORLD_FAMILY_MAX && !self.over {
+            self.over = true;
+            let most = config::WORLD_FAMILY_MAX;
+            self.errs.err(at, format!("families expand to more than {most} declarations"), "");
+        }
+        !self.over
+    }
+
     fn decl(&mut self, f: u32, d: &Decl, env: &Env, cond: Option<&Expr>) {
+        if self.over {
+            return;
+        }
         let no_cond = |x: &mut Self, what: &str, at: Pos| {
             if cond.is_some() {
                 x.errs.err(
@@ -787,6 +835,9 @@ impl X {
                         i.when.as_ref().map_or(name.pos, |w| w.at),
                     ));
                 }
+                if !self.grow(env, name.pos) {
+                    return;
+                }
                 self.ident(false, &name, i.key.as_ref(), i.was.as_ref(), env);
                 let class = (i.class.v != "match").then(|| i.class.clone());
                 self.world.items.push(Item {
@@ -832,7 +883,9 @@ impl X {
                 for m in &r.members {
                     self.member(f, m, env, None, &mut region);
                 }
-                self.world.regions.push(region);
+                if self.grow(env, region.key.pos) {
+                    self.world.regions.push(region);
+                }
             }
             Decl::Table(_) => {}
             Decl::For(binders, body) => {
@@ -874,14 +927,21 @@ impl X {
     }
 
     fn member(&mut self, f: u32, m: &Member, env: &Env, cond: Option<&Expr>, region: &mut Region) {
+        if self.over {
+            return;
+        }
         match m {
             Member::Check(c) => {
-                if let Some(check) = self.check(f, c, env, cond) {
+                if let Some(check) = self.check(f, c, env, cond)
+                    && self.grow(env, check.key.pos)
+                {
                     region.checks.push(check);
                 }
             }
             Member::Exit(x) => {
-                if let Some(exit) = self.exit(f, x, env, cond) {
+                if let Some(exit) = self.exit(f, x, env, cond)
+                    && self.grow(env, exit.to.pos)
+                {
                     region.exits.push(exit);
                 }
             }
@@ -891,7 +951,9 @@ impl X {
                 else {
                     return;
                 };
-                region.events.push((name, rule));
+                if self.grow(env, name.pos) {
+                    region.events.push((name, rule));
+                }
             }
             Member::For(binders, body) => {
                 for (e2, c2) in self.combos(binders, env) {
@@ -1047,14 +1109,33 @@ impl X {
                 Target::Def(d) => format!("def {}", d.v),
                 Target::Item(i) => format!("item {}", i.v),
             };
-            if verb == "replace" {
-                if let Some((g, at)) = replaced.get(&label).copied()
+            // What this overlay touches: its target, and for `extend` each check or exit it
+            // adds. Two overlays touching one thing must be ordered by a `use`.
+            let mut touched = vec![label.clone()];
+            if let (Overlay::Extend(_, Target::Region(r), members), "extend") = (&o, verb) {
+                touched.clear();
+                for m in members {
+                    match m {
+                        Member::Check(c) => {
+                            touched.extend(plain(&c.name).map(|n| format!("check {}.{n}", r.v)))
+                        }
+                        Member::Exit(x) => {
+                            touched.extend(plain(&x.to).map(|n| format!("exit {}.{n}", r.v)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for t in touched {
+                if let Some((g, at)) = replaced.get(&t).copied()
+                    && g != f
                     && !self.closure(f).contains(&g)
                     && !self.closure(g).contains(&f)
                 {
-                    self.errs.err(pos, format!("`replace {label}` is also replaced at line {}, and neither file uses the other", at.line), "add a `use` from the overlay that should win to the other");
+                    let other = self.paths[g as usize].clone();
+                    self.errs.err(pos, format!("`{verb} {label}` changes `{t}`, which `{other}` line {} also changes, and neither file uses the other", at.line), "add a `use` from the overlay that should win to the other");
                 }
-                replaced.insert(label.clone(), (f, pos));
+                replaced.insert(t, (f, pos));
             }
             let found = self.overlay(&o);
             if !found {
@@ -1200,7 +1281,7 @@ impl X {
         for f in self.order.clone() {
             let ast = &self.asts[f as usize];
             let Some(g) = ast.generated.clone() else { continue };
-            let hash = content_hash(ast);
+            let hash = content_hash(ast, files);
             match &g.content {
                 None => self.errs.err(
                     g.pos,
@@ -1248,6 +1329,14 @@ impl X {
                 }
             }
         }
+    }
+}
+
+/// A name without `{var}` pieces, as written.
+fn plain(n: &Tn) -> Option<&str> {
+    match n.v.as_slice() {
+        [Piece::Text(t)] => Some(t),
+        _ => None,
     }
 }
 

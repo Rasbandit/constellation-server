@@ -33,12 +33,15 @@ fn rando_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
         for e in std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))? {
-            let p = e.map_err(|e| e.to_string())?.path();
+            let e = e.map_err(|e| e.to_string())?;
+            let p = e.path();
             let hidden = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'));
-            if hidden {
+            // Links are not followed: one could lead outside the folder, or round in a loop.
+            let kind = e.file_type().map_err(|e| e.to_string())?;
+            if hidden || kind.is_symlink() {
                 continue;
             }
-            if p.is_dir() {
+            if kind.is_dir() {
                 todo.push(p);
             } else if p.extension().is_some_and(|x| x == "rando") {
                 out.push(p);
@@ -103,8 +106,14 @@ fn main() -> ExitCode {
     let mut rest = args[1..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
-            "-o" => out = rest.next().map(PathBuf::from),
-            "--instance" => instance = rest.next().map(PathBuf::from),
+            "-o" | "--instance" => {
+                let Some(p) = rest.next() else { return usage() };
+                if a == "-o" {
+                    out = Some(PathBuf::from(p));
+                } else {
+                    instance = Some(PathBuf::from(p));
+                }
+            }
             "--allow-edited" => opts.allow_edited = true,
             "--publish" => opts.publish = true,
             "--check" => check_only = true,

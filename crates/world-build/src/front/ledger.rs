@@ -12,7 +12,7 @@ use crate::model::{At, World};
 use crate::world::Errs;
 
 /// Largest id: inside 2^53 - 1, the range world ids keep to.
-const MAX_ID: i64 = (1 << 53) - 1;
+const MAX_ID: i64 = config::ID_MAX;
 
 /// One table of the ledger: key to (id, retired).
 type Table = BTreeMap<String, (i64, bool)>;
@@ -76,19 +76,38 @@ pub(crate) fn assign(
     for (check, field) in [(false, "items"), (true, "checks")] {
         let mut table = read_table(&old[field], &field[..field.len() - 1], errs);
         let mut next = table.values().map(|x| x.0).max().unwrap_or(0) + 1;
+        // What is declared after overlays: a removed check or item is retired.
+        let present: HashSet<&str> = if check {
+            w.regions.iter().flat_map(|r| &r.checks).map(|c| c.key.v.as_str()).collect()
+        } else {
+            w.items.iter().map(|i| i.key.v.as_str()).collect()
+        };
+        let mine: Vec<&Ident> = idents
+            .iter()
+            .filter(|i| i.check == check && present.contains(i.name.as_str()))
+            .collect();
+        let key_of = |i: &Ident| i.key.clone().unwrap_or_else(|| i.name.clone());
+        let declared: HashSet<String> = mine.iter().map(|i| key_of(i)).collect();
         let mut used: HashSet<String> = HashSet::new();
         let mut ids: BTreeMap<String, i64> = BTreeMap::new();
-        for i in idents.iter().filter(|i| i.check == check) {
-            let key = i.key.clone().unwrap_or_else(|| i.name.clone());
+        for i in mine {
+            let key = key_of(i);
             if !used.insert(key.clone()) {
-                // Two declarations of one name are the checks' error, reported there.
-                if i.key.is_some() {
+                // Two declarations of one name are the checks' error, reported there; a key
+                // that meets another's key or name is this one's.
+                if i.key.is_some() || mine_has_key(idents, check, &key) {
                     errs.err(
                         i.pos,
                         format!("ledger key `{key}` is used twice"),
-                        "a key names one item or check forever",
+                        "a key names one item or check forever; give each its own",
                     );
                 }
+                continue;
+            }
+            if let Some(o) = &i.was
+                && declared.contains(o)
+            {
+                errs.err(i.pos, format!("`was {o}` names a key that is still declared"), "a rename moves an id from a name that is gone; drop the `was`, or the old declaration");
                 continue;
             }
             let id = match (
@@ -131,4 +150,9 @@ pub(crate) fn assign(
         errs.whole(format!("the ledger is not canonical: {e}"), "");
         String::new()
     })
+}
+
+/// Whether some declaration of this table writes `key` as its `key "..."`.
+fn mine_has_key(idents: &[Ident], check: bool, key: &str) -> bool {
+    idents.iter().any(|i| i.check == check && i.key.as_deref() == Some(key))
 }

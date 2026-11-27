@@ -16,12 +16,23 @@ pub fn format(ast: &FileAst) -> String {
 /// The file from token `from` on (the content after a `generated` block), canonical.
 #[must_use]
 pub fn format_from(ast: &FileAst, from: usize) -> String {
+    layout(ast, from, true)
+}
+
+/// [`format_from`] without the comments: what a generated file's hash covers.
+#[must_use]
+pub fn format_tokens(ast: &FileAst, from: usize) -> String {
+    layout(ast, from, false)
+}
+
+fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
     let toks = &ast.toks;
     let mut out = String::new();
     let mut depth = 0usize;
     let mut last_line = toks.get(from).map_or(0, |t| t.pos.line);
     let mut need_break = false;
-    let comments: Vec<_> = ast.comments.iter().filter(|c| c.before >= from).collect();
+    let comments: Vec<_> =
+        ast.comments.iter().filter(|c| with_comments && c.before >= from).collect();
     let mut ci = 0;
     let open: Vec<usize> = ast.layout.parens.iter().map(|p| p.0).collect();
     let close: Vec<usize> = ast.layout.parens.iter().map(|p| p.1 - 1).collect();
@@ -35,7 +46,12 @@ pub fn format_from(ast: &FileAst, from: usize) -> String {
                 if !out.is_empty() && c.pos.line > last_line + 1 {
                     out.push('\n');
                 }
-                let d = ast.layout.brk.get(i).copied().flatten().unwrap_or(depth);
+                // At the depth of what it sits in: a comment before a closing `}` stays with
+                // the members, one inside a rule that goes on stays with the rule.
+                let d = match ast.layout.brk.get(i).copied().flatten() {
+                    Some(b) => b.max(depth),
+                    None => depth + 1,
+                };
                 out.push_str(&"  ".repeat(d));
             } else {
                 out.push(' ');
@@ -55,7 +71,8 @@ pub fn format_from(ast: &FileAst, from: usize) -> String {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
-            if !out.is_empty() && t.pos.line > last_line + 1 && brk.is_some() {
+            // Without comments (the hash), blank lines are left out: a comment's line is not one.
+            if with_comments && !out.is_empty() && t.pos.line > last_line + 1 && brk.is_some() {
                 out.push('\n');
             }
             let d = brk.unwrap_or(depth + 1);

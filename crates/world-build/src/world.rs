@@ -33,11 +33,13 @@ pub(crate) struct Errs {
     dropped: usize,
     /// Warnings past the cap, dropped.
     dropped_warnings: usize,
+    /// Every message given, so one mistake a family repeats is reported once.
+    seen: HashSet<(Option<Pos>, String)>,
 }
 
 impl Errs {
     pub(crate) fn new(files: Vec<String>) -> Self {
-        Errs { files, errors: Vec::new(), warnings: Vec::new(), dropped: 0, dropped_warnings: 0 }
+        Errs { files, ..Errs::default() }
     }
 
     fn make(&self, pos: Option<Pos>, msg: impl Into<String>, help: &str) -> Error {
@@ -58,6 +60,10 @@ impl Errs {
     }
 
     fn push(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
+        let msg = msg.into();
+        if !self.seen.insert((pos, msg.clone())) {
+            return;
+        }
         if self.errors.len() < config::WORLD_BUILD_MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.errors.push(e);
@@ -75,6 +81,10 @@ impl Errs {
     }
 
     fn warning(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
+        let msg = msg.into();
+        if !self.seen.insert((pos, msg.clone())) {
+            return;
+        }
         if self.warnings.len() < config::WORLD_BUILD_MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.warnings.push(e);
@@ -215,9 +225,10 @@ impl Space {
         match self.first.get(&n.v) {
             Some((Sort::Event, _)) if sort == Sort::Event => true,
             Some((was, at)) => {
+                let file = errs.files.get(at.file as usize).cloned().unwrap_or_default();
                 errs.err(
                     n.pos,
-                    format!("`{}` is already {} (line {}, column {})", n.v, was.word(), at.line, at.col),
+                    format!("`{}` is already {} ({file}:{}:{})", n.v, was.word(), at.line, at.col),
                     "items, checks, defs, events, regions, item groups, placement sets and shuffles share one namespace",
                 );
                 false

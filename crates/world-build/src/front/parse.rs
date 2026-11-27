@@ -425,11 +425,8 @@ impl P<'_> {
         while let Some((x, d)) = todo.pop() {
             match &x.e {
                 E::Or(parts) => {
-                    for p in parts {
-                        if matches!(p.e, E::And(_)) && !p.paren {
-                            self.layout.parens.push(p.span);
-                        }
-                        todo.push((p, d));
+                    for p in parts.iter().filter(|p| matches!(p.e, E::And(_)) && !p.paren) {
+                        self.layout.parens.push(p.span);
                     }
                 }
                 E::Interp(_) => {
@@ -440,38 +437,22 @@ impl P<'_> {
                     }
                 }
                 E::Match(_, arms) => {
-                    for a in arms {
-                        self.brk(a.start, d + 1);
-                        todo.push((&a.rule, d + 1));
-                    }
+                    arms.iter().for_each(|a| self.brk(a.start, d + 1));
                     self.brk(x.span.1 - 1, d);
-                }
-                E::Call(_, xs) | E::And(xs) | E::Sum(xs) => todo.extend(xs.iter().map(|y| (y, d))),
-                E::In(a, xs) => {
-                    todo.push((a, d));
-                    todo.extend(xs.iter().map(|y| (y, d)));
-                }
-                E::Not(a) => todo.push((a, d)),
-                E::Cmp(_, a, b) | E::Arith(_, a, b) => {
-                    todo.push((a, d));
-                    todo.push((b, d));
                 }
                 _ => {}
             }
+            let inner = if matches!(x.e, E::Match(..)) { d + 1 } else { d };
+            todo.extend(x.children().into_iter().map(|c| (c, inner)));
         }
     }
 
     /// The tokens after a failed declaration, up to the next one.
     fn skip_to_decl(&mut self, start: usize) {
+        // Braces are counted from where the error stopped, not from the declaration's start:
+        // a block left open by the error must not hide the declarations after it.
         self.k = self.k.max(start + 1);
         let mut depth = 0i32;
-        for i in start..self.k {
-            match self.toks[i].t {
-                Tok::LBrace => depth += 1,
-                Tok::RBrace => depth -= 1,
-                _ => {}
-            }
-        }
         while let Some(t) = self.peek() {
             match t {
                 Tok::LBrace => depth += 1,
@@ -579,8 +560,19 @@ impl P<'_> {
         Ok(At::new(pieces, pos))
     }
 
+    fn deep(&self, depth: usize) -> R<()> {
+        if depth >= config::WORLD_BLOCK_MAX_DEPTH {
+            return Err((
+                self.here(),
+                format!("blocks nest more than {} deep", config::WORLD_BLOCK_MAX_DEPTH),
+            ));
+        }
+        Ok(())
+    }
+
     fn decl(&mut self, depth: usize) -> R<Decl> {
         let pos = self.here();
+        self.deep(depth)?;
         let Some(Tok::Kw(kw)) = self.peek().cloned() else {
             return Err((
                 pos,
@@ -668,6 +660,15 @@ impl P<'_> {
                 while !matches!(self.peek(), Some(Tok::RBrace) | None) {
                     let start = self.k;
                     self.brk(start, depth + 1);
+                    let inside = matches!(
+                        self.peek(),
+                        Some(Tok::Kw("item" | "region" | "start_item" | "assumed" | "for"))
+                    );
+                    if !inside {
+                        self.errors.push((self.here(), format!("{} cannot be inside a family; a family repeats items, regions, start items and families", self.got())));
+                        self.skip_to_member(start);
+                        continue;
+                    }
                     match self.decl(depth + 1) {
                         Ok(d) => body.push(d),
                         Err(e) => {
@@ -683,12 +684,19 @@ impl P<'_> {
             "shuffle" => self.shuffle(depth)?,
             "goal" => Decl::Goal(self.rule(depth)?),
             "extend" | "replace" | "remove" => Decl::Overlay(self.overlay(kw, pos, depth)?),
-            other => {
+            other @ ("score" | "steps" | "trick" | "require") => {
                 // A declaration of doc 18 this version does not build: skipped whole.
                 let start = self.k - 1;
                 self.skip_to_decl(start);
                 Decl::Later(At::new(other.to_owned(), pos))
             }
+            "check" | "exit" | "event" | "stay" => {
+                return Err((
+                    pos,
+                    format!("`{kw}` belongs inside a region: `region NAME {{ {kw} ... }}`"),
+                ));
+            }
+            other => return Err((pos, format!("`{other}` cannot start a declaration here"))),
         })
     }
 
@@ -756,8 +764,13 @@ impl P<'_> {
             let pos = self.here();
             self.rule(depth)?;
             At::new("match".to_owned(), pos)
+        } else if matches!(self.peek(), Some(Tok::Name(_))) {
+            self.name("its class")?
         } else {
-            self.name("its class (progression, useful, filler or trap)")?
+            return Err((
+                self.here(),
+                "an item needs a class: progression, useful, filler or trap".into(),
+            ));
         };
         let mut d = ItemD { name, class, count: None, when: None, key: None, was: None };
         loop {
@@ -809,6 +822,14 @@ impl P<'_> {
     fn members(&mut self, depth: usize) -> R<Vec<Member>> {
         let mut out = Vec::new();
         while !matches!(self.peek(), Some(Tok::RBrace) | None) {
+            if matches!(self.peek(), Some(Tok::Kw(k)) if DECLS.contains(k) && *k != "for") {
+                // A declaration where a member was expected: the block was left open. Stop at
+                // it, so the declarations after it are read.
+                return Err((
+                    self.here(),
+                    "a region's `{` is not closed before this declaration".into(),
+                ));
+            }
             let start = self.k;
             self.brk(start, depth);
             match self.member(depth) {
@@ -816,9 +837,6 @@ impl P<'_> {
                 Err(e) => {
                     self.errors.push(e);
                     self.skip_to_member(start);
-                    if matches!(self.peek(), Some(Tok::Kw(k)) if DECLS.contains(k) && *k != "for") {
-                        return Err((self.here(), "a region's `{` is not closed".into()));
-                    }
                 }
             }
         }
@@ -829,6 +847,7 @@ impl P<'_> {
 
     fn member(&mut self, depth: usize) -> R<Member> {
         let pos = self.here();
+        self.deep(depth)?;
         let Some(Tok::Kw(kw)) = self.peek().cloned() else {
             return Err((
                 pos,

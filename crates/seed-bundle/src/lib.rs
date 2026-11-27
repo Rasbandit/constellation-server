@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub const FORMAT: u32 = 1;
 
 /// Largest id magnitude a JSON number carries exactly (2^53 - 1); the protocol document's range.
-pub const MAX_ID: i64 = (1 << 53) - 1;
+pub const MAX_ID: i64 = config::ID_MAX;
 
 /// One room's seed data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use data_fill::seed::{Player, generate};
-use world_build::front::{Dir, Mem, Options, content_hash, format_text, write_generated};
+use world_build::front::{Dir, Mem, Options, format_text, write_generated};
 use world_build::{Built, build, build_model};
 
 fn example() -> Dir {
@@ -229,7 +229,7 @@ fn a_table_from_a_csv_file_is_read_with_its_own_line_numbers() {
     fails(&files, "data/songs.csv:2:15", "`one` in column `tier` is not a whole number");
     fails(&files, "data/songs.csv:3:19", "the rule ends where a value was expected");
     let header = mem(&[("world.rando", entry), ("data/songs.csv", "key, tier\n")]);
-    fails(&header, "data/songs.csv:1:1", "the columns are key, tier");
+    fails(&header, "data/songs.csv:1:1", "does not name the columns key, tier, need");
 }
 
 #[test]
@@ -302,35 +302,53 @@ fn the_ledger_keeps_ids_across_reordering_renames_and_removals() {
 
 #[test]
 fn a_generated_file_refuses_hand_edits_and_keeps_its_promises() {
-    let body = "table song(key: name) {\n  a\n  b\n}\nregion a {\n  for s in song { check {s.key}_c }\n}\n";
-    let csv = "whatever";
-    let generated = write_generated("songs-export 1", &[("data/in.csv", csv)], body).unwrap();
+    let body = "table song(key: name) {\n  a\n  b\n}\ntable more(key: name) from \"data/more.csv\"\nregion a {\n  for s in song { check {s.key}_c }\n  for m in more { check {m.key}_m }\n}\n";
+    let (csv, more) = ("whatever", "key\nx\n");
     let entry =
         "world t\nuse songs\nstart a\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n";
-    let files = |g: &str, src: &str| {
-        mem(&[("world.rando", entry), ("songs.rando", g), ("data/in.csv", src)])
+    let files = |g: &str, src: &str, more: &str| {
+        mem(&[
+            ("world.rando", entry),
+            ("songs.rando", g),
+            ("data/in.csv", src),
+            ("data/more.csv", more),
+        ])
     };
-    let b = ok(&files(&generated, csv));
-    assert_eq!(region(&b, "a")["checks"].as_array().unwrap().len(), 2);
+    let folder = files("", csv, more);
+    let generated =
+        write_generated("songs-export 1", &[("data/in.csv", csv)], &[("song", 2)], body, &folder)
+            .unwrap();
+    let b = ok(&files(&generated, csv, more));
+    assert_eq!(region(&b, "a")["checks"].as_array().unwrap().len(), 3);
     // Edited by hand: an error, a warning with `--allow-edited`, an error again when publishing.
     let edited = generated.replace("  a\n", "  a\n  c\n");
-    fails(&files(&edited, csv), "songs.rando:4:18", "edited after it was generated");
+    fails(&files(&edited, csv, more), "songs.rando:5:18", "edited after it was generated");
     let local =
-        build(&files(&edited, csv), &Options { allow_edited: true, publish: false }).unwrap();
+        build(&files(&edited, csv, more), &Options { allow_edited: true, publish: false }).unwrap();
     assert!(local.warnings.iter().any(|w| w.msg.contains("edited after")));
-    assert!(build(&files(&edited, csv), &Options { allow_edited: true, publish: true }).is_err());
-    // Its source changed: a warning to regenerate.
-    let stale = build(&files(&generated, "changed"), &Options::default()).unwrap();
-    assert!(stale.warnings.iter().any(|w| w.msg.contains("changed after this file was generated")));
-    // A promised size it does not reach is an error.
-    let short = generated.replacen("}\n", "  expect song >= 40\n}\n", 1);
-    assert_eq!(
-        content_hash(&world_build::front::parse::parse(&short, 0)),
-        content_hash(&world_build::front::parse::parse(&generated, 0))
+    assert!(
+        build(&files(&edited, csv, more), &Options { allow_edited: true, publish: true }).is_err()
+    );
+    // A table file it reads, and its promises, are covered too; a comment is not an edit.
+    fails(
+        &files(&generated, csv, "key\nx\ny\n"),
+        "songs.rando:5:18",
+        "edited after it was generated",
     );
     fails(
-        &files(&short, csv),
-        "songs.rando:5:10",
+        &files(&generated.replace("song >= 2", "song >= 1"), csv, more),
+        "songs.rando:5:18",
+        "edited after",
+    );
+    ok(&files(&generated.replace("region a {", "# a note\nregion a {"), csv, more));
+    // Its source changed: a warning to regenerate.
+    let stale = build(&files(&generated, "changed", more), &Options::default()).unwrap();
+    assert!(stale.warnings.iter().any(|w| w.msg.contains("changed after this file was generated")));
+    // A promised size it does not reach is an error.
+    let short = write_generated("songs-export 1", &[], &[("song", 40)], body, &folder).unwrap();
+    fails(
+        &files(&short, csv, more),
+        "songs.rando:3:10",
         "has 2 rows, and the generator promised at least 40",
     );
 }
@@ -406,4 +424,133 @@ fn doc_16s_smallest_world_in_rando_builds_to_the_same_bytes_as_its_model() {
     let text = "world two_rooms\nstart hall\nitem `key` progression\nregion hall {\n  check shelf\n  exit vault: has(`key`)\n}\nregion vault {\n  check chest\n}\ngoal reach(vault)\n";
     let b = ok(&mem(&[("world.rando", text)]));
     assert_eq!(b.json(), build_model(&super::support::two_rooms(), "w").unwrap().json());
+}
+
+#[test]
+fn hostile_families_stop_at_their_limits_without_crashing() {
+    let huge = world(
+        "region a {\n  for i in -9223372036854775807..9223372036854775807 {\n    check c{i}\n  }\n}",
+    );
+    assert!(errors(&huge).iter().any(|e| e.contains("empty or too long")));
+    // Few combinations, many declarations each: the count is of declarations.
+    let wide_body: String = (0..200).map(|k| format!("    check c{k}_{{i}}\n")).collect();
+    let wide = world(&format!("region a {{\n  for i in 1..99999 {{\n{wide_body}  }}\n}}"));
+    assert!(
+        errors(&wide)
+            .iter()
+            .any(|e| e.contains("families expand to more than 100000 declarations"))
+    );
+    let deep = format!(
+        "{}region r {{\n  check q\n}}{}",
+        "for i in 1..1 {\n".repeat(2000),
+        "}\n".repeat(2000)
+    );
+    assert!(errors(&world(&deep)).iter().any(|e| e.contains("blocks nest more than")));
+    assert!(format_text(&deep, "d").is_err());
+    // One mistake a family repeats is reported once.
+    let repeated = world("region a {\n  for i in 1..100 {\n    check c_{nope}\n  }\n}");
+    assert_eq!(errors(&repeated).len(), 1);
+}
+
+#[test]
+fn a_family_where_is_put_in_once() {
+    let files = world(
+        "option k: choice(blue, red) = red\nregion a {\n  check spare\n  for v in [blue], blue in [red] where opt.k == v {\n    check c_{v}_{blue}\n  }\n}",
+    );
+    let b = ok(&files);
+    assert_eq!(b.default_instance().unwrap().locations, ["spare"]);
+}
+
+#[test]
+fn declarations_a_family_cannot_repeat_and_misplaced_keywords_are_errors() {
+    fails(
+        &world("for i in 1..2 {\n  table t(key: name) {\n    a\n  }\n}"),
+        &format!("world.rando:{}:3", line(2)),
+        "cannot be inside a family",
+    );
+    fails(
+        &world("check q"),
+        &format!("world.rando:{}:1", line(1)),
+        "`check` belongs inside a region",
+    );
+    fails(
+        &world("item y\nregion b {\n  check z\n}"),
+        &format!("world.rando:{}:1", line(2)),
+        "an item needs a class",
+    );
+}
+
+#[test]
+fn an_unclosed_block_does_not_hide_the_errors_after_it() {
+    let all =
+        errors(&world("region x {\n  check c1\nregion b {\n  check c3 ::\n}\ngoal has(k) and"));
+    assert!(all.iter().any(|e| e.contains("not closed")), "{all:#?}");
+    assert!(all.iter().any(|e| e.starts_with(&format!("world.rando:{}:", line(4)))), "{all:#?}");
+    assert!(all.iter().any(|e| e.starts_with(&format!("world.rando:{}:", line(7)))), "{all:#?}");
+}
+
+#[test]
+fn the_ledger_refuses_renames_and_keys_that_would_move_an_id() {
+    let mut w = world("region a {\n  check c3 was c1\n  check c1\n}");
+    w.0.insert("ledger.json".into(), "{\"checks\":{\"c1\":{\"id\":1,\"retired\":false},\"c2\":{\"id\":2,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into());
+    fails(&w, &format!("world.rando:{}:9", line(2)), "`was c1` names a key that is still declared");
+    let k = world("region a {\n  check c1 key \"c2\"\n  check c2\n}");
+    assert!(errors(&k).iter().any(|e| e.contains("ledger key `c2` is used twice")));
+    // A removed check is retired.
+    let base = "world t\nuse tweaks\nstart a\nitem junk filler\npool fill { junk 1 }\nregion a {\n  check x\n  check y\n}\ngoal reach(a)\n";
+    let b = ok(&mem(&[("world.rando", base), ("tweaks.rando", "remove check a.y\n")]));
+    let l: serde_json::Value = serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap();
+    assert!(l["checks"].get("y").is_none_or(|e| e["retired"] == true), "{l}");
+}
+
+#[test]
+fn defs_with_arguments_of_different_kinds_never_share_a_written_def() {
+    let files = world(
+        "option k: toggle = off\nregion a {\n  check c1: need(opt.k)\n  check c2: need(opt_k)\n  check c3: need(m1)\n  check c4: atleast(-1) or atleast(1)\n  event opt_k: true\n  event m1: true\n}\ndef need(z) = z\ndef atleast(n) = count(k) >= n",
+    );
+    let b = ok(&files);
+    let mut names: Vec<&String> = b.manifest["defs"].as_object().unwrap().keys().collect();
+    names.sort();
+    assert_eq!(names, ["atleast__1", "atleast__1n", "need__0opt_k", "need__m1", "need__opt_k"]);
+    assert_eq!(
+        b.manifest["defs"]["need__opt_k"],
+        serde_json::json!({"ge": [{"counter": "opt_k"}, 1]})
+    );
+}
+
+#[test]
+fn an_overlay_conflict_covers_remove_and_extend_too() {
+    let base = "region a {\n  check x\n}\n";
+    let entry = "world t\nuse base\nuse one\nuse two\nstart a\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n";
+    let clash = mem(&[
+        ("world.rando", entry),
+        ("base.rando", base),
+        ("one.rando", "use base\nreplace check a.x: true\n"),
+        ("two.rando", "use base\nremove check a.x\n"),
+    ]);
+    fails(&clash, "two.rando:2:1", "neither file uses the other");
+    let added = mem(&[
+        ("world.rando", entry),
+        ("base.rando", base),
+        ("one.rando", "use base\nextend region a {\n  check n\n}\n"),
+        ("two.rando", "use base\nremove check a.n\n"),
+    ]);
+    fails(&added, "two.rando:2:1", "neither file uses the other");
+}
+
+#[test]
+fn a_link_out_of_the_world_folder_is_refused() {
+    let root = std::env::temp_dir().join(format!("rando-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("w/data")).unwrap();
+    std::fs::write(root.join("secret.txt"), "SECRET=1\n").unwrap();
+    std::fs::write(root.join("w/world.rando"), "world t\nstart a\nitem junk filler\npool fill { junk 1 }\ntable t(key: name) from \"data/t.csv\"\nregion a {\n  check x\n}\ngoal reach(a)\n").unwrap();
+    std::os::unix::fs::symlink(root.join("secret.txt"), root.join("w/data/t.csv")).unwrap();
+    let e = build(&Dir(root.join("w")), &Options::default()).unwrap_err();
+    let text = e.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    assert!(
+        text.contains("leads outside the world's folder") && !text.contains("SECRET"),
+        "{text}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }

@@ -445,6 +445,14 @@ pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
 /// engine's limit, one byte).
 pub const RULE_MAX_PARTS: usize = 255;
 
+/// Largest item or location id on the wire and in a world's ledger: 2^53 - 1, the range world
+/// ids keep to so every client holds them exactly (a format value, not a limit).
+pub const ID_MAX: i64 = (1 << 53) - 1;
+
+/// Deepest that blocks (`for`, `region`, `extend`) may nest in a `.rando` file: the parser and
+/// the expansion recurse once per block (a design value; a world nests three or four deep).
+pub const WORLD_BLOCK_MAX_DEPTH: usize = 32;
+
 /// Most items, checks or regions one world may declare: the engine's 16-bit index width
 /// (design doc 16 section 5.3).
 pub const WORLD_TABLE_MAX: usize = 65_536;

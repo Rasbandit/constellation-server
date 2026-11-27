@@ -242,12 +242,15 @@ impl<'a> Lower<'a> {
                 None => a.clone(),
             })
             .collect();
+        // Each argument's spelling cannot be another's: numbers and constants start with a
+        // digit, which no name does, and no name holds `__`, which joins them.
         for a in &args {
             let piece = match &a.e {
-                E::Int(n) if *n < 0 => format!("m{}", n.unsigned_abs()),
+                E::Int(n) if *n < 0 => format!("{}n", n.unsigned_abs()),
                 E::Int(n) => n.to_string(),
-                E::Bool(b) => b.to_string(),
-                E::Name(n) if !n.starts_with("at.") => n.replace('.', "_"),
+                E::Bool(b) => format!("{}b", u8::from(*b)),
+                E::Name(n) if n.starts_with("opt.") => format!("0opt_{}", &n["opt.".len()..]),
+                E::Name(n) if !n.contains('.') => n.clone(),
                 _ => {
                     return self.err(a.at, "an argument is a number, a name or `opt.<key>`", "the build writes one def per distinct argument list, so arguments are fixed when it builds");
                 }
@@ -1004,20 +1007,7 @@ fn subst(e: &Expr, map: &HashMap<&str, &Expr>) -> Expr {
             *x = Expr { paren: true, at, ..(*arg).clone() };
             continue;
         }
-        match &mut x.e {
-            E::Call(_, xs) | E::And(xs) | E::Or(xs) | E::Sum(xs) => todo.extend(xs.iter_mut()),
-            E::In(a, xs) => {
-                todo.push(a);
-                todo.extend(xs.iter_mut());
-            }
-            E::Not(a) => todo.push(a),
-            E::Cmp(_, a, b) | E::Arith(_, a, b) => {
-                todo.push(a);
-                todo.push(b);
-            }
-            E::Match(_, arms) => todo.extend(arms.iter_mut().map(|a| &mut a.rule)),
-            _ => {}
-        }
+        todo.extend(x.children_mut());
     }
     out
 }

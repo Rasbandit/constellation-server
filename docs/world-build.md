@@ -75,21 +75,35 @@ Where doc 18's sketch was ambiguous, did not parse its own examples, or said not
 6. **`use PATH`**: `PATH` is names joined by `/`, without quotes, read as `PATH.rando` inside the world folder.
 7. **`shuffle NAME [kind NAME] { ... }`**, one item per line: `slots exits(g, ...)`, `things exits(...)`, `slots a, b` (free names), `thing NAME [: rule] [group NAME]`, `coupled [rule]`, `check none|layout`, `when rule`, and rows `slots S only|deny T [when r] [again]` and `things T only_in|deny_in S ...`. `kind`, `when`, row `when` and `again`, `pin`, `vanilla`, `pool`, `after` and `scope` are parsed and refused as not supported yet (the engine's first slice).
 8. **Overlay targets** are `region NAME`, `check REGION.NAME`, `exit REGION.TO`, `def NAME` and `item NAME`. `extend` takes a region and a block, `replace` takes `: rule` for a check, exit or def, and `remove` takes any target. There is no syntax for the base hash an overlay was last built against, so the missing-target message cannot name the hashes doc 18 section 2.8 shows.
-9. **`generated { ... }`** must be the first thing in its file. `content` is the SHA-256 of the file after the block, formatted. `expect NAME >= N` names a table declared in that file. Families have no names to expect.
+9. **`generated { ... }`** must be the first thing in its file. `content` is the SHA-256 of the tokens after the block in the canonical layout, comments and blank lines left out (so a note is not an edit), plus the header's `expect` lines and the bytes of every table file the file reads with `from`. `expect NAME >= N` names a table declared in that file. Families have no names to expect. `world_build::front::write_generated` writes a header with the right hash.
 10. **Toggles**: their default is `on`/`off` (also `true`/`false`), and `match` on a toggle has arms `on` and `off`. `match` on a range is an error.
 11. **`no_progression`** alone means always. A rule after it is read only if a rule starts there.
 12. **Declarations doc 18 shows but this version does not build** (`score`, `steps`, `trick`, `require`, `stay`, an item `when`, a class `match`) are parsed far enough to be skipped and reported as not supported yet, with their place.
-13. **A family's `where`** may read options. What folds at build time drops combinations; what is left joins each generated check's (or region's) `when`, and an exit's or event's rule. A `where` cannot switch off declarations that have no `when` (options, defs, shuffles, items).
+13. **A family's body** holds `item`, `region`, `start_item`, `assumed` and `for` at the top level, and members inside a region; anything else there is an error. Blocks nest at most 32 deep. **A family's `where`** may read options. What folds at build time drops combinations; what is left joins each generated check's (or region's) `when`, and an exit's or event's rule. A `where` cannot switch off declarations that have no `when` (options, defs, shuffles, items).
 14. **Ledger keys in a family** are the expanded names. A written `key "..."` applies to one declaration outside a family.
 15. **Visibility**: a file may read a name declared in itself, in a file it reaches by `use`, or in the entry file. An exit's target region does not count, so region files can lead to each other without a `use` each way.
-16. **Def parameters**: an argument is a number, a name or `opt.<key>`, after folding. The written def is named `<def>__<arg>__<arg>`, so a user name may not contain `__`.
+16. **Def parameters**: an argument is a number, a name or `opt.<key>`, after folding. The written def is named `<def>__<arg>__<arg>`, where a number is its digits (`3`, or `3n` for -3), a constant `0b`/`1b`, an option `0opt_<key>` and a name itself. No name starts with a digit or holds `__`, so two argument lists never share a written def.
+17. **Top-level keywords** other than declarations are errors: `check`, `exit`, `event` and `stay` say they belong inside a region. `score`, `steps`, `trick` and `require` are skipped and reported as not supported yet.
+
+**Where this parser and doc 18 (at `d2c302b`, "answer PR 8 review") now differ**, for the two to converge on one form:
+
+- Doc 18 ends a statement at a newline. Here only table rows are line-based, and statements end where their grammar ends.
+- Doc 18 starts every file with `language 1`. Here there is no version line.
+- Doc 18 writes `use "base.rando"`. Here it is `use base` (names joined by `/`, no quotes, no extension).
+- Doc 18 writes `pool fill [coin 9, gust 1]`. Here it is `pool fill { coin 9, gust 1 }`.
+- Doc 18 writes templates in backticks, `` `{t.key}_lap{lap}` ``. Here it is bare glued pieces, `{t.key}_lap{lap}`, and backticks only quote one plain name.
+- Doc 18 writes `expect dish 40`. Here it is `expect dish >= 40`.
+- Doc 18 writes `replace check cliff.summit { clauses }`. Here `replace` takes `: rule` only.
+- The reserved and contextual word lists differ. Doc 18 reserves `language`, `context`, `roll`, `requires`, `in`, `where`, `opt`, `at`, and here `where` is contextual. Here `key`, `was`, `door`, `vanilla`, `holds`, `no_progression` and `can_stay` are contextual, as doc 18 now also has them.
+- Doc 18 section 2.7 says laps 1 and 2 "compile to `t.unlock` alone". Here they compile to `t.unlock and count(tire) >= 0`: the fold turns `max(0, lap - 2)` into 0, and the comparison stays.
 
 ## What is checked
 
 Each error names the file, line and column and what to do. All errors are collected; the parser recovers at the next keyword.
 
 - Syntax, everywhere, with recovery; modules that do not exist; names read without a `use`.
-- Families and tables: unknown tables and variables, a row or name piece of the wrong type, CSV header, types and line numbers, duplicate rows, and at most 100,000 expanded declarations.
+- Families and tables: unknown tables and variables, a row or name piece of the wrong type, CSV header, types and line numbers, duplicate rows (at their own line), ranges that are empty or too long, at most 100,000 declarations written by families, and blocks at most 32 deep. One mistake a family repeats is reported once.
+- Files: a path or link that leads out of the world's folder is refused, and `fmt` does not follow links.
 - Names: unknown names, a name used as the wrong kind ("`lamp` is an item; did you mean `has(lamp)`?"), duplicates across the one namespace (events may repeat), reserved words, name shape.
 - Regions: an exit to a missing region, two exits to one region, a region no exit leads to from the start.
 - Format rule a (D-132): `not` over state, comparisons that can turn false, products and divisions that can.
@@ -99,7 +113,8 @@ Each error names the file, line and column and what to do. All errors are collec
 - Items, the pool test across option values, shuffles in the engine's first slice, read cycles, nesting depth, and table sizes, as before.
 - The ledger: ids unique, in 1 to 2^53 - 1, and for this world. Renames with `was` keep ids. Retired ids are never given again.
 - Generated files: a content hash that does not match (an error, or a warning with `--allow-edited` when not publishing), sources that changed (a warning), and tables smaller than their `expect`.
-- Overlays: a target that is gone (`overlay.target_missing`), and two replacements of one target where neither file uses the other.
+- Overlays: a target that is gone (`overlay.target_missing`), and any two overlays that change one target (a replace, a remove, or a check or exit an `extend` adds) where neither file uses the other. A removed check or item is retired in the ledger.
+- The ledger also refuses a `was` that names a key still declared, and a written `key` that meets another declaration's key or name.
 
 Limits are in `crates/config` (`WORLD_*`, `RULE_MAX_PARTS`). All are design values except the engine's own.
 

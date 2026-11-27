@@ -80,6 +80,33 @@ pub struct Expr {
     pub span: (usize, usize),
 }
 
+impl Expr {
+    /// The node's direct children, in order: the one walk every pass over a tree uses.
+    #[must_use]
+    pub fn children(&self) -> Vec<&Expr> {
+        match &self.e {
+            E::Call(_, xs) | E::And(xs) | E::Or(xs) | E::Sum(xs) => xs.iter().collect(),
+            E::In(a, xs) => std::iter::once(&**a).chain(xs).collect(),
+            E::Not(a) => vec![a],
+            E::Cmp(_, a, b) | E::Arith(_, a, b) => vec![a, b],
+            E::Match(_, arms) => arms.iter().map(|a| &a.rule).collect(),
+            E::Bool(_) | E::Int(_) | E::Name(_) | E::Interp(_) => Vec::new(),
+        }
+    }
+
+    /// [`Expr::children`], to change them.
+    pub fn children_mut(&mut self) -> Vec<&mut Expr> {
+        match &mut self.e {
+            E::Call(_, xs) | E::And(xs) | E::Or(xs) | E::Sum(xs) => xs.iter_mut().collect(),
+            E::In(a, xs) => std::iter::once(&mut **a).chain(xs.iter_mut()).collect(),
+            E::Not(a) => vec![a],
+            E::Cmp(_, a, b) | E::Arith(_, a, b) => vec![a, b],
+            E::Match(_, arms) => arms.iter_mut().map(|a| &mut a.rule).collect(),
+            E::Bool(_) | E::Int(_) | E::Name(_) | E::Interp(_) => Vec::new(),
+        }
+    }
+}
+
 /// The node kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum E {

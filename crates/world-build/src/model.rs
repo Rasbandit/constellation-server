@@ -7,7 +7,7 @@
 
 /// A place in the source: the file (an index into [`World::files`]), line and column, both
 /// from 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Pos {
     /// The file, by index.
     pub file: u32,
