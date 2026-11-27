@@ -427,7 +427,7 @@ jobs:
       - name: in turns
         run: |
           set -o pipefail
-          for pair in 1 2 3 4; do for profile in light heavy; do
+          for pair in $(seq 12); do for profile in light heavy; do
             sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
             for side in $sides; do
               bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
@@ -439,7 +439,7 @@ jobs:
       - name: summary
         run: |
           {
-            echo "### Base against head, worlds without shuffles, exact fill, one thread (measured on this runner, release build, 4 runs a side in turns; each run's fill ms is its own median)"
+            echo "### Base against head, worlds without shuffles, exact fill, one thread (measured on this runner, release build, 12 runs a side in turns; each run's fill ms is its own median)"
             echo
             echo "| profile | players | path | base fill ms median | base range | head fill ms median | head range | head / base | same placements |"
             echo "|---|---|---|---|---|---|---|---|---|"

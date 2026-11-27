@@ -481,7 +481,39 @@ impl World {
             });
             Arc::make_mut(&mut w.names)[k].sorted = v;
         }
-        Ok(w)
+        Ok(w.packed())
+    }
+
+    /// The same world with everything a solve reads copied once more, list after list. The
+    /// loader makes its lists between its own scratch work, so they end up apart in memory;
+    /// copies taken in one run sit together, which is what a room that copied its worlds got
+    /// and what a fill on 100 worlds measures (1% to 3% of the fill, see PR 207).
+    fn packed(mut self) -> Self {
+        fn again<T: Clone>(x: &mut Shared<T>) {
+            *x = Shared::from(&x[..]);
+        }
+        again(&mut self.rules);
+        again(&mut self.game);
+        let h = &mut self.hot;
+        again(&mut h.target);
+        again(&mut h.place);
+        again(&mut h.starts);
+        for pair in [&mut h.item_sites, &mut h.counter_sites].into_iter().chain(&mut h.into) {
+            again(&mut pair.0);
+            again(&mut pair.1);
+        }
+        self.hot = Hot {
+            time_dep: h.time_dep.clone(),
+            def_time: h.def_time.clone(),
+            def_items: h.def_items.clone(),
+            def_counters: h.def_counters.clone(),
+            ..std::mem::take(h)
+        };
+        self.names = Arc::new((*self.names).clone());
+        again(&mut self.item_groups.0);
+        again(&mut self.item_groups.1);
+        self.bits = Arc::new(Bits::clone(&self.bits));
+        self
     }
 
     /// Group member lists, and the per-item membership index built from them.
