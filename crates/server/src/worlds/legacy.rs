@@ -214,19 +214,17 @@ pub(super) async fn prepare(
     Ok(())
 }
 
-pub(super) async fn create_world(
-    State(w): State<Arc<Worlds>>,
-    who: Identity,
-    body: Bytes,
+/// The legacy branch of `POST /api/worlds`: `{"apworlds": [<id>...], "yamls": [<id>...]}`, a
+/// world the sidecar generates from the chosen files, laid out in its job folder first.
+pub(super) async fn create_legacy_world(
+    w: &Arc<Worlds>,
+    req: &Value,
+    owner: Option<&str>,
+    slot: JobSlot,
 ) -> Reply {
-    let Some(slot) = w.admit() else { return Ok(busy(&w, "too many generations are queued")) };
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
-    let req: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("bad JSON: {e}")))?;
-    if req.get("manifest").is_some() {
-        return create_data_only_world(&w, &req, Some(who.subject.as_str()), slot).await;
-    }
-    let apworlds = chosen(&w, &req, "apworlds", Kind::Apworld).await?;
-    let yamls = chosen(&w, &req, "yamls", Kind::Yaml).await?;
+    let apworlds = chosen(w, req, "apworlds", Kind::Apworld).await?;
+    let yamls = chosen(w, req, "yamls", Kind::Yaml).await?;
     if yamls.is_empty() {
         return Err(bad("choose at least one yaml".to_owned()));
     }
@@ -236,16 +234,16 @@ pub(super) async fn create_world(
         return Err(bad("two apworlds have the same module name".to_owned()));
     }
     let (apworld_ids, yaml_ids) = (ids(&apworlds), ids(&yamls));
-    let id = new_world_id(&w, &[&apworld_ids, &yaml_ids]);
+    let id = new_world_id(w, &[&apworld_ids, &yaml_ids]);
     let world = w.dir.join("worlds").join(&id);
-    if let Err(e) = prepare(&w, &world, &apworlds, &yamls).await {
+    if let Err(e) = prepare(w, &world, &apworlds, &yamls).await {
         drop(std::fs::remove_dir_all(&world));
         return Err(internal(e));
     }
     let mut status =
         json!({"id": id, "status": "queued", "apworlds": apworld_ids, "yamls": yaml_ids});
-    with_owner(&mut status, Some(who.subject.as_str()));
-    queue(&w, status, slot).await
+    with_owner(&mut status, owner);
+    queue(w, status, slot).await
 }
 
 /// What `ap_gen.py generate` prints. The bundle stays raw text (no tree of values in memory);

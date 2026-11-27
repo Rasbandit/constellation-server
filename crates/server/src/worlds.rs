@@ -371,6 +371,20 @@ fn busy(w: &Worlds, what: &str) -> Response {
     r
 }
 
+/// `POST /api/worlds`: take a place in the queue, then hand the request to its path, the
+/// data-only engine for one that names a manifest and the sidecar for any other.
+async fn create_world(State(w): State<Arc<Worlds>>, who: Identity, body: Bytes) -> Reply {
+    let Some(slot) = w.admit() else { return Ok(busy(&w, "too many generations are queued")) };
+    let req: Value = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad JSON: {e}")))?;
+    let owner = Some(who.subject.as_str());
+    if req.get("manifest").is_some() {
+        create_data_only_world(&w, &req, owner, slot).await
+    } else {
+        create_legacy_world(&w, &req, owner, slot).await
+    }
+}
+
 /// The address failures are counted under: the last entry of the last line of the trusted proxy
 /// header (what the proxy itself appended; earlier lines and entries are the client's to forge),
 /// else the peer's. An IPv6 address counts as its /64, since one host owns a whole /64.
