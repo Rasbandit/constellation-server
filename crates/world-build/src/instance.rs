@@ -310,6 +310,57 @@ pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
 }
 
 /// An option's lowest and highest value.
+/// The value `text` gives option `key`, as an author writes it: `on`/`off` (or `true`/`false`)
+/// for a toggle, a value's name for a choice, a whole number for a range.
+pub(crate) fn option_value(m: &Model, key: &str, text: &str) -> Result<i64, String> {
+    let opt = m.options.iter().find(|o| o.key == key).ok_or_else(|| {
+        let known: Vec<&str> = m.options.iter().map(|o| o.key.as_str()).collect();
+        format!(
+            "unknown option `{key}`; the options are {}",
+            if known.is_empty() { "none".into() } else { known.join(", ") }
+        )
+    })?;
+    let v = match (&opt.ty, text) {
+        (OptTy::Toggle, "on" | "true") => Some(1),
+        (OptTy::Toggle, "off" | "false") => Some(0),
+        (OptTy::Toggle, _) => None,
+        (OptTy::Choice(vs), t) => {
+            vs.iter().position(|v| v == t).and_then(|i| i64::try_from(i).ok())
+        }
+        (OptTy::Range(..), t) => t.parse().ok(),
+    };
+    let (lo, hi) = bounds(&opt.ty);
+    match v {
+        Some(v) if (lo..=hi).contains(&v) => Ok(v),
+        _ => Err(format!(
+            "option `{key}` cannot be `{text}`; it takes {}",
+            match &opt.ty {
+                OptTy::Toggle => "on or off".to_owned(),
+                OptTy::Choice(vs) => format!("one of {}", vs.join(", ")),
+                OptTy::Range(lo, hi) => format!("a whole number from {lo} to {hi}"),
+            }
+        )),
+    }
+}
+
+/// An option's value as an author writes it: the inverse of [`option_value`].
+pub(crate) fn option_text(m: &Model, key: &str, v: i64) -> String {
+    match m.options.iter().find(|o| o.key == key).map(|o| &o.ty) {
+        Some(OptTy::Toggle) => (if v == 0 { "off" } else { "on" }).to_owned(),
+        Some(OptTy::Choice(vs)) => usize::try_from(v)
+            .ok()
+            .and_then(|i| vs.get(i))
+            .cloned()
+            .unwrap_or_else(|| v.to_string()),
+        _ => v.to_string(),
+    }
+}
+
+/// Every option's key and default, in declaration order.
+pub(crate) fn option_defaults(m: &Model) -> Vec<(String, i64)> {
+    m.options.iter().map(|o| (o.key.clone(), o.default)).collect()
+}
+
 fn bounds(ty: &OptTy) -> (i64, i64) {
     match ty {
         OptTy::Toggle => (0, 1),

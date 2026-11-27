@@ -17,7 +17,7 @@ use world_build::front::{Dir, LEDGER, Options, format_text};
 use world_build::{Error, build};
 
 fn usage() -> ExitCode {
-    eprintln!("usage: rando check|fmt|build [dir] [options]; see the crate's docs/world-build.md");
+    eprintln!("usage: rando check|fmt|build|generate [dir] [options]; see docs/world-build.md");
     ExitCode::from(2)
 }
 
@@ -103,9 +103,17 @@ fn main() -> ExitCode {
     let mut dir = PathBuf::from(".");
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
     let (mut opts, mut check_only) = (Options::default(), false);
+    let mut g = Gen::default();
     let mut rest = args[1..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
+            "--seed" | "--players" | "--option" | "--options" | "--format" | "--check-seeds" => {
+                let Some(v) = rest.next() else { return usage() };
+                if let Err(e) = g.set(a, v) {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            }
             "-o" | "--instance" => {
                 let Some(p) = rest.next() else { return usage() };
                 if a == "-o" {
@@ -124,7 +132,7 @@ fn main() -> ExitCode {
     if verb == "fmt" {
         return fmt(&dir, check_only);
     }
-    if verb != "check" && verb != "build" {
+    if !matches!(verb.as_str(), "check" | "build" | "generate") {
         return usage();
     }
     let built = match build(&Dir(dir.clone()), &opts) {
@@ -142,13 +150,10 @@ fn main() -> ExitCode {
     if verb == "check" {
         return ExitCode::SUCCESS;
     }
-    // A link is not written through: it could lead out of the folder.
-    let write = |p: &Path, text: &str| {
-        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(format!("{} is a link; not writing through it", p.display()));
-        }
-        std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()))
-    };
+    if verb == "generate" {
+        return generate(&built, &g, out.as_deref());
+    }
+    let write = |p: &Path, text: &str| write_file(p, text.as_bytes());
     let mut steps = Vec::new();
     if let Some(l) = &built.ledger {
         steps.push(write(&dir.join(LEDGER), l));
@@ -168,4 +173,148 @@ fn main() -> ExitCode {
     let failed: Vec<String> = steps.into_iter().filter_map(Result::err).collect();
     failed.iter().for_each(|e| eprintln!("error: {e}"));
     if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// What `rando generate` was asked for.
+#[derive(Default)]
+struct Gen {
+    seed: Option<u64>,
+    players: Option<u32>,
+    /// `name=value` pairs, in the order given (`--options` files first where they came first).
+    options: Vec<(String, String)>,
+    json: bool,
+    check_seeds: Option<u64>,
+}
+
+impl Gen {
+    fn set(&mut self, flag: &str, v: &str) -> Result<(), String> {
+        let num = |what: &str| {
+            v.parse::<u64>().map_err(|_| format!("{what} takes a whole number, not `{v}`"))
+        };
+        match flag {
+            "--seed" => self.seed = Some(num("--seed")?),
+            "--players" => {
+                let n = u32::try_from(num("--players")?).ok().filter(|n| *n >= 1);
+                self.players = Some(n.ok_or("--players takes a number of at least 1")?);
+            }
+            "--check-seeds" => self.check_seeds = Some(num("--check-seeds")?.max(1)),
+            "--format" => match v {
+                "json" => self.json = true,
+                "text" => self.json = false,
+                _ => return Err(format!("--format is text or json, not `{v}`")),
+            },
+            "--option" => self.options.push(pair(v)?),
+            _ => {
+                // An options file: one `name = value` per line, `#` starts a comment.
+                let text = std::fs::read_to_string(v).map_err(|e| format!("{v}: {e}"))?;
+                for l in text
+                    .lines()
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
+                {
+                    self.options.push(pair(l).map_err(|e| format!("{v}: {e}"))?);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pair(v: &str) -> Result<(String, String), String> {
+    let (k, x) =
+        v.split_once('=').ok_or_else(|| format!("an option is `name=value`, not `{v}`"))?;
+    Ok((k.trim().to_owned(), x.trim().to_owned()))
+}
+
+/// A seed when none was asked for: from the process's random hash keys, printed so the seed
+/// can be made again.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    // Within 2^53, so the number survives any JSON reader.
+    std::collections::hash_map::RandomState::new().build_hasher().finish() & ((1 << 53) - 1)
+}
+
+fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode {
+    use world_build::generate::{Generator, spoiler_text};
+    let mut options = std::collections::HashMap::new();
+    for (k, v) in &g.options {
+        match built.option_value(k, v) {
+            Ok(x) => {
+                options.insert(k.clone(), x);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let generator = match Generator::new(built) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let players = g.players.unwrap_or(1);
+    if let Some(count) = g.check_seeds {
+        let from = g.seed.unwrap_or(1);
+        let c = generator.check_seeds(&options, players, from, count);
+        let mut ms: Vec<f64> = c.times.iter().map(|t| t.as_secs_f64() * 1000.0).collect();
+        ms.sort_by(f64::total_cmp);
+        let last = from + count - 1;
+        let s = if players == 1 { "" } else { "s" };
+        println!(
+            "{} of {} seeds fill (seeds {from} to {last}, {players} player{s})",
+            c.filled, c.tried
+        );
+        println!("fill attempts: {} (restarts: {})", c.attempts, c.restarts);
+        if let (Some(lo), Some(hi)) = (ms.first(), ms.last()) {
+            println!(
+                "fill time per seed: fastest {lo:.0} ms, median {:.0} ms, slowest {hi:.0} ms",
+                ms[ms.len() / 2]
+            );
+        }
+        return match c.first_failure {
+            None => ExitCode::SUCCESS,
+            Some((seed, e)) => {
+                eprintln!("error: seed {seed}: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let seed = g.seed.unwrap_or_else(random_seed);
+    let made = match generator.run(&options, players, seed) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error: seed {seed}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = out.unwrap_or(Path::new("."));
+    let spoiler = if g.json {
+        world_build::canon::to_string(&made.spoiler).unwrap_or_default()
+    } else {
+        spoiler_text(&made.spoiler)
+    };
+    let ext = if g.json { "json" } else { "txt" };
+    let seed_path = dir.join(format!("{}.seed", made.name));
+    let spoiler_path = dir.join(format!("{}-spoiler.{ext}", made.name));
+    let written = std::fs::create_dir_all(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))
+        .and_then(|()| write_file(&seed_path, &made.file))
+        .and_then(|()| write_file(&spoiler_path, spoiler.as_bytes()));
+    if let Err(e) = written {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("seed {seed}: wrote {} and {}", seed_path.display(), spoiler_path.display());
+    ExitCode::SUCCESS
+}
+
+/// Write `bytes` to `p`, never through a link (it could lead out of the folder).
+fn write_file(p: &Path, bytes: &[u8]) -> Result<(), String> {
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a link; not writing through it", p.display()));
+    }
+    std::fs::write(p, bytes).map_err(|e| format!("{}: {e}", p.display()))
 }

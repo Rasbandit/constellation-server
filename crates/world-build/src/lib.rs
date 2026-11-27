@@ -15,6 +15,8 @@ use serde_json::Value;
 
 pub mod canon;
 pub mod front;
+#[cfg(feature = "engine")]
+pub mod generate;
 mod instance;
 pub mod lex;
 mod lower;
@@ -94,6 +96,32 @@ impl Built {
         options: &std::collections::HashMap<String, i64>,
     ) -> Result<data_fill::Instance, String> {
         serde_json::from_value(self.instance_json(options)?).map_err(|e| e.to_string())
+    }
+
+    /// The value `text` sets option `key` to (`on`, a choice's name, a number), checked: an
+    /// unknown option or a value it does not take is refused by name.
+    ///
+    /// # Errors
+    /// The option or the value, and what it takes.
+    pub fn option_value(&self, key: &str, text: &str) -> Result<i64, String> {
+        instance::option_value(&self.model, key, text)
+    }
+
+    /// Every option's key and the value `given` sets (its default otherwise), as an author
+    /// writes it, in declaration order.
+    #[must_use]
+    pub fn option_texts(
+        &self,
+        given: &std::collections::HashMap<String, i64>,
+    ) -> Vec<(String, String)> {
+        instance::option_defaults(&self.model)
+            .into_iter()
+            .map(|(k, d)| {
+                let v = given.get(&k).copied().unwrap_or(d);
+                let t = instance::option_text(&self.model, &k, v);
+                (k, t)
+            })
+            .collect()
     }
 
     /// The instance at every option's default.

@@ -20,6 +20,8 @@ config = { path = "../config", default-features = false }
 data-fill = { path = "../data-fill", optional = true }
 # The comparison operators and their monotone rule, shared with the engine.
 rule-ops = { path = "../rule-ops" }
+# The seed bundle type `rando generate` reads its spoiler from (with feature `engine`).
+seed-bundle = { path = "../seed-bundle", optional = true }
 serde_json = { workspace = true, features = ["std"] }
 # SHA-256 of generated files' content and sources (doc 18 section 2.9): the RustCrypto crate the
 # workspace already uses (MIT OR Apache-2.0).
@@ -27,7 +29,7 @@ sha2 = { version = "0.11", default-features = false }
 
 [features]
 default = ["engine"]
-engine = ["dep:data-fill"]
+engine = ["dep:data-fill", "dep:seed-bundle"]
 
 [dev-dependencies]
 data-fill = { path = "../data-fill" }
