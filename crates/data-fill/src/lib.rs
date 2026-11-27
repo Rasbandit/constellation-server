@@ -4,6 +4,7 @@
 mod bitrules;
 pub mod check;
 pub mod decode;
+mod depth;
 pub mod fairness;
 pub mod fill;
 mod fold;

@@ -515,7 +515,7 @@ pub fn room(shape: &Shape, seed: u64, players: usize, workers: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room::{Given, Path, fill_room_on, fill_room_spheres};
+    use crate::room::{Algorithm, Given, Path, fill_room_by, fill_room_on, fill_room_spheres};
     use crate::spheres::RoomSpheres;
     use crate::world::World;
 
@@ -796,6 +796,133 @@ mod tests {
         assert!(split.as_ref().is_ok_and(|f| f.3 > 64), "rounds: {:?}", split.map(|f| f.3));
         assert_eq!(split, outcome(&c, 1, Path::Forward { workers: 1 }).0, "400 checks");
         assert!(undone > 100_000, "{undone} journal steps undone");
+    }
+
+    /// One attempt of `mode` on `path`: everything it decides, or its error.
+    fn one_pass(c: &Compiled, seed: u64, path: Path, mode: Algorithm) -> Outcome {
+        fill_room_by(&c.seats(), &mut SpecRng::from_u64(seed), 1, path, mode)
+            .map(|(f, sp)| (f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached))
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// Issue 212: rooms of worlds where one key hides everything behind it, at sizes the
+    /// rounds in drawn order were stuck on at every attempt (chain from 22 players, keys from
+    /// 16). Deepest first they fill in one pass, no round divided, every goal reachable, and
+    /// the report is a fresh solve's. In drawn order the same room and seed is stuck.
+    #[test]
+    fn rooms_of_chains_fill_in_one_pass_where_drawn_order_was_stuck() {
+        for (how, players) in [(Hostile::Chain, 22), (Hostile::Keys, 16)] {
+            let c = room(&Shape::hostile(how), 1, players, 1).unwrap();
+            let seats = c.seats();
+            let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
+            for seed in [1, 2] {
+                let at = format!("{how:?}, {players} players, seed {seed}");
+                let (placed, _, attempts, rounds, beatable, reached) =
+                    one_pass(&c, seed, Path::Split, Algorithm::Exact).expect(&at);
+                assert_eq!(attempts, 1, "{at}");
+                assert_eq!(rounds as usize, piles, "{at}: a round was divided");
+                assert!(beatable.iter().all(|b| *b), "{at}");
+                let fresh = crate::room::validate_room(&seats, &placed).unwrap();
+                assert_eq!((beatable, reached), fresh, "{at}");
+                let drawn = one_pass(&c, seed, Path::Split, Algorithm::Drawn);
+                assert!(drawn.is_err_and(|e| e.contains("Stuck")), "{at}: drawn order filled");
+            }
+        }
+    }
+
+    /// Many rooms and seeds, one attempt each: a room that fills is beatable by a fresh solve
+    /// of the whole room, every location that exists holds one item, and the same seed gives
+    /// the same room again. Counted: most fill, and some rounds are divided.
+    #[test]
+    fn one_pass_fills_are_beatable_and_the_same_for_a_seed() {
+        let hostile = |how| Shape { checks: 80, ..Shape::hostile(how) };
+        let shapes = [
+            small(false),
+            small(true),
+            Shape { checks: 80, layers: 3, ..Shape::heavy() },
+            hostile(Hostile::Chain),
+            hostile(Hostile::Keys),
+            hostile(Hostile::Gated),
+            hostile(Hostile::Brink),
+            Shape { checks: 200, ..Shape::hostile(Hostile::Tight) },
+            Shape::wide(),
+        ];
+        let (mut filled, mut stuck, mut divided) = (0, 0, 0);
+        for (n, shape) in shapes.iter().enumerate() {
+            for players in [1usize, 2, 5, 13] {
+                let c = room(shape, 40 + n as u64, players, 1).unwrap();
+                let seats = c.seats();
+                let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
+                for seed in 1..=6 {
+                    let at = format!("shape {n}, {players} players, seed {seed}");
+                    let got = one_pass(&c, seed, Path::Split, Algorithm::Exact);
+                    assert_eq!(got, one_pass(&c, seed, Path::Split, Algorithm::Exact), "{at}");
+                    let Ok((placed, _, _, rounds, beatable, reached)) = got else {
+                        stuck += 1;
+                        continue;
+                    };
+                    filled += 1;
+                    // More groups placed than the longest pile has items: one was divided, or
+                    // the rounds went on after an item was moved.
+                    divided += u32::from(rounds as usize > piles);
+                    assert!(beatable.iter().all(|b| *b), "{at}");
+                    let fresh = crate::room::validate_room(&seats, &placed).unwrap();
+                    assert_eq!((beatable, reached), fresh, "{at}");
+                    for (s, row) in seats.iter().zip(&placed) {
+                        let held = row.iter().flatten().count();
+                        assert_eq!(held, s.plan.included.len(), "{at}");
+                    }
+                }
+            }
+        }
+        assert!(filled > 150 && divided > 0, "{filled} filled, {stuck} stuck, {divided} divided");
+    }
+
+    /// A round that does not fit its state is divided, and an item with nowhere to go takes
+    /// the place of a seated one, the same way on every path: rooms with as much progression
+    /// as locations that take it, one attempt, carried, forward (1 and 4 threads) and split.
+    /// Counted: some of them fill only because of that.
+    #[test]
+    fn a_repaired_round_places_the_same_on_every_path() {
+        let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
+        let mut repaired = 0;
+        for players in [2usize, 3, 8, 12] {
+            let c = room(&tight, 23, players, 1).unwrap();
+            let piles = c.seats().iter().map(|s| s.plan.progression.len()).max().unwrap();
+            for seed in 1..=8 {
+                let at = format!("{players} players, seed {seed}");
+                let split = one_pass(&c, seed, Path::Split, Algorithm::Exact);
+                for path in
+                    [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }]
+                {
+                    assert_eq!(split, one_pass(&c, seed, path, Algorithm::Exact), "{at}, {path:?}");
+                }
+                repaired += u32::from(split.is_ok_and(|x| x.3 as usize > piles));
+            }
+        }
+        assert!(repaired > 8, "{repaired} repaired");
+    }
+
+    /// A room nothing can fill: every location in front of the last region is excluded, so
+    /// the key to the last region has nowhere to go. The fill ends with the item's name after
+    /// the attempts it was allowed, on every path.
+    #[test]
+    fn a_room_nothing_can_fill_ends_stuck_after_the_attempts_allowed() {
+        let shape = Shape { checks: 60, ..Shape::hostile(Hostile::Chain) };
+        let c = room_with(&shape, 5, 3, |_, inst| {
+            inst.excluded = inst.locations.iter().take(50).cloned().collect();
+        })
+        .unwrap();
+        for path in [Path::Split, Path::Carry, Path::Forward { workers: 1 }] {
+            let got =
+                fill_room_on(&c.seats(), &mut SpecRng::from_u64(1), 3, path).map(|x| x.0.placed);
+            match got {
+                Err(crate::FillError::Stuck { item, attempts: 3 }) => {
+                    assert!(item.starts_with('k'))
+                }
+                other => panic!("{path:?}: {other:?}"),
+            }
+        }
     }
 
     /// Rule nodes of a rule in the manifest's JSON: one per object, plus its list operands.

@@ -446,6 +446,11 @@ pub const FILL_GOAL_ONLY: bool = false;
 /// way; `false` is the reference the saving is measured against (a design value).
 pub const FILL_SKIP_EMPTY_CHECKS: bool = true;
 
+/// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
+/// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
+/// (a design value).
+pub const FILL_DISPLACE_TRIES: usize = 32;
+
 /// Random reached-location draws a shuffle fill (`data_fill::room::Algorithm::Shuffle`) makes
 /// for one freed item before it checks every candidate in turn (a design value).
 pub const SHUFFLE_FILL_MAX_PROBES: u32 = 32;
