@@ -120,6 +120,8 @@ pub enum FillError {
     Stuck {
         /// Item key.
         item: String,
+        /// Whose item it is: the player's index in the room, from 0 (0 for a lone world).
+        player: usize,
         /// Attempts made.
         attempts: u32,
     },

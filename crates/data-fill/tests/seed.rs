@@ -94,6 +94,72 @@ fn a_manifest_without_a_game_or_players_without_names_are_refused() {
     assert!(generate(&m, "s", &[], 1).is_err());
 }
 
+/// A stuck fill is a typed error naming the item and whose item it is, so a caller can say
+/// it without reading text. Ann (player 0) holds the key in logic but her checks are all
+/// excluded; Bo (player 1) reaches nothing without his key: Bo's key has nowhere to go.
+#[test]
+fn a_stuck_fill_names_the_item_and_its_player() {
+    use data_fill::FillError;
+    use data_fill::prepared::{Prepared, build};
+    use data_fill::seed::{GenerateError, generate_on};
+    let key = json!({"has": "key"});
+    let locs: Vec<String> = (0..4).map(|l| format!("l{l}")).collect();
+    let m = json!({
+        "game": "Stuck", "version": "1",
+        "options": [],
+        "items": [{"key": "key", "id": 1}, {"key": "junk", "id": 2}],
+        "locations": (0..4).map(|l| json!({"key": format!("l{l}"), "id": l + 1})).collect::<Vec<_>>(),
+        "start": "a",
+        "x.time": {"slices": 1, "start_mask": 1},
+        "defs": {},
+        "regions": [{"key": "a", "can_stay": false, "events": [], "stays": [],
+                     "checks": locs.iter().map(|l| json!({"loc": l, "rule": key})).collect::<Vec<_>>(),
+                     "exits": [{"to": "b", "rule": key}]},
+                    {"key": "b", "can_stay": false, "checks": [], "exits": [], "events": [], "stays": []}],
+        "goal": {"reach": "region:b"},
+    });
+    let class = [("key", "progression"), ("junk", "filler")]
+        .map(|(k, c)| (k.to_owned(), c.to_owned()))
+        .into_iter()
+        .collect();
+    let ann = Instance {
+        locations: locs.clone(),
+        excluded: locs.clone(),
+        pool: vec!["junk".to_owned(); 4],
+        pool_class: class,
+        logic_start: [("key".to_owned(), 1)].into_iter().collect(),
+        ..Instance::default()
+    };
+    let bo = Instance {
+        pool: ["key", "junk", "junk", "junk"].map(String::from).to_vec(),
+        excluded: Vec::new(),
+        logic_start: Default::default(),
+        ..ann.clone()
+    };
+    let p = vec![
+        Player { name: "Ann".into(), instance: ann },
+        Player { name: "Bo".into(), instance: bo },
+    ];
+    let on = Prepared::open(&build(&m).unwrap().0).unwrap();
+    for seed in 1..=3 {
+        match generate_on(&on, "s", &p, seed) {
+            Err(GenerateError::Fill(FillError::Stuck { item, player, attempts })) => {
+                assert_eq!(
+                    (item.as_str(), player, attempts),
+                    ("key", 1, config::FILL_MAX_ATTEMPTS)
+                );
+            }
+            other => panic!("seed {seed}: {:?}", other.map(|x| x.1)),
+        }
+    }
+    // As text it reads as it always has, now with the player.
+    let text = String::from(generate_on(&on, "s", &p, 1).unwrap_err());
+    assert!(
+        text.contains("Stuck") && text.contains("\"key\"") && text.contains("player: 1"),
+        "{text}"
+    );
+}
+
 /// The found record and the prepared world file of a manifest's bytes, as `job::prepare`
 /// prints them.
 fn prepare(manifest: &[u8]) -> Result<(Value, Vec<u8>), String> {

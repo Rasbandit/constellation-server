@@ -10,7 +10,7 @@ use seed_bundle::{GameData, Mode, SeedBundle, ServerOptions, Slot, SlotKind, Ver
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
-use crate::fill::Instance;
+use crate::fill::{FillError, Instance};
 use crate::prepared::Prepared;
 use crate::room::{self, Seat};
 use crate::spheres::RoomSpheres;
@@ -74,7 +74,47 @@ pub fn generate(
     named(players)?;
     let w = World::load(manifest)?;
     let data = game_data(&w)?;
-    fill_on((&w, game, data), seed_name, players, rng_seed).map(|x| x.0)
+    fill_on((&w, game, data), seed_name, players, rng_seed).map(|x| x.0).map_err(String::from)
+}
+
+/// Why [`generate_on`] made no seed: a fill that could not finish, typed (a stuck fill names
+/// the item and whose item it is), or any other refusal in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateError {
+    /// The fill could not finish.
+    Fill(FillError),
+    /// The fill finished, but a player cannot reach their goal (index in the room, from 0).
+    Unbeatable {
+        /// The player's index.
+        player: usize,
+    },
+    /// Anything else: a bad player, a shuffle that cannot stage, a seed that cannot assemble.
+    Message(String),
+}
+
+impl From<FillError> for GenerateError {
+    fn from(e: FillError) -> Self {
+        Self::Fill(e)
+    }
+}
+
+impl From<String> for GenerateError {
+    fn from(e: String) -> Self {
+        Self::Message(e)
+    }
+}
+
+/// The error as the text a caller reports: what it read before this was typed.
+impl From<GenerateError> for String {
+    fn from(e: GenerateError) -> Self {
+        match e {
+            GenerateError::Fill(f) => f.into(),
+            GenerateError::Unbeatable { player } => {
+                format!("player {} cannot reach their goal", player + 1)
+            }
+            GenerateError::Message(m) => m,
+        }
+    }
 }
 
 /// How a seed's fill went, beside the bundle, which cannot say.
@@ -103,13 +143,14 @@ pub struct FillReport {
 /// its fill went.
 ///
 /// # Errors
-/// As [`generate`], less what only a manifest can get wrong.
+/// As [`generate`], less what only a manifest can get wrong; a fill that cannot finish is
+/// [`GenerateError::Fill`].
 pub fn generate_on(
     prepared: &Prepared,
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
-) -> Result<(SeedBundle, FillReport), String> {
+) -> Result<(SeedBundle, FillReport), GenerateError> {
     named(players)?;
     let on = (prepared.world(), prepared.game(), prepared.data().clone());
     fill_on(on, seed_name, players, rng_seed)
@@ -179,7 +220,7 @@ fn fill_on(
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
-) -> Result<(SeedBundle, FillReport), String> {
+) -> Result<(SeedBundle, FillReport), GenerateError> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
     // A world that declares shuffles is staged per player first: each gets their own layout,
     // and the fill below sees ordinary worlds.
@@ -197,7 +238,7 @@ fn fill_on(
         config::FILL_MAX_ATTEMPTS,
     )?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
-        return Err(format!("player {} cannot reach their goal", p + 1));
+        return Err(GenerateError::Unbeatable { player: p });
     }
     let repaired = filled.divided > 0 || filled.repair_evals > 0 || filled.attempts > 1;
     let (tight_players, capacity_milli) =
