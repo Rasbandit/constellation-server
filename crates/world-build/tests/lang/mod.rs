@@ -299,6 +299,45 @@ fn modules_load_by_use_and_a_name_needs_the_use_of_its_file() {
     ok(&cycle);
 }
 
+/// A built-in function's name is not a read of a declaration that shares it: a region called
+/// `max` in another file does not make `max(...)` need a `use` of that file. A def with
+/// parameters is still a read of its file.
+#[test]
+fn a_built_in_call_is_not_a_read_of_a_declaration_with_its_name() {
+    let entry = "world t\nuse items\nuse rooms/a\nuse rooms/b\nstart a\ngoal reach(a)\n";
+    let items = "item k progression\nitem junk filler\npool fill { junk 1 }\n";
+    let a = "use items\nregion a {\n  check x: max(count(k), 0) >= 1\n  exit max\n}\n";
+    let b = "region max {\n  check y\n}\ndef need(n) = true\n";
+    ok(&mem(&[
+        ("world.rando", entry),
+        ("items.rando", items),
+        ("rooms/a.rando", a),
+        ("rooms/b.rando", b),
+    ]));
+    // A plain def (no parameters) named like the function does not shadow it either.
+    let b2 = "region max {\n  check y\n}\ndef `max` = true\n";
+    ok(&mem(&[
+        ("world.rando", entry),
+        ("items.rando", items),
+        (
+            "rooms/a.rando",
+            "use items\nregion a {\n  check x: max(count(k), 0) >= 1\n  exit max_room\n}\n",
+        ),
+        ("rooms/b.rando", &b2.replace("region max", "region max_room")),
+    ]));
+    let a = "use items\nregion a {\n  check x: need(1)\n  exit max\n}\n";
+    fails(
+        &mem(&[
+            ("world.rando", entry),
+            ("items.rando", items),
+            ("rooms/a.rando", a),
+            ("rooms/b.rando", b),
+        ]),
+        "rooms/a.rando:3:12",
+        "`need` is declared in `rooms/b.rando`, which this file does not use",
+    );
+}
+
 #[test]
 fn a_family_over_a_table_and_ranges_expands_to_plain_checks() {
     // Doc 18 section 2.6's invented "Card Tower".

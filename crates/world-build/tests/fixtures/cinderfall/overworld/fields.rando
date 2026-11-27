@@ -1,0 +1,35 @@
+# The road out of town and the fields beyond it.
+use items
+use logic
+
+region ashen_road {
+  check milestone
+  check roadside_shrine
+  check thorn_patch: can_cut
+  exit hearth_gate
+  exit ashen_fields
+  exit ashen_cottage door cottage_door group outside
+}
+
+region ashen_fields {
+  for i in 1..4 {
+    check field_grass_{i}: can_cut
+  }
+  check scarecrow
+  check haystack
+  check buried_chest: can_blast
+  check rabbit_warren: can_shoot
+  exit ashen_road
+  exit ashen_orchard
+  exit ember_foothills: can_lift(1)
+  exit ruined_mill door mill_door group outside
+}
+
+region ashen_orchard {
+  for i in 1..4 {
+    check apple_tree_{i}
+  }
+  check beehive: can_burn
+  check orchard_well: can_swim
+  exit ashen_fields
+}

@@ -261,7 +261,8 @@ struct X {
     idents: Vec<Ident>,
     overlays: Vec<(u32, Overlay)>,
     /// Names each file reads, with where: checked against the files it uses.
-    refs: Vec<(u32, String, Pos)>,
+    /// Names rules read: file, name, place, and whether it was called (`name(...)`).
+    refs: Vec<(u32, String, Pos, bool)>,
     /// Family combinations made so far.
     made: usize,
     /// Declarations families wrote so far.
@@ -742,8 +743,9 @@ impl X {
         let mut todo = vec![e];
         while let Some(x) = todo.pop() {
             match &x.e {
-                E::Name(n) | E::Call(n, _) => self.refs.push((f, n.clone(), x.at)),
-                E::Match(k, _) => self.refs.push((f, format!("opt.{k}"), x.at)),
+                E::Name(n) => self.refs.push((f, n.clone(), x.at, false)),
+                E::Call(n, _) => self.refs.push((f, n.clone(), x.at, true)),
+                E::Match(k, _) => self.refs.push((f, format!("opt.{k}"), x.at, false)),
                 _ => {}
             }
             todo.extend(x.children());
@@ -1277,7 +1279,14 @@ impl X {
         }
         let mut closures: HashMap<u32, BTreeSet<u32>> = HashMap::new();
         let mut seen = HashSet::new();
-        for (f, name, at) in std::mem::take(&mut self.refs) {
+        // A call reads a def with parameters (as lowering reads it); any other call is a
+        // built-in function, which a plain def, region or item of the same name does not shadow.
+        let defs: HashSet<&str> =
+            w.defs.iter().filter(|d| !d.params.is_empty()).map(|d| d.name.v.as_str()).collect();
+        for (f, name, at, call) in std::mem::take(&mut self.refs) {
+            if call && !defs.contains(name.as_str()) {
+                continue;
+            }
             let key = match name.strip_prefix("at.") {
                 Some(rest) => rest.split('.').next().unwrap_or("").to_owned(),
                 None => name.clone(),

@@ -1,0 +1,50 @@
+# The ember keep: three small keys and a great key.
+use items
+use logic
+
+region ember_entry placement ember_keys {
+  check ember_brazier_1
+  check ember_brazier_2: can_burn
+  check entry_rack
+  exit ember_gate
+  exit ember_forge
+}
+
+region ember_forge placement ember_keys {
+  for i in 1..4 {
+    check forge_pot_{i}
+  }
+  check forge_chest
+  check bellows: can_lift(1)
+  check slag_heap: can_blast
+  exit ember_entry
+  exit ember_bridge: keys(ember_key, 1)
+}
+
+region ember_bridge placement ember_keys {
+  check bridge_chest
+  check chain_lift: can_shoot
+  exit ember_forge
+  exit ember_vault: keys(ember_key, 2)
+  exit ember_tower: keys(ember_key, 3) and can_cross_gap
+}
+
+region ember_vault placement ember_keys {
+  check vault_left
+  check vault_right
+  check vault_great: can_fight(2)
+  exit ember_bridge
+}
+
+region ember_tower placement ember_keys {
+  check tower_chest
+  check tower_spire: can_shoot
+  exit ember_bridge
+  exit ember_lair: has(ember_great_key)
+}
+
+region ember_lair placement ember_keys {
+  check ember_heart: can_fight(2) and can_burn holds relic
+  check ember_spoils: can_fight(2)
+  exit ember_tower
+}

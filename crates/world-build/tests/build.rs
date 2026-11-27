@@ -4,6 +4,7 @@
 mod lang;
 mod seeds;
 mod support;
+mod trials;
 
 use std::collections::HashMap;
 

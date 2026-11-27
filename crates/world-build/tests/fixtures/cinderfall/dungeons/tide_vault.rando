@@ -1,0 +1,42 @@
+# The tide vault: two small keys and a great key; most rooms need swimming.
+use items
+use logic
+
+region tide_entry placement tide_keys {
+  check kelp_bed
+  check entry_clam: can_cut
+  exit tide_gate
+  exit tide_cistern: can_swim
+}
+
+region tide_cistern placement tide_keys {
+  for i in 1..3 {
+    check cistern_jar_{i}
+  }
+  check cistern_chest
+  check cistern_floor: can_swim
+  check drain_grate: can_lift(1)
+  exit tide_entry
+  exit tide_pump: keys(tide_key, 1)
+}
+
+region tide_pump placement tide_keys {
+  check pump_wheel
+  check pump_chest: can_fight(2)
+  exit tide_cistern
+  exit tide_reservoir: keys(tide_key, 2) and has(grapple)
+}
+
+region tide_reservoir placement tide_keys {
+  check reservoir_chest
+  check reservoir_floor: can_shoot
+  exit tide_pump
+  exit tide_lair: has(tide_great_key)
+}
+
+region tide_lair placement tide_keys {
+  check tide_heart: can_fight(2) and can_swim holds relic
+  check tide_spoils: can_fight(2)
+  check throne_seal_chest: can_fight(3) holds throne_seal
+  exit tide_reservoir
+}
