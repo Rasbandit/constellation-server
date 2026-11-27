@@ -198,7 +198,7 @@ fn the_spoiler_lists_every_placement() {
     assert!(g.run(&opts, 1025, 1).unwrap_err().contains("1 to 1024 players"));
     assert!(g.run(&opts, 1, 1 << 53).is_err());
     assert!(g.check_seeds(&opts, 1, u64::MAX, 2).is_err());
-    assert!(g.check_seeds(&opts, 1, 1, 0).is_err());
+    assert!(g.check_seeds(&opts, 1, 1, 0).unwrap_err().contains("at least 1 seed"));
 }
 
 #[test]

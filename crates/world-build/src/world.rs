@@ -223,11 +223,12 @@ impl Space {
         if !name_ok(errs, n, sort.word().trim_start_matches("an ").trim_start_matches("a ")) {
             return false;
         }
-        if matches!(sort, Sort::Def | Sort::Event) && CHECK_MODIFIERS.contains(&n.v.as_str()) {
+        // Events are state, which `no_progression` never reads, so only defs can clash.
+        if sort == Sort::Def && CHECK_MODIFIERS.contains(&n.v.as_str()) {
             errs.err(
                 n.pos,
                 format!("`{}` starts a check modifier, so it cannot name {}", n.v, sort.word()),
-                "a rule reads a def or event by its bare name, and after `no_progression` this word starts the next modifier; pick another name",
+                "a rule reads a def by its bare name, and after `no_progression` this word starts the next modifier; pick another name",
             );
             return false;
         }

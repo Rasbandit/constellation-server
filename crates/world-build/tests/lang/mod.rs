@@ -214,11 +214,17 @@ fn a_bare_no_progression_ends_before_key_and_was() {
     for c in ["c1", "c2"] {
         assert!(inst.excluded.contains(&c.to_owned()), "{c}: {:?}", inst.excluded);
     }
-    // So no def or event may be named a modifier word: a rule could never read it there.
+    // An event may (`no_progression` never reads state), and a def named `key` used there
+    // says why it fails.
+    ok(&world("region a {\n  check c\n  event was: true\n}"));
+    let all =
+        errors(&world("def key = true\nregion a {\n  check c no_progression key\n}")).join("\n");
+    assert!(all.contains("a def cannot be named `key`"), "{all}");
+    // So no def may be named a modifier word: a rule could never read it there.
     for (decl, what) in [
         ("def key = true", "a def"),
         ("def holds = true", "a def"),
-        ("region b {\n  event was: true\n}", "an event"),
+        ("def no_progression = true", "a def"),
     ] {
         let all = errors(&world(&format!("{decl}\nregion a {{\n  check c\n}}"))).join("\n");
         assert!(
@@ -846,6 +852,13 @@ fn always_true_comparisons_fold_away() {
     // `min(count(k), 2) >= 1` and a sum against 1 can still be false: kept.
     assert!(rule("min(count(k), 2) >= 1").get("ge").is_some());
     assert!(rule("count(k) + count(junk) >= 1").get("ge").is_some());
+    // An option inside a sum or `min` can be negative: not folded either.
+    let opt_rule = |r: &str| {
+        let b = ok(&world(&format!("option o: range -3..3 = 0\nregion a {{\n  check c: {r}\n}}")));
+        region(&b, "a")["checks"][0]["rule"].clone()
+    };
+    assert!(opt_rule("count(k) + opt.o >= 0").get("ge").is_some());
+    assert!(opt_rule("min(count(k), opt.o) >= 0").get("ge").is_some());
     // What can still be false is kept.
     assert_eq!(rule("count(k) >= 1"), serde_json::json!({"ge": [{"count": "k"}, 1]}));
     // An option can be negative, so a comparison with one is not folded.

@@ -767,7 +767,7 @@ impl P<'_> {
     fn ident(&mut self, key: &mut Option<At<String>>, was: &mut Option<At<String>>) -> R<bool> {
         if self.ctx("key") {
             self.k += 1;
-            *key = Some(self.string("the ledger key")?);
+            *key = Some(self.string("the ledger key in quotes (a def cannot be named `key`)")?);
         } else if self.ctx("was") {
             self.k += 1;
             *was = Some(self.name("the old name")?);

@@ -288,7 +288,7 @@ pub(super) fn run(
                     &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
                 )
-                .map_err(|e| format!("fill {seed}: {e:?}"))?;
+                .map_err(|e| format!("fill {seed}: {}", String::from(e)))?;
                 cx.engine_seconds += t.elapsed().as_secs_f64();
                 cx.work.0.absorb(&filled.stats);
                 cx.work.1 += 1;

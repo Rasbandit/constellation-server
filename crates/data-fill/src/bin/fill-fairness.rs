@@ -113,7 +113,7 @@ fn shape_of(
         (num("--seeds", 200)?, num("--required", 0)?, num("--baseline", 0)?);
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
     let t = Instant::now();
-    let err = |e| format!("{e:?}");
+    let err = String::from;
     let mut out = shape_report(&shape(&seats, seeds, required).map_err(err)?);
     if baseline > 0 {
         let sampled = sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(err)?;

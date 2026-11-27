@@ -19,7 +19,7 @@ pub const RESERVED: [&str; 33] = [
 ];
 
 /// The words that start a check's modifiers. After a bare `no_progression` they start the next
-/// modifier, never a rule, so no def or event (the bare names a rule reads) may be named one.
+/// modifier, never a rule, so no def (a bare name `no_progression` could read) may be named one.
 pub const CHECK_MODIFIERS: [&str; 5] = ["key", "was", "vanilla", "holds", "no_progression"];
 
 /// More words a rule reads as operators or constants: reserved as well.

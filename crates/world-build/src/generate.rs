@@ -213,14 +213,12 @@ pub fn spoiler_text(s: &Value) -> String {
         }
     };
     // Players in room order (P2 before P10), from the order the placements are listed in.
-    let mut order: Vec<String> = Vec::new();
+    let mut order: HashMap<&str, usize> = HashMap::new();
     for p in &all {
-        let name = str_of(p, "player");
-        if !order.contains(&name) {
-            order.push(name);
-        }
+        let n = order.len();
+        order.entry(p["player"].as_str().unwrap_or("")).or_insert(n);
     }
-    let rank = |name: &str| order.iter().position(|x| x == name).unwrap_or(order.len());
+    let rank = |name: &str| order.get(name).copied().unwrap_or(order.len());
     let mut by_region: BTreeMap<(usize, String, String), Vec<&Value>> = BTreeMap::new();
     let mut by_item: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     let mut spheres: BTreeMap<u64, Vec<&Value>> = BTreeMap::new();
@@ -342,11 +340,9 @@ impl Generator<'_> {
         from: u64,
         count: u64,
     ) -> Result<SeedCheck, String> {
-        let last = count
-            .checked_sub(1)
-            .and_then(|n| from.checked_add(n))
-            .filter(|l| *l <= config::SEED_NUMBER_MAX)
-            .ok_or_else(|| {
+        let after = count.checked_sub(1).ok_or("checking seeds takes at least 1 seed")?;
+        let last =
+            from.checked_add(after).filter(|l| *l <= config::SEED_NUMBER_MAX).ok_or_else(|| {
                 format!(
                     "{count} seeds from {from} go past the largest seed number, {}",
                     config::SEED_NUMBER_MAX
