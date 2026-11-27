@@ -950,10 +950,11 @@ mod tests {
                 other => panic!("budget {budget}: {:?}", other.map(|f| f.attempts)),
             }
         }
-        // The first attempt's first division spent the (empty) budget; deepest first needs no
-        // division and no move.
+        // The first attempt's first division spent the (empty) budget: one unit, the
+        // evaluations of this room's start solve (counted); deepest first needs no division
+        // and no move.
         let f = fill_room_budget(&seats, &mut rng(), (2, 0), Path::Split).unwrap();
-        assert_eq!((f.attempts, f.swaps, f.divided), (2, 0, 0));
+        assert_eq!((f.attempts, f.swaps, f.divided, f.repair_evals), (2, 0, 0, 242));
         sound(&c, &f, "deepest first");
         let budget = config::FILL_REPAIR_EVALS;
         let f = fill_room_budget(&seats, &mut rng(), (1, budget), Path::Split).unwrap();

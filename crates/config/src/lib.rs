@@ -453,17 +453,17 @@ pub const FILL_DISPLACE_TRIES: usize = 32;
 /// of moves, one solve's worth more per move for the pass over the rounds after it, and per
 /// divided round the evaluations of the attempt's first solve in rank order with none of the
 /// rounds' items (`data_fill::room`, `charge_division`), all counted the same on every path.
-/// Checked before each solve and at each division, so a fill ends at most one solve past it;
-/// then the attempt is stuck, and so is any later one that needs a move or a division. A budget
-/// of work, not of time: a seed is the same on every machine and path. A design value with a
-/// margin over the most repaired bench room, keys at 100 players, which charges about 37
-/// million (counted on seed 1; 33 to 35 million before divisions were charged, `bench-room`
-/// run 45946179688, seeds 1 to 3): 1.7 times that. By the growth of that charge over room
-/// size (counted at 22 and 100 players) it lets key rooms up to about 120 players and chain
-/// rooms up to about 200 fill without a restart (estimated). Time is not bounded by it: on that
-/// run keys at 100 players took 6.2 to 6.5 s for 78 to 83 million evaluations in all
-/// (measured), about 80 ns an evaluation; at that rate the budget is about 5 s of repair, and
-/// at the heavy profile's 186 ns about 12 s (both estimated).
+/// Within the budget means at most this much spent: once more is spent, checked before each
+/// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
+/// it), and so is any later one that needs a move or a division. A budget of work, not of
+/// time: a seed is the same on every machine and path. A design value with a margin over the
+/// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
+/// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
+/// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about
+/// 120 players and chain rooms up to about 200 fill without a restart (estimated). Time is
+/// not bounded by it: on that run keys at 100 players took 4.3 to 4.4 s for 78 to 83 million
+/// evaluations in all (measured), about 55 ns an evaluation; at that rate the budget is about
+/// 3.5 s of repair, and at the heavy profile's 186 ns about 12 s (both estimated).
 pub const FILL_REPAIR_EVALS: u64 = 64_000_000;
 
 /// The least p value the product's fill may show against uniform beatable placements on the

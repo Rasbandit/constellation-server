@@ -1860,8 +1860,9 @@ impl Steps<'_, '_> {
         // counters depend on the path).
         let mut pass = 0;
         for k in 0..=config::FILL_DISPLACE_TRIES {
-            // A budget of work, not of time: a room that needs more repair than this is stuck.
-            if self.repair_evals >= self.repair_budget {
+            // A budget of work, not of time: within it means spent at most the budget, so a
+            // room whose repair has spent more is stuck (the same test as `charge_division`).
+            if self.repair_evals > self.repair_budget {
                 break;
             }
             self.room.solve(&self.held, placed);
@@ -1925,10 +1926,6 @@ impl Steps<'_, '_> {
         Err(stuck())
     }
 
-    /// Whether `group` is placed against the room's state as one: it is one item, or groups
-    /// are not divided, or the state reaches a free location for each of its items. A group
-    /// that does not fit is divided in halves, down to single items if need be: a round is
-    /// never stuck where its items, placed one at a time, would not be.
     /// Charge dividing `group` to the repair budget (one [`Steps::unit`] each): halving is
     /// repair work as much as a move is, and its worst case is rounds of one item.
     ///
@@ -1959,6 +1956,10 @@ impl Steps<'_, '_> {
         Ok(())
     }
 
+    /// Whether `group` is placed against the room's state as one: it is one item, or groups
+    /// are not divided, or the state reaches a free location for each of its items. A group
+    /// that does not fit is divided in halves, down to single items if need be: a round is
+    /// never stuck where its items, placed one at a time, would not be.
     fn fits(&self, group: &[Given], locs: &Live<(u16, u32)>) -> bool {
         let models = &self.room.models;
         let reached = |(p, l): &(u16, u32)| models[usize::from(*p)].reached(*l);
