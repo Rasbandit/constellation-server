@@ -34,7 +34,6 @@ use spec_rng::SpecRng;
 use crate::depth;
 use crate::fill::{FillError, Instance, Plan};
 use crate::live::Live;
-use crate::par::map_ordered;
 use crate::reach::{Mark, Msg, Reach, Stats};
 use crate::spheres::{RoomSpheres, room_from_states};
 use crate::world::World;
@@ -59,28 +58,30 @@ pub struct Given {
     pub item: u16,
 }
 
-/// Resolve every player's instance against their world, on up to `workers` threads. The plans
-/// come back in player order whatever the worker count; the first error by player index wins.
+/// Resolve every player's instance against their world. The plans come back in player order;
+/// the first error by player index wins.
 ///
 /// # Errors
 /// [`FillError::Instance`] naming the player.
-pub fn plans(players: &[(&World, &Instance)], workers: usize) -> Result<Vec<Plan>, FillError> {
+pub fn plans(players: &[(&World, &Instance)]) -> Result<Vec<Plan>, FillError> {
     too_many(players.len())?;
-    map_ordered(players, workers, |(w, inst)| Plan::new(w, inst))
-        .into_iter()
+    players
+        .iter()
+        .map(|(w, inst)| Plan::new(w, inst))
         .enumerate()
         .map(|(p, r)| r.map_err(|e| prefix(p, e)))
         .collect()
 }
 
-/// Compile every player's manifest into a world, on up to `workers` threads, in player order.
+/// Compile every player's manifest into a world, in player order.
 ///
 /// # Errors
 /// The first failing player's message, by player index.
-pub fn worlds(manifests: &[&serde_json::Value], workers: usize) -> Result<Vec<World>, String> {
+pub fn worlds(manifests: &[&serde_json::Value]) -> Result<Vec<World>, String> {
     too_many(manifests.len()).map_err(|e| format!("{e:?}"))?;
-    map_ordered(manifests, workers, |m| World::load(m))
-        .into_iter()
+    manifests
+        .iter()
+        .map(|m| World::load(m))
         .enumerate()
         .map(|(p, r)| r.map_err(|e| format!("player {}: {e}", p + 1)))
         .collect()
@@ -114,19 +115,15 @@ pub struct Compiled {
 
 impl Compiled {
     /// Compile each manifest ([`worlds`]) and resolve each player's instance against it
-    /// ([`plans`]), on up to `workers` threads.
+    /// ([`plans`]).
     ///
     /// # Errors
     /// As [`worlds`] and [`plans`], or when the two lists differ in length.
-    pub fn new(
-        manifests: &[&serde_json::Value],
-        insts: &[&Instance],
-        workers: usize,
-    ) -> Result<Self, String> {
+    pub fn new(manifests: &[&serde_json::Value], insts: &[&Instance]) -> Result<Self, String> {
         if manifests.len() != insts.len() {
             return Err(format!("{} manifests, {} instances", manifests.len(), insts.len()));
         }
-        Self::resolve(worlds(manifests, workers)?, insts, workers)
+        Self::resolve(worlds(manifests)?, insts)
     }
 
     /// One compiled `world` that every player plays, each with their own instance: the world
@@ -134,24 +131,20 @@ impl Compiled {
     ///
     /// # Errors
     /// As [`plans`].
-    pub fn shared(world: World, insts: &[&Instance], workers: usize) -> Result<Self, String> {
-        Self::resolve(vec![world], insts, workers)
+    pub fn shared(world: World, insts: &[&Instance]) -> Result<Self, String> {
+        Self::resolve(vec![world], insts)
     }
 
     /// Resolve each player's instance against their world (`worlds`, already loaded: one each,
-    /// or one for all), on up to `workers` threads.
+    /// or one for all).
     ///
     /// # Errors
     /// As [`plans`].
-    pub fn resolve(
-        worlds: Vec<World>,
-        insts: &[&Instance],
-        workers: usize,
-    ) -> Result<Self, String> {
+    pub fn resolve(worlds: Vec<World>, insts: &[&Instance]) -> Result<Self, String> {
         let world = |p: usize| &worlds[p % worlds.len().max(1)];
         let pairs: Vec<(&World, &Instance)> =
             insts.iter().enumerate().map(|(p, i)| (world(p), *i)).collect();
-        let plans = plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
+        let plans = plans(&pairs).map_err(|e| format!("{e:?}"))?;
         let progression = pairs.iter().map(|(w, i)| i.progression(w)).collect();
         Ok(Compiled { worlds, plans, progression })
     }
@@ -1438,7 +1431,7 @@ mod tests {
                     .collect();
                 let manifests: Vec<_> = built.iter().map(|b| &b.0).collect();
                 let insts: Vec<_> = built.iter().map(|b| &b.1).collect();
-                let c = Compiled::new(&manifests, &insts, 1).unwrap();
+                let c = Compiled::new(&manifests, &insts).unwrap();
                 let seats = c.seats();
                 let mut r = rng(seed);
                 let mut pick = |n: usize| usize::try_from(r.below(n as u64).unwrap()).unwrap();

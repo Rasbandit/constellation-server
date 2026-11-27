@@ -36,14 +36,14 @@ fn players() -> (Value, Vec<Player>) {
     (m, vec![Player { name: "Ann".into(), instance: a }, Player { name: "Bo".into(), instance: b }])
 }
 
-fn make(rng: u64, workers: usize) -> SeedBundle {
+fn make(rng: u64) -> SeedBundle {
     let (m, p) = players();
-    generate(&m, "seed-one", &p, rng, workers).unwrap()
+    generate(&m, "seed-one", &p, rng).unwrap()
 }
 
 #[test]
 fn the_bundle_names_slots_games_spheres_and_every_item_class() {
-    let b = make(7, 1);
+    let b = make(7);
     assert_eq!((b.seed_name.as_str(), b.slots.len()), ("seed-one", 2));
     assert_eq!(b.slots[1].name, "Bo");
     assert_eq!(b.connect_names["Ann"], (0, 1));
@@ -63,7 +63,7 @@ fn the_bundle_names_slots_games_spheres_and_every_item_class() {
 
 #[test]
 fn the_v2_round_trip_is_byte_equal_on_canonical_json() {
-    let b = make(7, 1);
+    let b = make(7);
     let text = serde_json::to_string(&b).unwrap();
     let hash: [u8; 32] = bundle_hash(&text).unwrap().try_into().unwrap();
     let enc = v2::encode(&b, &hash, 1 << 24).unwrap();
@@ -77,25 +77,25 @@ fn the_v2_round_trip_is_byte_equal_on_canonical_json() {
 }
 
 #[test]
-fn the_same_seed_gives_the_same_bundle_with_any_worker_count_and_others_differ() {
+fn the_same_seed_gives_the_same_bundle_and_others_differ() {
     let canon = |b: &SeedBundle| package::canonical(serde_json::to_value(b).unwrap());
-    assert_eq!(canon(&make(7, 1)), canon(&make(7, 8)));
-    assert!((0..8).any(|r| canon(&make(r, 1)) != canon(&make(7, 1))));
+    assert_eq!(canon(&make(7)), canon(&make(7)));
+    assert!((0..8).any(|r| canon(&make(r)) != canon(&make(7))));
 }
 
 #[test]
 fn a_manifest_without_a_game_or_players_without_names_are_refused() {
     let (mut m, p) = players();
-    let e = generate(&m, "s", &p, 1, 1).map(|_| ());
+    let e = generate(&m, "s", &p, 1).map(|_| ());
     assert!(e.is_ok());
     m.as_object_mut().unwrap().remove("game");
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("game"));
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("game"));
     let (m, mut p) = players();
     p[1].name = "Ann".into();
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("repeats"));
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("repeats"));
     p[1].name = String::new();
-    assert!(generate(&m, "s", &p, 1, 1).unwrap_err().contains("name"));
-    assert!(generate(&m, "s", &[], 1, 1).is_err());
+    assert!(generate(&m, "s", &p, 1).unwrap_err().contains("name"));
+    assert!(generate(&m, "s", &[], 1).is_err());
 }
 
 /// The found record and the prepared world file of a manifest's bytes, as `job::prepare`
@@ -110,7 +110,7 @@ fn prepare(manifest: &[u8]) -> Result<(Value, Vec<u8>), String> {
 fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     use data_fill::job::{Fill, fill, fill_reported, frame};
     let (m, p) = players();
-    let direct = generate(&m, "seed-one", &p, 7, 1).unwrap();
+    let direct = generate(&m, "seed-one", &p, 7).unwrap();
     let (found, file) = prepare(m.to_string().as_bytes()).unwrap();
     let game = data_fill::prepared::seed_game(&file).unwrap().to_vec();
     let bundle = |seed: Vec<u8>| v2::decode(seed, |_| Ok(game.clone()), 1 << 24).unwrap();
@@ -118,7 +118,6 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
         seed_name: "seed-one".to_owned(),
         players: p.clone(),
         rng_seed: 7,
-        workers: 1,
         seed_max_bytes: 1 << 24,
     };
     let req = serde_json::to_value(&head).unwrap();
@@ -133,7 +132,7 @@ fn the_child_process_jobs_give_the_same_bundle_and_check_a_manifest() {
     assert!(fill(&framed(&asked)).unwrap_err().contains("bad fill request"));
     // The job says how the fill went, since the bundle cannot: what the library says.
     let on = data_fill::prepared::Prepared::open(&file).unwrap();
-    let (_, report) = data_fill::seed::generate_on(&on, "seed-one", &p, 7, 1).unwrap();
+    let (_, report) = data_fill::seed::generate_on(&on, "seed-one", &p, 7).unwrap();
     assert_eq!(fill_reported(&framed(&req)).unwrap().1, report);
 
     assert_eq!(
@@ -184,7 +183,7 @@ fn the_fill_report_flags_worlds_with_little_room_early_on() {
         let players: Vec<Player> =
             (0..n).map(|p| Player { name: format!("P{p}"), instance: inst.clone() }).collect();
         let on = Prepared::open(&build(&m).unwrap().0).unwrap();
-        generate_on(&on, "s", &players, seed, 1).unwrap().1
+        generate_on(&on, "s", &players, seed).unwrap().1
     };
     let tight = Shape { checks: 200, ..Shape::hostile(Hostile::Tight) };
     let mut repaired = 0;

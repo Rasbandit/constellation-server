@@ -77,7 +77,7 @@ fn room_report(
 ) -> Result<(Value, bool), String> {
     let insts = room::instances(list)?;
     let insts: Vec<&Instance> = insts.iter().collect();
-    let room = room::Compiled::shared(World::load(manifest)?, &insts, config::FILL_SETUP_WORKERS)?;
+    let room = room::Compiled::shared(World::load(manifest)?, &insts)?;
     let seats = room.seats();
     let flat = Flat::new(&seats)?;
     let t = Instant::now();
@@ -101,7 +101,7 @@ fn shape_of(
             let one = [v["instance"].clone()];
             let insts = room::instances(v["instances"].as_array().map_or(&one[..], Vec::as_slice))?;
             let insts: Vec<&Instance> = insts.iter().collect();
-            room::Compiled::shared(World::load(&v["manifest"])?, &insts, 1)?
+            room::Compiled::shared(World::load(&v["manifest"])?, &insts)?
         }
         (None, Some(profile)) => {
             use data_fill::synth::{Hostile, Shape};
@@ -121,7 +121,7 @@ fn shape_of(
                 x => return Err(format!("--synth: light, heavy or mixed, got {x}")),
             };
             let players = usize::try_from(num("--players", 1)?).map_err(|e| e.to_string())?;
-            data_fill::synth::mixed(&shapes, num("--room-seed", 1)?, players, 1)?
+            data_fill::synth::mixed(&shapes, num("--room-seed", 1)?, players)?
         }
         _ => return Err(USAGE.into()),
     };

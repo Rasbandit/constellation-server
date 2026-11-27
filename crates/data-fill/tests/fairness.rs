@@ -129,7 +129,7 @@ fn a_room_is_measured_against_the_same_baseline() {
         serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
     let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
     let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts).expect("room");
     let (worlds, seats) = (&c.worlds, c.seats());
     let flat = Flat::new(&seats).expect("flat");
     let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
@@ -190,7 +190,7 @@ fn the_shape_of_the_fills_seeds_is_reported_on_the_small_room() {
         serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
     let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
     let insts: Vec<&Instance> = insts.iter().collect();
-    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts, 1).expect("room");
+    let c = room::Compiled::new(&vec![&v["manifest"]; insts.len()], &insts).expect("room");
     let seats = c.seats();
     let exact = shape(&seats, 300, 20).expect("exact");
     let own = shape_report(&exact);

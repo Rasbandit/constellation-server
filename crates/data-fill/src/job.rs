@@ -26,8 +26,6 @@ pub struct Fill<P> {
     pub players: Vec<P>,
     /// The seed's random stream.
     pub rng_seed: u64,
-    /// Threads the fill may use.
-    pub workers: usize,
     /// Most bytes the seed file may take; a request without it gets the design cap.
     #[serde(default = "seed_max_bytes")]
     pub seed_max_bytes: u64,
@@ -136,7 +134,7 @@ pub fn request(head: &[u8]) -> Result<Fill<Player>, String> {
 /// # Errors
 /// As [`fill`], less what the frame, the request's text and loading the world can refuse.
 pub fn fill_on(world: &Prepared, f: &Fill<Player>) -> Result<(Vec<u8>, FillReport), String> {
-    let (mut bundle, report) = generate_on(world, &f.seed_name, &f.players, f.rng_seed, f.workers)?;
+    let (mut bundle, report) = generate_on(world, &f.seed_name, &f.players, f.rng_seed)?;
     Ok((encode_on(world, &mut bundle, f.seed_max_bytes)?, report))
 }
 

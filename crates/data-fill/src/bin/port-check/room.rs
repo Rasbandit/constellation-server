@@ -30,8 +30,7 @@ impl<'w> Room<'w> {
             .map(|p| fetch_instance(legacy, &a.out, seed, Some(p)))
             .collect::<R<Vec<_>>>()?;
         let pairs: Vec<(&World, &_)> = insts.iter().map(|i| (w, i)).collect();
-        let plans =
-            room::plans(&pairs, config::FILL_SETUP_WORKERS).map_err(|e| format!("{e:?}"))?;
+        let plans = room::plans(&pairs).map_err(|e| format!("{e:?}"))?;
         let seeds = insts
             .into_iter()
             .zip(plans)

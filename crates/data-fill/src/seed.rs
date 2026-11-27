@@ -58,8 +58,7 @@ pub fn manifest_game(manifest: &Value) -> Result<&str, String> {
 }
 
 /// Fill a room of `players`, all playing the world `manifest` describes (its `game` key names
-/// it), and assemble the seed named `seed_name`. The same `rng_seed` gives the same bundle
-/// whatever `workers` is.
+/// it), and assemble the seed named `seed_name`. The same `rng_seed` gives the same bundle.
 ///
 /// # Errors
 /// A message for a manifest the engine refuses or without a `game`, a player without a name
@@ -70,13 +69,12 @@ pub fn generate(
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
-    workers: usize,
 ) -> Result<SeedBundle, String> {
     let game = manifest_game(manifest)?;
     named(players)?;
     let w = World::load(manifest)?;
     let data = game_data(&w)?;
-    fill_on((&w, game, data), seed_name, players, rng_seed, workers).map(|x| x.0)
+    fill_on((&w, game, data), seed_name, players, rng_seed).map(|x| x.0)
 }
 
 /// How a seed's fill went, beside the bundle, which cannot say.
@@ -111,11 +109,10 @@ pub fn generate_on(
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
-    workers: usize,
 ) -> Result<(SeedBundle, FillReport), String> {
     named(players)?;
     let on = (prepared.world(), prepared.game(), prepared.data().clone());
-    fill_on(on, seed_name, players, rng_seed, workers)
+    fill_on(on, seed_name, players, rng_seed)
 }
 
 /// The bundle of a room filled on a prepared world: `placed` (one row per seat) and the
@@ -182,17 +179,16 @@ fn fill_on(
     seed_name: &str,
     players: &[Player],
     rng_seed: u64,
-    workers: usize,
 ) -> Result<(SeedBundle, FillReport), String> {
     let insts: Vec<&Instance> = players.iter().map(|p| &p.instance).collect();
     // A world that declares shuffles is staged per player first: each gets their own layout,
     // and the fill below sees ordinary worlds.
     let (room, tables) = if on.0.has_shuffles() {
-        crate::shuffle::room(&[on.0], &insts, rng_seed, workers)
+        crate::shuffle::room(&[on.0], &insts, rng_seed)
             .map_err(|e| format!("world {:?}: {e}", on.1))?
     } else {
         // The room owns its world: a copy of the loaded bytes, small beside a fill.
-        (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
+        (room::Compiled::shared(on.0.clone(), &insts)?, Vec::new())
     };
     let seats = room.seats();
     let (filled, spheres) = room::fill_room_spheres(
@@ -342,7 +338,7 @@ mod tests {
         let (m, tight) = world(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 0);
         let open = crate::Instance { excluded: Vec::new(), ..tight.clone() };
         let insts = [&tight, &open, &tight, &open];
-        let c = Compiled::shared(World::load(&m).unwrap(), &insts, 1).unwrap();
+        let c = Compiled::shared(World::load(&m).unwrap(), &insts).unwrap();
         let (flagged, lowest) = super::capacity(&c.seats(), &insts);
         assert_eq!(flagged, 2);
         assert!(lowest < 1000, "{lowest}");

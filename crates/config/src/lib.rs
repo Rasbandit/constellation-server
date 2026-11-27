@@ -232,7 +232,7 @@ pub struct Limits {
     /// With a pool, a fill needs a worker, so there must be one for every generation that may
     /// run at once: the valid settings are 0, or `gen_concurrency` and up
     /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
-    /// one core ([`GENERATION_WORKERS`] thread per fill). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// one core (a fill runs on one thread). `CONSTELLATION_FILL_POOL_WORKERS`.
     /// Each worker runs under the same caps as a fill child process, and a job past
     /// `fill_timeout_ms` ends its worker.
     pub fill_pool_workers: usize,
@@ -394,15 +394,6 @@ pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// whole job, and this much for its start and what it does between jobs (design value).
 pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
 
-/// Threads one generation asks its fill for (`workers` of the fill request): one, so a
-/// generation costs one core and many run side by side. A room's fill itself always runs on
-/// one thread.
-pub const GENERATION_WORKERS: usize = 1;
-
-/// Worker threads that compile worlds and resolve instances of a room's players in parallel
-/// before a multiworld fill (a design value; results never depend on this number).
-pub const FILL_SETUP_WORKERS: usize = 4;
-
 /// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
 /// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
 /// (a design value).
@@ -434,10 +425,6 @@ pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
 /// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
 /// (as many orders as the measurement that found the ratio used; a design value).
 pub const FILL_CAPACITY_ORDERS: u32 = 30;
-
-/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
-/// value).
-pub const FILL_MAX_WORKERS: usize = 64;
 
 /// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
 /// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a

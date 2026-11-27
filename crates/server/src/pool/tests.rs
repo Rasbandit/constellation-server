@@ -312,12 +312,11 @@ fn a_worker_is_replaced_before_its_cpu_cap_could_end_a_job_that_did_nothing_wron
     let l = Limits::DESIGN;
     assert_eq!((l.fill_cpu_secs, l.fill_timeout_ms), (120, 60_000));
     assert_eq!(config::FILL_WORKER_CPU_MARGIN_MS, 1000);
-    assert!(has_cpu_left(0, 1, &l));
-    assert!(has_cpu_left(58_999, 1, &l));
-    assert!(!has_cpu_left(59_000, 1, &l), "a second is kept in hand");
-    assert!(!has_cpu_left(0, 2, &l), "two threads for 60 s may use the whole cap");
-    assert!(!has_cpu_left(0, 1, &Limits { fill_cpu_secs: 61, ..l }));
-    assert!(!has_cpu_left(u128::MAX / 4, 1, &l));
+    assert!(has_cpu_left(0, &l));
+    assert!(has_cpu_left(58_999, &l));
+    assert!(!has_cpu_left(59_000, &l), "a second is kept in hand");
+    assert!(!has_cpu_left(0, &Limits { fill_cpu_secs: 61, ..l }));
+    assert!(!has_cpu_left(u128::MAX / 4, &l));
 }
 
 /// A worker is started as a job child is: the same program under the same caps, in job mode,

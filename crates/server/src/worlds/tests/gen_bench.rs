@@ -165,7 +165,7 @@ async fn split(exe: &Path, room: &Room) -> Value {
 
     let f = data_fill::job::request(&head).unwrap();
     let (load_ms, loaded) = timed(|| Prepared::open(&room.prepared).unwrap());
-    let fill = || generate_on(&loaded, &f.seed_name, &f.players, f.rng_seed, f.workers);
+    let fill = || generate_on(&loaded, &f.seed_name, &f.players, f.rng_seed);
     let (fill_ms, filled) = timed(|| fill().unwrap());
     let mut bundle = filled.0;
     let (encode_ms, encoded) = timed(|| encode_on(&loaded, &mut bundle, f.seed_max_bytes).unwrap());
@@ -192,7 +192,7 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
     // Another world, to have a worker up that does not hold this room's.
     let (other_key, other_file, instance) = fills::prepared(&fills::small(), 2);
     let other = fills::head(&["P0"], &instance, 1);
-    let other = Job { head: &other, threads: 1, key: &other_key, file: &other_file };
+    let other = Job { head: &other, key: &other_key, file: &other_file };
 
     let kept = pool();
     let mut jobs: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
@@ -206,7 +206,7 @@ async fn room(exe: &Path, profile: &str, shape: &Shape, players: usize) -> Value
         let input = data_fill::job::frame(&head, file).unwrap();
         // A seed the fill refuses (a synthetic world can be stuck) would end every worker.
         let (own_ms, Ok(seed)) = child(exe, "fill", &input).await else { continue };
-        let job = Job { head: &head, threads: fill_threads(), key, file };
+        let job = Job { head: &head, key, file };
         if done == 0 {
             assert_eq!(fills::alone(&head, file).unwrap(), seed);
             kept.fill(job).await.unwrap();
@@ -283,7 +283,7 @@ async fn memory(exe: &Path, profile: &str, shape: &Shape) -> Value {
     while worlds * held <= full + full / 10 && worlds < most {
         manifest["game"] = json!(format!("Synth {worlds}"));
         let file = prepare(&manifest);
-        let job = Job { head: &head, threads: 1, key: &log::blob_key(&file), file: &file };
+        let job = Job { head: &head, key: &log::blob_key(&file), file: &file };
         pool.fill(job).await.unwrap();
         let pids = pool.idle_pids();
         if worlds == 0 {

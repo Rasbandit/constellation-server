@@ -33,7 +33,7 @@ fn pool(bin: &Path, limits: Limits) -> Pool {
 }
 
 fn job<'a>(head: &'a [u8], key: &'a BlobKey, file: &'a [u8]) -> Job<'a> {
-    Job { head, threads: config::GENERATION_WORKERS, key, file }
+    Job { head, key, file }
 }
 
 /// What a `fill` job in a process of its own answers: the path the pool stands in for.

@@ -11,7 +11,6 @@ pub mod fill;
 mod fold;
 pub mod job;
 mod live;
-pub mod par;
 pub mod parity_rng;
 pub mod prepared;
 pub mod reach;

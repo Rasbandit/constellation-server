@@ -298,7 +298,7 @@ fn a_world_that_can_never_pass_the_check_errors_at_the_cap() {
     assert!(e.contains(&cap) && e.contains("entrances") && e.contains("region \"a\""), "{e}");
     // Through the seed path the error also names the player and the world.
     let p = [Player { name: "Ann".into(), instance: inst }];
-    let e = generate(&m, "s", &p, 1, 1).unwrap_err();
+    let e = generate(&m, "s", &p, 1).unwrap_err();
     assert!(e.contains("player 1") && e.contains("Doors") && e.contains("entrances"), "{e}");
 }
 
@@ -466,7 +466,7 @@ fn a_world_without_shuffles_is_not_staged_and_its_seed_says_nothing_new() {
     assert!(stage(&w, &inst, 1, 0).unwrap().is_none());
     assert!(order(&w).is_empty());
     let p = [Player { name: "Ann".into(), instance: inst }];
-    let b = generate(&m, "s", &p, 1, 1).unwrap();
+    let b = generate(&m, "s", &p, 1).unwrap();
     assert_eq!(b.slots[0].slot_data, json!({}));
 }
 
@@ -480,7 +480,7 @@ fn filled_seeds_are_beatable_on_a_shuffled_layout_and_record_it() {
     for seed in 1..=150 {
         for players in [&p[..1], &p[..]] {
             // `generate` refuses a seed a player cannot finish.
-            let b = generate(&m, "s", players, seed, 1).unwrap();
+            let b = generate(&m, "s", players, seed).unwrap();
             for (k, slot) in b.slots.iter().enumerate() {
                 assert!(slot.locations.iter().all(|l| l.sphere.is_some()), "seed {seed}");
                 let want = stage(&w, &inst, seed, k as u32).unwrap().unwrap().table;
@@ -497,16 +497,10 @@ fn a_prepared_world_carries_its_shuffles_through_the_child_jobs() {
     use data_fill::job::{Fill, fill, frame, prepare, unframe};
     let (m, inst) = doors();
     let p = vec![Player { name: "Ann".into(), instance: inst.clone() }];
-    let direct = generate(&m, "s", &p, 9, 1).unwrap();
+    let direct = generate(&m, "s", &p, 9).unwrap();
     let out = prepare(m.to_string().as_bytes()).unwrap();
     let (_, file) = unframe(&out).unwrap();
-    let head = Fill {
-        seed_name: "s".to_owned(),
-        players: p,
-        rng_seed: 9,
-        workers: 1,
-        seed_max_bytes: 1 << 24,
-    };
+    let head = Fill { seed_name: "s".to_owned(), players: p, rng_seed: 9, seed_max_bytes: 1 << 24 };
     let seed = fill(&frame(&serde_json::to_vec(&head).unwrap(), file).unwrap()).unwrap();
     let game = data_fill::prepared::seed_game(file).unwrap().to_vec();
     let back = seed_bundle::v2::decode(seed, |_| Ok(game.clone()), 1 << 24).unwrap();
@@ -737,7 +731,7 @@ fn synthetic_worlds_with_shuffled_doors_all_fill_beatable() {
             let p: Vec<Player> = (0..players)
                 .map(|k| Player { name: format!("P{k}"), instance: inst.clone() })
                 .collect();
-            let b = generate(&m, "s", &p, seed, 1).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let b = generate(&m, "s", &p, seed).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             let w = World::load(&m).unwrap();
             let vanilla = graph(&m, &w);
             for (k, slot) in b.slots.iter().enumerate() {
@@ -772,7 +766,7 @@ fn a_synthetic_none_shuffle_fills_beatable_and_a_time_context_refuses_a_layout_s
         let (mut m, inst) = synth_world(&shape, seed, 0);
         m["game"] = json!("Synth");
         let p = [Player { name: "P".into(), instance: inst }];
-        let b = generate(&m, "s", &p, seed, 1).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let b = generate(&m, "s", &p, seed).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(b.slots[0].slot_data["shuffles"]["guards"].as_object().unwrap().len(), 8);
     }
     // More than one time slice, or clocks: an exit shuffle is refused until exits that narrow
@@ -876,7 +870,7 @@ fn a_shuffled_room_fills_the_same_by_a_solve_per_round() {
         for players in [1usize, 10] {
             let insts = vec![inst; players];
             for seed in 1..=30 {
-                let (c, tables) = room(&[&w], &insts, seed, 1).unwrap();
+                let (c, tables) = room(&[&w], &insts, seed).unwrap();
                 let fresh = fill(&c, seed, true);
                 assert_eq!(fresh, fill(&c, seed, false), "{players} players, seed {seed}");
                 rooms += 1;
@@ -889,8 +883,8 @@ fn a_shuffled_room_fills_the_same_by_a_solve_per_round() {
     let (m, inst) = synth_world(&Shape { checks: 60, layers: 3, ..Shape::default() }, 5, 0);
     let w = World::load(&m).unwrap();
     let insts = vec![&inst; 10];
-    let direct = Compiled::shared(w.clone(), &insts, 1).unwrap();
-    let (staged, tables) = room(&[&w], &insts, 9, 1).unwrap();
+    let direct = Compiled::shared(w.clone(), &insts).unwrap();
+    let (staged, tables) = room(&[&w], &insts, 9).unwrap();
     assert!(tables.iter().all(|t| t.is_empty()));
     for fresh in [false, true] {
         assert_eq!(fill(&direct, 9, fresh), fill(&staged, 9, fresh), "fresh {fresh}");
@@ -994,8 +988,8 @@ fn a_room_stages_the_same_on_one_thread_and_on_several() {
     let (m, inst) = doors();
     let w = World::load(&m).unwrap();
     let insts = vec![&inst; 9];
-    let (one, tables) = room(&[&w], &insts, 5, 1).unwrap();
-    let (many, same) = room(&[&w], &insts, 5, 4).unwrap();
+    let (one, tables) = room(&[&w], &insts, 5).unwrap();
+    let (many, same) = room(&[&w], &insts, 5).unwrap();
     assert_eq!(tables, same);
     let exits = |c: &data_fill::room::Compiled| {
         c.worlds.iter().map(|w| decode::manifest(w)["regions"].clone()).collect::<Vec<_>>()

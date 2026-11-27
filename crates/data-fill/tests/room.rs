@@ -20,10 +20,10 @@ fn load() -> (Value, Vec<Instance>) {
 }
 
 /// Compiled worlds, plans and progression flags for `n` players (the fixture's three, repeated).
-fn players(n: usize, workers: usize) -> Compiled {
+fn players(n: usize) -> Compiled {
     let (m, insts) = load();
     let insts: Vec<&Instance> = (0..n).map(|p| &insts[p % insts.len()]).collect();
-    Compiled::new(&vec![&m; n], &insts, workers).unwrap()
+    Compiled::new(&vec![&m; n], &insts).unwrap()
 }
 
 fn rng(seed: u64) -> SpecRng {
@@ -88,7 +88,7 @@ const CHAIN: &[(u16, &str, u16, &str)] = &[
 
 #[test]
 fn an_item_in_another_world_opens_the_door_for_a_third_player() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
     let (beatable, reached) = validate_room(&seats, &placed).unwrap();
@@ -128,7 +128,7 @@ fn an_item_in_another_world_opens_the_door_for_a_third_player() {
 
 #[test]
 fn an_item_behind_its_own_door_strands_only_its_owner() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     // Player 1's key moves into player 1's vault (behind the door it opens) and the lamp that
     // was there goes to player 3's first room: player 1 is stuck, the others do not need it.
@@ -142,7 +142,7 @@ fn an_item_behind_its_own_door_strands_only_its_owner() {
 
 #[test]
 fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     // crossed[a][b]: a progression item of player a seen in player b's world.
     let mut crossed = [[false; 3]; 3];
@@ -192,7 +192,7 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
 
 #[test]
 fn the_same_seed_gives_the_same_bytes_and_other_seeds_differ() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     let run = |seed| {
         let f = room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
@@ -202,27 +202,6 @@ fn the_same_seed_gives_the_same_bytes_and_other_seeds_differ() {
     assert_ne!(run(7), run(8));
 }
 
-#[test]
-fn the_result_is_the_same_with_one_worker_and_with_many() {
-    // Seven players, so every worker count splits them differently.
-    let outputs: Vec<Vec<String>> = [1usize, 2, 3, 7, 16]
-        .iter()
-        .map(|workers| {
-            let r = players(7, *workers);
-            let seats = r.seats();
-            (1u64..=5)
-                .map(|seed| {
-                    let f =
-                        room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
-                    assert!(f.all_beatable());
-                    lines(&seats, &f.placed)
-                })
-                .collect()
-        })
-        .collect();
-    assert!(outputs.windows(2).all(|p| p[0] == p[1]));
-}
-
 /// The fixture world filled, against its cross-check (`room::fill_room_fresh`, a fresh solve
 /// of every group's state): placements, spheres, attempts and rounds are the same, or the
 /// error is; and a fill that worked solved the room once, never once per round.
@@ -230,7 +209,7 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
 fn the_fixture_fills_what_a_solve_per_round_fills() {
     let mut filled = 0;
     for n in [1usize, 2, 3, 7, 8, 9, 12] {
-        let r = players(n, 1);
+        let r = players(n);
         let seats = r.seats();
         for seed in 1u64..=12 {
             let shown = |x: Result<(room::RoomFilled, _), data_fill::FillError>| match x {
@@ -256,7 +235,7 @@ fn the_fixture_fills_what_a_solve_per_round_fills() {
 
 #[test]
 fn a_room_needs_players_and_matching_counts() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     let e = room::fill_room(&[], &mut rng(1), 1).unwrap_err();
     assert!(matches!(e, data_fill::FillError::Instance(_)), "{e:?}");
@@ -277,13 +256,9 @@ fn an_unknown_key_names_the_player() {
     insts[1].pool.push("nope".to_owned());
     let w = World::load(&m).unwrap();
     let pairs = [(&w, &insts[0]), (&w, &insts[1]), (&w, &insts[2])];
-    for workers in [1, 3] {
-        match room::plans(&pairs, workers) {
-            Err(data_fill::FillError::Instance(msg)) => {
-                assert!(msg.starts_with("player 2:"), "{msg}")
-            }
-            other => panic!("{other:?}"),
-        }
+    match room::plans(&pairs) {
+        Err(data_fill::FillError::Instance(msg)) => assert!(msg.starts_with("player 2:"), "{msg}"),
+        other => panic!("{other:?}"),
     }
 }
 
@@ -299,7 +274,7 @@ fn shared_data_is_send_and_sync_and_a_state_can_move_to_a_task() {
 
 #[test]
 fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     let placed = hand(&seats, CHAIN);
     let sp = room_spheres(&seats, &placed).unwrap();
@@ -329,7 +304,7 @@ fn the_seed_output_names_a_slot_and_a_receiver_per_placement() {
 
 #[test]
 fn placements_that_do_not_fit_the_room_are_refused_not_indexed() {
-    let r = players(3, 1);
+    let r = players(3);
     let seats = r.seats();
     let good = hand(&seats, CHAIN);
     let bad = |placed: &[Vec<Option<Given>>]| {
@@ -367,21 +342,14 @@ fn placements_that_do_not_fit_the_room_are_refused_not_indexed() {
 }
 
 #[test]
-fn a_room_is_capped_in_players_and_setup_in_threads() {
+fn a_room_is_capped_in_players() {
     let (m, insts) = load();
     let n = config::ROOM_MAX_PLAYERS + 1;
     let manifests: Vec<&Value> = vec![&m; n];
-    assert!(room::worlds(&manifests, 1).is_err());
+    assert!(room::worlds(&manifests).is_err());
     let w = World::load(&m).unwrap();
     let pairs: Vec<(&World, &Instance)> = vec![(&w, &insts[0]); n];
-    assert!(matches!(room::plans(&pairs, 1), Err(data_fill::FillError::Instance(_))));
+    assert!(matches!(room::plans(&pairs), Err(data_fill::FillError::Instance(_))));
     assert!(room::instances(&vec![Value::Null; n]).is_err());
-    assert!(room::plans(&[], 1).is_err());
-    // However many workers are asked for, no more threads than the limit run.
-    let ids = std::sync::Mutex::new(std::collections::HashSet::new());
-    let items = vec![0u8; 4 * config::FILL_MAX_WORKERS];
-    data_fill::par::map_ordered(&items, usize::MAX, |_| {
-        ids.lock().unwrap().insert(std::thread::current().id());
-    });
-    assert!(ids.lock().unwrap().len() <= config::FILL_MAX_WORKERS);
+    assert!(room::plans(&[]).is_err());
 }

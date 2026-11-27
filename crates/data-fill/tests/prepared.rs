@@ -28,7 +28,7 @@ fn room(n: usize) -> (Value, Vec<Player>) {
 
 /// The seed file and package files the manifest path stores: `generate`, then the v1 import.
 fn by_manifest(manifest: &Value, players: &[Player], rng: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let bundle = generate(manifest, &format!("s{rng}"), players, rng, 1).unwrap();
+    let bundle = generate(manifest, &format!("s{rng}"), players, rng).unwrap();
     let text = serde_json::to_vec(&bundle).unwrap();
     let (seed, packages) = seed_bundle::import_v1(&text, MAX).unwrap();
     (seed.bytes().to_vec(), packages)
@@ -42,24 +42,23 @@ fn prepared(manifest: &Value) -> (Value, Vec<u8>) {
 }
 
 /// The fill request of `players` on a prepared world, as the server sends it.
-fn asked(players: &[Player], rng: u64, workers: usize) -> Fill<Player> {
+fn asked(players: &[Player], rng: u64) -> Fill<Player> {
     Fill {
         seed_name: format!("s{rng}"),
         players: players.to_vec(),
         rng_seed: rng,
-        workers,
         seed_max_bytes: MAX,
     }
 }
 
-fn request(file: &[u8], players: &[Player], rng: u64, workers: usize) -> Vec<u8> {
-    asked(players, rng, workers).framed(file).unwrap()
+fn request(file: &[u8], players: &[Player], rng: u64) -> Vec<u8> {
+    asked(players, rng).framed(file).unwrap()
 }
 
 /// The seed file and package files the prepared path stores: the fill's output as it is (a
 /// v2 seed file), and the game's package the world was prepared with.
 fn by_prepared(file: &[u8], players: &[Player], rng: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let seed = job::fill(&request(file, players, rng, 1)).unwrap();
+    let seed = job::fill(&request(file, players, rng)).unwrap();
     (seed, vec![prepared::seed_game(file).unwrap().to_vec()])
 }
 
@@ -117,16 +116,16 @@ fn a_fill_on_a_world_loaded_once_stores_the_bytes_of_a_fill_that_loads_it() {
         let (m, p) = room(n);
         let (_, file) = prepared(&m);
         let loaded = Prepared::open(&file).unwrap();
-        let on = |rng| job::fill_on(&loaded, &asked(&p, rng, 1)).unwrap();
+        let on = |rng| job::fill_on(&loaded, &asked(&p, rng)).unwrap();
         for rng in 1..=20 {
             let (seed, report) = on(rng);
-            let alone = job::fill_reported(&request(&file, &p, rng, 1)).unwrap();
+            let alone = job::fill_reported(&request(&file, &p, rng)).unwrap();
             assert_eq!((&seed, format!("{report:?}")), (&alone.0, format!("{:?}", alone.1)));
             all.extend(seed);
             all.extend(prepared::seed_game(&file).unwrap());
         }
         // An earlier seed again, after nineteen others on the same loaded world.
-        assert_eq!(on(1).0, job::fill(&request(&file, &p, 1, 1)).unwrap());
+        assert_eq!(on(1).0, job::fill(&request(&file, &p, 1)).unwrap());
         assert!(job::request(b"{").unwrap_err().contains("bad fill request"));
     }
     assert_eq!(hex(&key_of(&all)), PINNED);
@@ -144,20 +143,20 @@ fn fills_leave_a_loaded_world_exactly_as_it_was_loaded() {
     let mut filled = 0;
     for players in [&ten[..1], &ten[..]] {
         for rng in 1..=9 {
-            filled += usize::from(job::fill_on(&loaded, &asked(players, rng, 1)).is_ok());
+            filled += usize::from(job::fill_on(&loaded, &asked(players, rng)).is_ok());
         }
     }
     assert!(filled >= 15, "only {filled} of 18 fills ran to the end");
     // Refused before the fill (a name twice) and inside it (an item the world lacks).
     let twice = [ten[0].clone(), ten[0].clone()];
-    assert!(job::fill_on(&loaded, &asked(&twice, 1, 1)).is_err());
+    assert!(job::fill_on(&loaded, &asked(&twice, 1)).is_err());
     let mut lacking = ten[0].clone();
     lacking.instance.pool.push("no such item".to_owned());
-    assert!(job::fill_on(&loaded, &asked(&[lacking], 1, 1)).is_err());
+    assert!(job::fill_on(&loaded, &asked(&[lacking], 1)).is_err());
     assert!(format!("{loaded:?}") == before, "a fill changed the loaded world");
     // And it still fills as a world loaded now does.
-    let again = job::fill_on(&loaded, &asked(&ten, 2, 1)).unwrap().0;
-    assert_eq!(again, job::fill(&request(&file, &ten, 2, 1)).unwrap());
+    let again = job::fill_on(&loaded, &asked(&ten, 2)).unwrap().0;
+    assert_eq!(again, job::fill(&request(&file, &ten, 2)).unwrap());
 }
 
 #[test]
@@ -171,15 +170,12 @@ fn preparing_checks_a_manifest_and_the_file_opens_as_its_world() {
     assert_eq!((world.game(), world.world().locations()), ("Synth", 200));
     // The same manifest prepares to the same bytes: the stored form is found by content.
     assert_eq!(prepared(&m).1, file);
-    // More workers when the request asks: the same seed.
-    let four = job::fill(&request(&file, &p, 3, 4)).unwrap();
-    assert_eq!(four, job::fill(&request(&file, &p, 3, 1)).unwrap());
     // What prepare refuses is what inspect refuses, and a cut file is refused, not filled.
     let mut bad = m.clone();
     bad.as_object_mut().unwrap().remove("version");
     assert!(job::prepare(bad.to_string().as_bytes()).unwrap_err().contains("version"));
     assert!(job::prepare(b"{").unwrap_err().contains("JSON"));
-    assert!(job::fill(&request(&file[..file.len() / 2], &p, 1, 1)).is_err());
+    assert!(job::fill(&request(&file[..file.len() / 2], &p, 1)).is_err());
     assert!(job::fill(b"\x02").is_err());
     assert!(job::run("nope", b"").unwrap_err().contains("unknown job"));
 }
@@ -192,7 +188,7 @@ fn the_prepared_world_holds_the_tables_every_seed_of_it_shares() {
     let (m, p) = room(1);
     let (_, file) = prepared(&m);
     let world = Prepared::open(&file).unwrap();
-    let bundle = generate(&m, "s1", &p, 1, 1).unwrap();
+    let bundle = generate(&m, "s1", &p, 1).unwrap();
     assert_eq!(world.data(), &bundle.games["Synth"]);
     let (_, packages) = by_manifest(&m, &p, 1);
     assert_eq!(packages, [prepared::seed_game(&file).unwrap().to_vec()]);
@@ -207,16 +203,16 @@ fn the_prepared_world_holds_the_tables_every_seed_of_it_shares() {
 fn the_fill_prints_a_seed_file_with_the_hash_of_its_bundle() {
     let (m, p) = room(2);
     let (_, file) = prepared(&m);
-    let seed = job::fill(&request(&file, &p, 5, 1)).unwrap();
+    let seed = job::fill(&request(&file, &p, 5)).unwrap();
     assert!(seed_bundle::v2::is_v2(&seed));
-    let bundle = generate(&m, "s5", &p, 5, 1).unwrap();
+    let bundle = generate(&m, "s5", &p, 5).unwrap();
     let text = serde_json::to_string(&bundle).unwrap();
     let hash = seed_bundle::bundle_hash(&text).unwrap();
     assert_eq!(seed_bundle::v2::bundle_hash_of(&seed).unwrap().to_vec(), hash);
     let game = prepared::seed_game(&file).unwrap().to_vec();
     let back = seed_bundle::v2::decode(seed, |_| Ok(game.clone()), MAX).unwrap();
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&bundle).unwrap());
-    let framed = request(&file, &p, 5, 1);
+    let framed = request(&file, &p, 5);
     let (head, world) = job::unframe(&framed).unwrap();
     let mut head: Value = serde_json::from_slice(head).unwrap();
     head["seed_max_bytes"] = json!(64);
@@ -227,7 +223,7 @@ fn the_fill_prints_a_seed_file_with_the_hash_of_its_bundle() {
     let misspelt = job::frame(head.to_string().as_bytes(), world).unwrap();
     assert!(job::fill(&misspelt).unwrap_err().contains("bad fill request"));
     // A world that does not load says so in the words the server looks for.
-    let junk = asked(&p, 5, 1).framed(b"not a prepared world").unwrap();
+    let junk = asked(&p, 5).framed(b"not a prepared world").unwrap();
     assert!(job::fill(&junk).unwrap_err().starts_with(job::UNLOADABLE));
 }
 
@@ -288,12 +284,12 @@ fn the_prepared_path_matches_on_start_items_excluded_and_locked_locations() {
         let (_, file) = prepared(&m);
         let game = prepared::seed_game(&file).unwrap().to_vec();
         for rng in 1..=9 {
-            let old = generate(&m, &format!("s{rng}"), &p, rng, 1).map(|b| {
+            let old = generate(&m, &format!("s{rng}"), &p, rng).map(|b| {
                 let text = serde_json::to_vec(&b).unwrap();
                 let (seed, packages) = seed_bundle::import_v1(&text, MAX).unwrap();
                 (seed.bytes().to_vec(), packages)
             });
-            let new = job::fill(&asked(&p, rng, 1).framed(&file).unwrap())
+            let new = job::fill(&asked(&p, rng).framed(&file).unwrap())
                 .map(|seed| (seed, vec![game.clone()]));
             assert_eq!(new, old, "{what}, seed {rng}");
             made += usize::from(old.is_ok());
@@ -321,7 +317,7 @@ fn the_encoded_seed_is_the_import_of_its_json_at_1_10_and_100_players() {
             let (m, p) = varied_of(shape, what, n);
             let (_, file) = prepared(&m);
             let on = Prepared::open(&file).unwrap();
-            let (mut bundle, _) = generate_on(&on, "s", &p, 1, 1).expect("the room fills");
+            let (mut bundle, _) = generate_on(&on, "s", &p, 1).expect("the room fills");
             assert_eq!(m["shuffles"].is_object(), what == "shuffled");
             let text = serde_json::to_string(&bundle).unwrap();
             let (old, packages) = seed_bundle::import_v1(text.as_bytes(), MAX).unwrap();

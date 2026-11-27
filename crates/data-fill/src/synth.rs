@@ -500,12 +500,12 @@ pub fn world(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
 }
 
 /// A room of `players` synthetic worlds (player `p` drawn as [`world`]`(shape, seed, p)`),
-/// compiled and resolved on up to `workers` threads.
+/// compiled and resolved.
 ///
 /// # Errors
 /// As [`Compiled::new`].
-pub fn room(shape: &Shape, seed: u64, players: usize, workers: usize) -> Result<Compiled, String> {
-    mixed(std::slice::from_ref(shape), seed, players, workers)
+pub fn room(shape: &Shape, seed: u64, players: usize) -> Result<Compiled, String> {
+    mixed(std::slice::from_ref(shape), seed, players)
 }
 
 /// A room of `players` synthetic worlds of `shapes` in turn: player `p` drawn as
@@ -514,17 +514,12 @@ pub fn room(shape: &Shape, seed: u64, players: usize, workers: usize) -> Result<
 ///
 /// # Errors
 /// As [`Compiled::new`].
-pub fn mixed(
-    shapes: &[Shape],
-    seed: u64,
-    players: usize,
-    workers: usize,
-) -> Result<Compiled, String> {
+pub fn mixed(shapes: &[Shape], seed: u64, players: usize) -> Result<Compiled, String> {
     let built: Vec<(Value, Instance)> =
         (0..players).map(|p| world(&shapes[p % shapes.len()], seed, p as u64)).collect();
     let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
     let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
-    Compiled::new(&manifests, &insts, workers)
+    Compiled::new(&manifests, &insts)
 }
 
 #[cfg(test)]
@@ -586,7 +581,7 @@ mod tests {
             .collect();
         let manifests: Vec<&Value> = built.iter().map(|b| &b.0).collect();
         let insts: Vec<&Instance> = built.iter().map(|b| &b.1).collect();
-        Compiled::new(&manifests, &insts, 1)
+        Compiled::new(&manifests, &insts)
     }
 
     /// Confine `p0` to the group `home`: the locations `l` with `l % every < most`.
@@ -647,7 +642,7 @@ mod tests {
     /// commit that says so.
     #[test]
     fn the_repaired_rounds_of_a_room_of_chains_are_pinned() {
-        let c = room(&Shape::hostile(Hostile::Chain), 1, 22, 1).unwrap();
+        let c = room(&Shape::hostile(Hostile::Chain), 1, 22).unwrap();
         for fresh in [false, true] {
             let f = once(&c, 1, fresh).unwrap();
             let counts = (f.attempts, f.rounds, f.divided, f.swaps);
@@ -776,7 +771,7 @@ mod tests {
             c.plans = c.plans.into_iter().map(crate::Plan::interpreted).collect();
             let (m, inst) = world(&shape, 23, 0);
             let one = vec![&inst; 9];
-            let shared = Compiled::shared(World::load(&m).unwrap(), &one, 1).unwrap();
+            let shared = Compiled::shared(World::load(&m).unwrap(), &one).unwrap();
             for seed in 1..=4 {
                 for (room, what) in [(&c, "bytecode"), (&shared, "one world")] {
                     let (split, stats, _) = outcome(room, seed, false);
@@ -854,7 +849,7 @@ mod tests {
     #[test]
     fn rooms_of_chains_fill_in_one_pass_by_repair_where_drawn_order_was_stuck() {
         for (how, players) in [(Hostile::Chain, 22), (Hostile::Keys, 16)] {
-            let c = room(&Shape::hostile(how), 1, players, 1).unwrap();
+            let c = room(&Shape::hostile(how), 1, players).unwrap();
             let seats = c.seats();
             for seed in [1, 2] {
                 let at = format!("{how:?}, {players} players, seed {seed}");
@@ -891,7 +886,7 @@ mod tests {
     /// sound, where the rounds as they were needed another attempt.
     #[test]
     fn a_player_alone_is_repaired_in_place_instead_of_starting_over() {
-        let c = room(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 1, 1).unwrap();
+        let c = room(&Shape { checks: 200, ..Shape::hostile(Hostile::Tight) }, 23, 1).unwrap();
         let mut moved = 0;
         for seed in 1..=24 {
             let at = format!("seed {seed}");
@@ -913,7 +908,7 @@ mod tests {
     /// fills in one attempt within it, and the work counted is the same by the cross-check.
     #[test]
     fn repair_has_a_budget_of_work_and_a_stuck_attempt_goes_deepest_first() {
-        let c = room(&Shape::hostile(Hostile::Chain), 1, 22, 1).unwrap();
+        let c = room(&Shape::hostile(Hostile::Chain), 1, 22).unwrap();
         let seats = c.seats();
         let rng = || SpecRng::from_u64(1);
         let fill_room_budget =
@@ -979,7 +974,7 @@ mod tests {
         let (mut filled, mut stuck, mut divided, mut moved) = (0, 0, 0, 0);
         for (n, shapes) in rooms.enumerate() {
             for players in [1usize, 2, 5, 13] {
-                let c = mixed(shapes, 40 + n as u64, players, 1).unwrap();
+                let c = mixed(shapes, 40 + n as u64, players).unwrap();
                 let seats = c.seats();
                 let piles = seats.iter().map(|s| s.plan.progression.len()).max().unwrap();
                 for seed in 1..=6 {
@@ -1027,7 +1022,7 @@ mod tests {
             (vec![tight], 12),
             (vec![tight, chain, small(true)], 9),
         ] {
-            let c = mixed(&shapes, 23, players, 1).unwrap();
+            let c = mixed(&shapes, 23, players).unwrap();
             let piles = c.seats().iter().map(|s| s.plan.progression.len()).max().unwrap();
             for seed in 1..=8 {
                 let at = format!("{shapes:?}, {players} players, seed {seed}");
@@ -1102,7 +1097,7 @@ mod tests {
         );
         // A small room of it fills beatable, the same bytes for a seed, items crossing worlds.
         let shape = Shape { checks: 60, layers: 3, ..shape };
-        let (a, b) = (room(&shape, 7, 3, 1).unwrap(), room(&shape, 7, 3, 3).unwrap());
+        let (a, b) = (room(&shape, 7, 3).unwrap(), room(&shape, 7, 3).unwrap());
         for seed in 1..=3 {
             let x = fill(&a, seed);
             assert_eq!(x, fill(&b, seed), "seed {seed}");
@@ -1132,7 +1127,7 @@ mod tests {
         assert_eq!(sites().count(), 137);
         assert!(size / 137 >= 15, "{} nodes per rule site", size / 137);
         for players in [1, 3] {
-            let c = room(&shape, 1, players, 1).unwrap();
+            let c = room(&shape, 1, players).unwrap();
             let classes = c.plans[0].bit_rules(&c.worlds[0]).0;
             assert!(classes[2] > 15 && classes[4] > 30, "counted and bytecode rules: {classes:?}");
             let plain = Compiled {
@@ -1308,7 +1303,7 @@ mod tests {
             }
         }
         // One state, lean and whole: the same regions, counters and existing locations.
-        let c = room(&heavy, 23, 1, 1).unwrap();
+        let c = room(&heavy, 23, 1).unwrap();
         let (w, plan) = (&c.worlds[0], &c.plans[0]);
         let whole = plan.state(w, &plan.progression, &[]);
         let mut lean = crate::Reach::new(w, plan).lean();
@@ -1323,7 +1318,7 @@ mod tests {
     /// A room of one solves once and undoes what it added for its rounds.
     #[test]
     fn a_room_solves_once_and_undoes_what_it_added_for_its_rounds() {
-        let c = room(&small(false), 5, 1, 1).unwrap();
+        let c = room(&small(false), 5, 1).unwrap();
         let (f, _) =
             fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
                 .unwrap();
@@ -1338,8 +1333,8 @@ mod tests {
             let (x, y) = (world(&shape, 7, 1), world(&shape, 7, 1));
             assert_eq!((x.0, x.1.pool), (y.0, y.1.pool), "same seed, same manifest and pool");
             assert_ne!(world(&shape, 7, 1).0, world(&shape, 7, 2).0, "players differ");
-            let a = room(&shape, 7, 3, 1).unwrap();
-            let b = room(&shape, 7, 3, 3).unwrap();
+            let a = room(&shape, 7, 3).unwrap();
+            let b = room(&shape, 7, 3).unwrap();
             for seed in 1..=3 {
                 let x = fill(&a, seed);
                 assert_eq!(x, fill(&b, seed), "clocks {clocks}, seed {seed}");

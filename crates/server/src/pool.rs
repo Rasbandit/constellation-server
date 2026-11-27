@@ -294,12 +294,12 @@ async fn ask<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 }
 
 /// Whether a worker whose jobs may have used `cpu_ms` of CPU time can run one more whole job
-/// on `threads` threads inside the CPU cap of its process (`fill_cpu_secs`, counted over its
+/// (a fill runs on one thread) inside the CPU cap of its process (`fill_cpu_secs`, counted over its
 /// whole life), with `config::FILL_WORKER_CPU_MARGIN_MS` in hand for its start and what it
 /// does between jobs. A worker without that much left is replaced, so the cap only ever ends
 /// a job that overran by itself.
-fn has_cpu_left(cpu_ms: u128, threads: usize, l: &Limits) -> bool {
-    let job = u128::from(l.fill_timeout_ms) * threads.max(1) as u128;
+fn has_cpu_left(cpu_ms: u128, l: &Limits) -> bool {
+    let job = u128::from(l.fill_timeout_ms);
     let worst = cpu_ms + job + u128::from(config::FILL_WORKER_CPU_MARGIN_MS);
     worst < u128::from(l.fill_cpu_secs) * 1000
 }
@@ -318,8 +318,6 @@ pub(crate) fn status_bytes(pid: u32, field: &str) -> Option<u64> {
 pub struct Job<'a> {
     /// The fill request.
     pub head: &'a [u8],
-    /// The threads that request asks its fill for: what bounds the job's CPU time.
-    pub threads: usize,
     /// The hash of `file`: the name a worker keeps the loaded world under.
     pub key: &'a BlobKey,
     /// The prepared world's file, sent to a worker that does not hold it.
@@ -344,8 +342,8 @@ struct Worker {
     /// The end of its error output, read as it comes (so it never blocks on a full pipe).
     errors: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, u64)>>,
     jobs: usize,
-    /// Most CPU time its jobs can have used, ms: each job's wall time times its threads (an
-    /// idle worker uses none).
+    /// Most CPU time its jobs can have used, ms: each job's wall time, on one thread (an idle
+    /// worker uses none).
     cpu_ms: u128,
 }
 
@@ -361,11 +359,11 @@ impl Worker {
         Ok(Self { child, to, from, errors, jobs: 0, cpu_ms: 0 })
     }
 
-    /// Whether it is still running and may take one more job of `threads` threads.
-    fn fit(&mut self, threads: usize, l: &Limits) -> bool {
+    /// Whether it is still running and may take one more job.
+    fn fit(&mut self, l: &Limits) -> bool {
         matches!(self.child.try_wait(), Ok(None))
             && self.jobs < l.fill_worker_jobs
-            && has_cpu_left(self.cpu_ms, threads, l)
+            && has_cpu_left(self.cpu_ms, l)
     }
 
     /// Whether its address space leaves the next job enough of the cap
@@ -435,7 +433,7 @@ impl Pool {
     pub async fn fill(&self, job: Job<'_>) -> Result<Vec<u8>, Failure> {
         let closed = |_| Failure::Broken("the fill pool is closed".into());
         let _turn = self.free.acquire().await.map_err(closed)?;
-        let worker = self.take(job.threads).await?;
+        let worker = self.take().await?;
         let reused = worker.jobs > 0;
         let ended = match self.on(worker, job).await {
             Err(Ended::Worker(why)) if reused => {
@@ -460,10 +458,10 @@ impl Pool {
         let asked = ask(pipes, job.head, (job.key, job.file), l);
         let asked = tokio::time::timeout(timeout, asked).await;
         worker.jobs += 1;
-        worker.cpu_ms += started.elapsed().as_millis() * job.threads.max(1) as u128;
+        worker.cpu_ms += started.elapsed().as_millis();
         match asked {
             Ok(Ok(Ok(seed))) => {
-                if worker.fit(job.threads, l) && worker.roomy(l) {
+                if worker.fit(l) && worker.roomy(l) {
                     self.idle().push(worker);
                 } else {
                     worker.stop().await;
@@ -499,13 +497,13 @@ impl Pool {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// An idle worker fit for one more job of `threads` threads, else a new one. One that
+    /// An idle worker fit for one more job, else a new one. One that
     /// stopped while idle, or has no CPU time left for a whole job, is ended here.
-    async fn take(&self, threads: usize) -> Result<Worker, Failure> {
+    async fn take(&self) -> Result<Worker, Failure> {
         loop {
             let next = self.idle().pop();
             let Some(mut worker) = next else { return Worker::start(&self.exe, &self.limits) };
-            if worker.fit(threads, &self.limits) {
+            if worker.fit(&self.limits) {
                 return Ok(worker);
             }
             worker.stop().await;

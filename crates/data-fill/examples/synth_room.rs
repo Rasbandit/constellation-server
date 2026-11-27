@@ -1,5 +1,5 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
-//! [--workers 1] [--players 1,10,20,50,100]
+//! [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). One JSON object per player count, then one with the
@@ -11,7 +11,7 @@
 //! ([`Prepared::open`]); `bit_rules_ms` is the part of it that builds the worlds' bit rules,
 //! measured by building them once more, so `load_ms - bit_rules_ms` is the load without them.
 //! Per seed: `setup_ms` resolves every player's instance against their
-//! loaded world (on `--workers` threads; drawing the synthetic manifests is not timed), and
+//! loaded world (drawing the synthetic manifests is not timed), and
 //! `fill_ms` is the median of `reps` fills of the same seed (the work is identical, so the
 //! spread is timing noise only).
 //!
@@ -169,7 +169,7 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    (workers, one_world): (usize, bool),
+    one_world: bool,
     (bits, skip, vanilla): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
@@ -215,11 +215,11 @@ fn one(
             }
             Ok(c)
         } else if shape.doors || shape.guards {
-            data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
+            data_fill::shuffle::room(&base, &insts, seed).map(|x| x.0)
         } else {
             // Several worlds are copied side by side; one is shared as loaded.
             let own = |w: &&World| if count > 1 { w.packed() } else { (*w).clone() };
-            Compiled::resolve(base.iter().map(own).collect(), &insts, workers)
+            Compiled::resolve(base.iter().map(own).collect(), &insts)
         }
     };
     let (c, room_bytes) = kept(setup);
@@ -229,8 +229,7 @@ fn one(
         let (stage_ms, _) = median(reps, || setup().map(drop))?;
         let pairs: Vec<(&World, &Instance)> =
             (0..players).map(|p| (c.world(p), insts[p])).collect();
-        let (plans_ms, _) =
-            median(reps, || plans(&pairs, 1).map(drop).map_err(|e| format!("{e:?}")))?;
+        let (plans_ms, _) = median(reps, || plans(&pairs).map(drop).map_err(|e| format!("{e:?}")))?;
         let (mut restarts, mut steps) = (0, [0u64; data_fill::shuffle::STEPS.len()]);
         for (p, inst) in insts.iter().enumerate() {
             let player = u32::try_from(p).map_err(|e| e.to_string())?;
@@ -325,7 +324,6 @@ fn one(
                         "all_held": eval_only(&seats[0], &pool)});
     let mut out = json!({
         "players": players,
-        "workers": workers,
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks && !shape.timeless,
@@ -462,7 +460,6 @@ fn main() -> Result<(), String> {
     } else {
         vec![shape]
     };
-    let workers: usize = arg(&args, "--workers", 1)?;
     let one_world = match arg(&args, "--worlds", "each".to_owned())?.as_str() {
         "each" => false,
         "one" => true,
@@ -485,7 +482,7 @@ fn main() -> Result<(), String> {
     // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
     let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let row = one(&shapes, seed, n, reps, (workers, one_world), engine);
+        let row = one(&shapes, seed, n, reps, one_world, engine);
         let mut row = match row {
             Err(e) if failed_row => {
                 println!(
@@ -504,7 +501,7 @@ fn main() -> Result<(), String> {
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "workers": workers,
+        json!({"profile": profile,
                "rules": if engine.0 { "bits" } else { "bytecode" },
                "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },
