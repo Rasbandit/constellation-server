@@ -97,8 +97,6 @@ pub struct Plan {
     /// Per world item: its placement group, if it has one.
     item_group: Vec<Option<u32>>,
     loc_group: Vec<Option<u32>>,
-    /// Per item: copies that exist this seed (pool, locked, self-granting checks, start).
-    copies: Vec<i64>,
     /// Clock slices the start inventory alone owns (all slices when clocks do not restrict).
     /// A state starts from these, not from what an empty inventory owns: a start item that
     /// owns only a later slice must leave the first one out, as the solver does.
@@ -294,14 +292,14 @@ impl Plan {
             rest,
             item_group,
             loc_group,
-            copies: Vec::new(),
             owned_start: w.time.all,
         };
         if plan.clocks {
             // A state reads this while it is built, and the first one is this very probe.
             plan.owned_start = plan.base(w, &[]).compute_owned();
         }
-        // Every copy that can exist this seed: a state sizes its lists by it.
+        // Every copy that can exist this seed (pool, locked, self-granting checks, start) must
+        // fit a state's count.
         let mut copies = vec![0i64; w.items()];
         let placed = plan.progression.iter().chain(&plan.rest);
         let fixed = plan.locked.iter().chain(&plan.self_grants).map(|x| &x.1);
@@ -318,7 +316,6 @@ impl Plan {
         for (i, n) in &plan.start {
             add(*i, *n)?;
         }
-        plan.copies = copies;
         Ok(plan)
     }
 
@@ -429,11 +426,6 @@ impl Plan {
     pub(crate) fn without_start_fold(mut self, w: &World) -> Self {
         self.folded = fold(w, &self.opts, &self.rolls, &[]);
         self
-    }
-
-    /// Copies of `item` that exist this seed.
-    pub(crate) fn copies(&self, item: usize) -> usize {
-        self.copies.get(item).map_or(0, |n| usize::try_from(*n).unwrap_or(0))
     }
 
     /// A state holding the start items plus `extra`, where reaching a location collects what

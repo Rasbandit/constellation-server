@@ -307,8 +307,8 @@ const NONE: u32 = u32::MAX;
 /// an item that belongs to the other player.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Msg {
-    /// The location was reached at `rank`: its item is a new copy for `to`, found at that rank.
-    Give { to: u16, item: u16, rank: u32 },
+    /// The location was reached: its item is a new copy for `to`.
+    Give { to: u16, item: u16 },
 }
 /// Growths per region the state reserves room for.
 const GROWS: usize = 4;
@@ -378,10 +378,6 @@ pub struct Reach<'w> {
     grows: Vec<Vec<u64>>,
     /// Per location: rank it was reached at (the first check that held).
     loc_rank: Vec<u32>,
-    /// Per item: ranks of the copies collected, ascending.
-    copies: Vec<Vec<u32>>,
-    /// Per counter: ranks of the events that fired, ascending.
-    lit: Vec<Vec<u32>>,
     gate: Gate,
     /// Every step since [`Reach::keep_journal`], in order, for [`Reach::undo_to`].
     journal: Vec<Step>,
@@ -416,8 +412,8 @@ enum Step {
     Seen(u32),
     /// The half-day rule held and took a rank.
     Half(u32),
-    /// A copy of the item was collected at the rank.
-    Copy(u16, u32),
+    /// A copy of the item was collected.
+    Copy(u16),
     /// The location, which held nothing, was given something to hold.
     Hold(u32),
     /// The location was given another player's item to hold.
@@ -446,10 +442,6 @@ impl<'w> Reach<'w> {
             plan,
             counts: vec![0; w.items()],
             counters: vec![0; w.counters()],
-            // At most one rank per event, so these never grow.
-            lit: (0..w.counters())
-                .map(|c| Vec::with_capacity(w.sites_into(EVENTS, c).len()))
-                .collect(),
             groups: vec![0; w.groups()],
             rules: plan.rules(w),
             atoms: plan.atoms.clone(),
@@ -482,8 +474,6 @@ impl<'w> Reach<'w> {
             // reused state keeps the capacity.
             grows: (0..n).map(|_| Vec::with_capacity(GROWS)).collect(),
             loc_rank: vec![NONE; w.locations()],
-            // At most one copy per existing copy of the seed, so these never grow.
-            copies: (0..w.items()).map(|i| Vec::with_capacity(plan.copies(i))).collect(),
             gate: Gate { out: BitSet::new(sites + halves), out_list: Vec::new(), active: false },
             journal: Vec::new(),
             journaling: false,
@@ -544,8 +534,6 @@ impl<'w> Reach<'w> {
         self.half_rank.fill(NONE);
         self.grows.iter_mut().for_each(Vec::clear);
         self.loc_rank.fill(NONE);
-        self.copies.iter_mut().for_each(Vec::clear);
-        self.lit.iter_mut().for_each(Vec::clear);
         self.journal.clear();
         self.journaling = false;
         self.start();
@@ -648,7 +636,7 @@ impl<'w> Reach<'w> {
         assert!(before.is_none() || !self.journaling, "a journaled location held an item");
         self.log(Step::Hold(loc));
         if self.reached.contains(l) {
-            self.collect(item, self.loc_rank[l]);
+            self.collect(item);
         }
     }
 
@@ -672,7 +660,7 @@ impl<'w> Reach<'w> {
         self.away[l] = Some((to, item));
         self.log(Step::Away(loc));
         if self.reached.contains(l) {
-            self.outbox.push(Msg::Give { to, item, rank: self.loc_rank[l] });
+            self.outbox.push(Msg::Give { to, item });
         }
     }
 
@@ -697,9 +685,9 @@ impl<'w> Reach<'w> {
         self.regions_q.len() + self.sites_q.len()
     }
 
-    /// A copy of `item` for this player, found elsewhere at rank `rank`.
-    pub(crate) fn give(&mut self, item: u16, rank: u32) {
-        self.collect(item, rank);
+    /// A copy of `item` for this player, found elsewhere.
+    pub(crate) fn give(&mut self, item: u16) {
+        self.collect(item);
     }
 
     fn log(&mut self, step: Step) {
@@ -750,14 +738,14 @@ impl<'w> Reach<'w> {
         while self.journal.len() > mark {
             let Some(step) = self.journal.pop() else { break };
             match step {
-                Step::Copy(item, k) => self.uncollect(item, k),
+                Step::Copy(item) => self.count_change(item, -1),
                 Step::Hold(l) => self.holds[l as usize] = None,
                 Step::Away(l) => self.away[l as usize] = None,
                 Step::Seen(r) => self.seen.remove(r as usize),
                 Step::Half(h) => {
                     // The owned clocks are what the half-days that hold give (`clocks`).
                     self.half_rank[h as usize] = NONE;
-                    self.owned = self.owned_at(NONE);
+                    self.owned = self.owned();
                 }
                 Step::Grow(r) => {
                     let r = r as usize;
@@ -775,9 +763,6 @@ impl<'w> Reach<'w> {
                         EVENTS => {
                             self.counters[t] -= 1;
                             self.rules.set(&mut self.atoms, COUNTER, t, self.counters[t]);
-                            if let Ok(at) = self.lit[t].binary_search(&k) {
-                                self.lit[t].remove(at);
-                            }
                         }
                         CHECKS if self.loc_rank[t] == k => {
                             self.loc_rank[t] = NONE;
@@ -803,8 +788,7 @@ impl<'w> Reach<'w> {
             return;
         }
         for _ in 0..n {
-            let k = self.next();
-            self.collect(item, k);
+            self.collect(item);
         }
     }
 
@@ -843,14 +827,10 @@ impl<'w> Reach<'w> {
         })
     }
 
-    /// A copy of `item` collected at rank `k`; after the first run the rules reading it are
-    /// rechecked.
-    fn collect(&mut self, item: u16, k: u32) {
-        self.log(Step::Copy(item, k));
+    /// A copy of `item` collected; after the first run the rules reading it are rechecked.
+    fn collect(&mut self, item: u16) {
+        self.log(Step::Copy(item));
         self.count_change(item, 1);
-        let v = &mut self.copies[usize::from(item)];
-        let at = v.partition_point(|x| *x < k);
-        v.insert(at, k);
         if !self.ran {
             return;
         }
@@ -863,15 +843,6 @@ impl<'w> Reach<'w> {
         self.stats.collected += 1;
         self.stats.rechecks += walked;
         self.stats.max_recheck = self.stats.max_recheck.max(walked);
-    }
-
-    /// Drop the copy of `item` collected at rank `k`.
-    fn uncollect(&mut self, item: u16, k: u32) {
-        let v = &mut self.copies[usize::from(item)];
-        if let Ok(at) = v.binary_search(&k) {
-            v.remove(at);
-            self.count_change(item, -1);
-        }
     }
 
     /// Run to the fixed point.
@@ -908,12 +879,12 @@ impl<'w> Reach<'w> {
         self.epoch += 1;
     }
 
-    /// Owned clocks as of rank `k`.
-    fn owned_at(&self, k: u32) -> u64 {
+    /// Owned clocks: what the half-days that hold give.
+    fn owned(&self) -> u64 {
         if !self.plan.clocks {
             return self.w.time.all;
         }
-        let held = (0..self.half_rank.len()).filter(|h| self.half_rank[*h] < k);
+        let held = (0..self.half_rank.len()).filter(|h| self.half_rank[*h] != NONE);
         held.fold(self.owned0, |a, h| a | self.w.half(h).0)
     }
 
@@ -1121,8 +1092,6 @@ impl<'w> Reach<'w> {
                 let c = target as usize;
                 self.counters[c] += 1;
                 self.rules.set(&mut self.atoms, COUNTER, c, self.counters[c]);
-                let at = self.lit[c].partition_point(|x| *x < k);
-                self.lit[c].insert(at, k);
                 if w.def_reads_counter(c) {
                     self.epoch += 1;
                 }
@@ -1136,9 +1105,9 @@ impl<'w> Reach<'w> {
                     self.reached.insert(l);
                     self.loc_rank[l] = k;
                     if let Some(item) = self.holds[l] {
-                        self.collect(item, k);
+                        self.collect(item);
                     } else if let Some((to, item)) = self.away[l] {
-                        self.outbox.push(Msg::Give { to, item, rank: k });
+                        self.outbox.push(Msg::Give { to, item });
                     }
                 }
             }
@@ -1157,7 +1126,7 @@ impl<'w> Reach<'w> {
                 self.log(Step::Half(u32::try_from(h).unwrap_or(0)));
             }
         }
-        let owned = self.owned_at(NONE);
+        let owned = self.owned();
         if owned == self.owned {
             return;
         }
@@ -1239,8 +1208,6 @@ impl Reach<'_> {
             (self.fired != o.fired, "fired"),
             (self.half_rank != o.half_rank, "half_rank"),
             (self.loc_rank != o.loc_rank, "loc_rank"),
-            (self.copies != o.copies, "copies"),
-            (self.lit != o.lit, "lit"),
             (self.owned != o.owned, "owned"),
             (self.seq != o.seq, "seq"),
             (self.grows != o.grows, "grows"),

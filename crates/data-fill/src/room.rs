@@ -2,7 +2,7 @@
 //!
 //! Each player has one reachability state ([`Reach`]) over their own world. When an item placed
 //! in world B belongs to player A, B's state does not collect it; it sends it to the room, which
-//! gives it to A's state as a new copy found at the rank of the location that held it. A's state
+//! gives it to A's state as a new copy. A's state
 //! then goes on, and what it reaches may send items to others in turn. All states take ranks
 //! from one sequence (the room hands it from state to state).
 //!
@@ -733,9 +733,9 @@ impl<'a, 'w> Linked<'a, 'w> {
     /// Hand state `p`'s messages to their receivers.
     fn deliver(&mut self, p: usize) {
         for i in 0..self.models[p].outbox.len() {
-            let Msg::Give { to, item, rank } = self.models[p].outbox[i];
+            let Msg::Give { to, item } = self.models[p].outbox[i];
             debug_assert_ne!(usize::from(to), p, "an item for the same player is held in place");
-            self.models[usize::from(to)].give(item, rank);
+            self.models[usize::from(to)].give(item);
             self.mark(usize::from(to));
         }
         self.models[p].outbox.clear();
