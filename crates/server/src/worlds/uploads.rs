@@ -144,12 +144,12 @@ impl Worlds {
 
 /// Ids are the lowercase hex of a SHA-256: checked before any id reaches a path.
 pub(super) fn valid_id(id: &str) -> bool {
-    id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    manifests::key_of(id).is_some()
 }
 
-/// The content address of an upload.
+/// The content address of an upload: the hex of the key the store keeps it under.
 pub(super) fn content_id(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    hex(&log::blob_key(bytes))
 }
 
 /// The `name` query parameter, percent-decoded, checked to be a plain file name. It is only

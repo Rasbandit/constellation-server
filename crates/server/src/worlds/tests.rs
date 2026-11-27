@@ -748,11 +748,7 @@ async fn uploading_a_torn_manifest_again_heals_it() {
 }
 
 fn hex_key(id: &str) -> [u8; 32] {
-    let mut key = [0_u8; 32];
-    for (k, pair) in key.iter_mut().zip(id.as_bytes().chunks(2)) {
-        *k = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
-    }
-    key
+    manifests::key_of(id).unwrap()
 }
 
 #[tokio::test]
