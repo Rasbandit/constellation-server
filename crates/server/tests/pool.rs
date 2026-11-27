@@ -45,50 +45,96 @@ async fn own_process(head: &[u8], file: &[u8]) -> Result<Vec<u8>, Failure> {
 }
 
 /// A copy of the server binary under a name of this test's own, so its workers can be told
-/// from every other test's in `/proc`.
-fn own_binary(test: &str) -> PathBuf {
+/// from every other test's in `/proc`. Reads as its path; the copy is removed with it.
+struct OwnBinary {
+    dir: PathBuf,
+    bin: PathBuf,
+}
+
+impl std::ops::Deref for OwnBinary {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.bin
+    }
+}
+
+impl Drop for OwnBinary {
+    fn drop(&mut self) {
+        // A copy is the size of the server binary: none is left behind in the temp folder.
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            eprintln!("{}: not removed: {e}", self.dir.display());
+        }
+    }
+}
+
+fn own_binary(test: &str) -> OwnBinary {
     let dir = std::env::temp_dir().join(format!("pool-it-{test}-{}", std::process::id()));
     drop(std::fs::remove_dir_all(&dir));
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("server-copy");
     std::fs::copy(BIN, &bin).unwrap();
-    bin
+    OwnBinary { dir, bin }
 }
 
-/// The processes running `bin`.
+/// Whether process `pid` is a worker of `bin`, at any point of its start: `prlimit` about to
+/// run it (then `bin` is in its command line) or `bin` itself (then it is its executable).
+/// The command line alone does not say: while a process execs it reads as empty. It is read
+/// first, the executable second: the kernel names the new executable before it swaps the
+/// command line out, so a process that is past the first is already at the second.
+fn ours(pid: u32, bin: &Path) -> bool {
+    let named = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&*bin.to_string_lossy()));
+    named || std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == bin)
+}
+
+/// The processes that are workers of `bin` ([`ours`]).
 fn running(bin: &Path) -> Vec<u32> {
-    let marker = bin.display().to_string();
     std::fs::read_dir("/proc")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
-        })
+        .filter(|pid| ours(*pid, bin))
         .collect()
 }
 
-fn kill(pid: u32) {
-    let sent = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
-    assert!(sent.unwrap().success(), "kill -KILL {pid}");
+/// Whether process `pid` is stopped (state `T` in its `/proc` stat).
+fn stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|stat| stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('T')))
 }
 
-/// Give other tasks the thread until `done` holds: a signal the test waits on, never a sleep.
-async fn until(what: &str, mut done: impl FnMut() -> bool) {
+fn signal(pid: u32, which: &str) {
+    let sent = std::process::Command::new("kill").args([which, &pid.to_string()]).status();
+    assert!(sent.unwrap().success(), "kill {which} {pid}");
+}
+
+fn kill(pid: u32) {
+    signal(pid, "-KILL");
+}
+
+/// Stop process `pid` where it is, and wait until it is stopped: whatever it is given after
+/// this it cannot finish, so a job on it is in flight for as long as the test needs.
+async fn freeze(pid: u32) {
+    signal(pid, "-STOP");
+    until("the worker is stopped", || stopped(pid)).await;
+}
+
+/// Give other tasks the thread until `found` gives something: a signal the test waits on,
+/// never a sleep. What it gives is what the test goes on with, from that one look.
+async fn until_some<T>(what: &str, mut found: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !done() {
+    loop {
+        if let Some(it) = found() {
+            return it;
+        }
         assert!(Instant::now() < deadline, "never: {what}");
         tokio::task::yield_now().await;
     }
 }
 
-/// A job that runs long enough to be caught in the middle: ten players on a heavy world.
-fn long_job() -> (BlobKey, Vec<u8>, Vec<u8>) {
-    let (key, file, instance) = prepared(&Shape::heavy(), 3);
-    let ten: Vec<String> = (0..10).map(|p| format!("P{p}")).collect();
-    let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
-    (key, file, head(&ten, &instance, 1, Algorithm::Exact))
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    until_some(what, || done().then_some(())).await;
 }
 
 /// Byte identity through real processes: on two worlds, for one and ten players, the three
@@ -153,7 +199,9 @@ async fn a_refusal_is_worded_as_a_job_in_its_own_process_words_it() {
 
 /// A job never fails for what its worker went through before it: a worker that has taken a
 /// job and is killed in the middle of the next one costs that job nothing but time. It runs
-/// again on a new worker and gives the right bytes, as does the job waiting behind it.
+/// again on a new worker and gives the right bytes, as does the job waiting behind it. In the
+/// middle by construction: the worker is stopped before the job is asked, so it holds the job
+/// and cannot answer it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_whose_reused_worker_is_killed_runs_again_on_a_new_one() {
     let bin = own_binary("killed-reused");
@@ -163,19 +211,21 @@ async fn a_job_whose_reused_worker_is_killed_runs_again_on_a_new_one() {
     assert!(pool.fill(job(&quick, &key, &file)).await.is_ok());
     let first = pool.idle_pids();
     assert_eq!(first.len(), 1);
+    freeze(first[0]).await;
 
-    let (long_key, long_file, long) = long_job();
-    let want = alone(&long, &long_file).unwrap();
+    let other = head(&["Bo"], &instance, 2, Algorithm::Exact);
+    let want = alone(&other, &file).unwrap();
     let caught = {
-        let pool = Arc::clone(&pool);
-        tokio::spawn(async move { pool.fill(job(&long, &long_key, &long_file)).await })
+        let (pool, file) = (Arc::clone(&pool), file.clone());
+        tokio::spawn(async move { pool.fill(job(&other, &key, &file)).await })
     };
-    until("the long job takes the worker", || pool.idle_pids().is_empty()).await;
+    until("the job takes the worker", || pool.idle_pids().is_empty()).await;
     // Behind it in line, for the one worker.
     let waiting = {
         let (pool, quick, file) = (Arc::clone(&pool), quick.clone(), file.clone());
         tokio::spawn(async move { pool.fill(job(&quick, &key, &file)).await })
     };
+    assert!(!caught.is_finished(), "a stopped worker answers nothing");
     kill(first[0]);
     assert_eq!(caught.await.unwrap(), Ok(want));
     assert_eq!(waiting.await.unwrap(), Ok(alone(&quick, &file).unwrap()));
@@ -185,25 +235,34 @@ async fn a_job_whose_reused_worker_is_killed_runs_again_on_a_new_one() {
 }
 
 /// A job that fails on a worker that is new for it fails for real, alone, and says so: a
-/// worker killed in the middle of its first job. The next job gets a new worker.
+/// worker killed in the middle of its first job. The next job gets a new worker. In the
+/// middle by construction: the pool's program is, for that one job, a script that stops
+/// itself, so the worker the pool started for the job never answers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_whose_new_worker_is_killed_fails_alone_and_the_pool_recovers() {
     let bin = own_binary("killed-new");
+    // Written over the copy: it keeps the copy's permission to run.
+    std::fs::write(&*bin, "#!/bin/sh\nkill -STOP $$\n").unwrap();
     let pool = Arc::new(pool(&bin, ON));
-    let (long_key, long_file, long) = long_job();
+    let (key, file, instance) = prepared(&small(), 1);
+    let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
     let doomed = {
-        let pool = Arc::clone(&pool);
-        tokio::spawn(async move { pool.fill(job(&long, &long_key, &long_file)).await })
+        let (pool, quick, file) = (Arc::clone(&pool), quick.clone(), file.clone());
+        tokio::spawn(async move { pool.fill(job(&quick, &key, &file)).await })
     };
-    until("the worker starts", || !running(&bin).is_empty()).await;
-    kill(running(&bin)[0]);
+    // The worker, from the one look that shows it started and stopped.
+    let worker = until_some("the worker starts and stops itself", || {
+        running(&bin).into_iter().find(|pid| stopped(*pid))
+    })
+    .await;
+    assert!(!doomed.is_finished(), "a stopped worker answers nothing");
+    kill(worker);
     let failed = doomed.await.unwrap().unwrap_err();
     let Failure::Broken(why) = &failed else { panic!("{failed:?}") };
     assert!(why.contains("the fill worker stopped") && why.contains("signal: 9"), "{why}");
     assert!(running(&bin).is_empty(), "nothing ran it a second time");
 
-    let (key, file, instance) = prepared(&small(), 1);
-    let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
+    std::fs::copy(BIN, &*bin).unwrap();
     assert_eq!(pool.fill(job(&quick, &key, &file)).await, Ok(alone(&quick, &file).unwrap()));
 }
 
@@ -385,28 +444,67 @@ async fn jobs_past_the_pools_size_wait_for_a_free_worker() {
 
 /// A request that goes away in the middle of its fill (its future is dropped) takes its
 /// worker with it: no process is left, and no worker with half an answer in its pipe waits
-/// for the next job. A pool that is dropped takes its idle workers with it.
+/// for the next job. A pool that is dropped takes its idle workers with it. In the middle by
+/// construction: the worker is stopped before the job is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_job_and_a_dropped_pool_leave_no_process() {
     let bin = own_binary("dropped");
     let pool = Arc::new(pool(&bin, ON));
-    let (long_key, long_file, long) = long_job();
-    let gone = {
-        let pool = Arc::clone(&pool);
-        tokio::spawn(async move { pool.fill(job(&long, &long_key, &long_file)).await })
-    };
-    until("the worker starts", || !running(&bin).is_empty()).await;
-    gone.abort();
-    assert!(gone.await.unwrap_err().is_cancelled());
-    until("the dropped job's worker is gone", || running(&bin).is_empty()).await;
-    assert!(pool.idle_pids().is_empty());
-
     let (key, file, instance) = prepared(&small(), 1);
     let quick = head(&["Ann"], &instance, 1, Algorithm::Exact);
-    assert_eq!(pool.fill(job(&quick, &key, &file)).await, Ok(alone(&quick, &file).unwrap()));
-    assert_eq!(running(&bin).len(), 1, "an idle worker");
+    let want = alone(&quick, &file).unwrap();
+    assert_eq!(pool.fill(job(&quick, &key, &file)).await.as_ref(), Ok(&want));
+    let worker = pool.idle_pids()[0];
+    freeze(worker).await;
+    let gone = {
+        let (pool, quick, file) = (Arc::clone(&pool), quick.clone(), file.clone());
+        tokio::spawn(async move { pool.fill(job(&quick, &key, &file)).await })
+    };
+    until("the job takes the worker", || pool.idle_pids().is_empty()).await;
+    gone.abort();
+    assert!(gone.await.unwrap_err().is_cancelled());
+    until("the dropped job's worker is gone", || !ours(worker, &bin)).await;
+    assert!(pool.idle_pids().is_empty() && running(&bin).is_empty());
+
+    assert_eq!(pool.fill(job(&quick, &key, &file)).await, Ok(want));
+    let idle = pool.idle_pids();
+    assert_eq!(running(&bin), idle, "an idle worker");
     drop(pool);
-    until("the dropped pool's worker is gone", || running(&bin).is_empty()).await;
+    until("the dropped pool's worker is gone", || !ours(idle[0], &bin)).await;
+    assert!(running(&bin).is_empty());
+}
+
+/// The look into `/proc` these tests rest on never loses a worker that is starting: from the
+/// first sighting (`prlimit`, the copy in its arguments) to the worker running the copy, it
+/// is seen at every look. Fails with a look at the command line alone, which reads as empty
+/// while a process execs: a test that found a worker and looked again for its id found none.
+#[test]
+fn a_starting_worker_is_in_sight_at_every_look() {
+    let bin = own_binary("in-sight");
+    let is_exe =
+        |pid: u32| std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == *bin);
+    for start in 0..100 {
+        let mut worker = std::process::Command::new("/usr/bin/prlimit")
+            .args(["--as=1073741824", "--"])
+            .arg(&*bin)
+            .args(["fill-job", "worker=1048576,1048576"])
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = worker.id();
+        let mut seen = false;
+        // Until it runs the copy and is seen doing so; the worker waits on its stdin.
+        while !(seen && is_exe(pid)) {
+            let now = ours(pid, &bin);
+            assert!(now || !seen, "start {start}: worker {pid} was seen and then was not");
+            seen |= now;
+        }
+        assert!(ours(pid, &bin), "start {start}: worker {pid} runs the copy and is not seen");
+        drop(worker.stdin.take());
+        assert!(worker.wait().unwrap().success());
+    }
 }
 
 /// A worker whose server is gone (killed, so nothing told the worker) ends by itself: its
