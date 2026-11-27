@@ -83,12 +83,13 @@ jobs:
             bench --profile "$profile" --rules bytecode --absent check --players 10 --checks "$CHECKS"
           done
           # Half the gates as sums of three kinds' copies (`Shape::sums`): weighted, against the
-          # same worlds with plain-count sums, and weighted as bytecode for the gate below.
+          # same worlds with plain-count sums, and weighted as bytecode for the gate below (at 100
+          # players too, which parts the atom's own cost from the world's on the same placements).
           for sums in counts weighted; do for profile in light heavy; do
             bench --profile "$profile" --sums "$sums" --players "$PLAYERS" --checks "$CHECKS" --failed-row
           done; done
           for profile in light heavy; do
-            bench --profile "$profile" --sums weighted --rules bytecode --absent check --players 10 --checks "$CHECKS"
+            bench --profile "$profile" --sums weighted --rules bytecode --absent check --players 10,100 --checks "$CHECKS"
           done
           # Worlds built to need repair (`data_fill::synth::Hostile`): chains, keys, a room of
           # chain, light, key and heavy worlds in turn (`mixed`), and as much progression as
