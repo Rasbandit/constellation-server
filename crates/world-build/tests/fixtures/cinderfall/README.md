@@ -6,7 +6,7 @@ What it exercises:
 
 - **Modules**: an entry file, `items` and `logic` shared by every area, six overworld files and five dungeon files, each with its own `use` lines.
 - **Progressive items**: `blade x 3`, `gauntlet x 2`, `quiver x 2`, read as `has(blade, 2)` and through `can_lift(n)`.
-- **Dungeon keys confined to their dungeon**: four `placement` sets, each dungeon region marked `placement <set>`, small keys counted with `keys(k, n)`.
+- **Dungeon keys confined to their dungeon**: the keys come from one table and a family (`x d.keys`), and each dungeon file wraps its rooms in a placement block (`placement mire_keys { ... } { region ... }`); small keys are counted with `keys(k, n)`.
 - **Named conditions with parameters**: `can_lift(n)`, `keys(k, n)`, `can_fight(tier)`.
 - **Options that reshape rules**: `difficulty` through `match` (in `can_fight` and `can_see_dark`), `relics_needed` in a rule, `start_lantern` as a conditional start item, and `sunken_vault`, an optional dungeon whose rooms carry `when opt.sunken_vault`.
 - **An entrance shuffle of interiors**: eight house doors (`group outside` and `group inside`), shuffled coupled with `check layout`.

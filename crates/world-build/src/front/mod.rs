@@ -311,6 +311,8 @@ struct X {
     over: bool,
     /// Names written in files that did not parse ([`Partial::broken`]).
     broken: HashSet<String>,
+    /// The placement set whose block is being read: its regions join it.
+    set: Option<At<String>>,
 }
 
 impl X {
@@ -980,8 +982,24 @@ impl X {
                     });
                 }
             }
-            Decl::Group(n, m) => self.world.item_groups.push((n.clone(), m.clone())),
-            Decl::Placement(n, m) => self.world.placement.push((n.clone(), m.clone())),
+            Decl::Group(n, m) => {
+                let Some(n) = self.tn(n, env) else { return };
+                let Some(m) = m.iter().map(|x| self.tn(x, env)).collect() else { return };
+                no_cond(self, "an item group", n.pos);
+                self.world.item_groups.push((n, m));
+            }
+            Decl::Placement(n, m, body) => {
+                let Some(n) = self.tn(n, env) else { return };
+                let Some(m) = m.iter().map(|x| self.tn(x, env)).collect() else { return };
+                no_cond(self, "a placement set", n.pos);
+                self.world.placement.push((n.clone(), m));
+                // Every region of its block joins the set, unless it names its own.
+                let outer = self.set.replace(n);
+                for d in body {
+                    self.decl(f, d, env, cond);
+                }
+                self.set = outer;
+            }
             Decl::Region(r) => {
                 let Some(key) = self.tn(&r.name, env) else { return };
                 let when = self.opt_rule(f, r.when.as_ref(), env, cond);
@@ -991,7 +1009,7 @@ impl X {
                     exits: Vec::new(),
                     events: Vec::new(),
                     when,
-                    placement: r.placement.clone(),
+                    placement: r.placement.clone().or_else(|| self.set.clone()),
                     can_stay: r.can_stay,
                     later: Vec::new(),
                 };

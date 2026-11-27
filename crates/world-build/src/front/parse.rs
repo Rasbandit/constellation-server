@@ -180,8 +180,10 @@ pub enum Decl {
         params: Vec<At<String>>,
         rule: Expr,
     },
-    Group(At<String>, Vec<At<String>>),
-    Placement(At<String>, Vec<At<String>>),
+    Group(Tn, Vec<Tn>),
+    /// A placement set, and the declarations of its block when it has one: every region in
+    /// the block joins the set.
+    Placement(Tn, Vec<Tn>, Vec<Decl>),
     Region(RegionD),
     Table(Table),
     For(Vec<Binder>, Vec<Decl>),
@@ -436,14 +438,6 @@ impl P<'_> {
         Ok(out)
     }
 
-    /// `{ a, b }`.
-    fn name_set(&mut self, what: &str) -> R<Vec<At<String>>> {
-        self.expect(&Tok::LBrace, "`{`")?;
-        let out = self.names(what)?;
-        self.expect(&Tok::RBrace, "`}`")?;
-        Ok(out)
-    }
-
     /// A rule here: parsed, its `and` inside `or` noted for `fmt`, its `match` arms laid out.
     fn rule(&mut self, depth: usize) -> R<Expr> {
         let (e, end) = parse_in(self.toks, self.k, self.toks.len())?;
@@ -685,43 +679,27 @@ impl P<'_> {
                 Decl::Def { name, params, rule: self.rule(depth)? }
             }
             "group" => {
-                let name = self.name("the group's name")?;
+                let name = self.tname("the group's name")?;
                 self.expect(&Tok::Eq, "`=`")?;
-                Decl::Group(name, self.name_set("an item")?)
+                Decl::Group(name, self.tname_set("an item")?)
             }
             "placement" => {
-                let name = self.name("the placement set's name")?;
-                Decl::Placement(name, self.name_set("an item")?)
+                let name = self.tname("the placement set's name")?;
+                let items = self.tname_set("an item")?;
+                let body = if self.peek() == Some(&Tok::LBrace) {
+                    self.k += 1;
+                    self.block(depth)?
+                } else {
+                    Vec::new()
+                };
+                Decl::Placement(name, items, body)
             }
             "region" => Decl::Region(self.region(depth)?),
             "table" => Decl::Table(self.table(depth)?),
             "for" => {
                 let binders = self.binders(depth)?;
                 self.expect(&Tok::LBrace, "`{`")?;
-                let mut body = Vec::new();
-                while !matches!(self.peek(), Some(Tok::RBrace) | None) {
-                    let start = self.k;
-                    self.brk(start, depth + 1);
-                    let inside = matches!(
-                        self.peek(),
-                        Some(Tok::Kw("item" | "region" | "start_item" | "assumed" | "for"))
-                    );
-                    if !inside {
-                        self.errors.push((self.here(), format!("{} cannot be inside a family; a family repeats items, regions, start items and families", self.got())));
-                        self.skip_to_member(start);
-                        continue;
-                    }
-                    match self.decl(depth + 1) {
-                        Ok(d) => body.push(d),
-                        Err(e) => {
-                            self.errors.push(e);
-                            self.skip_to_member(start);
-                        }
-                    }
-                }
-                self.brk(self.k, depth);
-                self.expect(&Tok::RBrace, "`}`")?;
-                Decl::For(binders, body)
+                Decl::For(binders, self.block(depth)?)
             }
             "shuffle" => self.shuffle(depth)?,
             "goal" => Decl::Goal(self.rule(depth)?),
@@ -740,6 +718,50 @@ impl P<'_> {
             }
             other => return Err((pos, format!("`{other}` cannot start a declaration here"))),
         })
+    }
+
+    /// The declarations of a family's or a placement set's block, after its `{`, up to and
+    /// including its `}`: items, regions, start and assumed items, groups, placement sets and
+    /// families.
+    fn block(&mut self, depth: usize) -> R<Vec<Decl>> {
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RBrace) | None) {
+            let start = self.k;
+            self.brk(start, depth + 1);
+            let inside = matches!(
+                self.peek(),
+                Some(Tok::Kw(
+                    "item" | "region" | "start_item" | "assumed" | "for" | "group" | "placement"
+                ))
+            );
+            if !inside {
+                self.errors.push((self.here(), format!("{} cannot be inside a family or a placement block; they hold items, regions, start items, groups, placement sets and families", self.got())));
+                self.skip_to_member(start);
+                continue;
+            }
+            match self.decl(depth + 1) {
+                Ok(d) => body.push(d),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.skip_to_member(start);
+                }
+            }
+        }
+        self.brk(self.k, depth);
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(body)
+    }
+
+    /// `{ a, b }` of names that may hold `{var}` pieces.
+    fn tname_set(&mut self, what: &str) -> R<Vec<Tn>> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut out = vec![self.tname(what)?];
+        while self.peek() == Some(&Tok::Comma) {
+            self.k += 1;
+            out.push(self.tname(what)?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(out)
     }
 
     fn option(&mut self) -> R<Decl> {

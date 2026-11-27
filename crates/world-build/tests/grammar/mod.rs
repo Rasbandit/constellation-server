@@ -305,3 +305,45 @@ region a {
         "a number of copies reads options and numbers only",
     );
 }
+
+/// A placement set may be written inside a family, and as a block around the regions it
+/// covers, so a dungeon's keys and rooms are declared together once per dungeon.
+#[test]
+fn placement_sets_in_families_and_as_blocks() {
+    let b = ok(&world(
+        "table dungeon(key: name, keys: int) {
+  mire 2
+  ember 1
+}
+for d in dungeon {
+  item {d.key}_key progression x d.keys
+  group {d.key}_all = { {d.key}_key }
+  placement {d.key}_keys { {d.key}_key } {
+    region {d.key}_hall {
+      check {d.key}_c1
+      check {d.key}_c2: group_count({d.key}_all) >= 1
+      exit a
+    }
+  }
+}
+placement vault { junk } {
+  region vault_room {
+    check v1
+    exit a
+  }
+}
+region a {
+  check a1
+  check a2
+  exit mire_hall
+  exit ember_hall
+  exit vault_room
+}",
+    ));
+    let inst = b.instance_json(&HashMap::new()).unwrap();
+    assert_eq!(inst["item_groups"]["mire_key"], "mire_keys");
+    assert_eq!(inst["item_groups"]["ember_key"], "ember_keys");
+    assert_eq!(inst["location_groups"]["mire_c2"], "mire_keys");
+    assert_eq!(inst["location_groups"]["v1"], "vault");
+    assert!(inst["location_groups"].get("a1").is_none());
+}
