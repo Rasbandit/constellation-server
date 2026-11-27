@@ -77,19 +77,40 @@ impl Drop for OwnBinary {
 impl OwnBinary {
     /// Put the server binary at the path (again).
     fn link(&self) {
-        drop(std::fs::remove_file(&self.bin));
+        clear(&self.bin);
         std::fs::hard_link(BIN, &self.bin).expect("a hard link beside cargo's test files");
     }
 
     /// Put in its place a script that stops itself: a worker that takes a job and never
-    /// answers it. Written by a child process, so this one never holds it open for writing.
+    /// answers it.
     fn stand_in(&self) {
-        drop(std::fs::remove_file(&self.bin));
-        let write = "printf '#!/bin/sh\\nkill -STOP $$\\n' > \"$1\" && chmod +x \"$1\"";
-        let wrote =
-            std::process::Command::new("/bin/sh").args(["-c", write, "sh"]).arg(&self.bin).status();
-        assert!(wrote.unwrap().success(), "the stand-in script is written");
+        clear(&self.bin);
+        assert!(write_stand_in(&self.bin), "the stand-in script is written");
     }
+}
+
+/// Remove the file at `path`. Nothing there is fine; any other failure stops the test: what
+/// is there may be a link to the server binary, and nothing may be written while it is.
+fn clear(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("{}: not removed: {e}", path.display()),
+    }
+}
+
+/// Write the stand-in script as a new file at `path`; false when it could not be. Only ever
+/// as a new file (the shell's no-clobber: it creates the file or fails): a path that still
+/// exists may be a hard link to the server binary, and writing to it would write into the
+/// binary. Written by a child process, so this one never holds a program open for writing.
+fn write_stand_in(path: &Path) -> bool {
+    let write = "set -C; printf '#!/bin/sh\\nkill -STOP $$\\n' > \"$1\" && chmod +x \"$1\"";
+    let wrote = std::process::Command::new("/bin/sh")
+        .args(["-c", write, "sh"])
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .status();
+    wrote.unwrap().success()
 }
 
 fn own_binary(test: &str) -> OwnBinary {
@@ -498,6 +519,30 @@ async fn a_dropped_job_and_a_dropped_pool_leave_no_process() {
     drop(pool);
     until("the dropped pool's worker is gone", || !ours(idle[0], &bin)).await;
     assert!(running(&bin).is_empty());
+}
+
+/// The stand-in script is never written into a file that is already there: a test's binary
+/// is a hard link to the server binary, so a write through a link left in place would
+/// overwrite the server binary itself. Shown on a decoy: a file and a hard link to it, as the
+/// server binary and a test's link are. The write through the link is refused and the file
+/// is untouched; a link that cannot be removed stops a test before anything is written.
+#[test]
+fn the_stand_in_is_never_written_through_a_link_left_in_place() {
+    let own = own_binary("no-clobber");
+    let (decoy, link) = (own.dir.join("decoy"), own.dir.join("link"));
+    std::fs::write(&decoy, "the server binary").unwrap();
+    std::fs::hard_link(&decoy, &link).unwrap();
+    assert!(!write_stand_in(&link), "an existing path is refused");
+    assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "the server binary");
+    // Once the link is gone the script is written, as a file of its own.
+    clear(&link);
+    assert!(write_stand_in(&link));
+    assert!(std::fs::read_to_string(&link).unwrap().starts_with("#!/bin/sh"));
+    assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "the server binary");
+    // Nothing to remove is fine; a path that cannot be removed (a folder) stops the test.
+    clear(&own.dir.join("never there"));
+    let folder = own.dir.clone();
+    assert!(std::panic::catch_unwind(move || clear(&folder)).is_err());
 }
 
 /// The look into `/proc` these tests rest on never loses a worker that is starting: from the
