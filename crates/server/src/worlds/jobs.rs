@@ -72,6 +72,11 @@ impl Worlds {
     }
 }
 
+/// Whether `status` is of a job that has not ended: queued or running.
+pub(super) fn unfinished(status: &Value) -> bool {
+    matches!(status["status"].as_str(), Some("queued" | "running"))
+}
+
 /// A status's job id, state and text, as the store keeps them.
 pub(super) fn job_row(status: &Value) -> Result<(&str, JobState, String), String> {
     let id = status["id"].as_str().filter(|i| valid_id(i)).ok_or("a status with a bad id")?;

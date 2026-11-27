@@ -54,8 +54,7 @@ impl Worlds {
         let (text, _) = self.store.job_status(id).await.ok()??;
         let mut status: Value = serde_json::from_str(&text).ok()?;
         let was = status["status"].as_str().map(str::to_owned);
-        status["status"] = json!(JobState::Failed.as_str());
-        status["error"] = json!("the server restarted before this generation finished");
+        fail_restarted(&mut status);
         match self.store.job_fail_stale(id, &status.to_string(), Duration::ZERO).await {
             Ok(true) => tracing::warn!(world = %id, "generation failed: its server restarted"),
             Ok(false) => {}
@@ -102,9 +101,8 @@ impl Worlds {
                     .await;
             }
             if let Some(mut status) = found {
-                if matches!(status["status"].as_str(), Some("queued" | "running")) {
-                    status["status"] = json!(JobState::Failed.as_str());
-                    status["error"] = json!("the server restarted before this generation finished");
+                if unfinished(&status) {
+                    fail_restarted(&mut status);
                 }
                 // Never over a row the store already has: a file is older than any row.
                 match self.save_old_status(&status).await {
@@ -166,6 +164,12 @@ impl Worlds {
         }
         Ok(())
     }
+}
+
+/// Mark `status` failed: its job was this host's, and the process running it stopped.
+fn fail_restarted(status: &mut Value) {
+    status["status"] = json!(JobState::Failed.as_str());
+    status["error"] = json!("the server restarted before this generation finished");
 }
 
 /// Run blocking file work off the runtime's threads; `None` when it panicked (said in the log).

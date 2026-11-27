@@ -15,8 +15,7 @@ pub(super) async fn read_status(w: &Worlds, id: &str) -> Result<Value, (StatusCo
     let (text, ago) = found.ok_or((StatusCode::NOT_FOUND, "no such world".to_owned()))?;
     let mut status: Value = serde_json::from_str(&text)
         .map_err(|e| internal(format!("world {id}: bad status: {e}")))?;
-    let unfinished = matches!(status["status"].as_str(), Some("queued" | "running"));
-    if unfinished && ago >= Duration::from_secs(w.limits.gen_stale_secs) {
+    if unfinished(&status) && ago >= Duration::from_secs(w.limits.gen_stale_secs) {
         status["status"] = json!("stalled");
     }
     Ok(status)
