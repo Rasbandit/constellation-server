@@ -495,8 +495,14 @@ fn a_starting_worker_is_in_sight_at_every_look() {
             .unwrap();
         let pid = worker.id();
         let mut seen = false;
-        // Until it runs the copy and is seen doing so; the worker waits on its stdin.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // Until it runs the copy and is seen doing so; the worker waits on its stdin. A
+        // worker that ended instead (`prlimit` refused to start it) or never gets there
+        // fails the test here, it does not spin.
         while !(seen && is_exe(pid)) {
+            let ended = worker.try_wait().unwrap();
+            assert!(ended.is_none(), "start {start}: worker {pid} ended early: {ended:?}");
+            assert!(Instant::now() < deadline, "start {start}: worker {pid} never ran the copy");
             let now = ours(pid, &bin);
             assert!(now || !seen, "start {start}: worker {pid} was seen and then was not");
             seen |= now;
