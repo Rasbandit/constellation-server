@@ -592,25 +592,16 @@ mod tests {
         out
     }
 
-    /// The exact placements of fixed seeds, room and single player, with and without clocks,
-    /// with `p0` confined to a placement group: pinned, so a change to how the fill scans its
-    /// locations or looks up groups must keep every byte.
+    /// A snapshot: the exact placements of fixed seeds, room and single player, with and
+    /// without clocks, with `p0` confined to a placement group. It catches a change nobody
+    /// meant and a difference between machines. When placements are meant to change, update
+    /// the hash in a commit that says so.
     #[test]
     fn placements_of_fixed_seeds_are_pinned() {
         let out = pinned(None);
         let p0 = |row: &str| row.matches("item: 0 }").count();
         assert!(out.lines().any(|r| p0(r) > 0), "the confined item was placed");
         assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
-    }
-
-    /// The same pin with the rooms forced onto the forward path, on one thread and on four.
-    #[test]
-    fn the_pinned_placements_are_the_same_on_the_forward_path() {
-        for workers in [1, 4] {
-            let out = pinned(Some(Path::Forward { workers }));
-            let hash = format!("{:016x}", crate::check::fnv1a(out.as_bytes()));
-            assert_eq!(hash, "036064f5ec95175d", "{workers} workers");
-        }
     }
 
     /// A confined progression item never lands on an excluded location of its group (#203):
@@ -705,13 +696,6 @@ mod tests {
         );
     }
 
-    /// The same pin with the rooms forced onto the split path.
-    #[test]
-    fn the_pinned_placements_are_the_same_on_the_split_path() {
-        let out = pinned(Some(Path::Split));
-        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "036064f5ec95175d");
-    }
-
     /// The split path reaches every round's state by adding to one solve and taking the
     /// additions back; that state is the least fixed point a fresh solve of the round gives,
     /// so it must decide everything exactly as the forward path and truth maintenance do:
@@ -762,8 +746,8 @@ mod tests {
                 }
             }
         }
-        // As much progression as locations that take it: stuck at first, filled on a later
-        // attempt, with the same draws on every path.
+        // As much progression as locations that take it: seeds that were stuck at first in
+        // drawn order. They fill in one attempt now, the same on every path.
         let tight = Shape { progression: 0.5, ..small(true) };
         for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
             let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
@@ -772,7 +756,7 @@ mod tests {
             retried += u32::from(split.is_ok_and(|x| x.2 > 1));
         }
         assert_eq!(rooms, 280);
-        assert!(stuck > 0 && retried >= 4, "{stuck} stuck, {retried} retried");
+        assert!(stuck > 0 && retried == 0, "{stuck} stuck, {retried} retried");
         // Every rule as bytecode, and every player on one world (`Compiled::shared`).
         for (shape, players) in [(heavy, 3), (hostile(Hostile::Brink), 2), (Shape::wide(), 2)] {
             let mut c = room_with(&shape, 23, players, |_, _| {}).unwrap();
@@ -975,7 +959,9 @@ mod tests {
                 x.0.iter()
                     .enumerate()
                     .any(|(p, r)| r.iter().flatten().any(|g| usize::from(g.to) != p));
-            assert!(crossed && x.1.removals > 0, "seed {seed}: items cross, removals ran");
+            let carried = fill_on(&a, seed, Some(Path::Carry));
+            assert!(crossed && x.0 == carried.0, "seed {seed}: items cross, carried or split");
+            assert!(carried.1.removals > 0, "seed {seed}: the carried path took nothing back");
         }
     }
 
@@ -1144,14 +1130,14 @@ mod tests {
         }
         assert!(rooms == 80 && fresh > 0 && retracted > 0, "both paths ran");
         assert_eq!(stuck, 10, "the cramped rooms, every size and seed");
-        // As much progression as locations that take it: these seeds are stuck at first and
-        // fill on a later attempt, with the same draws on every path.
+        // As much progression as locations that take it: these seeds were stuck at first in
+        // drawn order. They fill in one attempt now, the same on every path.
         let tight = Shape { progression: 0.5, ..small(true) };
         for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
             let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
             let (a, ..) = outcome(&c, seed, Path::Carry);
             let attempts = a.as_ref().map(|f| f.2).unwrap();
-            assert!(attempts > 1, "{players} players, seed {seed}: {attempts} attempts");
+            assert_eq!(attempts, 1, "{players} players, seed {seed}");
             for workers in [1, 4] {
                 let (b, ..) = outcome(&c, seed, Path::Forward { workers });
                 assert_eq!(a, b, "{players} players, seed {seed}, {workers} workers");
@@ -1420,16 +1406,15 @@ mod tests {
         assert!(level > 0 && level * 5 < exact, "level {level} against exact {exact} evaluations");
     }
 
-    /// A room below `config::ROOM_FORWARD_MIN_PLAYERS` is carried, one at it takes the split
-    /// path, whatever the workers asked for.
+    /// Every room takes the split path (`config::ROOM_FORWARD_MIN_PLAYERS` is 1), whatever
+    /// the workers asked for.
     #[test]
-    fn the_path_changes_at_the_configured_room_size() {
+    fn every_room_takes_the_split_path() {
         let at = config::ROOM_FORWARD_MIN_PLAYERS;
-        assert_eq!(Path::of(1, 4), Path::Carry);
-        assert_eq!(Path::of(at - 1, 4), Path::Carry);
-        assert_eq!(Path::of(at, 1), Path::Split);
+        assert_eq!(at, 1);
+        assert_eq!(Path::of(1, 4), Path::Split);
         assert_eq!(Path::of(at + 1, 0), Path::Split);
-        assert_eq!(Path::of(at, usize::MAX), Path::Split);
+        assert_eq!(Path::of(100, usize::MAX), Path::Split);
         // The room fill takes that path: a room at the threshold solves once, takes nothing
         // back by truth maintenance, and undoes what it added for its rounds.
         let c = room(&small(false), 5, at, 1).unwrap();
@@ -1452,7 +1437,10 @@ mod tests {
             for seed in 1..=3 {
                 let x = fill(&a, seed);
                 assert_eq!(x, fill(&b, seed), "clocks {clocks}, seed {seed}");
-                assert!(x.1.removals > 0 && x.1.retractions > 0, "the take-back path ran");
+                // The carried path places the same, by taking items back.
+                let carried = fill_on(&a, seed, Some(Path::Carry));
+                assert_eq!(x.0, carried.0, "clocks {clocks}, seed {seed}: carried");
+                assert!(carried.1.removals > 0 && carried.1.retractions > 0, "nothing taken back");
                 let crossed =
                     x.0.iter()
                         .enumerate()

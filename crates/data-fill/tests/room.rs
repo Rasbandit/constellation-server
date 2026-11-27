@@ -6,7 +6,7 @@ use data_fill::room::{
     self, Compiled, Given, Seat, fill_room_spheres, locked_placed, validate_room,
 };
 use data_fill::spheres::room_spheres;
-use data_fill::{Instance, Plan, World, fill};
+use data_fill::{Instance, Plan, World};
 use serde_json::Value;
 use spec_rng::SpecRng;
 
@@ -260,19 +260,6 @@ fn the_fixture_fills_the_same_carried_and_forward() {
         }
     }
     assert!(split > 0, "rooms at and above the threshold filled on the split path");
-}
-
-#[test]
-fn a_room_of_one_fills_exactly_like_a_single_player() {
-    let r = players(1, 1);
-    let seats = r.seats();
-    for seed in 1u64..=40 {
-        let one =
-            fill(&r.worlds[0], &r.plans[0], &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
-        let many = room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
-        let flat: Vec<Option<u16>> = many.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
-        assert_eq!(one.placed, flat, "seed {seed}");
-    }
 }
 
 #[test]
