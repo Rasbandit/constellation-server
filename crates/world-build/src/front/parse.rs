@@ -215,10 +215,10 @@ pub struct Layout {
     pub glue: Vec<bool>,
     /// Token ranges `fmt` wraps in parentheses (`and` inside `or`).
     pub parens: Vec<(usize, usize)>,
-    /// Rules `fmt` may break over lines: first token, one past the last, and the tokens to
-    /// break before when the rule is too long for one line (its top-level `or`s, or its
-    /// top-level `and`s when it has no `or`).
-    pub wraps: Vec<(usize, usize, Vec<usize>)>,
+    /// `and` and `or` nodes `fmt` may break over lines: first token, one past the last, the
+    /// tokens to break before when the node is too long for its line (its operators), and how
+    /// many such nodes hold it.
+    pub wraps: Vec<(usize, usize, Vec<usize>, usize)>,
 }
 
 /// A parsed file.
@@ -456,14 +456,10 @@ impl P<'_> {
         Ok(e)
     }
 
-    /// Where `fmt` may break `e` when it is too long for one line: before each top-level
-    /// `or`, or each top-level `and` when there is no `or`. A rule with a `match` (laid out
-    /// over lines already) is left alone.
+    /// Where `fmt` may break `e` when it is too long for one line: before the `or`s of each
+    /// `or`, and the `and`s of each `and`, outer ones first, each with how many `and`/`or`
+    /// nodes hold it. A rule with a `match` (laid out over lines already) is left alone.
     fn lay_wrap(&mut self, e: &Expr) {
-        let parts = match &e.e {
-            E::Or(p) | E::And(p) if !e.paren => p,
-            _ => return,
-        };
         let mut todo = vec![e];
         while let Some(x) = todo.pop() {
             if matches!(x.e, E::Match(..)) {
@@ -471,8 +467,20 @@ impl P<'_> {
             }
             todo.extend(x.children());
         }
-        let at: Vec<usize> = parts.iter().skip(1).map(|p| p.span.0 - 1).collect();
-        self.layout.wraps.push((e.span.0, e.span.1, at));
+        let mut todo = vec![(e, 0usize)];
+        while let Some((x, level)) = todo.pop() {
+            let inner = match &x.e {
+                E::Or(parts) | E::And(parts) => {
+                    // A part in parentheses starts at its `(`; the operator is just before.
+                    let at: Vec<usize> = parts.iter().skip(1).map(|p| p.span.0 - 1).collect();
+                    let first = if x.paren { x.span.0 + 1 } else { x.span.0 };
+                    self.layout.wraps.push((first, x.span.1, at, level));
+                    level + 1
+                }
+                _ => level,
+            };
+            todo.extend(x.children().into_iter().map(|c| (c, inner)));
+        }
     }
 
     /// A rule that must end on this line (a table cell).

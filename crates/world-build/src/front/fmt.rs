@@ -51,18 +51,19 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
             *n += 1;
         }
     }
-    // Rules too long for one line, by first token; and the tokens to break before, with
-    // their indent, once one is found too long.
-    let wraps: std::collections::HashMap<usize, (usize, &Vec<usize>)> = if with_comments {
-        ast.layout.wraps.iter().map(|(a, b, at)| (*a, (*b, at))).collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    // `and` and `or` nodes, by first token, outer first; and the tokens to break before, with
+    // their indent, once one is found too long for its line.
+    let mut wraps: std::collections::HashMap<usize, Vec<(usize, &Vec<usize>, usize)>> =
+        std::collections::HashMap::new();
+    if with_comments {
+        for (a, b, at, level) in &ast.layout.wraps {
+            wraps.entry(*a).or_default().push((*b, at, *level));
+        }
+        wraps.values_mut().for_each(|v| v.sort_by_key(|w| w.2));
+    }
     let mut wrap_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for i in from..=toks.len() {
-        if let Some((end, at)) = wraps.get(&i)
-            && !at.is_empty()
-        {
+        for (end, at, level) in wraps.get(&i).into_iter().flatten() {
             let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
             let mut len = 0;
             for k in i..(*end).min(toks.len()) {
@@ -71,9 +72,9 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
                 len += usize::from(k > i && space(&toks[k - 1], &toks[k], glue));
             }
             if line + 1 + len > WIDTH {
-                at.iter().for_each(|k| {
-                    wrap_at.insert(*k, depth + 1);
-                });
+                for k in at.iter() {
+                    wrap_at.insert(*k, depth + 1 + level);
+                }
             }
         }
         // Comments that come before this token.

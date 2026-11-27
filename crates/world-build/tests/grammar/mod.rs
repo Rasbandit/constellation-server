@@ -408,6 +408,15 @@ fn fmt_breaks_long_rules_at_or_and_and() {
     assert!(once.contains("\n    or has(item_number_1)\n"), "{once}");
     assert!(once.contains("\n    and has(item_number_1)\n"), "{once}");
     assert!(once.contains("\n  check e: has(x)\n"), "{once}");
+    // A part still too long breaks inside, one level deeper.
+    let nested =
+        format!("world t\nregion a {{\n  check f: has(x) and ({})\n}}\n", parts.join(" or "));
+    let f = world_build::front::format_text(&nested, "w.rando").unwrap();
+    assert!(
+        f.contains("  check f: has(x)\n    and (has(item_number_0)\n      or has(item_number_1)\n"),
+        "{f}"
+    );
+    assert_eq!(world_build::front::format_text(&f, "w.rando").unwrap(), f);
     assert_eq!(world_build::front::format_text(&once, "w.rando").unwrap(), once);
     let hash = |t: &str| {
         world_build::front::content_hash(
