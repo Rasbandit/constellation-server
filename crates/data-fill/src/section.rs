@@ -49,7 +49,8 @@ pub mod sub {
     pub const LOCATIONS: usize = 12;
     /// Region, counter, def, option and roll keys (diagnostics and binding by key).
     pub const NAMES: usize = 13;
-    /// Item groups that a sum of copies reads: packed starts, items, caps (0 = no cap).
+    /// Item groups that a sum of copies reads: packed starts, items, caps (0 = no cap), and
+    /// weights when one is not 1.
     pub const GROUPS: usize = 14;
 }
 /// Site groups of a region, in site order.
@@ -258,21 +259,35 @@ pub fn monotone_cmp(op: usize, left_state: bool, right_state: bool) -> bool {
     }
 }
 
-/// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`:
-/// its members as (key, cap).
-fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>)>> {
+/// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`, each
+/// alone or times a weight (`{"int": ["*", that, w]}`, either side, `w` an integer from 0 to
+/// `config::RULE_WEIGHT_MAX`): its members as (key, cap, weight).
+fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
+    fn copies(a: &Value) -> Option<(&str, Option<u16>)> {
+        if let Some(k) = a.get("count").and_then(Value::as_str) {
+            return (a.as_object()?.len() == 1).then_some((k, None));
+        }
+        match a.get("int")?.as_array()?.as_slice() {
+            [m, c, n] if m == "min" && c.as_object()?.len() == 1 => {
+                let cap = u16::try_from(n.as_i64()?).ok().filter(|x| *x < u16::MAX)?;
+                Some((c.get("count")?.as_str()?, Some(cap)))
+            }
+            _ => None,
+        }
+    }
+    let weight = |w: &Value| {
+        u16::try_from(w.as_i64().filter(|w| (0..=config::RULE_WEIGHT_MAX).contains(w))?).ok()
+    };
     args.iter()
         .map(|a| {
-            if let Some(k) = a.get("count").and_then(Value::as_str) {
-                return (a.as_object()?.len() == 1).then_some((k, None));
+            if let Some((k, cap)) = copies(a) {
+                return Some((k, cap, 1));
             }
-            match a.get("int")?.as_array()?.as_slice() {
-                [m, c, n] if m == "min" && c.as_object()?.len() == 1 => {
-                    let cap = u16::try_from(n.as_i64()?).ok().filter(|x| *x < u16::MAX)?;
-                    Some((c.get("count")?.as_str()?, Some(cap)))
-                }
-                _ => None,
-            }
+            let (c, w) = match a.get("int")?.as_array()?.as_slice() {
+                [m, x, y] if m == "*" => copies(x).zip(weight(y)).or(copies(y).zip(weight(x)))?,
+                _ => return None,
+            };
+            Some((c.0, c.1, w))
         })
         .collect()
 }
@@ -349,8 +364,8 @@ struct Compiler<'m> {
     def_depth: Vec<u32>,
     code: Vec<u8>,
     dedupe: HashMap<Vec<u8>, u32>,
-    /// Item groups: (item, cap) members, `None` for an uncapped count.
-    groups: Vec<Vec<(u16, Option<u16>)>>,
+    /// Item groups: (item, cap, weight) members, `None` for an uncapped count.
+    groups: Vec<Vec<(u16, Option<u16>, u16)>>,
     /// The world's shuffles: what an `at` read stands for ([`crate::shuffle`]).
     shuffles: Option<&'m Decl>,
     w: Widths,
@@ -706,13 +721,20 @@ pub(crate) fn compiled(m: &Value) -> R<Compiled> {
     for g in &c.groups {
         starts.push(starts[starts.len() - 1] + small::<u32>(g.len(), "group members")?);
     }
-    let members: Vec<&(u16, Option<u16>)> = c.groups.iter().flatten().collect();
+    let members: Vec<&(u16, Option<u16>, u16)> = c.groups.iter().flatten().collect();
     put_packed(&mut subs[sub::GROUPS], &starts);
     put_packed(&mut subs[sub::GROUPS], &members.iter().map(|m| u32::from(m.0)).collect::<Vec<_>>());
     put_packed(
         &mut subs[sub::GROUPS],
         &members.iter().map(|m| m.1.map_or(0, |c| u32::from(c) + 1)).collect::<Vec<_>>(),
     );
+    // Only a world with a weight other than 1 has the list, so other sections keep their bytes.
+    if members.iter().any(|m| m.2 != 1) {
+        put_packed(
+            &mut subs[sub::GROUPS],
+            &members.iter().map(|m| u32::from(m.2)).collect::<Vec<_>>(),
+        );
+    }
 
     let mut out = Vec::new();
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -1117,8 +1139,16 @@ impl<'m> Compiler<'m> {
             let members = members
                 .into_iter()
                 .enumerate()
-                .map(|(j, (k, cap))| Ok((self.item(&json!(k), &format!("{p}[{}]", j + 1))?, cap)))
+                .map(|(j, (k, cap, w))| {
+                    Ok((self.item(&json!(k), &format!("{p}[{}]", j + 1))?, cap, w))
+                })
                 .collect::<R<Vec<_>>>()?;
+            if members.len() > config::RULE_GROUP_MAX_MEMBERS {
+                return Err(format!(
+                    "{p}: a sum of more than {} members",
+                    config::RULE_GROUP_MAX_MEMBERS
+                ));
+            }
             r.items.extend(members.iter().map(|m| m.0));
             let g = match self.groups.iter().position(|x| *x == members) {
                 Some(g) => g,

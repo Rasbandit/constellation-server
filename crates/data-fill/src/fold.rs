@@ -265,6 +265,12 @@ pub(crate) mod tests {
 
     /// [`world`] over the items `keys` (the events read `c` and `d`) and the defs `defs`.
     pub(crate) fn world_of(keys: &[String], defs: &Value, rules: &[Value]) -> (World, Instance) {
+        let (m, inst) = manifest_of(keys, defs, rules);
+        (World::load(&m).unwrap(), inst)
+    }
+
+    /// The manifest and instance of [`world_of`], not compiled.
+    pub(crate) fn manifest_of(keys: &[String], defs: &Value, rules: &[Value]) -> (Value, Instance) {
         let checks: Vec<Value> = rules
             .iter()
             .enumerate()
@@ -289,7 +295,7 @@ pub(crate) mod tests {
             locations: (0..rules.len()).map(|k| format!("l{k}")).collect(),
             ..Instance::default()
         };
-        (World::load(&m).unwrap(), inst)
+        (m, inst)
     }
 
     /// A `has` the start items already meet is folded to a constant: only copies a fill added

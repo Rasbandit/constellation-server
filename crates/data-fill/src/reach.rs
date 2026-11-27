@@ -803,9 +803,9 @@ impl<'w> Reach<'w> {
         self.counts[i] = after;
         let bits = self.rules;
         bits.set(&mut self.atoms, ITEM, i, after);
-        for &(g, cap) in self.w.item_groups(i) {
+        for &(g, cap, weight) in self.w.item_groups(i) {
             let (g, cap) = (usize::from(g), i64::from(cap));
-            self.groups[g] += after.min(cap) - before.min(cap);
+            self.groups[g] += i64::from(weight) * (after.min(cap) - before.min(cap));
             bits.set(&mut self.atoms, GROUP, g, self.groups[g]);
         }
     }

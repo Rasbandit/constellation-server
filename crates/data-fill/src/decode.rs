@@ -135,9 +135,12 @@ fn i(w: &World, pc: usize) -> (Value, usize) {
         Node::Counter(c) => (json!({"counter": w.counter_key(usize::from(c))}), at),
         Node::Group(g) => {
             let mut args = vec![json!("+")];
-            args.extend(w.group_members(usize::from(g)).map(|(item, cap)| match cap {
-                None => json!({"count": w.item_key(item)}),
-                Some(c) => json!({"int": ["min", {"count": w.item_key(item)}, c]}),
+            args.extend(w.group_members(usize::from(g)).map(|(item, cap, weight)| {
+                let copies = match cap {
+                    None => json!({"count": w.item_key(item)}),
+                    Some(c) => json!({"int": ["min", {"count": w.item_key(item)}, c]}),
+                };
+                if weight == 1 { copies } else { json!({"int": ["*", copies, weight]}) }
             }));
             (json!({"int": args}), at)
         }

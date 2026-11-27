@@ -458,7 +458,7 @@ impl Builder<'_> {
 mod tests {
     use super::{Bits, CLASSES, TIME};
     use crate::fill::Plan;
-    use crate::fold::tests::{any_of, world, world_of};
+    use crate::fold::tests::{any_of, manifest_of, world, world_of};
     use serde_json::{Value, json};
     use spec_rng::SpecRng;
 
@@ -654,6 +654,179 @@ mod tests {
             }
         }
         assert!(by_bits > 300 && lost > 50, "{by_bits} bit rules, {lost} undos that lost a check");
+    }
+
+    /// `{"int": ["*", {"count": k}, w]}`, weight on either side.
+    fn times(c: Value, w: i64, first: bool) -> Value {
+        if first { json!({"int": ["*", w, c]}) } else { json!({"int": ["*", c, w]}) }
+    }
+
+    /// `["+", terms...] >= n`.
+    fn sum_at_least(terms: &[Value], n: i64) -> Value {
+        let mut t = vec![json!("+")];
+        t.extend_from_slice(terms);
+        json!({"ge": [{"int": t}, n]})
+    }
+
+    /// A weighted sum of copies is one group atom, so no rule of it stays bytecode, and it
+    /// holds from its threshold on: at the boundary, with a weight first, a cap, a zero
+    /// weight, many copies and the largest weight.
+    #[test]
+    fn weighted_sums_are_one_group_atom_that_holds_at_its_threshold() {
+        let c = |k: &str| json!({"count": k});
+        let rules = [
+            sum_at_least(&[times(c("a"), 3, false), times(c("b"), 2, false)], 7),
+            sum_at_least(&[times(json!({"int": ["min", c("c"), 1]}), 5, true), c("e")], 6),
+            sum_at_least(&[times(c("f"), 0, false), c("g")], 1),
+            sum_at_least(&[times(c("h"), 100, false), times(c("i"), 0, true)], 20_000),
+            sum_at_least(&[times(c("j"), 32_767, false), c("a")], 32_767),
+        ];
+        let (w, inst) = world(&rules);
+        assert_eq!(bytecode(&w), 0, "every weighted sum is a bit rule");
+        let plan = Plan::new(&w, &inst).unwrap();
+        let plain = plan.clone().interpreted();
+        let (a, b, cc, e, f, g, h, i, j) = (0u16, 1, 2, 4, 5, 6, 7, 8, 9);
+        let cases: Vec<(Vec<u16>, [bool; 5])> = vec![
+            (vec![], [false; 5]),
+            (vec![a, a], [false; 5]),
+            (vec![b, b, b], [false; 5]),
+            (vec![a, b, b], [true, false, false, false, false]),
+            (vec![a, a, b], [true, false, false, false, false]),
+            (vec![cc, cc], [false; 5]),
+            (vec![cc, e], [false, true, false, false, false]),
+            (vec![f; 50], [false; 5]),
+            (vec![g], [false, false, true, false, false]),
+            ([vec![h; 199], vec![i; 300]].concat(), [false; 5]),
+            (vec![h; 200], [false, false, false, true, false]),
+            (vec![j], [false, false, false, false, true]),
+        ];
+        for (inv, want) in cases {
+            let (x, y) = (plan.solve(&w, &inv), plain.solve(&w, &inv));
+            crate::reach::assert_same(&w, &x, &y, &format!("holding {inv:?}"));
+            let got: Vec<bool> = (0..5).map(|l| x.reached(l)).collect();
+            assert_eq!(got, want, "holding {inv:?}");
+        }
+    }
+
+    /// The compiler refuses a weight that is negative, not an integer or past
+    /// `config::RULE_WEIGHT_MAX`, and a group past `config::RULE_GROUP_MAX_MEMBERS` members.
+    #[test]
+    fn weighted_sums_refuse_bad_weights_and_oversized_groups() {
+        let keys: Vec<String> = ('a'..='j').map(String::from).collect();
+        let load = |rule: Value| {
+            let (m, _) = manifest_of(&keys, &json!({}), &[rule]);
+            crate::World::load(&m).map(|_| ())
+        };
+        let weighted = |w: Value| json!({"ge": [{"int": ["+", {"int": ["*", {"count": "a"}, w]}, {"count": "b"}]}, 1]});
+        assert_eq!(config::RULE_WEIGHT_MAX, 32_767);
+        assert!(load(weighted(json!(32_767))).is_ok());
+        for bad in [json!(-1), json!(1.5), json!(32_768), json!("2"), json!(null)] {
+            assert!(load(weighted(bad.clone())).is_err(), "weight {bad}");
+        }
+        let members = |n: usize| sum_at_least(&vec![json!({"count": "a"}); n], 1);
+        assert!(load(members(config::RULE_GROUP_MAX_MEMBERS)).is_ok());
+        let e = load(members(config::RULE_GROUP_MAX_MEMBERS + 1)).unwrap_err();
+        assert!(e.contains("members"), "{e}");
+    }
+
+    /// The loader checks the weights as untrusted bytes: a list of the wrong length or a
+    /// weight past `config::RULE_WEIGHT_MAX` is refused; the compiler's own list loads.
+    #[test]
+    fn the_loader_refuses_bad_weight_lists() {
+        use crate::section::{HEADER, put_packed, sub};
+        let keys: Vec<String> = ('a'..='j').map(String::from).collect();
+        let rule =
+            sum_at_least(&[times(json!({"count": "a"}), 3, false), json!({"count": "b"})], 4);
+        let (m, _) = manifest_of(&keys, &json!({}), &[rule]);
+        let (rules, game) = crate::section::sections(&m).unwrap();
+        // The weights are the last list of the last subsection.
+        let mut tail = Vec::new();
+        put_packed(&mut tail, &[3, 1]);
+        assert!(rules.ends_with(&tail), "the weights list closes the section");
+        let with = |list: &[u32]| {
+            let mut r = rules[..rules.len() - tail.len()].to_vec();
+            put_packed(&mut r, list);
+            let d = HEADER + sub::GROUPS * 8 + 4;
+            let len = u32::from_le_bytes(r[d..d + 4].try_into().unwrap());
+            let len = len - u32::try_from(tail.len()).unwrap()
+                + u32::try_from(r.len() + tail.len() - rules.len()).unwrap();
+            r[d..d + 4].copy_from_slice(&len.to_le_bytes());
+            crate::World::from_parts(r, game.clone(), None).map(|_| ())
+        };
+        assert!(with(&[3, 1]).is_ok());
+        assert!(with(&[0, 32_767]).is_ok());
+        assert!(with(&[3]).is_err(), "one weight for two members");
+        assert!(with(&[3, 1, 1]).is_err(), "three weights for two members");
+        assert!(with(&[32_768, 1]).is_err(), "a weight past the cap");
+    }
+
+    /// A random weighted sum over the test world's items, and its twin with a trailing `0`
+    /// term, which the compiler leaves as plain bytecode that sums every term again on every
+    /// read: the oracle the incremental group sums are held against.
+    fn random_weighted(rng: &mut SpecRng) -> (Value, Value) {
+        let mut below = |n: u64| usize::try_from(rng.below(n).unwrap_or(0)).unwrap_or(0);
+        let item = |k: usize| String::from(char::from(b'a' + u8::try_from(k % 10).unwrap_or(0)));
+        let mut terms = Vec::new();
+        for _ in 0..2 + below(4) {
+            let k = json!({"count": item(below(10))});
+            let c = if below(3) == 0 { json!({"int": ["min", k, 1 + below(2)]}) } else { k };
+            let w = i64::try_from(below(6)).unwrap();
+            terms.push(match below(3) {
+                0 => c,
+                x => times(c, w, x == 1),
+            });
+        }
+        let n = i64::try_from(1 + below(12)).unwrap();
+        let twin = [terms.clone(), vec![json!(0)]].concat();
+        (sum_at_least(&terms, n), sum_at_least(&twin, n))
+    }
+
+    /// Random weighted sums under random adds and undos (`Reach::undo_to`): after every step
+    /// each one holds exactly when its bytecode twin does, and an add never closes a check
+    /// (monotone).
+    #[test]
+    fn random_weighted_sums_under_adds_and_undos_match_a_rescan_and_are_monotone() {
+        let (mut adds, mut undos, mut opened) = (0, 0, 0);
+        for seed in 1..=60u64 {
+            let mut rng = SpecRng::from_u64(seed);
+            let (rules, twins): (Vec<Value>, Vec<Value>) =
+                (0..12).map(|_| random_weighted(&mut rng)).unzip();
+            let (w, inst) = world(&[rules, twins].concat());
+            assert_eq!(bytecode(&w), 12, "seed {seed}: the twins only");
+            let plan = Plan::new(&w, &inst).unwrap();
+            let mut pick =
+                |n: usize| usize::try_from(rng.below(n as u64).unwrap_or(0)).unwrap_or(0);
+            let mut r = plan.solve(&w, &[]);
+            r.keep_journal();
+            let reached = |r: &crate::Reach<'_>| (0..12).map(|l| r.reached(l)).collect::<Vec<_>>();
+            let mut marks = Vec::new();
+            for step in 0..60 {
+                let before = reached(&r);
+                if marks.is_empty() || pick(3) > 0 {
+                    marks.push(r.mark());
+                    r.add(u16::try_from(pick(10)).unwrap(), 1);
+                    r.run();
+                    let after = reached(&r);
+                    assert!(
+                        before.iter().zip(&after).all(|(b, a)| !b || *a),
+                        "seed {seed}, step {step}: an add closed a check"
+                    );
+                    opened += after.iter().zip(&before).filter(|(a, b)| **a && !**b).count();
+                    adds += 1;
+                } else {
+                    let back = pick(marks.len());
+                    r.undo_to(marks[back]);
+                    marks.truncate(back);
+                    undos += 1;
+                }
+                let twin: Vec<bool> = (12..24).map(|l| r.reached(l)).collect();
+                assert_eq!(reached(&r), twin, "seed {seed}, step {step}");
+            }
+        }
+        assert!(
+            adds > 1500 && undos > 500 && opened > 300,
+            "{adds} adds, {undos} undos, {opened} opened"
+        );
     }
 
     /// Every class of rule, and the term cap: an AND of four ORs of two is 16 terms and

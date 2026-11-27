@@ -143,10 +143,11 @@ pub struct World {
     roll_locs: List,
     names: Arc<[Names; 7]>,
     loc_ids: usize,
-    /// Members of every item group (starts, items, caps + 1 with 0 for none).
-    groups: (List, List, List),
-    /// Per item, the groups it is a member of and its cap there (computed at load).
-    item_groups: (Shared<u32>, Shared<(u16, u16)>),
+    /// Members of every item group (starts, items, caps + 1 with 0 for none, and weights when
+    /// the section has them; every weight is 1 without).
+    groups: (List, List, List, Option<List>),
+    /// Per item, the groups it is a member of with its cap and weight there (computed at load).
+    item_groups: (Shared<u32>, Shared<(u16, u16, u16)>),
     /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
     /// `None` for a world that declares none, and for a seed's staged world.
     shuffles: Option<Arc<Bound>>,
@@ -400,7 +401,8 @@ impl World {
         let gd = dir[sub::GROUPS].clone();
         let (g_starts, e) = list(b, gd.start, gd.end)?;
         let (g_items, e) = list(b, e, gd.end)?;
-        let (g_caps, _) = list(b, e, gd.end)?;
+        let (g_caps, e) = list(b, e, gd.end)?;
+        let g_weights = (e < gd.end).then(|| list(b, e, gd.end)).transpose()?.map(|w| w.0);
         let lc = dir[sub::LOCATIONS].clone();
         let (vanilla, _) = list(b, lc.start, lc.end)?;
         let t = dir[sub::TIME].start;
@@ -448,7 +450,7 @@ impl World {
             roll_locs,
             names: Arc::new(names),
             loc_ids,
-            groups: (g_starts, g_items, g_caps),
+            groups: (g_starts, g_items, g_caps, g_weights),
             item_groups: Default::default(),
             shuffles: None,
             bits: Arc::new(Bits::clone(&crate::bitrules::NONE)),
@@ -530,29 +532,39 @@ impl World {
 
     /// Group member lists, and the per-item membership index built from them.
     fn check_groups(&mut self) -> R<()> {
-        let (starts, items, caps) = self.groups;
+        let (starts, items, caps, weights) = self.groups;
         let n = starts.len.saturating_sub(1);
         if starts.len == 0
             || self.at(starts, 0) != 0
             || self.at(starts, n) as usize != items.len
             || caps.len != items.len
+            || weights.is_some_and(|w| w.len != items.len)
         {
             return Err(bad("item group lists"));
         }
-        let mut per: Vec<Vec<(u16, u16)>> = vec![Vec::new(); self.counts[ITEMS]];
+        let mut per: Vec<Vec<(u16, u16, u16)>> = vec![Vec::new(); self.counts[ITEMS]];
         for g in 0..n {
             let (a, z) = (self.at(starts, g) as usize, self.at(starts, g + 1) as usize);
             if a > z {
                 return Err(bad("item group lists are not ascending"));
+            }
+            if z - a > config::RULE_GROUP_MAX_MEMBERS {
+                return Err(bad("item group has too many members"));
             }
             for k in a..z {
                 let i = self.at(items, k) as usize;
                 let cap = self.at(caps, k);
                 let cap =
                     if cap == 0 { u16::MAX } else { u16::try_from(cap - 1).unwrap_or(u16::MAX) };
-                per.get_mut(i)
-                    .ok_or_else(|| bad("group member out of range"))?
-                    .push((u16::try_from(g).unwrap_or(0), cap));
+                let weight = self.weight(k);
+                if i64::from(weight) > config::RULE_WEIGHT_MAX {
+                    return Err(bad("group weight out of range"));
+                }
+                per.get_mut(i).ok_or_else(|| bad("group member out of range"))?.push((
+                    u16::try_from(g).unwrap_or(0),
+                    cap,
+                    u16::try_from(weight).unwrap_or(0),
+                ));
             }
         }
         let mut at = vec![0u32];
@@ -566,20 +578,29 @@ impl World {
         self.groups.0.len.saturating_sub(1)
     }
 
-    /// Members of group `g`: item and cap (`None` for an uncapped count).
-    pub(crate) fn group_members(&self, g: usize) -> impl Iterator<Item = (u16, Option<u16>)> + '_ {
-        let (starts, items, caps) = self.groups;
+    /// Weight of group member `k` (in member order over every group): 1 without a weights list.
+    fn weight(&self, k: usize) -> u32 {
+        self.groups.3.map_or(1, |w| self.at(w, k))
+    }
+
+    /// Members of group `g`: item, cap (`None` for an uncapped count) and weight.
+    pub(crate) fn group_members(
+        &self,
+        g: usize,
+    ) -> impl Iterator<Item = (u16, Option<u16>, u16)> + '_ {
+        let (starts, items, caps, _) = self.groups;
         (self.at(starts, g) as usize..self.at(starts, g + 1) as usize).map(move |k| {
             let cap = self.at(caps, k);
             (
                 u16::try_from(self.at(items, k)).unwrap_or(0),
                 cap.checked_sub(1).map(|c| u16::try_from(c).unwrap_or(0)),
+                u16::try_from(self.weight(k)).unwrap_or(0),
             )
         })
     }
 
-    /// Groups item `i` is a member of, with its cap there (`u16::MAX` for none).
-    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16)] {
+    /// Groups item `i` is a member of, with its cap (`u16::MAX` for none) and weight there.
+    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16, u16)] {
         let (at, m) = &self.item_groups;
         &m[at[i] as usize..at[i + 1] as usize]
     }
