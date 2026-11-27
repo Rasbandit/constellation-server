@@ -21,7 +21,8 @@ async fn real(name: &str, limits: Limits) -> Arc<Worlds> {
     hosting_on(&temp(name), limits, JobRunner::Child(exe), pool).await
 }
 
-const ON: Limits = Limits { fill_pool_workers: 1, ..Limits::DESIGN };
+/// The design's limits with the pool on: one worker.
+pub(super) const ON: Limits = Limits { fill_pool_workers: 1, ..Limits::DESIGN };
 
 /// The fixture manifest as version `version`: each version is another world.
 fn versioned(version: &str) -> Vec<u8> {
@@ -30,16 +31,7 @@ fn versioned(version: &str) -> Vec<u8> {
 
 /// Ask for a world of `names` on the uploaded `manifest` and wait until it ends: its status.
 async fn generation(w: &Arc<Worlds>, manifest: &[u8], names: &[&str]) -> Value {
-    let up = upload_manifest(w, Some("name=m.json"), manifest).await.unwrap();
-    let manifest_id = json_of(up).await["id"].clone();
-    let instances = fixture_instances();
-    let mut yamls = Vec::new();
-    for (name, instance) in names.iter().zip(&instances) {
-        yamls.push(player_yaml(w, name, "Fixture Game", instance).await["id"].clone());
-    }
-    let req = json!({"manifest": manifest_id, "yamls": yamls});
-    let queued = create_world(State(Arc::clone(w)), me(), Bytes::from(req.to_string()));
-    let id = json_of(queued.await.unwrap()).await["id"].as_str().unwrap().to_owned();
+    let id = asked_world(w, &me(), manifest, names).await;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let status = read_status(w, &id).await.unwrap();

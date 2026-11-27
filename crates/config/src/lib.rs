@@ -472,6 +472,15 @@ pub const SEED_CHECK_POINTS: u32 = 1;
 /// Most players one room's fill takes (a design value; player numbers are 16 bits).
 pub const ROOM_MAX_PLAYERS: usize = 1024;
 
+/// Writes of a generation's last status while the store is down: how many tries (a cost trade:
+/// with the doubling wait about 15 s in all, one `gen_heartbeat_secs`, which rides out a store
+/// restart).
+pub const GEN_FINAL_WRITE_TRIES: u32 = 6;
+
+/// The wait after the first failed write of a generation's last status, ms; it doubles after
+/// each further one ([`GEN_FINAL_WRITE_TRIES`]).
+pub const GEN_FINAL_WRITE_WAIT_MS: u64 = 500;
+
 impl Limits {
     /// The design values (see each field).
     pub const DESIGN: Self = Self {
