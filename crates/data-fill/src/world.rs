@@ -481,14 +481,22 @@ impl World {
             });
             Arc::make_mut(&mut w.names)[k].sorted = v;
         }
-        Ok(w.packed())
+        Ok(w)
     }
 
-    /// The same world with everything a solve reads copied once more, list after list. The
-    /// loader makes its lists between its own scratch work, so they end up apart in memory;
-    /// copies taken in one run sit together, which is what a room that copied its worlds got
-    /// and what a fill on 100 worlds measures (1% to 3% of the fill, see PR 207).
-    fn packed(mut self) -> Self {
+    /// A copy of this world that owns everything a solve reads, list after list in one run of
+    /// memory, where [`Clone`] shares the lists. A room of worlds without shuffles fills on
+    /// such copies: the loader leaves a world's lists apart in memory, between its own scratch
+    /// work and the next world's, and a fill on 100 shared worlds measured up to 4% slower
+    /// than on copies (PR 207). A seed's staged world stays shared.
+    #[must_use]
+    pub fn packed(&self) -> Self {
+        let mut w = self.clone();
+        w.pack();
+        w
+    }
+
+    fn pack(&mut self) {
         fn again<T: Clone>(x: &mut Shared<T>) {
             *x = Shared::from(&x[..]);
         }
@@ -513,7 +521,6 @@ impl World {
         again(&mut self.item_groups.0);
         again(&mut self.item_groups.1);
         self.bits = Arc::new(Bits::clone(&self.bits));
-        self
     }
 
     /// Group member lists, and the per-item membership index built from them.

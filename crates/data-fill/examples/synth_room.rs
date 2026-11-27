@@ -210,7 +210,7 @@ fn one(
     let base: Vec<&World> = loaded.iter().map(Prepared::world).collect();
     let t = Instant::now();
     // A room owns its worlds, as in `seed::generate_on`: staged per player when the world
-    // declares shuffles, copies of the loaded world otherwise.
+    // declares shuffles, packed copies of the loaded world otherwise.
     let setup = || {
         if vanilla {
             // The doors-shaped worlds with every door where the manifest has it.
@@ -226,7 +226,7 @@ fn one(
         } else if shape.doors || shape.guards {
             data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
         } else {
-            Compiled::resolve(base.iter().map(|w| (*w).clone()).collect(), &insts, workers)
+            Compiled::resolve(base.iter().map(|w| w.packed()).collect(), &insts, workers)
         }
     };
     let (c, room_bytes) = kept(setup);
