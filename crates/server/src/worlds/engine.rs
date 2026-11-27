@@ -74,10 +74,7 @@ pub(super) async fn put_manifest(
 
 /// Check `manifest` in a capped child process (the same engine that will fill it) and keep what
 /// the check compiled: the found record and the prepared world's file (`data_fill::prepared`).
-pub(super) async fn prepare_manifest(
-    w: &Worlds,
-    manifest: &[u8],
-) -> Result<(Value, Vec<u8>), Failure> {
+async fn prepare_manifest(w: &Worlds, manifest: &[u8]) -> Result<(Value, Vec<u8>), Failure> {
     let timeout = Duration::from_millis(w.limits.inspect_timeout_ms);
     let out = w.run_job("prepare", manifest, timeout).await?;
     let (found, file) = data_fill::job::unframe(&out).map_err(Failure::Broken)?;
@@ -98,7 +95,7 @@ pub(super) async fn prepared_world(w: &Worlds, id: &str) -> Result<PreparedWorld
 
 /// Prepare manifest `id`'s world from the stored manifest and store it in place of what was
 /// stored for this engine.
-pub(super) async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
+async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
     let manifest = w.manifests.bytes(id).await.map_err(|e| format!("{e:?}"))?;
     let manifest = manifest.ok_or("the manifest is gone")?;
     tracing::info!(id, engine = w.manifests.engine, "preparing a world again");
@@ -206,7 +203,7 @@ pub(super) struct PlayerReq {
 
 /// The players' files as fill request players. Real YAML player files are not read for manifest
 /// worlds yet (see #114).
-pub(super) fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String> {
+fn player_requests(files: &[(String, Vec<u8>)]) -> Result<Vec<PlayerReq>, String> {
     files
         .iter()
         .map(|(label, raw)| {

@@ -24,7 +24,7 @@ impl Worlds {
     /// Reserve `seed` for a world about to enter the rooms folder. The host lists one room per
     /// seed name, so a second world with a seed it already hosts would silently share the first
     /// one's room: refused instead.
-    pub(super) fn claim_seed(&self, seed: &str) -> Result<(), String> {
+    fn claim_seed(&self, seed: &str) -> Result<(), String> {
         let mut published = self.published.lock().unwrap_or_else(PoisonError::into_inner);
         let listed = self.rooms.as_ref().is_some_and(|(folder, _)| folder.key_of(seed).is_some());
         if listed || !published.insert(seed.to_owned()) {

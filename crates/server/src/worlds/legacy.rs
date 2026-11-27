@@ -106,7 +106,7 @@ pub(super) async fn upload(w: &Worlds, kind: Kind, query: Option<&str>, body: &[
     Ok(json_reply(StatusCode::CREATED, &meta))
 }
 
-pub(super) async fn inspect_and_store(
+async fn inspect_and_store(
     w: &Worlds,
     kind: Kind,
     name: &str,
@@ -128,7 +128,7 @@ pub(super) async fn inspect_and_store(
 }
 
 /// What the sidecar finds in an `.apworld` or a player `.yaml` (the file is `tmp/<file>`).
-pub(super) async fn inspect_in_sandbox(
+async fn inspect_in_sandbox(
     w: &Worlds,
     kind: Kind,
     file: &str,

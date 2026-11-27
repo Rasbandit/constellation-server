@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(super) fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
+fn checked_id(id: &str) -> Result<(), (StatusCode, String)> {
     if valid_id(id) { Ok(()) } else { Err((StatusCode::BAD_REQUEST, "bad id".to_owned())) }
 }
 
@@ -55,7 +55,7 @@ pub(super) async fn world_status(
     Ok(json_reply(StatusCode::OK, &status))
 }
 
-pub(super) fn no_room() -> (StatusCode, String) {
+fn no_room() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "this world does not run as a room on this server".to_owned())
 }
 

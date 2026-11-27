@@ -41,7 +41,7 @@ impl Worlds {
     ///
     /// # Errors
     /// A status without an id and state, or the store failing.
-    pub(super) async fn save_old_status(&self, status: &Value) -> Result<(), String> {
+    async fn save_old_status(&self, status: &Value) -> Result<(), String> {
         let (id, state, text) = job_row(status)?;
         let put = self.store.job_put_if_absent(id, state, &text).await;
         put.map(drop).map_err(|e| store_failed(&e))
@@ -50,7 +50,7 @@ impl Worlds {
     /// Fail job `id` at once, while it is queued or running: its job folder here outlived this
     /// host's process, so the job died with it (each instance has its own data folder). How
     /// far the job had got, for the log.
-    pub(super) async fn fail_left(&self, id: &str) -> Option<String> {
+    async fn fail_left(&self, id: &str) -> Option<String> {
         let (text, _) = self.store.job_status(id).await.ok()??;
         let mut status: Value = serde_json::from_str(&text).ok()?;
         let was = status["status"].as_str().map(str::to_owned);
@@ -126,12 +126,7 @@ impl Worlds {
     }
 
     /// Move one upload an older server kept: `record` is its `<id>.json`, beside its file.
-    pub(super) async fn import_file(
-        &self,
-        kind: Kind,
-        record: &Path,
-        remove: bool,
-    ) -> Result<(), String> {
+    async fn import_file(&self, kind: Kind, record: &Path, remove: bool) -> Result<(), String> {
         let id = record.file_stem().and_then(|s| s.to_str()).filter(|s| valid_id(s));
         let id = id.ok_or("not an upload record")?;
         let file = record.with_extension(kind.ext());
@@ -173,9 +168,7 @@ fn fail_restarted(status: &mut Value) {
 }
 
 /// Run blocking file work off the runtime's threads; `None` when it panicked (said in the log).
-pub(super) async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| tracing::error!(error = %e, "file work stopped"))
@@ -183,7 +176,7 @@ pub(super) async fn blocking<T: Send + 'static>(
 }
 
 /// Remove `paths` in order, stopping at the first that will not go.
-pub(super) async fn remove_files(paths: Vec<PathBuf>) -> Result<(), String> {
+async fn remove_files(paths: Vec<PathBuf>) -> Result<(), String> {
     let gone = blocking(move || {
         paths
             .iter()
@@ -194,7 +187,7 @@ pub(super) async fn remove_files(paths: Vec<PathBuf>) -> Result<(), String> {
 
 /// The folders under an upload kind's `root` (the root and its game folders), and every upload
 /// record (`*.json`) in them; none when there is no root.
-pub(super) fn upload_records(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+fn upload_records(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     let games = std::fs::read_dir(root).ok()?;
     let mut dirs = vec![root.to_owned()];
     dirs.extend(games.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()));
@@ -205,12 +198,12 @@ pub(super) fn upload_records(root: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)
 }
 
 /// Every job folder under `root`; none when there is no root.
-pub(super) fn job_folders(root: &Path) -> Option<Vec<PathBuf>> {
+fn job_folders(root: &Path) -> Option<Vec<PathBuf>> {
     let entries = std::fs::read_dir(root).ok()?;
     Some(entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
 }
 
 /// The JSON value in the file at `path`; none when it cannot be read or is not JSON.
-pub(super) fn read_json(path: &Path) -> Option<Value> {
+fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
