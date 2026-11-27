@@ -2,7 +2,9 @@
 
 Turns a world as an author wrote it into the manifest JSON the fill engine loads (`crates/data-fill`), and into the per-seed instance the engine fills from. The design is doc 16 (the world file standard) and doc 17 (generic shuffles) in the `constellation` docs repo. Issue #27.
 
-**Status.** The authoring syntax is not decided: YAML with rule strings (D-131) is being reconsidered against a language of its own. So everything here is built on a syntax-neutral model, and the front end that reads a file is one function (`world_build::front::read`) that is not built yet and refuses every input. A world is built today from its model, in Rust.
+**Status.** The owner has chosen an authoring language of its own, with its own file extension, over YAML; its design is being written (docs repo, draft doc 18). So everything here is built on a syntax-neutral model, and the front end that reads a file is one function (`world_build::front::read`) that is not built yet and refuses every input. A world is built today from its model, in Rust.
+
+Two things the model is shaped for: a front end that expands location families and tables into many plain checks, each keeping the place of the declaration it came from (a test builds 20,000 generated checks in about 2 s in a debug build, measured once on a shared machine); and a ledger of permanent ids, held apart from names (`id` on items and checks).
 
 ## The parts
 
@@ -73,8 +75,8 @@ Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERR
 
 - **Output is the engine's manifest shape, not all of doc 16's canonical JSON.** The engine reads a subset (doc 16 section 3.5 table); fields it would ignore are not written. Doc 16's world-side fields (class, count, pool, `when`, `holds`, `no_progression`, placement, start items, assumed) go into the per-seed instance instead.
 - **Canonical text is compact**: no whitespace, a newline at the end.
-- **Ids are file order**, items and checks each from 1. There is no `ledger.json` yet, so reordering a world renumbers it.
-- **`nothing`** is added as an item (filler, the last id) only when the world has no `fill_with`.
+- **Ids**: an item's or check's `id` from the ledger when the model has one (1 to 2^53, each used once per table); the rest are numbered on from the largest given, in file order, so a world with no ledger is numbered from 1. Reading and writing the ledger file is the front end's job and is not built.
+- **`nothing`** is added as an item (filler, the id after the largest) only when the world has no `fill_with`.
 - **Free slots are split by weight deterministically** (largest remainder, ties by key), since the seeded draw waits on D-47.
 - **A `holds` copy of a check that does not exist this seed stays in the pool.**
 - **`class` is required**; the doc's proposed default by use is not built.

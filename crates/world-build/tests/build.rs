@@ -558,3 +558,118 @@ fn a_def_that_reads_a_shuffle_cannot_settle_a_field() {
     w.regions[0].checks[0].when = Some(text("via", P));
     fails(&w, "def `via` reads one", P);
 }
+
+#[test]
+fn the_pool_test_sees_options_read_through_a_def() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.items[3].count = Some(f.at(13));
+    w.defs.push((f.s("not_one"), f.r("opt.pearls_needed != 1")));
+    for c in w.regions[1].checks.iter_mut().filter(|c| c.when.is_some()) {
+        c.when = Some(f.r("not_one"));
+    }
+    let all = errors(&w).join("\n");
+    assert!(all.contains("pearls_needed = 1") && all.contains("items to place"), "{all}");
+}
+
+#[test]
+fn past_the_warning_cap_the_rest_are_counted() {
+    let mut w = tidewell();
+    let f = F::default();
+    let mixed = "has(oar) or has(lamp) and has(oar) or ".repeat(12) + "true";
+    for c in w.regions.iter_mut().flat_map(|r| &mut r.checks) {
+        c.rule = f.r(&mixed);
+    }
+    let b = built(&w);
+    assert_eq!(b.warnings.len(), config::WORLD_BUILD_MAX_ERRORS + 1);
+    assert!(b.warnings.last().unwrap().msg.contains("4 more warnings"), "{:?}", b.warnings.last());
+}
+
+#[test]
+fn ledger_ids_are_kept_apart_from_names_and_the_rest_are_numbered_on() {
+    let mut w = tidewell();
+    w.items[1].id = Some(At::new(40, P)); // lamp
+    w.regions[0].checks[1].id = Some(At::new(7, P)); // net_pile
+    let b = built(&w);
+    let id = |table: &str, key: &str| {
+        b.manifest[table].as_array().unwrap().iter().find(|r| r["key"] == key).unwrap()["id"]
+            .as_i64()
+    };
+    assert_eq!(
+        (id("items", "lamp"), id("items", "oar"), id("items", "crowbar")),
+        (Some(40), Some(41), Some(42))
+    );
+    assert_eq!(
+        (id("locations", "net_pile"), id("locations", "bollard"), id("locations", "tide_pool")),
+        (Some(7), Some(8), Some(9))
+    );
+    // Renaming an item keeps its id.
+    let mut renamed = w.clone();
+    renamed.items[1].key = At::new("lantern".into(), P);
+    for r in &mut renamed.regions {
+        for c in &mut r.checks {
+            if let Rule::Text(t) = &mut c.rule.v {
+                *t = t.replace("lamp", "lantern");
+            }
+        }
+        for (_, rule) in &mut r.events {
+            if let Rule::Text(t) = &mut rule.v {
+                *t = t.replace("lamp", "lantern");
+            }
+        }
+    }
+    renamed.start_items[0].item = At::new("lantern".into(), P);
+    renamed.item_groups[0].1[1] = At::new("lantern".into(), P);
+    let f = F::default();
+    let Some(At { v: Members::Names(things), .. }) = &mut renamed.shuffles[1].things else {
+        panic!()
+    };
+    things[1].rule = Some(f.r("has(lantern)"));
+    renamed.options[3].values[1] = At::new("lantern".into(), P);
+    renamed.start_items[0].when = Some(f.r("opt.start_gift == lantern"));
+    let b2 = built(&renamed);
+    let lantern = b2.manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "lantern")
+        .unwrap()["id"]
+        .as_i64();
+    assert_eq!(lantern, Some(40));
+    let mut w = tidewell();
+    w.items[0].id = Some(At::new(3, P));
+    w.items[2].id = Some(At::new(3, Pos::new(901, 2)));
+    fails(&w, "item id 3 is used twice", Pos::new(901, 2));
+    let mut w = tidewell();
+    w.regions[0].checks[0].id = Some(At::new(0, P));
+    fails(&w, "check id 0 is outside", P);
+}
+
+#[test]
+fn many_generated_checks_build_quickly_and_keep_their_source_place() {
+    // What a front end makes of a family or a table: many checks, each at its declaration.
+    let mut w = tidewell();
+    let family = Pos::new(500, 3);
+    let n = 20_000;
+    w.regions[0].checks.extend((0..n).map(|k| world_build::model::Check {
+        key: At::new(format!("shelf_{k}"), family),
+        id: None,
+        rule: At::new(
+            Rule::Text(if k % 2 == 0 { "true".into() } else { "has(oar)".into() }),
+            family,
+        ),
+        when: None,
+        vanilla: None,
+        holds: None,
+        no_progression: None,
+        placement: None,
+        later: vec![],
+    }));
+    let start = std::time::Instant::now();
+    let b = built(&w);
+    assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    assert_eq!(b.default_instance().unwrap().locations.len(), 17 + n);
+    // One bad generated check points at the family that made it.
+    w.regions[0].checks[9_000].rule = At::new(Rule::Text("has(nope)".into()), family);
+    fails(&w, "unknown item `nope`", family.right(4));
+}

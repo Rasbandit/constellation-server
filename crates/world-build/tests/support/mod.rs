@@ -42,6 +42,7 @@ impl F {
     pub fn item(&self, key: &str, class: &str, count: Option<i64>) -> Item {
         Item {
             key: self.s(key),
+            id: None,
             class: Some(self.s(class)),
             count: count.map(|c| self.at(c)),
             later: vec![],
@@ -51,6 +52,7 @@ impl F {
     pub fn check(&self, key: &str, rule: &str) -> Check {
         Check {
             key: self.s(key),
+            id: None,
             rule: self.r(rule),
             when: None,
             vanilla: None,

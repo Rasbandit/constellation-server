@@ -482,7 +482,8 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         }
     }
     fill_with.sort();
-    let is_item = |k: &str| items.iter().any(|i| i.0 == k);
+    let item_set: HashSet<String> = items.iter().map(|i| i.0.clone()).collect();
+    let is_item = |k: &str| item_set.contains(k);
 
     // Groups and placement sets.
     for (g, members) in &w.item_groups {
@@ -593,7 +594,12 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let mut held_by: HashMap<String, Vec<Pos>> = HashMap::new();
     let mut exit_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut exit_keys: BTreeSet<String> = BTreeSet::new();
-    let mut check_id = 0i64;
+    let check_ids = ids(
+        lw.errs(),
+        &w.regions.iter().flat_map(|r| &r.checks).map(|c| c.id.as_ref()).collect::<Vec<_>>(),
+        "check",
+    );
+    let mut check_ids = check_ids.into_iter();
     for r in &w.regions {
         let when = match &r.when {
             Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
@@ -613,7 +619,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         let region_set = set_ok(&mut lw, &r.placement);
         let mut checks = Vec::new();
         for c in &r.checks {
-            check_id += 1;
+            let check_id = check_ids.next().unwrap_or(0);
             let rule = lw.rule(&c.rule, Mode::Rule).map_or_else(truth, |v| v.0);
             let cwhen = match &c.when {
                 Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
@@ -693,8 +699,9 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             "key": r.key.v, "stays": [],
         }));
     }
+    let counts: HashMap<&str, i64> = items.iter().map(|i| (i.0.as_str(), i.2)).collect();
     for (item, places) in &held_by {
-        let count = items.iter().find(|i| i.0 == *item).map_or(0, |i| i.2);
+        let count = counts.get(item.as_str()).copied().unwrap_or(0);
         if let Some(p) = places.get(usize::try_from(count).unwrap_or(0)) {
             lw.errs().err(
                 *p,
@@ -768,10 +775,12 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
 
     // Every region can be reached from the start by some exits (rules aside).
     if let Some(start) = &start {
+        let exits_of: HashMap<&str, &Vec<crate::model::Exit>> =
+            w.regions.iter().map(|r| (r.key.v.as_str(), &r.exits)).collect();
         let mut seen: HashSet<&str> = HashSet::from([start.as_str()]);
         let mut todo = vec![start.as_str()];
         while let Some(r) = todo.pop() {
-            for x in w.regions.iter().filter(|x| x.key.v == r).flat_map(|x| &x.exits) {
+            for x in exits_of.get(r).copied().into_iter().flatten() {
                 if region_of.contains(x.to.v.as_str()) && seen.insert(&x.to.v) {
                     todo.push(&x.to.v);
                 }
@@ -798,8 +807,14 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         ordered.push((NOTHING.to_owned(), "filler".to_owned(), 0));
         fill_with.push((NOTHING.to_owned(), 1));
     }
-    let id_of: HashMap<&str, usize> =
-        ordered.iter().enumerate().map(|(k, i)| (i.0.as_str(), k + 1)).collect();
+    let item_ids = ids(errs, &w.items.iter().map(|i| i.id.as_ref()).collect::<Vec<_>>(), "item");
+    let mut id_of: HashMap<&str, i64> =
+        w.items.iter().map(|i| i.key.v.as_str()).zip(item_ids.iter().copied()).collect();
+    let next = item_ids.iter().max().map_or(1, |m| m + 1);
+    id_of.entry(NOTHING).or_insert(next);
+    if !errs.errors.is_empty() {
+        return None;
+    }
     let mut item_rows: Vec<Value> =
         ordered.iter().map(|i| json!({"id": id_of[i.0.as_str()], "key": i.0})).collect();
     item_rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
@@ -1141,4 +1156,34 @@ fn refs(v: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// The ids of one table (items or checks), in file order: a ledger id where the model gives
+/// one (a whole number from 1 to 2^53, used once), and the rest numbered on from the largest
+/// given, in file order. Without a ledger that is file order from 1.
+fn ids(errs: &mut Errs, given: &[Option<&At<i64>>], what: &str) -> Vec<i64> {
+    let most = 1i64 << 53;
+    let mut used = HashSet::new();
+    for id in given.iter().flatten() {
+        if !(1..=most).contains(&id.v) {
+            errs.err(id.pos, format!("{what} id {} is outside 1 to 2^53", id.v), "");
+        } else if !used.insert(id.v) {
+            errs.err(
+                id.pos,
+                format!("{what} id {} is used twice", id.v),
+                &format!("an id names one {what} forever"),
+            );
+        }
+    }
+    let mut next = used.iter().max().map_or(1, |m| m + 1);
+    given
+        .iter()
+        .map(|id| match id {
+            Some(id) => id.v,
+            None => {
+                next += 1;
+                next - 1
+            }
+        })
+        .collect()
 }

@@ -179,24 +179,32 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
     Ok(inst)
 }
 
-/// Every option key an options-only rule of `m` reads.
+/// Every option key an options-only rule of `m` reads, through the defs it names (each def
+/// walked once).
 fn read_options(m: &Model) -> Vec<String> {
-    fn walk(v: &Value, out: &mut Vec<String>) {
+    let mut todo: Vec<&Value> = m.checks.iter().map(|c| &c.when).collect();
+    todo.extend(m.start_items.iter().chain(&m.assumed).map(|g| &g.when));
+    let (mut out, mut seen) = (Vec::new(), std::collections::HashSet::new());
+    while let Some(v) = todo.pop() {
         match v {
-            Value::Object(o) => o.iter().for_each(|(k, x)| match (k.as_str(), x.as_str()) {
-                ("opt", Some(s)) => out.push(s.to_owned()),
-                _ => walk(x, out),
-            }),
-            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(o) => {
+                for (k, x) in o {
+                    match (k.as_str(), x.as_str()) {
+                        ("opt", Some(s)) => out.push(s.to_owned()),
+                        ("ref", Some(d)) => {
+                            if seen.insert(d)
+                                && let Some(body) = m.defs.get(d)
+                            {
+                                todo.push(body);
+                            }
+                        }
+                        _ => todo.push(x),
+                    }
+                }
+            }
+            Value::Array(a) => todo.extend(a),
             _ => {}
         }
-    }
-    let mut out = Vec::new();
-    for c in &m.checks {
-        walk(&c.when, &mut out);
-    }
-    for g in m.start_items.iter().chain(&m.assumed) {
-        walk(&g.when, &mut out);
     }
     out.sort();
     out.dedup();

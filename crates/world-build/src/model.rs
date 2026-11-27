@@ -130,8 +130,11 @@ pub struct Opt {
 /// An item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
-    /// Its key.
+    /// Its key: the name rules use.
     pub key: At<String>,
+    /// Its permanent number from the ledger, when it has one; separate from the name, so a
+    /// rename keeps it (doc 16 section 3.4).
+    pub id: Option<At<i64>>,
     /// `progression`, `useful`, `filler` or `trap`.
     pub class: Option<At<String>>,
     /// Copies in the pool (default 1, or 0 for an item in `fill_with`).
@@ -175,8 +178,11 @@ pub struct Region {
 /// A check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
-    /// Its key.
+    /// Its key: the name rules use. A check a front end generates from a family or a table
+    /// carries the place of the declaration it came from.
     pub key: At<String>,
+    /// Its permanent number from the ledger, when it has one; separate from the name.
+    pub id: Option<At<i64>>,
     /// What reaching it takes.
     pub rule: RuleAt,
     /// Options-only: the check exists this seed.
