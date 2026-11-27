@@ -122,10 +122,7 @@ pub(super) async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]
     let Ok(_check) = w.checks.try_acquire() else {
         return Ok(busy(w, "too many manifests are being checked"));
     };
-    let (found, prepared) = prepare_manifest(w, body).await.map_err(|e| match e {
-        Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
-        Failure::Broken(why) => internal(why),
-    })?;
+    let (found, prepared) = prepare_manifest(w, body).await.map_err(failure_reply)?;
     let stored = w.manifests.put(&name, body, &found).await.map_err(store_error)?;
     // What the check compiled is kept: a generation fills from it and compiles nothing. The
     // manifest is stored by now, and a generation prepares a world that has no stored form, so

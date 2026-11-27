@@ -120,6 +120,15 @@ fn internal(e: impl core::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error (see the server log)".to_owned())
 }
 
+/// A failed check as a reply: what the check refused is the uploader's to read (422), anything
+/// else is a 500 that hides its detail.
+fn failure_reply(e: Failure) -> (StatusCode, String) {
+    match e {
+        Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
+        Failure::Broken(why) => internal(why),
+    }
+}
+
 /// A failed store call as a 500 that hides its detail (it is in the log).
 fn store_error(e: log::StoreError) -> (StatusCode, String) {
     internal(store_failed(&e))

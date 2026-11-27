@@ -150,10 +150,7 @@ pub(super) async fn inspect_in_sandbox(
         .sandbox
         .run(false, &[Mount::Ro(tmp.to_owned(), JOB.to_owned())], &args, timeout)
         .await
-        .map_err(|e| match e {
-            Failure::Refused(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
-            Failure::Broken(why) => internal(why),
-        })?;
+        .map_err(failure_reply)?;
     let found: Value = serde_json::from_slice(&found)
         .map_err(|e| internal(format!("sidecar printed bad JSON: {e}")))?;
     match (kind, found) {
