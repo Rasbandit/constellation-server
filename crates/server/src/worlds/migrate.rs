@@ -210,8 +210,7 @@ pub(super) fn job_folders(root: &Path) -> Option<Vec<PathBuf>> {
     Some(entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect())
 }
 
-/// Write `bytes` to `path` through a temporary file and a rename, so a reader never sees half.
-/// The temporary name is unique, so two writers of one path never share it.
+/// The JSON value in the file at `path`; none when it cannot be read or is not JSON.
 pub(super) fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }

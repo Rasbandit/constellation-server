@@ -1,5 +1,15 @@
-//! Uploads of `.apworld` and player `.yaml` files, and seed generation from a chosen set of
-//! them, over HTTP. Signed-in accounts only: every route but sign-up and login needs a session.
+//! Uploads of world files (`.apworld`, or a data-only manifest) and player files, and seed
+//! generation from a chosen set of them, over HTTP. Signed-in accounts only: every route but
+//! sign-up and login needs a session.
+//!
+//! This file holds the shared state, its routes and their gates. The rest is one module a job:
+//! - [`uploads`]: the kinds of upload, their records and files in the store, id and name checks;
+//! - [`legacy`]: the sidecar's path, with uploads inspected and worlds generated in the sandbox;
+//! - [`engine`]: the data-only path, with manifests prepared and worlds filled by `data_fill`, in
+//!   a capped child process or on a pooled worker ([`crate::pool`]);
+//! - [`jobs`]: a generation's queue slot, status, heartbeat and sweep, its run and its publishing;
+//! - [`view`]: a world's status, seed and room, for the accounts that may see them;
+//! - [`migrate`]: what a start moves in from the data folder of an older or stopped server.
 //!
 //! Storage:
 //! - uploads live in the host's store (`world_uploads`, migration 0005), content-addressed by
@@ -96,8 +106,9 @@ pub(crate) struct Worlds {
     published: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
-    /// With `--rooms`: the host's rooms folder, where a finished world's bundle goes as
-    /// `<world id>.json`, and the public `host:port` its join address is under.
+    /// With `--rooms`: the host's rooms folder, where a finished world is listed as a room (its
+    /// seed is in the host's store, never a file), and the public `host:port` its join address
+    /// is under.
     rooms: Option<(RoomsFolder, String)>,
     /// The host's store, where every finished world's seed and packages go.
     importer: Option<Waker>,

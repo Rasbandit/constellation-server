@@ -65,8 +65,6 @@ pub(super) fn unavailable(why: impl core::fmt::Display) -> (StatusCode, String) 
     (StatusCode::SERVICE_UNAVAILABLE, "the room is not available right now; try again".to_owned())
 }
 
-/// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
-/// cold room is loaded to answer, as a connection would load it.
 /// A finished world's seed, decoded from the store to its v1 JSON: the human view of what the
 /// server keeps as binary (`docs/seed-bundle-v2.md`).
 pub(super) async fn world_bundle(
@@ -83,6 +81,8 @@ pub(super) async fn world_bundle(
     Ok(json_text(StatusCode::OK, v1))
 }
 
+/// The world's room now ([`edge_compat::CompatRoom::summary`]), with its key and address. A
+/// cold room is loaded to answer, as a connection would load it.
 pub(super) async fn room_summary(
     State(w): State<Arc<Worlds>>,
     who: Identity,

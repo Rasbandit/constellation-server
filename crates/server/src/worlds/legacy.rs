@@ -249,7 +249,7 @@ pub(super) async fn create_world(
 }
 
 /// What `ap_gen.py generate` prints. The bundle stays raw text (no tree of values in memory);
-/// `load_bundle` parses it into its typed form.
+/// `parse_bundle` parses it into its typed form.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GenOut {
     pub(super) report: Value,
