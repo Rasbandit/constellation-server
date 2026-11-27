@@ -44,8 +44,12 @@ pub(super) struct Layout {
     /// Per distinct door region: the regions that reach it by fixed exits, itself included,
     /// ascending.
     behind: Vec<Vec<u16>>,
-    /// Per region: how many doors it reaches by fixed exits.
+    /// Per region: how many regions with a door it reaches by fixed exits, and per list of
+    /// `behind`: the doors in its region.
     opens: Vec<u32>,
+    doors_at: Vec<u32>,
+    /// Per exit of the declaration: its place among them by key.
+    rank: Vec<usize>,
     /// Per region: the things that lead to it, as bits of the sets of things.
     into: Vec<Vec<usize>>,
     /// The set of things that lead to a region with a door in reach (`opens` above 0), and
@@ -109,7 +113,7 @@ impl Layout {
         let mut behind: Vec<Vec<u16>> = Vec::new();
         let mut of_region: HashMap<usize, usize> = HashMap::new();
         let mut seen = vec![usize::MAX; regions];
-        let mut opens = vec![0u32; regions];
+        let (mut opens, mut doors_at) = (vec![0u32; regions], Vec::new());
         // Regions listed and exits walked, against one budget.
         let mut steps = 0usize;
         for (k, d) in doors.iter_mut().enumerate() {
@@ -134,7 +138,9 @@ impl Layout {
                     }
                     let mut found: Vec<u16> = found.into_iter().map(small).collect();
                     found.sort_unstable();
+                    found.iter().for_each(|r| opens[usize::from(*r)] += 1);
                     behind.push(found);
+                    doors_at.push(0);
                     of_region.insert(d.region, b);
                     b
                 }
@@ -147,7 +153,7 @@ impl Layout {
                     config::SHUFFLE_MAX_BEHIND
                 ));
             }
-            behind[d.behind].iter().for_each(|r| opens[usize::from(*r)] += 1);
+            doors_at[d.behind] += 1;
         }
         let (mut into, mut live) = (vec![Vec::new(); regions], vec![0u64; words]);
         for d in &doors {
@@ -155,7 +161,11 @@ impl Layout {
             into[d.target].push(bit);
             live[bit / 64] |= u64::from(opens[d.target] > 0) << (bit % 64);
         }
-        let layout = Layout { doors, fixed, doors_in, behind, opens, into, live };
+        let mut by_key: Vec<usize> = (0..decl.exits.len()).collect();
+        by_key.sort_unstable_by_key(|e| &decl.exits[*e].key);
+        let mut rank = vec![0; by_key.len()];
+        by_key.iter().enumerate().for_each(|(at, e)| rank[*e] = at);
+        let layout = Layout { doors, fixed, doors_in, behind, opens, doors_at, rank, into, live };
         layout.listed_from_the_near_side(w, decl)?;
         Ok(Some(layout))
     }
@@ -214,7 +224,7 @@ impl Layout {
         let n = self.doors.len();
         let key = |d: &Door| decl.exits[d.exit].key.as_str();
         let mut placed = vec![false; self.fixed.len()];
-        let mut opens = self.opens.clone();
+        let (mut opens, mut doors_at) = (self.opens.clone(), self.doors_at.clone());
         let (mut free, mut fresh) =
             (vec![u64::MAX; self.live.len()], vec![u64::MAX; self.live.len()]);
         let mut live = self.live.clone();
@@ -245,8 +255,12 @@ impl Layout {
             };
             let x = &self.doors[open.swap_remove(k)];
             let sh = &decl.shuffles[x.shuffle];
-            // The door being connected is no longer one a region opens.
-            for r in self.behind[x.behind].iter().map(|r| usize::from(*r)) {
+            // The door being connected is no longer one a region opens: when it was the last
+            // of its region, that region is one fewer for every region that reaches it.
+            doors_at[x.behind] -= 1;
+            let emptied =
+                if doors_at[x.behind] == 0 { self.behind[x.behind].as_slice() } else { &[] };
+            for r in emptied.iter().map(|r| usize::from(*r)) {
                 opens[r] -= 1;
                 if opens[r] == 0 {
                     drop(&mut live, r);
@@ -288,10 +302,11 @@ impl Layout {
         Ok(out)
     }
 
-    /// Write what a growth connected into `table`: per shuffle, slot key to thing key.
-    pub(super) fn record(decl: &Decl, mut pairs: Vec<Pair>, table: &mut Table) {
+    /// Write what a growth connected into `table`: per shuffle, slot key to thing key. The
+    /// pairs are put in key order by the exits' ranks, so no key is compared to sort them.
+    pub(super) fn record(&self, decl: &Decl, mut pairs: Vec<Pair>, table: &mut Table) {
         let key = |exit: usize| decl.exits[exit].key.clone();
-        pairs.sort_unstable();
+        pairs.sort_unstable_by_key(|p| (p.0, self.rank[p.1]));
         for of_shuffle in pairs.chunk_by(|a, b| a.0 == b.0) {
             let row: BTreeMap<_, _> = of_shuffle.iter().map(|p| (key(p.1), key(p.2))).collect();
             table.entry(decl.shuffles[of_shuffle[0].0].name.clone()).or_default().extend(row);

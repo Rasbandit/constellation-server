@@ -207,7 +207,7 @@ impl Bound {
         lap(4);
         let Err(why) = checked else {
             // Only a layout that passed is written out by name.
-            Layout::record(&self.decl, pairs, &mut table);
+            layout.record(&self.decl, pairs, &mut table);
             lap(5);
             return Ok(Staged { world, plan, table, attempts: 1, nanos });
         };
