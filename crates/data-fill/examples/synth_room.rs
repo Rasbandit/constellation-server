@@ -226,7 +226,9 @@ fn one(
         } else if shape.doors || shape.guards {
             data_fill::shuffle::room(&base, &insts, seed, 1).map(|x| x.0)
         } else {
-            Compiled::resolve(base.iter().map(|w| w.packed()).collect(), &insts, workers)
+            // Several worlds are copied side by side; one is shared as loaded.
+            let own = |w: &&World| if count > 1 { w.packed() } else { (*w).clone() };
+            Compiled::resolve(base.iter().map(own).collect(), &insts, workers)
         }
     };
     let (c, room_bytes) = kept(setup);

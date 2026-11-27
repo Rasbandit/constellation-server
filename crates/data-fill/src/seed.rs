@@ -207,7 +207,7 @@ fn fill_on(
             .map_err(|e| format!("world {:?}: {e}", on.1))?
     } else {
         // The room owns its world: a copy of the loaded bytes, small beside a fill.
-        (room::Compiled::shared(on.0.packed(), &insts, workers)?, Vec::new())
+        (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
     };
     let seats = room.seats();
     let (filled, spheres) = room::fill_room_by(
