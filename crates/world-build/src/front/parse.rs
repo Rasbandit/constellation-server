@@ -917,7 +917,7 @@ impl P<'_> {
                         "vanilla" => c.vanilla = Some(self.tname("an item")?),
                         "holds" => c.holds = Some(self.tname("an item")?),
                         "placement" => c.placement = Some(self.name("a placement set")?),
-                        _ => {
+                        "no_progression" => {
                             // A modifier word after it starts the next modifier, not a rule: no
                             // def may take one of these names, and an event is state, which
                             // `no_progression` never reads.
@@ -929,6 +929,9 @@ impl P<'_> {
                             };
                             c.no_progression = Some((at, r));
                         }
+                        // A word added to the lists without a case here is a parse error, not
+                        // a silent `no_progression`.
+                        other => return Err((at, format!("`{other}` is not read here yet"))),
                     }
                 }
             }
