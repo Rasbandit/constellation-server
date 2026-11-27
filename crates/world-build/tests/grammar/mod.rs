@@ -230,3 +230,18 @@ fn a_check_may_share_a_name_with_an_item_a_region_or_an_event() {
         "`c1` is a check; a rule reads items, defs and events",
     );
 }
+
+/// Events and regions are visible world-wide: a rule reads an event another region file
+/// fires without a `use` of that file. Defs, items, groups and options still need one.
+#[test]
+fn events_and_regions_need_no_use() {
+    let files = super::lang::mem(&[
+        (
+            "world.rando",
+            "world t\nuse rooms/a\nuse rooms/b\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal opened\n",
+        ),
+        ("rooms/a.rando", "region a {\n  check a1: opened\n  exit b\n}\n"),
+        ("rooms/b.rando", "region b {\n  check b1\n  event opened: true\n  exit a\n}\n"),
+    ]);
+    ok(&files);
+}

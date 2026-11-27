@@ -1307,9 +1307,10 @@ impl X {
         }
     }
 
-    /// A file reads a name declared in another file only if it uses that file, directly or
-    /// through modules it uses, or the name is in the entry file (doc 18 section 2.5). An
-    /// exit's target is not a read: regions in different files lead to each other, and a `use`
+    /// A file reads a def, item, item group, placement set, shuffle or option declared in
+    /// another file only if it uses that file, directly or through modules it uses, or the name
+    /// is in the entry file (doc 18 section 2.5). Regions, events and checks are visible
+    /// world-wide: region files lead to each other and read each other's events, and a `use`
     /// each way would be a cycle for no gain.
     fn visibility(&mut self) {
         let w = &self.world;
@@ -1323,10 +1324,8 @@ impl X {
         w.item_groups.iter().for_each(|g| put(g.0.v.clone(), g.0.pos));
         w.placement.iter().for_each(|g| put(g.0.v.clone(), g.0.pos));
         w.shuffles.iter().for_each(|s| put(s.name.v.clone(), s.name.pos));
-        for r in &w.regions {
-            put(r.key.v.clone(), r.key.pos);
-            r.events.iter().for_each(|e| put(e.0.v.clone(), e.0.pos));
-        }
+        // Regions, events and checks are visible world-wide: only defs, items, item groups,
+        // placement sets, shuffles and options need a `use`.
         let mut closures: HashMap<u32, BTreeSet<u32>> = HashMap::new();
         let mut seen = HashSet::new();
         // A call reads a def with parameters (as lowering reads it); any other call is a
