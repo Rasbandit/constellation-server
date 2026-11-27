@@ -3,11 +3,11 @@ item blade progression x 3
 item gauntlet progression x 2
 item quiver progression x 2
 item lantern progression
-item flippers progression
+item kelp_charm progression
 item grapple progression
 item glider progression
 item bombs progression
-item fire_rod progression
+item cinder_wand progression
 item shield progression
 item relic progression x 4
 item throne_seal progression
@@ -17,8 +17,8 @@ item coin filler
 item spark_trap trap
 pool fill { coin 20, spark_trap 1 }
 
-group fire_tools = { lantern, fire_rod }
-group mobility = { grapple, glider, flippers }
+group fire_tools = { lantern, cinder_wand }
+group mobility = { grapple, glider, kelp_charm }
 
 # Dungeon keys stay inside their own dungeon.
 item mire_key progression x 2

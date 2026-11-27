@@ -2,8 +2,8 @@
 use items
 
 def can_cut = has(blade)
-def can_burn = has_any(lantern, fire_rod)
-def can_swim = has(flippers)
+def can_burn = has_any(lantern, cinder_wand)
+def can_swim = has(kelp_charm)
 def can_blast = has(bombs)
 def can_shoot = has(quiver)
 def can_lift(n) = has(gauntlet, n)
