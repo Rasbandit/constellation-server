@@ -430,7 +430,7 @@ fn long_arithmetic_and_deep_def_chains_are_errors_not_stack_overflows() {
 }
 
 #[test]
-fn a_def_in_a_settled_field_is_inlined_and_checked_as_that_field() {
+fn a_def_in_a_settled_field_is_evaluated_and_checked_as_that_field() {
     let mut w = tidewell();
     let f = F::default();
     w.defs.push((f.s("stalls_on"), f.r("opt.market_stalls")));
@@ -442,9 +442,9 @@ fn a_def_in_a_settled_field_is_inlined_and_checked_as_that_field() {
     assert_eq!(b.instance(&[("market_stalls".to_owned(), 0)].into()).unwrap().locations.len(), 15);
     // A def cannot carry a shuffle read, or a state read, into a settled field.
     let mut w = tidewell();
-    w.defs.push((f.s("crab_up"), text("at.wardens.tower_door == crab", P)));
-    w.regions[0].checks[0].when = Some(f.r("crab_up"));
-    fails(&w, "cannot read a shuffle result yet", P);
+    w.defs.push((f.s("crab_up"), f.r("at.wardens.tower_door == crab")));
+    w.regions[0].checks[0].when = Some(text("crab_up", P));
+    fails(&w, "cannot read a shuffle result yet, and def `crab_up` reads one", P);
     let mut w = tidewell();
     w.regions[0].checks[0].when = Some(f.r("can_climb"));
     assert!(errors(&w).iter().any(|e| e.contains("`when` may read options only")));
@@ -510,4 +510,51 @@ fn past_the_error_cap_the_rest_are_counted() {
     let all = errors(&w);
     assert_eq!(all.len(), config::WORLD_BUILD_MAX_ERRORS + 1);
     assert!(all.last().unwrap().contains("140 more errors"), "{:?}", all.last());
+}
+
+#[test]
+fn a_def_used_twice_by_each_next_def_builds_in_linear_time() {
+    // `eK: e(K-1) and e(K-1)` doubles a copied tree each level; referenced, it stays small.
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push((f.s("e0"), f.r("opt.tricky_climbs")));
+    for k in 1..40 {
+        w.defs.push((f.s(&format!("e{k}")), f.r(&format!("e{0} and e{0}", k - 1))));
+    }
+    w.regions[0].checks[0].when = Some(f.r("e39"));
+    let start = std::time::Instant::now();
+    let b = built(&w);
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    assert_eq!(b.default_instance().unwrap().locations.len(), 16);
+    assert_eq!(b.instance(&[("tricky_climbs".to_owned(), 1)].into()).unwrap().locations.len(), 17);
+}
+
+#[test]
+fn a_def_chain_the_engine_counts_deeper_gets_a_depth_error_not_a_report_request() {
+    // Each def adds one `not` over the one before; an event at the bottom is one node to the
+    // build and two to the engine. Somewhere past 240 deep one of the two depth checks refuses
+    // it, and both say what to do.
+    for n in 240..=256 {
+        let mut w = tidewell();
+        let f = F::default();
+        w.defs.push((f.s("x0"), f.r("opt.tricky_climbs")));
+        for k in 1..n {
+            w.defs.push((f.s(&format!("x{k}")), f.r(&format!("not x{}", k - 1))));
+        }
+        w.regions[0].checks[0].rule = f.r(&format!("x{}", n - 1));
+        if let Err(e) = build_model(&w, "w") {
+            let all = e.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+            assert!(all.contains("deep") && !all.contains("please report"), "{n}: {all}");
+        }
+    }
+}
+
+#[test]
+fn a_def_that_reads_a_shuffle_cannot_settle_a_field() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push((f.s("crab_deep"), f.r("opt.tricky_climbs or at.wardens.tower_door == crab")));
+    w.defs.push((f.s("via"), f.r("crab_deep")));
+    w.regions[0].checks[0].when = Some(text("via", P));
+    fails(&w, "def `via` reads one", P);
 }

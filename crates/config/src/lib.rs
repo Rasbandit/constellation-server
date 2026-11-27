@@ -440,6 +440,11 @@ pub const WORLD_RULE_MAX_DEPTH: usize = 64;
 /// file in one pass, bounded so a broken file cannot print without end).
 pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
 
+/// Most parts one rule node of the engine takes: the parts of an `all` or `any`, the items of
+/// `has_any` and `has_all`, the operands of a sum, `min` or `max`, and `n` in `has` (the
+/// engine's limit, one byte).
+pub const RULE_MAX_PARTS: usize = 255;
+
 /// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
 /// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
 pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;

@@ -2,7 +2,7 @@
 //! numbers, then which checks exist, the pool, start items, fixed placements and placement
 //! sets, in the engine's instance form. Also the build-time pool test of section 3.4.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use data_fill::Instance;
 use serde_json::Value;
@@ -31,25 +31,50 @@ fn int(v: &Value, o: &HashMap<&str, i64>) -> Option<i64> {
     }
 }
 
-/// An options-only rule's value.
-fn rule(v: &Value, o: &HashMap<&str, i64>) -> Option<bool> {
-    let (k, a) = v.as_object()?.iter().next()?;
-    Some(match k.as_str() {
-        "true" => true,
-        "false" => false,
-        "all" => {
-            a.as_array()?.iter().map(|x| rule(x, o)).collect::<Option<Vec<_>>>()?.iter().all(|x| *x)
-        }
-        "any" => {
-            a.as_array()?.iter().map(|x| rule(x, o)).collect::<Option<Vec<_>>>()?.iter().any(|x| *x)
-        }
-        "not" => !rule(a, o)?,
-        op => {
-            let ix = data_fill::section::CMP_OPS.iter().position(|x| *x == op)?;
-            let [x, y] = a.as_array()?.as_slice() else { return None };
-            data_fill::section::compare(u8::try_from(ix).ok()?, int(x, o)?, int(y, o)?)
-        }
-    })
+/// Options-only rules evaluated for one set of option values, each def once.
+struct Ev<'m> {
+    o: &'m HashMap<&'m str, i64>,
+    defs: &'m BTreeMap<String, Value>,
+    memo: HashMap<&'m str, bool>,
+}
+
+impl<'m> Ev<'m> {
+    /// An options-only rule's value. Recursion follows the rule's nesting, defs included,
+    /// which the build bounds.
+    fn rule(&mut self, v: &'m Value) -> Option<bool> {
+        let (k, a) = v.as_object()?.iter().next()?;
+        Some(match k.as_str() {
+            "true" => true,
+            "false" => false,
+            "all" | "any" => {
+                let mut out = k == "all";
+                for x in a.as_array()? {
+                    let b = self.rule(x)?;
+                    out = if k == "all" { out && b } else { out || b };
+                }
+                out
+            }
+            "not" => !self.rule(a)?,
+            "ref" => {
+                let name = a.as_str()?;
+                if let Some(b) = self.memo.get(name) {
+                    return Some(*b);
+                }
+                let b = self.rule(self.defs.get(name)?)?;
+                self.memo.insert(name, b);
+                b
+            }
+            op => {
+                let ix = data_fill::section::CMP_OPS.iter().position(|x| *x == op)?;
+                let [x, y] = a.as_array()?.as_slice() else { return None };
+                data_fill::section::compare(
+                    u8::try_from(ix).ok()?,
+                    int(x, self.o)?,
+                    int(y, self.o)?,
+                )
+            }
+        })
+    }
 }
 
 /// `free` slots split by weight, largest remainders first, ties by key: no random draw.
@@ -80,8 +105,9 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
     if let Some(k) = given.keys().find(|k| !o.contains_key(k.as_str())) {
         return Err(format!("unknown option {k:?}"));
     }
-    let holds =
-        |v: &Value| rule(v, &o).ok_or_else(|| format!("a rule here reads more than options: {v}"));
+    let mut ev = Ev { o: &o, defs: &m.defs, memo: HashMap::new() };
+    let mut holds =
+        |v| ev.rule(v).ok_or_else(|| format!("a rule here reads more than options: {v}"));
     let mut inst = Instance::default();
     let mut taken: HashMap<&str, i64> = HashMap::new();
     for c in &m.checks {
@@ -277,13 +303,20 @@ mod tests {
     #[test]
     fn options_only_rules_evaluate_as_the_engine_compares() {
         let o: HashMap<&str, i64> = [("k", 2)].into();
-        assert_eq!(rule(&json!({"ge": [{"opt": "k"}, 2]}), &o), Some(true));
-        assert_eq!(rule(&json!({"not": {"eq": [{"opt": "k"}, 2]}}), &o), Some(false));
-        assert_eq!(rule(&json!({"any": []}), &o), Some(false));
-        assert_eq!(
-            rule(&json!({"all": [{"lt": [{"int": ["+", {"opt": "k"}, 1]}, 4]}]}), &o),
-            Some(true)
-        );
-        assert_eq!(rule(&json!({"has": "x"}), &o), None);
+        let defs: BTreeMap<String, Value> =
+            [("two".to_owned(), json!({"eq": [{"opt": "k"}, 2]}))].into();
+        let cases = [
+            (json!({"ge": [{"opt": "k"}, 2]}), Some(true)),
+            (json!({"not": {"eq": [{"opt": "k"}, 2]}}), Some(false)),
+            (json!({"any": []}), Some(false)),
+            (json!({"all": [{"lt": [{"int": ["+", {"opt": "k"}, 1]}, 4]}]}), Some(true)),
+            (json!({"all": [{"ref": "two"}, {"ref": "two"}]}), Some(true)),
+            (json!({"has": "x"}), None),
+            (json!({"ref": "nope"}), None),
+        ];
+        for (v, want) in &cases {
+            let mut ev = Ev { o: &o, defs: &defs, memo: HashMap::new() };
+            assert_eq!(ev.rule(v), *want, "{v}");
+        }
     }
 }

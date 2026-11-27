@@ -100,6 +100,10 @@ pub(crate) struct Lower<'a> {
     depth: usize,
     /// The deepest the recursion went since it was last reset (per def body).
     peak: usize,
+    /// The rule being lowered reads a shuffle result (reset per def body, like `peak`).
+    at_read: bool,
+    /// Per lowered def: whether it reads a shuffle result, defs it reaches included.
+    def_at: HashMap<String, bool>,
 }
 
 /// Where a def's lowering stands.
@@ -131,6 +135,8 @@ impl<'a> Lower<'a> {
             place,
             depth: 0,
             peak: 0,
+            at_read: false,
+            def_at: HashMap::new(),
         }
     }
 
@@ -154,11 +160,6 @@ impl<'a> Lower<'a> {
     /// A rule as written in the file: `true`, `false`, or a rule string. Returns the tree and
     /// whether it reads state (items, events, counters, reached regions).
     pub(crate) fn rule(&mut self, n: &RuleAt, mode: Mode) -> L {
-        self.rule_as(n, mode, true)
-    }
-
-    /// [`Lower::rule`], warning about mixed `and` and `or` only when `warn`.
-    fn rule_as(&mut self, n: &RuleAt, mode: Mode, warn: bool) -> L {
         let text = match &n.v {
             Rule::Const(b) => return Some((json!({b.to_string(): {}}), false)),
             Rule::Text(text) => text,
@@ -168,7 +169,7 @@ impl<'a> Lower<'a> {
         let out = match parse(text) {
             Err((at, msg)) => self.err(at, msg, ""),
             Ok(parsed) => {
-                for at in parsed.mixed.into_iter().filter(|_| warn) {
+                for at in parsed.mixed {
                     let p = self.pos(at);
                     self.errs.warn(
                         p,
@@ -188,6 +189,7 @@ impl<'a> Lower<'a> {
     fn def(&mut self, name: &str, at: usize) -> Option<bool> {
         match self.state.get(name).copied() {
             Some(DefState::Done(state)) => {
+                self.at_read |= self.def_at.get(name).copied().unwrap_or(false);
                 let below = self.below.get(name).copied().unwrap_or(0);
                 self.deep(self.depth + below, at)?;
                 return Some(state);
@@ -206,11 +208,13 @@ impl<'a> Lower<'a> {
         }
         let node = self.names.defs.get(name)?.clone();
         self.state.insert(name.to_owned(), DefState::Busy);
-        let (base, outer) = (self.depth, self.peak);
-        self.peak = base;
+        let (base, outer, outer_at) = (self.depth, self.peak, self.at_read);
+        (self.peak, self.at_read) = (base, false);
         let out = self.rule(&node, Mode::Rule);
         self.below.insert(name.to_owned(), self.peak - base);
+        self.def_at.insert(name.to_owned(), self.at_read);
         self.peak = self.peak.max(outer);
+        self.at_read |= outer_at;
         let Some((v, state)) = out else {
             self.state.insert(name.to_owned(), DefState::Failed);
             return None;
@@ -368,12 +372,17 @@ impl<'a> Lower<'a> {
                 Dotted::Bare(n) => match self.sort_of(n) {
                     Some(Sort::Def) => {
                         let state = self.def(n, e.at)?;
-                        if let Mode::Static(_) = mode {
-                            // A settled field is folded from options by the per-seed step, which
-                            // reads no defs: the body goes inline, checked as that field.
-                            let node = self.names.defs.get(n)?.clone();
-                            return self.rule_as(&node, mode, false);
+                        if let Mode::Static(field) = mode
+                            && self.def_at.get(n).copied().unwrap_or(false)
+                        {
+                            return self.err(
+                                e.at,
+                                format!("`{field}` cannot read a shuffle result yet, and def `{n}` reads one"),
+                                "it is settled from options before the shuffles run",
+                            );
                         }
+                        // Kept as a reference everywhere: the per-seed step evaluates defs once
+                        // each, so a def used twice by the next one never doubles the work.
                         Some((json!({"ref": n}), state))
                     }
                     Some(Sort::Event) => Some((json!({"ge": [{"counter": n}, 1]}), true)),
@@ -409,12 +418,13 @@ impl<'a> Lower<'a> {
                 Some((json!({"not": v}), false))
             }
             E::And(xs) | E::Or(xs) => {
-                if xs.len() > usize::from(u8::MAX) {
+                if xs.len() > config::RULE_MAX_PARTS {
                     return self.err(
                         e.at,
                         format!(
-                            "{} parts; the engine takes at most 255 in one `and` or `or`",
-                            xs.len()
+                            "{} parts; the engine takes at most {} in one `and` or `or`",
+                            xs.len(),
+                            config::RULE_MAX_PARTS
                         ),
                         "split it with a def",
                     );
@@ -450,6 +460,7 @@ impl<'a> Lower<'a> {
                 "give every thing a `rule`, or test which thing is there with `==`",
             );
         }
+        self.at_read = true;
         Some((json!({"at": [s, slot]}), true))
     }
 
@@ -464,10 +475,10 @@ impl<'a> Lower<'a> {
                 let item = self.item(x)?;
                 match n.map(|n| &n.e) {
                     None | Some(E::Int(1)) => Some((json!({"has": item}), true)),
-                    Some(E::Int(k)) if (0..=255).contains(k) => Some((json!({"has": item, "n": k}), true)),
+                    Some(E::Int(k)) if usize::try_from(*k).is_ok_and(|k| k <= config::RULE_MAX_PARTS) => Some((json!({"has": item, "n": k}), true)),
                     Some(E::Int(k)) => self.err(
                         n.map_or(at, |n| n.at),
-                        format!("`has` counts 0 to 255 copies, not {k} (the engine's limit)"),
+                        format!("`has` counts 0 to {} copies, not {k} (the engine's limit)", config::RULE_MAX_PARTS),
                         "for more, write `count(x) >= n`",
                     ),
                     Some(_) => self.err(
@@ -478,8 +489,8 @@ impl<'a> Lower<'a> {
                 }
             }
             "has_all" | "has_any" => {
-                if args.is_empty() || args.len() > usize::from(u8::MAX) {
-                    return self.err(at, format!("`{f}` takes 1 to 255 items"), "");
+                if args.is_empty() || args.len() > config::RULE_MAX_PARTS {
+                    return self.err(at, format!("`{f}` takes 1 to {} items", config::RULE_MAX_PARTS), "");
                 }
                 let mut items = Vec::new();
                 for a in args {
@@ -547,6 +558,7 @@ impl<'a> Lower<'a> {
                     }
                     let Dotted::At(s, slot) = self.dotted(xn, x.at)? else { return None };
                     self.thing(s, yn, y.at)?;
+                    self.at_read = true;
                     return Some((json!({key: [{"at": [s, slot]}, yn]}), false));
                 }
             }
@@ -708,8 +720,12 @@ impl<'a> Lower<'a> {
                 ),
             },
             "min" | "max" => {
-                if args.is_empty() || args.len() > usize::from(u8::MAX) {
-                    return self.err(at, format!("`{f}` takes 1 to 255 numbers"), "");
+                if args.is_empty() || args.len() > config::RULE_MAX_PARTS {
+                    return self.err(
+                        at,
+                        format!("`{f}` takes 1 to {} numbers", config::RULE_MAX_PARTS),
+                        "",
+                    );
                 }
                 let mut out = vec![json!(f)];
                 let mut state = false;
@@ -740,10 +756,14 @@ impl<'a> Lower<'a> {
                 _ => terms.push(t),
             }
         }
-        if terms.len() > usize::from(u8::MAX) {
+        if terms.len() > config::RULE_MAX_PARTS {
             return self.err(
                 at,
-                format!("{} terms in one sum; the engine takes at most 255", terms.len()),
+                format!(
+                    "{} terms in one sum; the engine takes at most {}",
+                    terms.len(),
+                    config::RULE_MAX_PARTS
+                ),
                 "",
             );
         }

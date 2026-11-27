@@ -29,13 +29,21 @@ pub(crate) struct Errs {
     file: String,
     pub errors: Vec<Error>,
     pub warnings: Vec<Error>,
-    /// Errors and warnings past the cap, dropped.
+    /// Errors past the cap, dropped.
     dropped: usize,
+    /// Warnings past the cap, dropped.
+    dropped_warnings: usize,
 }
 
 impl Errs {
     fn new(file: &str) -> Self {
-        Errs { file: file.to_owned(), errors: Vec::new(), warnings: Vec::new(), dropped: 0 }
+        Errs {
+            file: file.to_owned(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            dropped: 0,
+            dropped_warnings: 0,
+        }
     }
 
     fn make(&self, pos: Option<Pos>, msg: impl Into<String>, help: &str) -> Error {
@@ -76,8 +84,18 @@ impl Errs {
             let e = self.make(pos, msg, help);
             self.warnings.push(e);
         } else {
-            self.dropped += 1;
+            self.dropped_warnings += 1;
         }
+    }
+
+    /// The warnings, and one more line for what the cap dropped.
+    fn warnings(mut self) -> Vec<Error> {
+        if self.dropped_warnings > 0 {
+            let e =
+                self.make(None, format!("{} more warnings not shown", self.dropped_warnings), "");
+            self.warnings.push(e);
+        }
+        self.warnings
     }
 
     /// The errors in file order, and one more line for what the cap dropped.
@@ -86,7 +104,7 @@ impl Errs {
         if self.dropped > 0 {
             let e = self.make(
                 None,
-                format!("{} more errors and warnings not shown", self.dropped),
+                format!("{} more errors not shown", self.dropped),
                 "fix these and build again",
             );
             self.errors.push(e);
@@ -135,6 +153,8 @@ pub(crate) struct Model {
     pub assumed: Vec<GrantM>,
     /// Item to the placement set it is confined to.
     pub confined: BTreeMap<String, String>,
+    /// The lowered defs, which settled fields may name.
+    pub defs: BTreeMap<String, Value>,
 }
 
 /// A name the rule language can read: `[a-z_][a-z0-9_]*`, not reserved, not too long.
@@ -220,16 +240,28 @@ pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
         && let Some((manifest, model)) = out
     {
         if let Err(e) = data_fill::section::compile(&manifest) {
-            errs.whole(
-                format!("the engine refused the built manifest: {e}"),
-                "the build's own checks missed this; please report it with the world file",
-            );
+            // The engine counts depth over its own nodes, which a short form (a toggle, an
+            // event, `in`, a shuffle read) turns into one or two more than the build counts:
+            // past the build's own cap the engine's check is the one that decides.
+            if e.contains("nested more than") {
+                errs.whole(
+                    format!(
+                        "{e} in the engine's form, counting the defs and shuffle reads it reaches"
+                    ),
+                    "flatten a def chain, or split the rule",
+                );
+            } else {
+                errs.whole(
+                    format!("the engine refused the built manifest: {e}"),
+                    "the build's own checks missed this; please report it with the world file",
+                );
+            }
         } else {
             instance::pool_test(&model, &mut errs);
         }
         match crate::canon::to_string(&manifest) {
             Ok(text) if errs.errors.is_empty() => {
-                return Ok(Built { manifest, warnings: errs.warnings, text, model });
+                return Ok(Built { manifest, warnings: errs.warnings(), text, model });
             }
             Ok(_) => {}
             Err(e) => errs.whole(format!("the manifest is not canonical: {e}"), ""),
@@ -468,13 +500,14 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 errs.err(m.pos, format!("`{}` is in item group `{}` twice", m.v, g.v), "");
             }
         }
-        if members.len() > usize::from(u8::MAX) {
+        if members.len() > config::RULE_MAX_PARTS {
             errs.err(
                 g.pos,
                 format!(
-                    "item group `{}` has {} items; a sum the engine reads has at most 255",
+                    "item group `{}` has {} items; a sum the engine reads has at most {}",
                     g.v,
-                    members.len()
+                    members.len(),
+                    config::RULE_MAX_PARTS
                 ),
                 "",
             );
@@ -792,6 +825,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         start_items,
         assumed,
         confined,
+        defs: m["defs"].as_object().map(|d| d.clone().into_iter().collect()).unwrap_or_default(),
     };
     Some((m, model))
 }
