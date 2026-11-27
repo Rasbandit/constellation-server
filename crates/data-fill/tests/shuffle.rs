@@ -805,6 +805,41 @@ fn the_results_of_fixed_seeds_are_pinned() {
     assert_eq!(got, ["a4521a4a03bded05", "7e7645c7fd61def5", "7b5053b20fdcc435"]);
 }
 
+/// A wider pin for the layout solve and the check behind it: per seed, the attempts taken and
+/// the table, on worlds whose layouts fail the check (the bell worlds, where the old check
+/// rejected one layout in four and one in eight), on three shuffles solved together, and on
+/// a synthetic world with more doors than fit one machine word. An attempt count that moves
+/// means a layout was judged differently; a table that moves means a draw changed.
+#[test]
+fn layouts_that_fail_the_check_are_rejected_on_the_same_attempts_as_before() {
+    let pin = |(m, inst): (Value, Instance), seeds: u64| {
+        let w = World::load(&m).unwrap();
+        let (mut out, mut restarted) = (String::new(), 0u32);
+        for seed in 1..=seeds {
+            // A seed whose every attempt fails is pinned by its error.
+            let s = stage(&w, &inst, seed, 0).map(|s| s.map(|s| (s.attempts, s.table)));
+            restarted += u32::from(s.as_ref().is_ok_and(|s| s.as_ref().unwrap().0 > 1));
+            out += &format!("{s:?}\n");
+        }
+        (format!("{:016x}", data_fill::check::fnv1a(out.as_bytes())), restarted)
+    };
+    let wide = Shape { checks: 400, doors: true, timeless: true, ..Shape::heavy() };
+    let (synth, inst) = synth_world(&wide, 7, 0);
+    let doors = synth["shuffles"]["entrances"]["slots"]["names"].as_array().unwrap().len();
+    assert!(doors > 64, "{doors} doors");
+    let got = [
+        pin(bell(&["b", "c"], json!([])), 300),
+        pin(bell(&["b", "c", "e", "f", "g", "h"], json!([])), 300),
+        pin(three_shuffles(), 100),
+        pin((synth, inst), 6),
+    ];
+    assert!(got[0].1 > 30 && got[1].1 > 15, "{got:?}: both bell worlds restart");
+    assert_eq!(
+        got.map(|x| x.0),
+        ["0807942c8978390a", "2f61edeb98a2c309", "fcd03d6e1bbef245", "6ea4add6e2bef5d5"]
+    );
+}
+
 /// A staged world is an ordinary world to every way the room fill places its rounds: taking
 /// items back (carried), a fresh forward solve per round, and the split path with its journal
 /// all read the seed's exits and the seed's `none` results, and decide the same placements and
@@ -912,9 +947,8 @@ fn decoupled_doors_are_four_slots_and_need_not_lead_back() {
     assert!(one_way > 0, "some door leads somewhere else than back");
 }
 
-/// Three shuffles over the doors of one world: one joint solve, each exit in its own table.
-#[test]
-fn several_layout_shuffles_of_a_world_are_solved_together() {
+/// The doors world with its doors split over three coupled shuffles.
+fn three_shuffles() -> (Value, Instance) {
     let slots =
         |names: &[&str]| json!({"coupled": true, "slots": {"type": "exit", "names": names}});
     let shuffles = json!({
@@ -922,7 +956,13 @@ fn several_layout_shuffles_of_a_world_are_solved_together() {
         "drops": slots(&["well_drop", "chute"]),
         "dungeons": slots(&["tower_gate", "crypt_gate"]),
     });
-    let (m, inst) = manifest(doors_regions(), shuffles);
+    manifest(doors_regions(), shuffles)
+}
+
+/// Three shuffles over the doors of one world: one joint solve, each exit in its own table.
+#[test]
+fn several_layout_shuffles_of_a_world_are_solved_together() {
+    let (m, inst) = three_shuffles();
     let w = World::load(&m).unwrap();
     assert_eq!(order(&w), ["layout"]);
     let mut seen = BTreeSet::new();
