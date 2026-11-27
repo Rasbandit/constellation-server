@@ -10,6 +10,7 @@ What it exercises:
 - **Named conditions with parameters**: `can_lift(n)`, `keys(k, n)`, `can_fight(tier)`.
 - **Options that reshape rules**: `difficulty` through `match` (in `can_fight` and `can_see_dark`), `relics_needed` in a rule, `start_lantern` as a conditional start item, and `sunken_vault`, an optional dungeon whose rooms carry `when opt.sunken_vault`.
 - **An entrance shuffle of interiors**: eight house doors (`group outside` and `group inside`), shuffled coupled with `check layout`.
+- **A check in two regions**: `flooded_shelf` is declared in `mire_flooded` and in `mire_hall`, each with its own rule.
 - **Fixed placements** (`holds relic`), `no_progression`, small families (`for i in 1..4`), groups and `has_any`.
 
 The optional dungeon's rooms each have a `when`: at `off` the build removes them with their checks and exits, which a world with a shuffle needs (engine issue 211). `ledger.json` is what `rando build` writes; the test holds it fixed.

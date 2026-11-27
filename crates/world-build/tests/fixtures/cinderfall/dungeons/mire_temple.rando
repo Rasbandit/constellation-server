@@ -15,6 +15,8 @@ region mire_hall placement mire_keys {
   check hall_chest
   check hall_statue: can_blast
   check hall_balcony: can_cross_gap
+  # The flooded room's shelf can also be reached across the gap from the hall.
+  check flooded_shelf: can_cross_gap and can_swim
   exit mire_entry
   exit mire_flooded: keys(mire_key, 1)
   exit mire_crypt: keys(mire_key, 2) and can_burn

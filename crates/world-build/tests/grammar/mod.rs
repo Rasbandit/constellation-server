@@ -142,3 +142,52 @@ fn an_overlay_on_a_base_that_did_not_parse_is_not_a_missing_target() {
     assert!(all.iter().any(|e| e.starts_with("base.rando:4:1: ")), "{all:#?}");
     assert!(!all.iter().any(|e| e.contains("target_missing")), "{all:#?}");
 }
+
+/// A check declared in several regions is one location reachable from each, with each
+/// region's own rule: one id, one place in the pool, a site per region in the engine's form,
+/// and no event per region.
+#[test]
+fn a_check_declared_in_several_regions_is_one_location() {
+    let b = ok(&world(
+        "item lamp progression\nregion a {\n  check drop: has(lamp)\n  check torch\n  exit b\n}\nregion b {\n  check drop vanilla k\n  exit a\n}",
+    ));
+    let locs: Vec<&str> = b.manifest["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(locs, ["drop", "torch"]);
+    assert_eq!(
+        region(&b, "a")["checks"][0],
+        serde_json::json!({"loc": "drop", "rule": {"has": "lamp"}})
+    );
+    assert_eq!(
+        region(&b, "b")["checks"][0],
+        serde_json::json!({"loc": "drop", "rule": {"true": {}}})
+    );
+    assert_eq!(b.manifest["locations"][0]["vanilla"], "k");
+    let inst = b.instance_json(&HashMap::new()).unwrap();
+    assert_eq!(inst["locations"], serde_json::json!(["drop", "torch"]));
+    let ledger: serde_json::Value = serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap();
+    assert_eq!(ledger["checks"].as_object().unwrap().len(), 2);
+    fills(&b, &HashMap::new(), 10);
+}
+
+/// The declarations of one check may each give a rule, and every other modifier once; the
+/// same region may not declare it twice.
+#[test]
+fn a_check_in_several_regions_gives_each_modifier_once() {
+    fails(
+        &world(
+            "region a {\n  check drop vanilla k\n  exit b\n}\nregion b {\n  check drop vanilla junk\n  exit a\n}",
+        ),
+        &format!("world.rando:{}:22", line(6)),
+        "`vanilla` of check `drop` is also given in region `a`",
+    );
+    fails(
+        &world("region a {\n  check drop\n  check drop: has(k)\n}"),
+        &format!("world.rando:{}:9", line(3)),
+        "`drop` is already a check in region `a`",
+    );
+}

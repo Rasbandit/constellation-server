@@ -608,12 +608,30 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
 
     // Regions, checks, events, defs, shuffles: declared before any rule is read.
+    let mut checks_seen: HashSet<&str> = HashSet::new();
     for r in &w.regions {
         space.declare(errs, &r.key, Sort::Region);
         later(errs, &r.later, "region field");
+        let mut here: HashMap<&str, Pos> = HashMap::new();
         for c in &r.checks {
-            space.declare(errs, &c.key, Sort::Check);
             later(errs, &c.later, "check field");
+            if let Some(at) = here.get(c.key.v.as_str()) {
+                let file = errs.files.get(at.file as usize).cloned().unwrap_or_default();
+                errs.err(
+                    c.key.pos,
+                    format!(
+                        "`{}` is already a check in region `{}` ({file}:{}:{})",
+                        c.key.v, r.key.v, at.line, at.col
+                    ),
+                    "a check is declared once in each region it can be reached from",
+                );
+            } else {
+                here.insert(c.key.v.as_str(), c.key.pos);
+                // Declared again in another region: the same check, reachable from both.
+                if checks_seen.insert(c.key.v.as_str()) {
+                    space.declare(errs, &c.key, Sort::Check);
+                }
+            }
         }
         for (e, _) in &r.events {
             space.declare(errs, e, Sort::Event);
@@ -685,12 +703,17 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let mut held_by: HashMap<String, Vec<Pos>> = HashMap::new();
     let mut exit_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut exit_keys: BTreeSet<String> = BTreeSet::new();
-    let check_ids = ids(
-        lw.errs(),
-        &w.regions.iter().flat_map(|r| &r.checks).map(|c| c.id.as_ref()).collect::<Vec<_>>(),
-        "check",
-    );
-    let mut check_ids = check_ids.into_iter();
+    let merged = merge_checks(lw.errs(), w);
+    let firsts: Vec<&crate::model::Check> = w
+        .regions
+        .iter()
+        .flat_map(|r| &r.checks)
+        .filter(|c| merged.get(c.key.v.as_str()).is_some_and(|m| std::ptr::eq(m.first, *c)))
+        .collect();
+    let check_ids =
+        ids(lw.errs(), &firsts.iter().map(|c| c.id.as_ref()).collect::<Vec<_>>(), "check");
+    let check_id: HashMap<&str, i64> =
+        firsts.iter().map(|c| c.key.v.as_str()).zip(check_ids).collect();
     // Each region's condition first: an exit into a region carries the region's condition
     // too, so a region that does not exist this seed has no way in.
     let mut present: HashMap<&str, Value> = HashMap::new();
@@ -724,21 +747,26 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             }
             s => s.as_ref().map(|s| s.v.clone()),
         };
-        let region_set = set_ok(&mut lw, &r.placement);
         let mut checks = Vec::new();
         for c in &r.checks {
-            let check_id = check_ids.next().unwrap_or(0);
             let rule = lw.rule(&c.rule, Mode::Rule).map_or_else(truth, |v| v.0);
-            let cwhen = match &c.when {
+            checks.push(json!({"loc": c.key.v, "rule": rule.clone()}));
+            let Some(m) = merged.get(c.key.v.as_str()) else { continue };
+            let cwhen = match m.when {
                 Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
                 None => truth(),
             };
-            let no_progression = match &c.no_progression {
+            sites.push((c.rule.pos, Some(r.key.v.as_str()), cwhen.clone(), rule));
+            if !std::ptr::eq(m.first, c) {
+                continue;
+            }
+            let no_progression = match m.no_progression {
                 Some(x) => lw.rule(x, Mode::Static("no_progression")).map_or_else(truth, |v| v.0),
                 None => json!({"false": {}}),
             };
-            let mut loc = json!({"id": check_id, "key": c.key.v});
-            for (field, it) in [("vanilla", &c.vanilla), ("holds", &c.holds)] {
+            let mut loc =
+                json!({"id": check_id.get(c.key.v.as_str()).copied().unwrap_or(0), "key": c.key.v});
+            for (field, it) in [("vanilla", m.vanilla), ("holds", m.holds)] {
                 let Some(it) = it else { continue };
                 if !is_item(&it.v) {
                     lw.errs().err(it.pos, format!("`{field}: {}` is not an item", it.v), "");
@@ -748,15 +776,38 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                     held_by.entry(it.v.clone()).or_default().push(it.pos);
                 }
             }
-            let set = set_ok(&mut lw, &c.placement).or_else(|| region_set.clone());
+            // The check exists where at least one of its regions does.
+            let mut wheres: Vec<Value> = Vec::new();
+            for q in &m.regions {
+                let v = when_of(&q.key.v);
+                if !wheres.contains(&v) {
+                    wheres.push(v);
+                }
+            }
+            let exists = if wheres.contains(&truth()) || wheres.is_empty() {
+                truth()
+            } else if wheres.len() == 1 {
+                wheres.remove(0)
+            } else {
+                json!({"any": wheres})
+            };
+            let mut region_sets: Vec<Option<String>> =
+                m.regions.iter().map(|q| set_ok(&mut lw, &q.placement)).collect();
+            region_sets.dedup();
+            if region_sets.len() > 1 && m.placement.is_none() {
+                lw.errs().err(
+                    c.key.pos,
+                    format!("check `{}` is in regions of different placement sets", c.key.v),
+                    "give the check its own `placement`",
+                );
+            }
+            let set = set_ok(&mut lw, &m.placement.cloned()).or_else(|| region_sets.remove(0));
             locations.push(loc);
-            sites.push((c.rule.pos, Some(r.key.v.as_str()), cwhen.clone(), rule.clone()));
-            checks.push(json!({"loc": c.key.v, "rule": rule}));
             checks_m.push(CheckM {
                 key: c.key.v.clone(),
-                when: both(&when, cwhen),
+                when: both(&exists, cwhen),
                 no_progression,
-                holds: c.holds.as_ref().map(|h| h.v.clone()),
+                holds: m.holds.map(|h| h.v.clone()),
                 set,
             });
         }
@@ -997,6 +1048,73 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         defs: m["defs"].as_object().map(|d| d.clone().into_iter().collect()).unwrap_or_default(),
     };
     Some((m, model))
+}
+
+/// One check, from every region that declares it: the first declaration, the regions, and
+/// each modifier from the one declaration that gives it.
+struct Merged<'w> {
+    first: &'w crate::model::Check,
+    regions: Vec<&'w crate::model::Region>,
+    when: Option<&'w crate::model::RuleAt>,
+    vanilla: Option<&'w At<String>>,
+    holds: Option<&'w At<String>>,
+    no_progression: Option<&'w crate::model::RuleAt>,
+    placement: Option<&'w At<String>>,
+}
+
+/// Every check by name, its declarations in several regions joined: a check reachable from
+/// several regions is declared in each, with that region's rule, and every other modifier in
+/// one declaration only (a second is an error naming the first's region).
+fn merge_checks<'w>(errs: &mut Errs, w: &'w World) -> HashMap<&'w str, Merged<'w>> {
+    let mut out: HashMap<&str, Merged<'w>> = HashMap::new();
+    let mut given: HashMap<(&str, &str), &str> = HashMap::new();
+    for r in &w.regions {
+        for c in &r.checks {
+            let m = out.entry(c.key.v.as_str()).or_insert(Merged {
+                first: c,
+                regions: Vec::new(),
+                when: None,
+                vanilla: None,
+                holds: None,
+                no_progression: None,
+                placement: None,
+            });
+            if m.regions.iter().any(|q| q.key.v == r.key.v) {
+                continue;
+            }
+            m.regions.push(r);
+            let fields: [(&str, Option<Pos>); 5] = [
+                ("when", c.when.as_ref().map(|x| x.pos)),
+                ("vanilla", c.vanilla.as_ref().map(|x| x.pos)),
+                ("holds", c.holds.as_ref().map(|x| x.pos)),
+                ("no_progression", c.no_progression.as_ref().map(|x| x.pos)),
+                ("placement", c.placement.as_ref().map(|x| x.pos)),
+            ];
+            for (field, pos) in fields {
+                let Some(pos) = pos else { continue };
+                if let Some(other) = given.get(&(c.key.v.as_str(), field)) {
+                    errs.err(
+                        pos,
+                        format!(
+                            "`{field}` of check `{}` is also given in region `{other}`",
+                            c.key.v
+                        ),
+                        "a check in several regions gives each modifier in one declaration only",
+                    );
+                    continue;
+                }
+                given.insert((c.key.v.as_str(), field), r.key.v.as_str());
+                match field {
+                    "when" => m.when = c.when.as_ref(),
+                    "vanilla" => m.vanilla = c.vanilla.as_ref(),
+                    "holds" => m.holds = c.holds.as_ref(),
+                    "no_progression" => m.no_progression = c.no_progression.as_ref(),
+                    _ => m.placement = c.placement.as_ref(),
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One shuffle as the engine's first slice reads it (`data_fill::shuffle`): exit slots
