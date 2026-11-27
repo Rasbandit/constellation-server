@@ -1342,21 +1342,54 @@ const ROUTES: &[(&str, &[&str], Class)] = &[
     ("/api/{*rest}", &["ANY"], Class::CatchAll),
 ];
 
+/// What a file declares its tests module with; the route walk reads nothing after it.
+const TESTS_MODULE: &str = "\n#[cfg(test)]\nmod tests";
+
+/// Whether `path` is a tests module in a file of its own: a `tests.rs` whose parent module's
+/// file (`<folder>.rs`) declares it under `#[cfg(test)]`. Never by its name alone.
+fn is_tests_module(path: &Path) -> bool {
+    let parent = path.parent().map(|dir| dir.with_extension("rs"));
+    path.file_name().is_some_and(|n| n == "tests.rs")
+        && parent
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|src| src.contains(&format!("{TESTS_MODULE};")))
+}
+
 /// Every `.rs` file under `dir`, with its non-test code: the tests module cut off, or left
-/// out when it is a file of its own (`tests.rs`).
+/// out when it is a file of its own ([`is_tests_module`]).
 fn source_files(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
     for e in std::fs::read_dir(dir).unwrap() {
         let path = e.unwrap().path();
         if path.is_dir() {
             source_files(&path, out);
-        } else if path.extension().is_some_and(|x| x == "rs")
-            && path.file_name().is_some_and(|n| n != "tests.rs")
-        {
+        } else if path.extension().is_some_and(|x| x == "rs") && !is_tests_module(&path) {
             let src = std::fs::read_to_string(&path).unwrap();
-            let code = src.split("\n#[cfg(test)]\nmod tests").next().unwrap().to_owned();
+            let code = src.split(TESTS_MODULE).next().unwrap().to_owned();
             out.push((path, code));
         }
     }
+}
+
+/// Only a real tests module is left out of the route walk: a `tests.rs` whose parent file
+/// declares it under `#[cfg(test)]`. A file that is merely named `tests.rs` is read like any
+/// other, so a route in it cannot escape the walk. Fails when the skip goes by name alone.
+#[test]
+fn the_route_walk_reads_a_tests_file_its_parent_does_not_mark_as_tests() {
+    let root = temp("route-walk-files");
+    for dir in ["real", "named"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("tests.rs"), "fn f() {}\n").unwrap();
+    }
+    std::fs::write(root.join("real.rs"), "fn a() {}\n\n#[cfg(test)]\nmod tests;\n").unwrap();
+    std::fs::write(root.join("named.rs"), "fn b() {}\n\nmod tests;\n").unwrap();
+    let mut files = Vec::new();
+    source_files(&root, &mut files);
+    let mut read: Vec<_> =
+        files.iter().map(|(p, _)| p.strip_prefix(&root).unwrap().to_owned()).collect();
+    read.sort();
+    let expected = ["named/tests.rs", "named.rs", "real.rs"].map(PathBuf::from);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(read, expected);
 }
 
 /// The HTTP methods named in `seg` (the text of one `.route(..)` call after its path):
