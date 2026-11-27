@@ -957,13 +957,17 @@ mod tests {
         let f = fill_room_budget(&seats, &mut rng(), (1, budget), Path::Split).unwrap();
         assert!(f.swaps > 0 && f.repair_evals > 0, "{} moved", f.swaps);
         assert!(f.repair_evals < budget, "{} evaluations", f.repair_evals);
+        // Half of what the room took: the budget runs out part way, the same on every path.
+        let half = (2, f.repair_evals / 2);
+        let split = fill_room_budget(&seats, &mut rng(), half, Path::Split).unwrap();
+        assert_eq!(split.attempts, 2);
         for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }] {
             let other = fill_room_budget(&seats, &mut rng(), (1, budget), path).unwrap();
-            assert_eq!(
-                (other.repair_evals, other.placed),
-                (f.repair_evals, f.placed.clone()),
-                "{path:?}"
-            );
+            let got = (other.repair_evals, other.placed);
+            assert_eq!(got, (f.repair_evals, f.placed.clone()), "{path:?}");
+            let other = fill_room_budget(&seats, &mut rng(), half, path).unwrap();
+            let got = (other.attempts, other.repair_evals, other.placed);
+            assert_eq!(got, (2, split.repair_evals, split.placed.clone()), "{path:?}, half");
         }
     }
 
