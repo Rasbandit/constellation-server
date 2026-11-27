@@ -1,7 +1,7 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
 //! [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
-//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off] [--confined on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
+//! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off] [--confined on|off] [--sums off|counts|weighted]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
 //! heavy profile has clocks on). One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
@@ -53,7 +53,9 @@
 //! `--entrances on` draws the worlds with shuffled two-way doors (`Shape::doors`), `--guards
 //! on` with a `none` shuffle that rules read (`Shape::guards`), and `--timeless on` without a
 //! time context (`Shape::timeless`, which an exit shuffle needs). `--confined on` confines
-//! every player's `p0` copies to a group of locations (`Shape::confined`). With a shuffle, every
+//! every player's `p0` copies to a group of locations (`Shape::confined`). `--sums counts` or
+//! `--sums weighted` makes half the gates sums of three kinds' copies, plain or weighted
+//! (`Shape::sums`); the row's profile then reads `light-sums-weighted` and so on. With a shuffle, every
 //! player's world is staged before the fill ([`data_fill::shuffle::room`]) and the row's
 //! `shuffle` holds, as medians of `reps`: `stage_ms` (the shuffles, the fold, the whole-world
 //! check and resolving the instances, every player, one thread), `plans_ms` (resolving the
@@ -75,7 +77,7 @@ use std::time::Instant;
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
 use data_fill::room::{Compiled, Seat, cross_world_share, fill_room_spheres, plans};
 use data_fill::seed::{assemble_on, encode_on};
-use data_fill::synth::{Hostile, Shape, world};
+use data_fill::synth::{Hostile, Shape, Sums, world};
 use data_fill::{Instance, Plan, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -409,8 +411,11 @@ fn exponent(points: &[(f64, f64)]) -> Option<f64> {
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let profile = arg(&args, "--profile", "light".to_owned())?;
-    let d = match profile.as_str() {
+    let base = arg(&args, "--profile", "light".to_owned())?;
+    let sums = arg(&args, "--sums", "off".to_owned())?;
+    // Rows of a world with sum gates carry them in the profile, so no gate pairs them with others.
+    let profile = if sums == "off" { base.clone() } else { format!("{base}-sums-{sums}") };
+    let d = match base.as_str() {
         "light" => Shape::default(),
         "heavy" => Shape::heavy(),
         "wide" => Shape::wide(),
@@ -448,11 +453,17 @@ fn main() -> Result<(), String> {
         guards: flag("--guards", d.guards)?,
         timeless: flag("--timeless", d.timeless)?,
         confined: flag("--confined", d.confined)?,
+        sums: match sums.as_str() {
+            "off" => Sums::Off,
+            "counts" => Sums::Counts,
+            "weighted" => Sums::Weighted,
+            x => return Err(format!("--sums: off, counts or weighted, got {x}")),
+        },
         ..d
     };
     // `mixed`: chain, light, keys and heavy worlds in turn, at their own sizes (piles of
     // different lengths and shapes in one room); the switches above apply to one-shape rooms.
-    let shapes = if profile == "mixed" {
+    let shapes = if base == "mixed" {
         let (chain, keys) = (Shape::hostile(Hostile::Chain), Shape::hostile(Hostile::Keys));
         vec![chain, Shape::default(), keys, Shape::heavy()]
     } else {

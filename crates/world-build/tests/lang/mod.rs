@@ -620,3 +620,11 @@ fn a_link_out_of_the_world_folder_is_refused() {
     assert!(!root.join("outside.json").exists(), "wrote through the ledger link");
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn a_weighted_sum_is_written_in_the_engine_form() {
+    let b = ok(&world("region a {\n  check c: count(k) * 3 + 2 * count(k) >= 5\n}"));
+    let rule = &region(&b, "a")["checks"][0]["rule"];
+    assert_eq!(rule["ge"][1], 5, "{rule}");
+    assert!(rule.to_string().contains(r#"["*",{"count":"k"},3]"#), "{rule}");
+}

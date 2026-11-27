@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 /// The seed cap of the imports here: the product's.
 const MAX: u64 = data_fill::prepared::SEED_MAX_BYTES;
 /// SHA-256 of every seed file and package file of [`rooms`], in order.
-const PINNED: &str = "d004200e1b3c59171fe9ccf5f2cd797aa1e780ba4fe741ab8ea143c126a204e7";
+const PINNED: &str = "063500c4eed6ef09194e1864adc22d39e4bfd82c21b94836f0161e01832424cf";
 
 /// One small synthetic world as an uploaded manifest, and `n` players on it.
 fn room(n: usize) -> (Value, Vec<Player>) {
