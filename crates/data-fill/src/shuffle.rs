@@ -164,12 +164,14 @@ impl Bound {
         stream: &dyn Fn(&str) -> R<SpecRng>,
     ) -> Result<Staged, Fail> {
         let mut table = Table::new();
-        // Wall time of each step, for the bench: six clock reads an attempt.
-        let (mut nanos, mut at) = ([0u64; STEPS.len()], Instant::now());
+        // Wall time of each step, for the bench only (`crate::COUNTED`).
+        let (mut nanos, mut at) = ([0u64; STEPS.len()], crate::COUNTED.then(Instant::now));
         let mut lap = |step: usize| {
-            let now = Instant::now();
-            nanos[step] += u64::try_from((now - at).as_nanos()).unwrap_or(u64::MAX);
-            at = now;
+            if let Some(at) = &mut at {
+                let now = Instant::now();
+                nanos[step] += u64::try_from((now - *at).as_nanos()).unwrap_or(u64::MAX);
+                *at = now;
+            }
         };
         for sh in self.decl.order.iter().filter_map(|i| self.decl.shuffles.get(*i)) {
             let mut rng = stream(&sh.name).map_err(Fail::Hard)?;
@@ -270,7 +272,8 @@ pub struct Staged {
     pub table: Table,
     /// Attempts taken (1: no restart).
     pub attempts: u32,
-    /// Wall time of the attempt that passed, nanoseconds per step of [`STEPS`].
+    /// Wall time of the attempt that passed, nanoseconds per step of [`STEPS`]; all 0
+    /// without feature `memory-harness`.
     pub nanos: [u64; STEPS.len()],
 }
 
