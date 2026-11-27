@@ -1,10 +1,15 @@
-//! The rule-string parser (design doc 16 section 5.0): a lexer, then recursive descent by
-//! precedence, tightest first: function forms and parentheses; `*`, `div`, `mod`; `+`, `-`;
-//! comparisons and `in` (no chaining); `not`; `and`; `or`. Nesting is capped at
-//! [`config::WORLD_RULE_MAX_DEPTH`], so no input can exhaust the stack. Names are not resolved
-//! here: that is the lowering's job (`crate::lower`).
+//! The rule parser (design doc 16 section 5.0, doc 18 sections 2.2 and 2.4): recursive descent
+//! by precedence, tightest first: function forms, parentheses and `match`; `*`, `div`, `mod`;
+//! `+`, `-`; comparisons and `in` (no chaining); `not`; `and`; `or`. It reads the language's
+//! tokens ([`crate::lex`]) and stops at the first token a rule cannot continue with, so a rule
+//! written bare in a file ends where the next keyword or row begins. Nesting is capped at
+//! [`config::WORLD_RULE_MAX_DEPTH`], arithmetic chains included, so no input can exhaust the
+//! stack. Names are not resolved here: that is the lowering's job (`crate::lower`).
 
-/// A comparison, in the engine's operand order (`data_fill::section::CMP_OPS`).
+use crate::lex::{Tok, Token, lex, show};
+use crate::model::Pos;
+
+/// A comparison, in the engine's operand order (`rule_ops::CMP_OPS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmp {
     /// `==`
@@ -22,14 +27,14 @@ pub enum Cmp {
 }
 
 impl Cmp {
-    /// The engine's operand index and name.
+    /// The engine's operand index.
     #[must_use]
     pub fn index(self) -> usize {
         self as usize
     }
 }
 
-/// An arithmetic operator.
+/// An arithmetic operator other than `+`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arith {
     /// `-`
@@ -42,15 +47,35 @@ pub enum Arith {
     Mod,
 }
 
-/// One parsed node. `at` is the character offset of its first character in the rule string.
+/// A piece of an interpolated name: `{d.key}_ante{ante}` is a variable, text, a variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    /// Written as is.
+    Text(String),
+    /// A family variable, or a field of one (`d.key`).
+    Var(String),
+}
+
+/// One arm of a `match`: its values (none for `_`) and its rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm {
+    /// The values it covers, each with its place; empty for `_`.
+    pub values: Vec<(String, Pos)>,
+    /// Its rule.
+    pub rule: Expr,
+}
+
+/// One parsed node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expr {
     /// What it is.
     pub e: E,
-    /// Character offset in the string.
-    pub at: usize,
+    /// Where its first character is.
+    pub at: Pos,
     /// Written inside parentheses.
     pub paren: bool,
+    /// Its tokens, first and one past the last, in the token list it was parsed from.
+    pub span: (usize, usize),
 }
 
 /// The node kinds.
@@ -62,6 +87,8 @@ pub enum E {
     Int(i64),
     /// A name, possibly dotted (`opt.k`, `at.s.slot`).
     Name(String),
+    /// A name with `{...}` pieces, replaced when its family expands.
+    Interp(Vec<Piece>),
     /// `f(args)`.
     Call(String, Vec<Expr>),
     /// `not a`.
@@ -78,210 +105,77 @@ pub enum E {
     Sum(Vec<Expr>),
     /// `a - b`, `a * b`, `a div b`, `a mod b`.
     Arith(Arith, Box<Expr>, Box<Expr>),
+    /// `match opt.k { a, b => rule  _ => rule }`: the option's key and the arms.
+    Match(String, Vec<Arm>),
 }
 
-/// A parse error: character offset and message.
-pub type Fail = (usize, String);
+/// A parse error: where and why.
+pub type Fail = (Pos, String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
-    Name(String),
-    Int(i64),
-    Open,
-    Close,
-    LBrack,
-    RBrack,
-    Comma,
-    Cmp(Cmp),
-    Plus,
-    Minus,
-    Star,
-}
-
-/// Words that are operators, so a `-` right after one starts a literal.
-const KEYWORDS: [&str; 6] = ["and", "or", "not", "in", "div", "mod"];
-
-fn lex(src: &str) -> Result<Vec<(Tok, usize)>, Fail> {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out: Vec<(Tok, usize)> = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let start = i;
-        let operand_before = match out.last() {
-            Some((Tok::Name(n), _)) => !KEYWORDS.contains(&n.as_str()),
-            Some((Tok::Int(_) | Tok::Close | Tok::RBrack, _)) => true,
-            _ => false,
-        };
-        let tok = match c {
-            c if c.is_whitespace() => {
-                i += 1;
-                continue;
-            }
-            '(' => Tok::Open,
-            ')' => Tok::Close,
-            '[' => Tok::LBrack,
-            ']' => Tok::RBrack,
-            ',' => Tok::Comma,
-            '+' => Tok::Plus,
-            '*' => Tok::Star,
-            '-' if !operand_before && chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
-                i += 1;
-                let (n, end) = number(&chars, i, start, true)?;
-                out.push((Tok::Int(n), start));
-                i = end;
-                continue;
-            }
-            '-' => Tok::Minus,
-            '>' | '<' | '=' | '!' => {
-                let two = chars.get(i + 1) == Some(&'=');
-                let op = match (c, two) {
-                    ('>', true) => Cmp::Ge,
-                    ('>', false) => Cmp::Gt,
-                    ('<', true) => Cmp::Le,
-                    ('<', false) => Cmp::Lt,
-                    ('=', true) => Cmp::Eq,
-                    ('!', true) => Cmp::Ne,
-                    ('=', false) => {
-                        return Err((i, "`=` alone is not an operator; write `==`".into()));
-                    }
-                    _ => {
-                        return Err((
-                            i,
-                            "`!` alone is not an operator; write `not` or `!=`".into(),
-                        ));
-                    }
-                };
-                i += usize::from(two);
-                Tok::Cmp(op)
-            }
-            c if c.is_ascii_digit() => {
-                let (n, end) = number(&chars, i, start, false)?;
-                out.push((Tok::Int(n), start));
-                i = end;
-                continue;
-            }
-            c if c.is_ascii_alphabetic() || c == '_' => {
-                let mut end = i;
-                while end < chars.len()
-                    && (chars[end].is_ascii_alphanumeric()
-                        || chars[end] == '_'
-                        || chars[end] == '.')
-                {
-                    end += 1;
-                }
-                let name: String = chars[i..end].iter().collect();
-                if name.ends_with('.') || name.contains("..") {
-                    return Err((i, format!("`{name}` is not a name")));
-                }
-                out.push((Tok::Name(name), start));
-                i = end;
-                continue;
-            }
-            c => return Err((i, format!("unexpected character `{c}`"))),
-        };
-        out.push((tok, start));
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn number(chars: &[char], from: usize, start: usize, neg: bool) -> Result<(i64, usize), Fail> {
-    let mut end = from;
-    while end < chars.len() && chars[end].is_ascii_digit() {
-        end += 1;
-    }
-    if chars.get(end).is_some_and(|c| c.is_ascii_alphabetic() || *c == '_' || *c == '.') {
-        return Err((start, "a number is whole and decimal, like `3` or `-3`".into()));
-    }
-    let digits: String = chars[from..end].iter().collect();
-    let n: i64 = digits.parse().map_err(|_| (start, format!("{digits} is too large")))?;
-    Ok((if neg { -n } else { n }, end))
-}
-
-struct P {
-    toks: Vec<(Tok, usize)>,
-    k: usize,
-    depth: usize,
-    end: usize,
-    /// Places where `and` sits unparenthesized inside `or`.
-    mixed: Vec<usize>,
-}
-
-/// A rule string parsed, and the places where `and` and `or` mix without parentheses (the
-/// build warns there: design doc 16 section 5.0).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Parsed {
-    /// The tree.
-    pub expr: Expr,
-    /// Offsets of unparenthesized `and` groups inside an `or`.
-    pub mixed: Vec<usize>,
-}
-
-/// Parse one rule string.
+/// Parse `text` as one whole rule; its first character is at `base`.
 ///
 /// # Errors
-/// The first syntax error, with its character offset.
-pub fn parse(src: &str) -> Result<Parsed, Fail> {
-    let toks = lex(src)?;
-    let end = src.chars().count();
-    let mut p = P { toks, k: 0, depth: 0, end, mixed: Vec::new() };
-    if p.toks.is_empty() {
-        return Err((0, "the rule is empty; write `true` for no requirement".into()));
+/// The first syntax error.
+pub fn parse(text: &str, base: Pos) -> Result<Expr, Fail> {
+    let (toks, _) = lex(text, base)?;
+    if toks.is_empty() {
+        return Err((base, "the rule is empty; write `true` for no requirement".into()));
     }
-    let expr = p.or()?;
-    if let Some((t, at)) = p.toks.get(p.k) {
-        return Err((*at, format!("unexpected {} after a complete rule", show(t))));
+    let (e, end) = parse_in(&toks, 0, toks.len())?;
+    if let Some(t) = toks.get(end) {
+        return Err((t.pos, format!("unexpected {} after a complete rule", show(&t.t))));
     }
-    Ok(Parsed { expr, mixed: p.mixed })
+    Ok(e)
 }
 
-fn show(t: &Tok) -> String {
-    match t {
-        Tok::Name(n) => format!("`{n}`"),
-        Tok::Int(n) => format!("`{n}`"),
-        Tok::Open => "`(`".into(),
-        Tok::Close => "`)`".into(),
-        Tok::LBrack => "`[`".into(),
-        Tok::RBrack => "`]`".into(),
-        Tok::Comma => "`,`".into(),
-        Tok::Cmp(_) => "a comparison".into(),
-        Tok::Plus => "`+`".into(),
-        Tok::Minus => "`-`".into(),
-        Tok::Star => "`*`".into(),
-    }
+/// Parse one rule from `toks[from..to]`, stopping at the first token it cannot continue with.
+/// Returns the rule and the index of that token.
+///
+/// # Errors
+/// The first syntax error.
+pub fn parse_in(toks: &[Token], from: usize, to: usize) -> Result<(Expr, usize), Fail> {
+    let mut p = P { toks, k: from, end: to.min(toks.len()), depth: 0 };
+    let e = p.or()?;
+    Ok((e, p.k))
 }
 
-fn ex(e: E, at: usize) -> Expr {
-    Expr { e, at, paren: false }
+struct P<'t> {
+    toks: &'t [Token],
+    k: usize,
+    end: usize,
+    depth: usize,
 }
 
-/// One term as itself, several as a sum.
-fn chain(mut terms: Vec<Expr>, at: usize) -> Expr {
-    if terms.len() == 1 { terms.remove(0) } else { ex(E::Sum(terms), at) }
-}
-
-impl P {
+impl P<'_> {
     fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.k).map(|x| &x.0)
+        (self.k < self.end).then(|| &self.toks[self.k].t)
     }
 
-    fn here(&self) -> usize {
-        self.toks.get(self.k).map_or(self.end, |x| x.1)
+    fn peek_at(&self, n: usize) -> Option<&Token> {
+        (self.k + n < self.end).then(|| &self.toks[self.k + n])
+    }
+
+    fn here(&self) -> Pos {
+        match self.toks.get(self.k) {
+            Some(t) if self.k < self.end => t.pos,
+            _ => self
+                .toks
+                .get(self.k.saturating_sub(1))
+                .map_or(Pos::default(), |t| t.pos.right(t.len)),
+        }
     }
 
     fn word(&self, w: &str) -> bool {
-        matches!(self.peek(), Some(Tok::Name(n)) if n == w)
+        matches!(self.peek(), Some(Tok::Kw(k)) if *k == w)
     }
 
     fn expect(&mut self, t: &Tok, what: &str) -> Result<(), Fail> {
         if self.peek() == Some(t) {
             self.k += 1;
-            Ok(())
-        } else {
-            let got = self.peek().map_or_else(|| "the end of the rule".to_owned(), show);
-            Err((self.here(), format!("expected {what}, found {got}")))
+            return Ok(());
         }
+        let got = self.peek().map_or_else(|| "the end of the rule".to_owned(), show);
+        Err((self.here(), format!("expected {what}, found {got}")))
     }
 
     fn enter(&mut self) -> Result<(), Fail> {
@@ -293,76 +187,71 @@ impl P {
         Ok(())
     }
 
+    fn ex(&self, e: E, at: Pos, from: usize) -> Expr {
+        Expr { e, at, paren: false, span: (from, self.k) }
+    }
+
     fn or(&mut self) -> Result<Expr, Fail> {
         self.enter()?;
-        let at = self.here();
+        let (at, from) = (self.here(), self.k);
         let mut parts = vec![self.and()?];
         while self.word("or") {
             self.k += 1;
             parts.push(self.and()?);
         }
         self.depth -= 1;
-        if parts.len() == 1 {
-            return Ok(parts.remove(0));
-        }
-        for p in &parts {
-            if matches!(p.e, E::And(_)) && !p.paren {
-                self.mixed.push(p.at);
-            }
-        }
-        Ok(ex(E::Or(parts), at))
+        Ok(if parts.len() == 1 { parts.remove(0) } else { self.ex(E::Or(parts), at, from) })
     }
 
     fn and(&mut self) -> Result<Expr, Fail> {
-        let at = self.here();
+        let (at, from) = (self.here(), self.k);
         let mut parts = vec![self.not()?];
         while self.word("and") {
             self.k += 1;
             parts.push(self.not()?);
         }
-        Ok(if parts.len() == 1 { parts.remove(0) } else { ex(E::And(parts), at) })
+        Ok(if parts.len() == 1 { parts.remove(0) } else { self.ex(E::And(parts), at, from) })
     }
 
     fn not(&mut self) -> Result<Expr, Fail> {
         if self.word("not") {
-            let at = self.here();
+            let (at, from) = (self.here(), self.k);
             self.k += 1;
             self.enter()?;
             let inner = self.not()?;
             self.depth -= 1;
-            return Ok(ex(E::Not(Box::new(inner)), at));
+            return Ok(self.ex(E::Not(Box::new(inner)), at, from));
         }
         self.cmp()
     }
 
     fn cmp(&mut self) -> Result<Expr, Fail> {
-        let at = self.here();
+        let (at, from) = (self.here(), self.k);
         let left = self.sum()?;
         let e = if let Some(Tok::Cmp(op)) = self.peek().cloned() {
             self.k += 1;
-            let right = self.sum()?;
-            E::Cmp(op, Box::new(left), Box::new(right))
+            E::Cmp(op, Box::new(left), Box::new(self.sum()?))
         } else if self.word("in") {
             self.k += 1;
             self.expect(&Tok::LBrack, "`[` after `in`")?;
-            let items = self.list(&Tok::RBrack, "`]`")?;
-            E::In(Box::new(left), items)
+            E::In(Box::new(left), self.list(&Tok::RBrack, "`]`")?)
         } else {
             return Ok(left);
         };
         if matches!(self.peek(), Some(Tok::Cmp(_))) || self.word("in") {
             return Err((self.here(), "comparisons do not chain; join them with `and`".into()));
         }
-        Ok(ex(e, at))
+        Ok(self.ex(e, at, from))
     }
 
     /// A chain of `+` is one [`E::Sum`]; each `-` nests, so it counts against the depth cap.
     fn sum(&mut self) -> Result<Expr, Fail> {
+        let from = self.k;
         let first = self.product()?;
         let at = first.at;
         let mut terms = vec![first];
         let mut nested = 0;
-        let out = loop {
+        loop {
             match self.peek() {
                 Some(Tok::Plus) => {
                     self.k += 1;
@@ -372,26 +261,35 @@ impl P {
                     self.k += 1;
                     self.enter()?;
                     nested += 1;
-                    let left = chain(std::mem::take(&mut terms), at);
+                    let left = self.chain(std::mem::take(&mut terms), at, from);
                     let right = self.product()?;
-                    terms.push(ex(E::Arith(Arith::Sub, Box::new(left), Box::new(right)), at));
+                    terms.push(self.ex(
+                        E::Arith(Arith::Sub, Box::new(left), Box::new(right)),
+                        at,
+                        from,
+                    ));
                 }
-                _ => break chain(terms, at),
+                _ => break,
             }
-        };
+        }
         self.depth -= nested;
-        Ok(out)
+        Ok(self.chain(terms, at, from))
+    }
+
+    fn chain(&self, mut terms: Vec<Expr>, at: Pos, from: usize) -> Expr {
+        if terms.len() == 1 { terms.remove(0) } else { self.ex(E::Sum(terms), at, from) }
     }
 
     /// Each `*`, `div` and `mod` nests, so it counts against the depth cap.
     fn product(&mut self) -> Result<Expr, Fail> {
+        let from = self.k;
         let mut left = self.atom()?;
         let mut nested = 0;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => Arith::Mul,
-                Some(Tok::Name(n)) if n == "div" => Arith::Div,
-                Some(Tok::Name(n)) if n == "mod" => Arith::Mod,
+                Some(Tok::Kw("div")) => Arith::Div,
+                Some(Tok::Kw("mod")) => Arith::Mod,
                 _ => break,
             };
             self.k += 1;
@@ -399,13 +297,13 @@ impl P {
             nested += 1;
             let right = self.atom()?;
             let at = left.at;
-            left = ex(E::Arith(op, Box::new(left), Box::new(right)), at);
+            left = self.ex(E::Arith(op, Box::new(left), Box::new(right)), at, from);
         }
         self.depth -= nested;
         Ok(left)
     }
 
-    /// Comma-separated expressions up to `close`.
+    /// Comma-separated rules up to `close`.
     fn list(&mut self, close: &Tok, what: &str) -> Result<Vec<Expr>, Fail> {
         let mut out = Vec::new();
         if self.peek() == Some(close) {
@@ -423,37 +321,133 @@ impl P {
         }
     }
 
+    /// `{` NAME `}` glued at the cursor: a variable piece of a name.
+    fn var_piece(&self) -> Option<String> {
+        let (a, b, c) = (self.peek_at(0)?, self.peek_at(1)?, self.peek_at(2)?);
+        match (&a.t, &b.t, &c.t) {
+            (Tok::LBrace, Tok::Name(n), Tok::RBrace) if b.glued && c.glued => Some(n.clone()),
+            _ => None,
+        }
+    }
+
+    /// A name and any glued `{var}` or text pieces after it: a plain name or an interpolation.
+    fn pieces(&mut self, first: Option<String>) -> E {
+        let mut out: Vec<Piece> = Vec::new();
+        out.extend(first.map(Piece::Text));
+        loop {
+            let glued = self.peek_at(0).is_some_and(|t| t.glued) || out.is_empty();
+            if !glued {
+                break;
+            }
+            if let Some(v) = self.var_piece() {
+                self.k += 3;
+                out.push(Piece::Var(v));
+            } else if let (false, Some(Tok::Name(n))) = (out.is_empty(), self.peek().cloned()) {
+                self.k += 1;
+                out.push(Piece::Text(n));
+            } else {
+                break;
+            }
+        }
+        match out.as_slice() {
+            [Piece::Text(n)] => E::Name(n.clone()),
+            _ => E::Interp(out),
+        }
+    }
+
     fn atom(&mut self) -> Result<Expr, Fail> {
-        let at = self.here();
+        let (at, from) = (self.here(), self.k);
+        if self.var_piece().is_some() {
+            let e = self.pieces(None);
+            return self.call_or(e, at, from);
+        }
         let Some(t) = self.peek().cloned() else {
             return Err((at, "the rule ends where a value was expected".into()));
         };
         self.k += 1;
         match t {
-            Tok::Int(n) => Ok(ex(E::Int(n), at)),
+            Tok::Int(n) => Ok(self.ex(E::Int(n), at, from)),
+            Tok::Kw("true") => Ok(self.ex(E::Bool(true), at, from)),
+            Tok::Kw("false") => Ok(self.ex(E::Bool(false), at, from)),
             Tok::Open => {
                 let mut inner = self.or()?;
                 self.expect(&Tok::Close, "`)`")?;
                 inner.paren = true;
+                inner.span = (from, self.k);
                 Ok(inner)
             }
-            Tok::Name(n) => match n.as_str() {
-                "true" => Ok(ex(E::Bool(true), at)),
-                "false" => Ok(ex(E::Bool(false), at)),
-                "and" | "or" | "not" | "in" | "div" | "mod" => {
-                    Err((at, format!("`{n}` needs a value before it")))
-                }
-                _ if self.peek() == Some(&Tok::Open) => {
-                    self.k += 1;
-                    self.enter()?;
-                    let args = self.list(&Tok::Close, "`)`")?;
-                    self.depth -= 1;
-                    Ok(ex(E::Call(n, args), at))
-                }
-                _ => Ok(ex(E::Name(n), at)),
-            },
+            Tok::Kw("match") => self.matching(at, from),
+            Tok::Name(n) => {
+                let e = self.pieces(Some(n));
+                self.call_or(e, at, from)
+            }
+            Tok::Kw(k) => Err((
+                at,
+                format!("`{k}` is a reserved word; write `` `{k}` `` to use it as a name"),
+            )),
             t => Err((at, format!("expected a value, found {}", show(&t)))),
         }
+    }
+
+    /// `name(args)` when an open parenthesis follows a plain name.
+    fn call_or(&mut self, e: E, at: Pos, from: usize) -> Result<Expr, Fail> {
+        if let (E::Name(f), Some(Tok::Open)) = (&e, self.peek()) {
+            let f = f.clone();
+            self.k += 1;
+            self.enter()?;
+            let args = self.list(&Tok::Close, "`)`")?;
+            self.depth -= 1;
+            return Ok(self.ex(E::Call(f, args), at, from));
+        }
+        Ok(self.ex(e, at, from))
+    }
+
+    /// `match opt.k { a, b => rule ... _ => rule }`.
+    fn matching(&mut self, at: Pos, from: usize) -> Result<Expr, Fail> {
+        let key = match self.peek().cloned() {
+            Some(Tok::Name(n)) if n.starts_with("opt.") => n["opt.".len()..].to_owned(),
+            _ => {
+                return Err((
+                    self.here(),
+                    "`match` reads an option: `match opt.<key> { ... }`".into(),
+                ));
+            }
+        };
+        self.k += 1;
+        self.expect(&Tok::LBrace, "`{` after the option")?;
+        self.enter()?;
+        let mut arms = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            let mut values = Vec::new();
+            if self.peek() == Some(&Tok::Under) {
+                self.k += 1;
+            } else {
+                loop {
+                    match self.peek().cloned() {
+                        Some(Tok::Name(v)) => {
+                            values.push((v, self.here()));
+                            self.k += 1;
+                        }
+                        _ => {
+                            return Err((
+                                self.here(),
+                                "an arm starts with option values or `_`".into(),
+                            ));
+                        }
+                    }
+                    if self.peek() != Some(&Tok::Comma) {
+                        break;
+                    }
+                    self.k += 1;
+                }
+            }
+            self.expect(&Tok::Arrow, "`=>`")?;
+            let rule = self.or()?;
+            arms.push(Arm { values, rule });
+        }
+        self.k += 1;
+        self.depth -= 1;
+        Ok(self.ex(E::Match(key, arms), at, from))
     }
 }
 
@@ -471,6 +465,13 @@ mod tests {
             E::Bool(b) => b.to_string(),
             E::Int(n) => n.to_string(),
             E::Name(n) => n.clone(),
+            E::Interp(ps) => ps
+                .iter()
+                .map(|p| match p {
+                    Piece::Text(t) => t.clone(),
+                    Piece::Var(v) => format!("{{{v}}}"),
+                })
+                .collect(),
             E::Call(f, a) => list(f, a),
             E::Not(x) => format!("(not {})", sx(x)),
             E::And(x) => list("and", x),
@@ -490,15 +491,31 @@ mod tests {
                 };
                 format!("({s} {} {})", sx(a), sx(b))
             }
+            E::Match(k, arms) => {
+                let arms: Vec<String> = arms
+                    .iter()
+                    .map(|a| {
+                        let v: Vec<&str> = a.values.iter().map(|v| v.0.as_str()).collect();
+                        format!(
+                            "[{}] {}",
+                            if v.is_empty() { "_".into() } else { v.join(",") },
+                            sx(&a.rule)
+                        )
+                    })
+                    .collect();
+                format!("(match {k} {})", arms.join(" "))
+            }
         }
     }
 
     fn p(s: &str) -> String {
-        sx(&parse(s).unwrap_or_else(|e| panic!("{s}: {e:?}")).expr)
+        sx(&parse(s, Pos::new(1, 1)).unwrap_or_else(|e| panic!("{s}: {e:?}")))
     }
 
-    fn fail(s: &str) -> Fail {
-        parse(s).unwrap_err()
+    /// The column (from 1) of a parse error in `s`.
+    fn fail(s: &str) -> (usize, String) {
+        let (pos, msg) = parse(s, Pos::new(1, 1)).unwrap_err();
+        (pos.col, msg)
     }
 
     #[test]
@@ -523,14 +540,24 @@ mod tests {
         assert_eq!(p("opt.k in [a, b]"), "(in opt.k (list a b))");
         assert_eq!(p("opt.k in []"), "(in opt.k (list ))");
         assert_eq!(p("reach(cliff)"), "(reach cliff)");
-        assert_eq!(p("level(sword) >= 2"), "(>= (level sword) 2)");
-        assert_eq!(p("group_count(medals) >= 2"), "(>= (group_count medals) 2)");
-        assert_eq!(p("counter(bell) >= 3"), "(>= (counter bell) 3)");
+        assert_eq!(p("count(a, b, c) >= 2"), "(>= (count a b c) 2)");
         assert_eq!(p("min(a, b) + max(c, 1) >= 2"), "(>= (+ (min a b) (max c 1)) 2)");
         assert_eq!(p("a * 2 div 3 mod 4 >= 1"), "(>= (mod (div (* a 2) 3) 4) 1)");
         assert_eq!(p("0 - opt.k >= -3"), "(>= (- 0 opt.k) -3)");
-        assert_eq!(p("during(night)"), "(during night)");
-        assert_eq!(p("roll(price) <= 5"), "(<= (roll price) 5)");
+        assert_eq!(p("has({s.key}_track)"), "(has {s.key}_track)");
+        assert_eq!(
+            p("d.unlock and count(joker) >= max(0, ante - 3)"),
+            "(and d.unlock (>= (count joker) (max 0 (- ante 3))))"
+        );
+        assert_eq!(
+            p("match opt.d { easy => has(a) and has(b)  normal => has(a)  hard, glitch => true }"),
+            "(match d [easy] (and (has a) (has b)) [normal] (has a) [hard,glitch] true)"
+        );
+        assert_eq!(
+            p("match opt.d { easy => has(a) _ => true }"),
+            "(match d [easy] (has a) [_] true)"
+        );
+        assert_eq!(p("`key` and has(`group`)"), "(and key (has group))");
     }
 
     #[test]
@@ -541,11 +568,6 @@ mod tests {
         assert_eq!(p("not count(x) >= 3"), "(not (>= (count x) 3))");
         assert_eq!(p("count(x) + 1 * 2 >= 3"), "(>= (+ (count x) (* 1 2)) 3)");
         assert_eq!(p("(a or b) and c"), "(and (or a b) c)");
-        assert_eq!(
-            p("count(shard) >= opt.shards_needed and reach(cliff)"),
-            "(and (>= (count shard) opt.shards_needed) (reach cliff))"
-        );
-        // A minus right after an operand is subtraction; elsewhere it starts a literal.
         assert_eq!(p("opt.a -3 >= 0"), "(>= (- opt.a 3) 0)");
         assert_eq!(p("min(-3, 2) >= -1"), "(>= (min -3 2) -1)");
         assert_eq!(p("a or -3 > 1"), "(or a (> -3 1))");
@@ -554,42 +576,44 @@ mod tests {
     }
 
     #[test]
-    fn mixing_and_with_or_without_parentheses_is_noted_for_a_warning() {
-        assert_eq!(parse("a or b and c").unwrap().mixed, [5]);
-        assert!(parse("a or (b and c)").unwrap().mixed.is_empty());
-        assert!(parse("a and b").unwrap().mixed.is_empty());
+    fn a_rule_in_a_file_stops_at_the_first_token_it_cannot_use() {
+        let (toks, _) = lex("has(a) and b\n  check c when opt.x", Pos::new(1, 1)).unwrap();
+        let (e, end) = parse_in(&toks, 0, toks.len()).unwrap();
+        assert_eq!(sx(&e), "(and (has a) b)");
+        assert_eq!(toks[end].t, Tok::Kw("check"));
+        let (toks, _) = lex("a b", Pos::new(1, 1)).unwrap();
+        assert_eq!(parse_in(&toks, 0, toks.len()).unwrap().1, 1);
     }
 
     #[test]
-    fn errors_name_the_character_where_they_start() {
-        assert_eq!(fail("a < b < c").0, 6);
+    fn errors_name_the_line_and_column_where_they_start() {
+        assert_eq!(fail("a < b < c").0, 7);
         assert!(fail("a < b < c").1.contains("do not chain"));
-        assert_eq!(fail("has(x").0, 5);
-        assert_eq!(fail("a and").0, 5);
-        assert_eq!(fail("a b").0, 2);
-        assert_eq!(fail("a = b").0, 2);
-        assert_eq!(fail("a ! b").0, 2);
-        assert_eq!(fail("x # y").0, 2);
-        assert_eq!(fail("3.5 > 1").0, 0);
-        assert_eq!(fail("").0, 0);
-        assert_eq!(fail("  ").0, 0);
-        assert_eq!(fail("opt.").0, 0);
-        assert_eq!(fail("a..b").0, 0);
-        assert_eq!(fail("and b").0, 0);
-        assert_eq!(fail("99999999999999999999 > 1").0, 0);
-        assert_eq!(fail("[a]").0, 0);
-        assert_eq!(fail("é").0, 0);
-        // Offsets count characters, not bytes.
-        assert_eq!(fail("has(x) é").0, 7);
+        assert_eq!(fail("has(x").0, 6);
+        assert_eq!(fail("a and").0, 6);
+        assert_eq!(fail("a b").0, 3);
+        assert_eq!(fail("a = b").0, 3);
+        assert_eq!(fail("a ! b").0, 3);
+        assert_eq!(fail("3.5 > 1").0, 1);
+        assert_eq!(fail("").0, 1);
+        assert_eq!(fail("opt.").0, 1);
+        assert_eq!(fail("and b").0, 1);
+        assert!(fail("check").1.contains("reserved word"));
+        assert_eq!(fail("[a]").0, 1);
+        assert_eq!(fail("é").0, 1);
+        assert_eq!(fail("has(x) é").0, 8);
+        assert!(fail("match d { }").1.contains("reads an option"));
+        assert!(fail("match opt.d { easy has(a) }").1.contains("`=>`"));
+        let (pos, _) = parse("has(a) and\n   (b or", Pos::new(10, 5)).unwrap_err();
+        assert_eq!(pos, Pos::new(11, 9));
     }
 
     #[test]
     fn deep_nesting_is_an_error_not_a_stack_overflow() {
         let n = config::WORLD_RULE_MAX_DEPTH;
         let ok = "(".repeat(n - 1) + "a" + &")".repeat(n - 1);
-        assert!(parse(&ok).is_ok());
-        // A sum does not nest, however long.
-        assert!(parse(&("a".to_owned() + &" + a".repeat(10_000))).is_ok());
+        assert!(parse(&ok, Pos::new(1, 1)).is_ok());
+        assert!(parse(&("a".to_owned() + &" + a".repeat(10_000)), Pos::new(1, 1)).is_ok());
         for deep in [
             "(".repeat(100_000) + "a" + &")".repeat(100_000),
             "not ".repeat(100_000) + "a",
@@ -597,8 +621,9 @@ mod tests {
             "a".to_owned() + &" * a".repeat(100_000),
             "a".to_owned() + &" div 2".repeat(100_000),
             "a".to_owned() + &" - 1".repeat(100_000),
+            "match opt.k { a => ".repeat(10_000) + "true",
         ] {
-            assert!(fail(&deep).1.contains("deep"));
+            assert!(fail(&deep).1.contains("deep"), "{}", &deep[..20]);
         }
     }
 }

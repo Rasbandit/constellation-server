@@ -449,6 +449,11 @@ pub const RULE_MAX_PARTS: usize = 255;
 /// (design doc 16 section 5.3).
 pub const WORLD_TABLE_MAX: usize = 65_536;
 
+/// Stack of the thread a world build runs on, bytes: lowering recurses once per rule node, up
+/// to [`RULES_MAX_DEPTH`] nodes deep through defs, at several frames a node (a design value,
+/// well over what that depth takes in a debug build; only the pages used are committed).
+pub const WORLD_BUILD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
 /// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
 pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;

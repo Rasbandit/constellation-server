@@ -18,6 +18,7 @@ use serde_json::Value;
 pub mod canon;
 pub mod front;
 mod instance;
+pub mod lex;
 mod lower;
 pub mod model;
 pub mod rule;

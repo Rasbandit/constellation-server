@@ -9,7 +9,7 @@ use data_fill::section::monotone_cmp;
 use serde_json::{Value, json};
 
 use crate::model::{Pos, Rule, RuleAt};
-use crate::rule::{Arith, Cmp, E, Expr, parse};
+use crate::rule::{Arith, Arm, Cmp, E, Expr, parse};
 use crate::world::Errs;
 
 /// What a name in the world's one namespace is.
@@ -64,7 +64,8 @@ pub(crate) struct Names {
     pub options: HashMap<String, OptTy>,
     pub item_groups: HashMap<String, Vec<String>>,
     pub shuffles: HashMap<String, Readable>,
-    pub defs: HashMap<String, RuleAt>,
+    /// Defs by name: their parameters and rule.
+    pub defs: HashMap<String, (Vec<String>, RuleAt)>,
 }
 
 /// Where a rule appears, which decides what it may read.
@@ -78,13 +79,6 @@ pub(crate) enum Mode {
     Static(&'static str),
 }
 
-/// Where the characters of the rule being lowered sit in the file.
-#[derive(Debug, Clone, Copy)]
-struct Place {
-    base: Pos,
-    one_line: bool,
-}
-
 /// The lowering state: the namespace, the errors, and the defs lowered so far.
 pub(crate) struct Lower<'a> {
     names: &'a Names,
@@ -95,7 +89,6 @@ pub(crate) struct Lower<'a> {
     state: HashMap<String, DefState>,
     /// Per lowered def: how deep its body nests, defs it reaches included.
     below: HashMap<String, usize>,
-    place: Place,
     /// Rule nodes open in the recursion, defs reached through a name included.
     depth: usize,
     /// The deepest the recursion went since it was last reset (per def body).
@@ -125,14 +118,12 @@ fn t() -> Value {
 
 impl<'a> Lower<'a> {
     pub(crate) fn new(names: &'a Names, errs: &'a mut Errs) -> Self {
-        let place = Place { base: Pos::default(), one_line: true };
         Lower {
             names,
             errs,
             defs: BTreeMap::new(),
             state: HashMap::new(),
             below: HashMap::new(),
-            place,
             depth: 0,
             peak: 0,
             at_read: false,
@@ -144,60 +135,68 @@ impl<'a> Lower<'a> {
         self.errs
     }
 
-    fn pos(&self, at: usize) -> Pos {
-        let p = self.place;
-        // shortcut: a rule written over several lines reports where it starts, not the
-        // character; upgrade if a front end allows multi-line rules.
-        if p.one_line { p.base.right(at) } else { p.base }
-    }
-
-    fn err(&mut self, at: usize, msg: impl Into<String>, help: &str) -> L {
-        let p = self.pos(at);
-        self.errs.err(p, msg, help);
+    fn err(&mut self, at: Pos, msg: impl Into<String>, help: &str) -> L {
+        self.errs.err(at, msg, help);
         None
     }
 
     /// A rule as written in the file: `true`, `false`, or a rule string. Returns the tree and
     /// whether it reads state (items, events, counters, reached regions).
     pub(crate) fn rule(&mut self, n: &RuleAt, mode: Mode) -> L {
-        let text = match &n.v {
-            Rule::Const(b) => return Some((json!({b.to_string(): {}}), false)),
-            Rule::Text(text) => text,
-        };
-        let saved = self.place;
-        self.place = Place { base: n.pos, one_line: !text.contains('\n') };
-        let out = match parse(text) {
-            Err((at, msg)) => self.err(at, msg, ""),
-            Ok(parsed) => {
-                for at in parsed.mixed {
-                    let p = self.pos(at);
-                    self.errs.warn(
-                        p,
-                        "`and` inside `or` without parentheses",
-                        "it reads as `a or (b and c)`; add parentheses to say so",
-                    );
-                }
-                self.b(&parsed.expr, mode)
-            }
-        };
-        self.place = saved;
-        out
+        match &n.v {
+            Rule::Const(b) => Some((json!({b.to_string(): {}}), false)),
+            Rule::Text(text) => match parse(text, n.pos) {
+                Err((at, msg)) => self.err(at, msg, ""),
+                Ok(e) => self.b(&e, mode),
+            },
+            Rule::Parsed(e) => self.b(e, mode),
+        }
     }
 
-    /// Whether a def reads state, lowering it on first use. The recursion it adds counts
-    /// against the one depth cap whether the def is lowered now or was earlier.
-    fn def(&mut self, name: &str, at: usize) -> Option<bool> {
-        match self.state.get(name).copied() {
+    /// A rule as a tree: parsed from its text when it has one.
+    fn tree(&mut self, n: &RuleAt) -> Option<Expr> {
+        match &n.v {
+            Rule::Const(b) => Some(Expr { e: E::Bool(*b), at: n.pos, paren: false, span: (0, 0) }),
+            Rule::Text(text) => match parse(text, n.pos) {
+                Ok(e) => Some(e),
+                Err((at, msg)) => {
+                    self.err(at, msg, "");
+                    None
+                }
+            },
+            Rule::Parsed(e) => Some(e.clone()),
+        }
+    }
+
+    /// Whether a plain def reads state, lowering it on first use.
+    fn def(&mut self, name: &str, at: Pos) -> Option<bool> {
+        let (params, node) = self.names.defs.get(name)?.clone();
+        if !params.is_empty() {
+            self.err(
+                at,
+                format!("def `{name}` takes {} arguments", params.len()),
+                &format!("call it as `{name}(..)`"),
+            );
+            return None;
+        }
+        self.def_as(name, at, |lw| lw.rule(&node, Mode::Rule))
+    }
+
+    /// Whether the def `key` reads state, lowering its body with `body` on first use. The
+    /// recursion it adds counts against the one depth cap whether it is lowered now or was
+    /// earlier.
+    fn def_as(&mut self, key: &str, at: Pos, body: impl FnOnce(&mut Self) -> L) -> Option<bool> {
+        match self.state.get(key).copied() {
             Some(DefState::Done(state)) => {
-                self.at_read |= self.def_at.get(name).copied().unwrap_or(false);
-                let below = self.below.get(name).copied().unwrap_or(0);
+                self.at_read |= self.def_at.get(key).copied().unwrap_or(false);
+                let below = self.below.get(key).copied().unwrap_or(0);
                 self.deep(self.depth + below, at)?;
                 return Some(state);
             }
             Some(DefState::Busy) => {
                 self.err(
                     at,
-                    format!("def `{name}` refers to itself through other defs"),
+                    format!("def `{key}` refers to itself through other defs"),
                     "a def may use defs, without a cycle",
                 );
                 return None;
@@ -206,28 +205,66 @@ impl<'a> Lower<'a> {
             Some(DefState::Failed) => return None,
             None => {}
         }
-        let node = self.names.defs.get(name)?.clone();
-        self.state.insert(name.to_owned(), DefState::Busy);
+        self.state.insert(key.to_owned(), DefState::Busy);
         let (base, outer, outer_at) = (self.depth, self.peak, self.at_read);
         (self.peak, self.at_read) = (base, false);
-        let out = self.rule(&node, Mode::Rule);
-        self.below.insert(name.to_owned(), self.peak - base);
-        self.def_at.insert(name.to_owned(), self.at_read);
+        let out = body(self);
+        self.below.insert(key.to_owned(), self.peak - base);
+        self.def_at.insert(key.to_owned(), self.at_read);
         self.peak = self.peak.max(outer);
         self.at_read |= outer_at;
         let Some((v, state)) = out else {
-            self.state.insert(name.to_owned(), DefState::Failed);
+            self.state.insert(key.to_owned(), DefState::Failed);
             return None;
         };
-        self.defs.insert(name.to_owned(), v);
-        self.state.insert(name.to_owned(), DefState::Done(state));
+        self.defs.insert(key.to_owned(), v);
+        self.state.insert(key.to_owned(), DefState::Done(state));
         Some(state)
+    }
+
+    /// A call of a def with parameters (doc 18 section 2.4): one plain def per distinct
+    /// argument list, named `<def>__<arg>__<arg>`, with the arguments put in for the
+    /// parameters. An argument is a number, a name or an option, so the expansion is static.
+    fn call_def(&mut self, f: &str, args: &[Expr], at: Pos) -> L {
+        let (params, node) = self.names.defs.get(f)?.clone();
+        if params.len() != args.len() {
+            return self.err(
+                at,
+                format!("def `{f}` takes {} arguments, given {}", params.len(), args.len()),
+                "",
+            );
+        }
+        let mut key = f.to_owned();
+        let args: Vec<Expr> = args
+            .iter()
+            .map(|a| match fold(a) {
+                Some(n) => Expr { e: E::Int(n), ..a.clone() },
+                None => a.clone(),
+            })
+            .collect();
+        for a in &args {
+            let piece = match &a.e {
+                E::Int(n) if *n < 0 => format!("m{}", n.unsigned_abs()),
+                E::Int(n) => n.to_string(),
+                E::Bool(b) => b.to_string(),
+                E::Name(n) if !n.starts_with("at.") => n.replace('.', "_"),
+                _ => {
+                    return self.err(a.at, "an argument is a number, a name or `opt.<key>`", "the build writes one def per distinct argument list, so arguments are fixed when it builds");
+                }
+            };
+            key = format!("{key}__{piece}");
+        }
+        let body = self.tree(&node)?;
+        let map: HashMap<&str, &Expr> = params.iter().map(String::as_str).zip(&args).collect();
+        let body = subst(&body, &map);
+        let state = self.def_as(&key, at, |lw| lw.b(&body, Mode::Rule))?;
+        Some((json!({"ref": key}), state))
     }
 
     /// The recursion reaches `deep` nodes: within the engine's cap, or an error. Lowering
     /// recurses once per node, so this is what bounds its stack, as the engine's own cap
     /// bounds the loader's.
-    fn deep(&mut self, deep: usize, at: usize) -> Option<()> {
+    fn deep(&mut self, deep: usize, at: Pos) -> Option<()> {
         self.peak = self.peak.max(deep);
         let most = config::RULES_MAX_DEPTH as usize;
         if deep > most {
@@ -242,7 +279,7 @@ impl<'a> Lower<'a> {
     }
 
     /// One level deeper for the duration of `f`.
-    fn nested(&mut self, at: usize, f: impl FnOnce(&mut Self) -> L) -> L {
+    fn nested(&mut self, at: Pos, f: impl FnOnce(&mut Self) -> L) -> L {
         self.depth += 1;
         let out = match self.deep(self.depth, at) {
             Some(()) => f(self),
@@ -254,10 +291,12 @@ impl<'a> Lower<'a> {
 
     /// Lower every def, used or not, so each is checked and in the manifest.
     pub(crate) fn all_defs(&mut self) {
-        let mut names: Vec<&String> = self.names.defs.keys().collect();
+        let mut names: Vec<&String> =
+            self.names.defs.iter().filter(|(_, d)| d.0.is_empty()).map(|(n, _)| n).collect();
         names.sort();
         for n in names {
-            self.def(n, 0);
+            let at = self.names.defs[n].1.pos;
+            self.def(n, at);
         }
     }
 
@@ -290,11 +329,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn state_ok(&mut self, mode: Mode, at: usize, state: bool) -> bool {
+    fn state_ok(&mut self, mode: Mode, at: Pos, state: bool) -> bool {
         if let (Mode::Static(field), true) = (mode, state) {
-            let p = self.pos(at);
             self.errs.err(
-                p,
+                at,
                 format!("`{field}` may read options only, and this reads what the player holds or reaches"),
                 "check filters, placement permissions and start items are settled from options before the fill (format rule c, D-134); move the requirement into the check's rule",
             );
@@ -304,7 +342,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `opt.k`, `at.s.slot` or a bare name, split.
-    fn dotted<'n>(&mut self, n: &'n str, at: usize) -> Option<Dotted<'n>> {
+    fn dotted<'n>(&mut self, n: &'n str, at: Pos) -> Option<Dotted<'n>> {
         if let Some(k) = n.strip_prefix("opt.") {
             return match self.names.options.get(k) {
                 Some(ty) => Some(Dotted::Opt(k, ty.clone())),
@@ -351,6 +389,15 @@ impl<'a> Lower<'a> {
 
     /// A rule node.
     fn b(&mut self, e: &Expr, mode: Mode) -> L {
+        if let E::Or(parts) = &e.e {
+            for p in parts.iter().filter(|p| matches!(p.e, E::And(_)) && !p.paren) {
+                self.errs.warn(
+                    p.at,
+                    "`and` inside `or` without parentheses",
+                    "it reads as `a or (b and c)`; `fmt` adds the parentheses",
+                );
+            }
+        }
         let out = self.nested(e.at, |s| s.b_inner(e, mode))?;
         self.state_ok(mode, e.at, out.1).then_some(out)
     }
@@ -444,13 +491,35 @@ impl<'a> Lower<'a> {
                 let key = if matches!(e.e, E::And(_)) { "all" } else { "any" };
                 ok.then(|| (json!({key: parts}), state))
             }
+            E::Call(f, args) if self.names.defs.get(f).is_some_and(|d| !d.0.is_empty()) => {
+                let (v, state) = self.call_def(f, args, e.at)?;
+                if let Mode::Static(field) = mode
+                    && let Some(key) = v["ref"].as_str()
+                    && self.def_at.get(key).copied().unwrap_or(false)
+                {
+                    return self.err(
+                        e.at,
+                        format!(
+                            "`{field}` cannot read a shuffle result yet, and this def reads one"
+                        ),
+                        "",
+                    );
+                }
+                Some((v, state))
+            }
             E::Call(f, args) => self.call(f, args, e.at, mode),
+            E::Match(k, arms) => self.matching(k, arms, e.at, mode),
+            E::Interp(_) => self.err(
+                e.at,
+                "a `{..}` name piece is a family variable, and this is not inside a family",
+                "",
+            ),
             E::Cmp(op, a, b) => self.cmp(*op, a, b, e.at, mode),
             E::In(a, xs) => self.is_in(a, xs, e.at, mode),
         }
     }
 
-    fn at_rule(&mut self, s: &str, slot: &str, at: usize) -> L {
+    fn at_rule(&mut self, s: &str, slot: &str, at: Pos) -> L {
         let Some(Readable::Names { things, .. }) = self.names.shuffles.get(s) else { return None };
         if let Some((t, _)) = things.iter().find(|(_, rule)| !rule) {
             let t = t.clone();
@@ -464,7 +533,7 @@ impl<'a> Lower<'a> {
         Some((json!({"at": [s, slot]}), true))
     }
 
-    fn call(&mut self, f: &str, args: &[Expr], at: usize, mode: Mode) -> L {
+    fn call(&mut self, f: &str, args: &[Expr], at: Pos, mode: Mode) -> L {
         match f {
             "has" => {
                 let (x, n) = match args {
@@ -536,7 +605,7 @@ impl<'a> Lower<'a> {
     }
 
     /// A comparison: a choice value or shuffle name test, or two integer expressions.
-    fn cmp(&mut self, op: Cmp, a: &Expr, b: &Expr, at: usize, mode: Mode) -> L {
+    fn cmp(&mut self, op: Cmp, a: &Expr, b: &Expr, at: Pos, mode: Mode) -> L {
         if matches!(op, Cmp::Eq | Cmp::Ne) {
             let key = if op == Cmp::Eq { "eq" } else { "ne" };
             for (x, y) in [(a, b), (b, a)] {
@@ -589,7 +658,7 @@ impl<'a> Lower<'a> {
         Some((json!({key: [x, y]}), xs || ys))
     }
 
-    fn value(&mut self, k: &str, values: &[String], v: &str, at: usize) -> Option<usize> {
+    fn value(&mut self, k: &str, values: &[String], v: &str, at: Pos) -> Option<usize> {
         let ix = values.iter().position(|x| x == v);
         if ix.is_none() {
             self.err(
@@ -601,7 +670,7 @@ impl<'a> Lower<'a> {
         ix
     }
 
-    fn thing(&mut self, s: &str, t: &str, at: usize) -> Option<()> {
+    fn thing(&mut self, s: &str, t: &str, at: Pos) -> Option<()> {
         let Some(Readable::Names { things, .. }) = self.names.shuffles.get(s) else { return None };
         if things.iter().any(|(n, _)| n == t) {
             return Some(());
@@ -616,7 +685,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `x in [a, b]`: an `any` of `eq` (doc 16 section 5.1).
-    fn is_in(&mut self, a: &Expr, xs: &[Expr], at: usize, mode: Mode) -> L {
+    fn is_in(&mut self, a: &Expr, xs: &[Expr], at: Pos, mode: Mode) -> L {
         let E::Name(n) = &a.e else {
             return self.err(
                 a.at,
@@ -630,6 +699,7 @@ impl<'a> Lower<'a> {
                 e: E::Cmp(Cmp::Eq, Box::new(a.clone()), Box::new(x.clone())),
                 at: x.at,
                 paren: false,
+                span: x.span,
             };
             parts.push(self.b(&eq, mode)?.0);
         }
@@ -649,6 +719,14 @@ impl<'a> Lower<'a> {
     }
 
     fn i_inner(&mut self, e: &Expr) -> L {
+        // Arithmetic over numbers alone (a family's variables put in) folds here, so `-` and
+        // `mod` over numbers reach the engine as one number.
+        if !matches!(e.e, E::Int(_))
+            && let Some(n) = fold(e)
+        {
+            let lit = Expr { e: E::Int(n), at: e.at, paren: false, span: e.span };
+            return self.i_inner(&lit);
+        }
         match &e.e {
             E::Int(n) => {
                 if i16::try_from(*n).is_err() {
@@ -686,12 +764,27 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn int_call(&mut self, f: &str, args: &[Expr], at: usize) -> L {
+    fn int_call(&mut self, f: &str, args: &[Expr], at: Pos) -> L {
         let one = |args: &[Expr]| match args {
             [x] => Some(x.clone()),
             _ => None,
         };
         match f {
+            "count" if args.len() > 1 => {
+                // An unnamed group: its members in key order, as a named group's are.
+                let mut args = args.to_vec();
+                args.sort_by(|a, b| format!("{:?}", a.e).cmp(&format!("{:?}", b.e)));
+                let terms: Vec<Expr> = args
+                    .iter()
+                    .map(|a| Expr {
+                        e: E::Call("count".into(), vec![a.clone()]),
+                        at: a.at,
+                        paren: false,
+                        span: a.span,
+                    })
+                    .collect();
+                self.sum(&terms, at)
+            }
             "count" | "level" => {
                 let Some(x) = one(args) else {
                     return self.err(at, format!("`{f}` takes one item"), "");
@@ -747,7 +840,7 @@ impl<'a> Lower<'a> {
 
     /// A sum: one `+` node over every term, parenthesized sums included (a sum of counts is
     /// then one counter read for the engine).
-    fn sum(&mut self, xs: &[Expr], at: usize) -> L {
+    fn sum(&mut self, xs: &[Expr], at: Pos) -> L {
         let mut terms = Vec::new();
         let mut todo: Vec<&Expr> = xs.iter().rev().collect();
         while let Some(t) = todo.pop() {
@@ -777,7 +870,7 @@ impl<'a> Lower<'a> {
         Some((json!({"int": out}), state))
     }
 
-    fn arith(&mut self, op: Arith, x: &Expr, y: &Expr, at: usize) -> L {
+    fn arith(&mut self, op: Arith, x: &Expr, y: &Expr, at: Pos) -> L {
         match op {
             Arith::Sub | Arith::Mod => {
                 let s = if op == Arith::Sub { "-" } else { "mod" };
@@ -834,4 +927,119 @@ enum Dotted<'n> {
 /// The always-true rule.
 pub(crate) fn truth() -> Value {
     t()
+}
+
+impl Lower<'_> {
+    /// `match opt.k { a, b => r ... _ => r }`: an `or` of "the option has one of these values
+    /// and the arm's rule"; `_` takes every value no arm before it names. Every value must be
+    /// covered (doc 18 section 2.4).
+    fn matching(&mut self, k: &str, arms: &[Arm], at: Pos, mode: Mode) -> L {
+        let values: Vec<String> = match self.names.options.get(k) {
+            Some(OptTy::Choice(v)) => v.clone(),
+            Some(OptTy::Toggle) => vec!["off".into(), "on".into()],
+            Some(OptTy::Range(..)) => {
+                return self.err(
+                    at,
+                    format!("`match` reads a choice or a toggle, and `{k}` is a range"),
+                    "compare the range instead",
+                );
+            }
+            None => return self.err(at, format!("unknown option `{k}`"), ""),
+        };
+        let mut seen = vec![false; values.len()];
+        let mut parts = Vec::new();
+        let mut state = false;
+        for (n, arm) in arms.iter().enumerate() {
+            let mut ix = Vec::new();
+            if arm.values.is_empty() {
+                if n + 1 != arms.len() {
+                    return self.err(arm.rule.at, "`_` is the last arm", "");
+                }
+                ix = (0..values.len()).filter(|i| !seen[*i]).collect();
+            }
+            for (v, p) in &arm.values {
+                let Some(i) = values.iter().position(|x| x == v) else {
+                    return self.err(
+                        *p,
+                        format!("`{v}` is not a value of option `{k}`"),
+                        &format!("its values: {}", values.join(", ")),
+                    );
+                };
+                if seen[i] {
+                    return self.err(*p, format!("`{v}` is in two arms"), "");
+                }
+                ix.push(i);
+            }
+            ix.iter().for_each(|i| seen[*i] = true);
+            let (rule, s) = self.b(&arm.rule, mode)?;
+            state |= s;
+            let tests: Vec<Value> = ix.iter().map(|i| json!({"eq": [{"opt": k}, i]})).collect();
+            if tests.is_empty() {
+                continue;
+            }
+            parts.push(json!({"all": [{"any": tests}, rule]}));
+        }
+        let missing: Vec<&str> =
+            values.iter().zip(&seen).filter(|(_, s)| !**s).map(|(v, _)| v.as_str()).collect();
+        if !missing.is_empty() {
+            return self.err(
+                at,
+                format!("`match opt.{k}` does not cover {}", missing.join(", ")),
+                "add arms for them, or end with `_ =>`",
+            );
+        }
+        Some((json!({"any": parts}), state))
+    }
+}
+
+/// `e` with each parameter name replaced by its argument.
+fn subst(e: &Expr, map: &HashMap<&str, &Expr>) -> Expr {
+    let mut out = e.clone();
+    let mut todo = vec![&mut out];
+    while let Some(x) = todo.pop() {
+        if let E::Name(n) = &x.e
+            && let Some(arg) = map.get(n.as_str())
+        {
+            let at = x.at;
+            *x = Expr { paren: true, at, ..(*arg).clone() };
+            continue;
+        }
+        match &mut x.e {
+            E::Call(_, xs) | E::And(xs) | E::Or(xs) | E::Sum(xs) => todo.extend(xs.iter_mut()),
+            E::In(a, xs) => {
+                todo.push(a);
+                todo.extend(xs.iter_mut());
+            }
+            E::Not(a) => todo.push(a),
+            E::Cmp(_, a, b) | E::Arith(_, a, b) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            E::Match(_, arms) => todo.extend(arms.iter_mut().map(|a| &mut a.rule)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The value of an expression over numbers alone, or `None`.
+pub(crate) fn fold(e: &Expr) -> Option<i64> {
+    match &e.e {
+        E::Int(n) => Some(*n),
+        E::Sum(xs) => xs.iter().try_fold(0i64, |s, x| s.checked_add(fold(x)?)),
+        E::Arith(op, a, b) => {
+            let (a, b) = (fold(a)?, fold(b)?);
+            match op {
+                Arith::Sub => a.checked_sub(b),
+                Arith::Mul => a.checked_mul(b),
+                Arith::Div => a.checked_div_euclid(b),
+                Arith::Mod => a.checked_rem_euclid(b),
+            }
+        }
+        E::Call(f, xs) if (f == "min" || f == "max") && !xs.is_empty() => {
+            let v: Vec<i64> = xs.iter().map(fold).collect::<Option<_>>()?;
+            if f == "min" { v.into_iter().min() } else { v.into_iter().max() }
+        }
+        _ => None,
+    }
 }

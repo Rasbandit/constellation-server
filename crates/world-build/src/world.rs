@@ -172,6 +172,14 @@ fn name_ok(errs: &mut Errs, n: &At<String>, what: &str) -> bool {
         );
         return false;
     }
+    if s.contains("__") {
+        errs.err(
+            n.pos,
+            format!("`{s}` holds `__`, which the build keeps for the defs it writes"),
+            "",
+        );
+        return false;
+    }
     if RESERVED.contains(&s) {
         errs.err(n.pos, format!("`{s}` is a reserved word and cannot name {what}"), "");
         return false;
@@ -234,6 +242,36 @@ fn both(a: &Value, b: Value) -> Value {
 
 /// Build `w`, read from `file`.
 pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
+    // The checks recurse once per rule node, to a bounded depth; a thread with a stack sized
+    // for that bound keeps it off the caller's stack, whatever that stack is.
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(config::WORLD_BUILD_STACK_BYTES)
+            .spawn_scoped(s, || build_here(w, file))
+            .map_or_else(
+                |e| {
+                    Err(vec![Error {
+                        file: file.to_owned(),
+                        pos: None,
+                        msg: format!("cannot start the build: {e}"),
+                        help: None,
+                    }])
+                },
+                |h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(vec![Error {
+                            file: file.to_owned(),
+                            pos: None,
+                            msg: "the build stopped unexpectedly".into(),
+                            help: Some("please report it with the world file".into()),
+                        }])
+                    })
+                },
+            )
+    })
+}
+
+fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
     let mut errs = Errs::new(file);
     let out = check(w, &mut errs);
     if errs.errors.is_empty()
@@ -560,9 +598,18 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     if w.regions.is_empty() {
         errs.whole("the world has no regions", "");
     }
-    for (d, rule) in &w.defs {
-        if space.declare(errs, d, Sort::Def) {
-            names.defs.insert(d.v.clone(), rule.clone());
+    for d in &w.defs {
+        if space.declare(errs, &d.name, Sort::Def) {
+            let mut params: Vec<String> = Vec::new();
+            for p in &d.params {
+                if !name_ok(errs, p, "parameter") {
+                } else if params.contains(&p.v) {
+                    errs.err(p.pos, format!("parameter `{}` is listed twice", p.v), "");
+                } else {
+                    params.push(p.v.clone());
+                }
+            }
+            names.defs.insert(d.name.v.clone(), (params, d.rule.clone()));
         }
     }
     for sh in &w.shuffles {

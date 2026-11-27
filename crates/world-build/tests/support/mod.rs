@@ -5,7 +5,7 @@
 use std::cell::Cell;
 
 use world_build::model::{
-    At, Check, Exit, Grant, Item, Lit, Members, Opt, Pos, Region, Row, Rule, RuleAt, Shuffle,
+    At, Check, Def, Exit, Grant, Item, Lit, Members, Opt, Pos, Region, Row, Rule, RuleAt, Shuffle,
     Thing, Verb, World,
 };
 
@@ -125,7 +125,7 @@ pub fn two_rooms() -> World {
             f.region(
                 "hall",
                 vec![f.check("shelf", "true")],
-                vec![f.exit("vault", "has(key)")],
+                vec![f.exit("vault", "has(`key`)")],
                 &[],
             ),
             f.region("vault", vec![f.check("chest", "true")], vec![], &[]),
@@ -272,7 +272,7 @@ pub fn tidewell() -> World {
             n: None,
             when: Some(f.r("opt.start_gift == lamp")),
         }],
-        defs: vec![(f.s("can_climb"), f.r("has(crowbar) or opt.tricky_climbs"))],
+        defs: vec![Def::plain(f.s("can_climb"), f.r("has(crowbar) or opt.tricky_climbs"))],
         item_groups: vec![(f.s("tools"), f.list(&["oar", "lamp", "crowbar"]))],
         regions,
         goal: Some(f.r("beacon_lit and count(pearl) >= opt.pearls_needed")),

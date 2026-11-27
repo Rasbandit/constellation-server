@@ -50,8 +50,10 @@ impl<T> At<T> {
 pub enum Rule {
     /// `true` or `false`.
     Const(bool),
-    /// A rule string.
+    /// A rule string, parsed when the world is built.
     Text(String),
+    /// A rule a front end has parsed already, with the place of every node.
+    Parsed(crate::rule::Expr),
 }
 
 /// A rule and where its text starts.
@@ -94,7 +96,7 @@ pub struct World {
     /// Things logic treats as held that are never placed.
     pub assumed: Vec<Grant>,
     /// Named rules.
-    pub defs: Vec<(At<String>, RuleAt)>,
+    pub defs: Vec<Def>,
     /// Named item lists that `group_count` reads.
     pub item_groups: Vec<(At<String>, Vec<At<String>>)>,
     /// Placement sets: name and the items confined to its checks.
@@ -108,6 +110,25 @@ pub struct World {
     /// Fields the file uses that this model does not carry (`rolls`, `contexts`, ...): each is
     /// reported as not supported yet.
     pub later: Vec<At<String>>,
+}
+
+/// A named rule, with parameters when it is called with arguments (doc 18 section 2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Def {
+    /// Its name.
+    pub name: At<String>,
+    /// Its parameters, in order; none for a plain def.
+    pub params: Vec<At<String>>,
+    /// Its rule.
+    pub rule: RuleAt,
+}
+
+impl Def {
+    /// A def without parameters.
+    #[must_use]
+    pub fn plain(name: At<String>, rule: RuleAt) -> Self {
+        Def { name, params: Vec::new(), rule }
+    }
 }
 
 /// An option.

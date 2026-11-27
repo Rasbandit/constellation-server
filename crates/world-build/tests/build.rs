@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use data_fill::seed::{Player, generate};
 use data_fill::{World as EngineWorld, job};
 use support::{F, tidewell, two_rooms};
-use world_build::model::{At, Grant, Members, Pos, Rule, Verb, World};
+use world_build::model::{At, Def, Grant, Members, Pos, Rule, Verb, World};
 use world_build::{Built, build, build_model};
 
 fn built(w: &World) -> Built {
@@ -304,7 +304,8 @@ fn every_short_form_lowers_to_the_engine_shape() {
         {"ge": [{"count": "oar"}, 1]},
         {"ge": [{"counter": "beacon_lit"}, 1]},
         {"any": [{"eq": [{"opt": "start_gift"}, 0]}, {"eq": [{"opt": "start_gift"}, 1]}]},
-        {"ge": [{"int": ["+", {"int": ["min", {"count": "oar"}, 1]}, {"int": ["max", 1, 2]}]}, 2]},
+        // `max(1, 2)` reads numbers only, so it folds to 2.
+        {"ge": [{"int": ["+", {"int": ["min", {"count": "oar"}, 1]}, 2]}, 2]},
         {"ge": [{"int": ["div", {"int": ["*", {"count": "oar"}, 2]}, 2]}, 1]},
     ]});
     assert_eq!(*rule, want);
@@ -328,8 +329,8 @@ fn and_inside_or_without_parentheses_is_a_warning() {
 fn defs_that_refer_to_themselves_are_an_error() {
     let mut w = tidewell();
     let f = F::default();
-    w.defs.push((f.s("loop_a"), text("loop_b", P)));
-    w.defs.push((f.s("loop_b"), f.r("loop_a")));
+    w.defs.push(Def::plain(f.s("loop_a"), text("loop_b", P)));
+    w.defs.push(Def::plain(f.s("loop_b"), f.r("loop_a")));
     let all = errors(&w).join("\n");
     assert!(all.contains("refers to itself"), "{all}");
 }
@@ -421,9 +422,12 @@ fn long_arithmetic_and_deep_def_chains_are_errors_not_stack_overflows() {
     // 64 defs, each 60 `not`s over the one before: every rule within its own cap, the chain not.
     let mut w = tidewell();
     let f = F::default();
-    w.defs.push((f.s("d0"), f.r("opt.tricky_climbs")));
+    w.defs.push(Def::plain(f.s("d0"), f.r("opt.tricky_climbs")));
     for k in 1..64 {
-        w.defs.push((f.s(&format!("d{k}")), f.r(&("not ".repeat(60) + &format!("d{}", k - 1)))));
+        w.defs.push(Def::plain(
+            f.s(&format!("d{k}")),
+            f.r(&("not ".repeat(60) + &format!("d{}", k - 1))),
+        ));
     }
     let all = errors(&w).join("\n");
     assert!(all.contains("nest more than 256 deep, counting the defs"), "{all}");
@@ -433,7 +437,7 @@ fn long_arithmetic_and_deep_def_chains_are_errors_not_stack_overflows() {
 fn a_def_in_a_settled_field_is_evaluated_and_checked_as_that_field() {
     let mut w = tidewell();
     let f = F::default();
-    w.defs.push((f.s("stalls_on"), f.r("opt.market_stalls")));
+    w.defs.push(Def::plain(f.s("stalls_on"), f.r("opt.market_stalls")));
     for c in w.regions[1].checks.iter_mut().filter(|c| c.when.is_some()) {
         c.when = Some(f.r("stalls_on"));
     }
@@ -442,7 +446,7 @@ fn a_def_in_a_settled_field_is_evaluated_and_checked_as_that_field() {
     assert_eq!(b.instance(&[("market_stalls".to_owned(), 0)].into()).unwrap().locations.len(), 15);
     // A def cannot carry a shuffle read, or a state read, into a settled field.
     let mut w = tidewell();
-    w.defs.push((f.s("crab_up"), f.r("at.wardens.tower_door == crab")));
+    w.defs.push(Def::plain(f.s("crab_up"), f.r("at.wardens.tower_door == crab")));
     w.regions[0].checks[0].when = Some(text("crab_up", P));
     fails(&w, "cannot read a shuffle result yet, and def `crab_up` reads one", P);
     let mut w = tidewell();
@@ -453,7 +457,7 @@ fn a_def_in_a_settled_field_is_evaluated_and_checked_as_that_field() {
 #[test]
 fn a_def_with_an_error_is_reported_once_where_it_is() {
     let mut w = with_check_rule("bollard", "bad and bad", Pos::new(901, 1));
-    w.defs.push((At::new("bad".into(), Pos::new(899, 1)), text("has(nope)", P)));
+    w.defs.push(Def::plain(At::new("bad".into(), Pos::new(899, 1)), text("has(nope)", P)));
     let all = errors(&w);
     assert_eq!(all.len(), 1, "{all:#?}");
     assert!(all[0].starts_with("w:900:9: unknown item `nope`"), "{all:#?}");
@@ -517,9 +521,9 @@ fn a_def_used_twice_by_each_next_def_builds_in_linear_time() {
     // `eK: e(K-1) and e(K-1)` doubles a copied tree each level; referenced, it stays small.
     let mut w = tidewell();
     let f = F::default();
-    w.defs.push((f.s("e0"), f.r("opt.tricky_climbs")));
+    w.defs.push(Def::plain(f.s("e0"), f.r("opt.tricky_climbs")));
     for k in 1..40 {
-        w.defs.push((f.s(&format!("e{k}")), f.r(&format!("e{0} and e{0}", k - 1))));
+        w.defs.push(Def::plain(f.s(&format!("e{k}")), f.r(&format!("e{0} and e{0}", k - 1))));
     }
     w.regions[0].checks[0].when = Some(f.r("e39"));
     let start = std::time::Instant::now();
@@ -537,9 +541,9 @@ fn a_def_chain_the_engine_counts_deeper_gets_a_depth_error_not_a_report_request(
     for n in 240..=256 {
         let mut w = tidewell();
         let f = F::default();
-        w.defs.push((f.s("x0"), f.r("opt.tricky_climbs")));
+        w.defs.push(Def::plain(f.s("x0"), f.r("opt.tricky_climbs")));
         for k in 1..n {
-            w.defs.push((f.s(&format!("x{k}")), f.r(&format!("not x{}", k - 1))));
+            w.defs.push(Def::plain(f.s(&format!("x{k}")), f.r(&format!("not x{}", k - 1))));
         }
         w.regions[0].checks[0].rule = f.r(&format!("x{}", n - 1));
         if let Err(e) = build_model(&w, "w") {
@@ -553,8 +557,11 @@ fn a_def_chain_the_engine_counts_deeper_gets_a_depth_error_not_a_report_request(
 fn a_def_that_reads_a_shuffle_cannot_settle_a_field() {
     let mut w = tidewell();
     let f = F::default();
-    w.defs.push((f.s("crab_deep"), f.r("opt.tricky_climbs or at.wardens.tower_door == crab")));
-    w.defs.push((f.s("via"), f.r("crab_deep")));
+    w.defs.push(Def::plain(
+        f.s("crab_deep"),
+        f.r("opt.tricky_climbs or at.wardens.tower_door == crab"),
+    ));
+    w.defs.push(Def::plain(f.s("via"), f.r("crab_deep")));
     w.regions[0].checks[0].when = Some(text("via", P));
     fails(&w, "def `via` reads one", P);
 }
@@ -564,7 +571,7 @@ fn the_pool_test_sees_options_read_through_a_def() {
     let mut w = tidewell();
     let f = F::default();
     w.items[3].count = Some(f.at(13));
-    w.defs.push((f.s("not_one"), f.r("opt.pearls_needed != 1")));
+    w.defs.push(Def::plain(f.s("not_one"), f.r("opt.pearls_needed != 1")));
     for c in w.regions[1].checks.iter_mut().filter(|c| c.when.is_some()) {
         c.when = Some(f.r("not_one"));
     }
@@ -675,4 +682,92 @@ fn many_generated_checks_build_quickly_and_keep_their_source_place() {
     // One bad generated check points at the family that made it.
     w.regions[0].checks[9_000].rule = At::new(Rule::Text("has(nope)".into()), family);
     fails(&w, "unknown item `nope`", family.right(4));
+}
+
+#[test]
+fn match_on_an_option_covers_every_value_and_lowers_to_an_or_of_arms() {
+    let b = built(&with_check_rule(
+        "bollard",
+        "match opt.start_gift { none => has(oar)  lamp => true }",
+        P,
+    ));
+    let dock =
+        b.manifest["regions"].as_array().unwrap().iter().find(|r| r["key"] == "dock").unwrap();
+    assert_eq!(
+        dock["checks"][0]["rule"],
+        serde_json::json!({"any": [
+            {"all": [{"any": [{"eq": [{"opt": "start_gift"}, 0]}]}, {"has": "oar"}]},
+            {"all": [{"any": [{"eq": [{"opt": "start_gift"}, 1]}]}, {"true": {}}]},
+        ]})
+    );
+    built(&with_check_rule("bollard", "match opt.tricky_climbs { on => true  _ => has(oar) }", P));
+    fails(
+        &with_check_rule("bollard", "match opt.start_gift { none => true }", P),
+        "does not cover lamp",
+        P,
+    );
+    fails(
+        &with_check_rule("bollard", "match opt.start_gift { none, sword => true }", P),
+        "`sword` is not a value",
+        P.right(29),
+    );
+    fails(
+        &with_check_rule("bollard", "match opt.start_gift { _ => true  none => true }", P),
+        "`_` is the last arm",
+        P.right(28),
+    );
+    fails(&with_check_rule("bollard", "match opt.pearls_needed { _ => true }", P), "is a range", P);
+}
+
+#[test]
+fn a_def_with_parameters_is_written_once_per_argument_list() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push(Def {
+        name: f.s("enough"),
+        params: vec![f.s("n")],
+        rule: f.r("count(pearl) >= n"),
+    });
+    w.regions[0].checks[0].rule = f.r("enough(2) or enough(opt.pearls_needed)");
+    w.regions[0].checks[1].rule = f.r("enough(2)");
+    let b = built(&w);
+    assert_eq!(b.manifest["defs"]["enough__2"], serde_json::json!({"ge": [{"count": "pearl"}, 2]}));
+    assert_eq!(
+        b.manifest["defs"]["enough__opt_pearls_needed"],
+        serde_json::json!({"ge": [{"count": "pearl"}, {"opt": "pearls_needed"}]})
+    );
+    assert!(b.manifest["defs"].get("enough").is_none());
+    fails(&with_check_rule("bollard", "can_climb(1)", P), "unknown function", P);
+    let mut w2 = w.clone();
+    w2.regions[0].checks[2].rule = text("enough(1, 2)", P);
+    fails(&w2, "takes 1 arguments, given 2", P);
+    let mut w3 = w.clone();
+    w3.regions[0].checks[2].rule = text("enough", P);
+    fails(&w3, "takes 1 arguments", P);
+    let mut w4 = w;
+    w4.regions[0].checks[2].rule = text("enough(count(oar))", P);
+    fails(&w4, "an argument is a number", P.right(7));
+    // A def that calls itself with a changed argument runs into the depth cap, not forever.
+    let mut w5 = tidewell();
+    w5.defs.push(Def { name: f.s("down"), params: vec![f.s("n")], rule: f.r("down(n + 1)") });
+    w5.regions[0].checks[0].rule = f.r("down(0)");
+    assert!(errors(&w5).iter().any(|e| e.contains("deep")));
+}
+
+#[test]
+fn count_of_several_items_is_one_sum_and_number_only_arithmetic_folds() {
+    let b = built(&with_check_rule(
+        "bollard",
+        "count(oar, lamp) >= 10 - 9 and count(pearl) >= 7 mod 4",
+        P,
+    ));
+    let dock =
+        b.manifest["regions"].as_array().unwrap().iter().find(|r| r["key"] == "dock").unwrap();
+    assert_eq!(
+        dock["checks"][0]["rule"],
+        serde_json::json!({"all": [
+            {"ge": [{"int": ["+", {"count": "lamp"}, {"count": "oar"}]}, 1]},
+            {"ge": [{"count": "pearl"}, 3]},
+        ]})
+    );
 }
