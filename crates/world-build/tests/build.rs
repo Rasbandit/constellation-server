@@ -1,0 +1,413 @@
+//! The build tool end to end: the example world builds to a manifest the engine prepares and
+//! fills beatable, the canonical bytes are pinned, and every check names its place.
+
+mod support;
+
+use std::collections::HashMap;
+
+use data_fill::seed::{Player, generate};
+use data_fill::{World as EngineWorld, job};
+use support::{F, tidewell, two_rooms};
+use world_build::model::{At, Grant, Members, Pos, Rule, Verb, World};
+use world_build::{Built, build, build_model};
+
+fn built(w: &World) -> Built {
+    build_model(w, "w").unwrap_or_else(|e| {
+        panic!("{}", e.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
+    })
+}
+
+/// Every error of building `w`, as printed.
+fn errors(w: &World) -> Vec<String> {
+    build_model(w, "w").map(|_| ()).unwrap_err().iter().map(ToString::to_string).collect()
+}
+
+/// The one error of `w` that contains `needle`, at `line:col`.
+fn fails(w: &World, needle: &str, pos: Pos) {
+    let all = errors(w);
+    let at = format!("w:{}:{}: ", pos.line, pos.col);
+    assert!(
+        all.iter().any(|e| e.starts_with(&at) && e.contains(needle)),
+        "want {at}..{needle}.. in {all:#?}"
+    );
+}
+
+fn text(r: &str, pos: Pos) -> At<Rule> {
+    At::new(Rule::Text(r.to_owned()), pos)
+}
+
+/// Tidewell with the rule of check `key` replaced by `rule` at `pos`.
+fn with_check_rule(key: &str, rule: &str, pos: Pos) -> World {
+    let mut w = tidewell();
+    let c = w.regions.iter_mut().flat_map(|r| &mut r.checks).find(|c| c.key.v == key).unwrap();
+    c.rule = text(rule, pos);
+    w
+}
+
+const P: Pos = Pos { line: 900, col: 5 };
+
+#[test]
+fn the_smallest_world_builds_to_the_pinned_canonical_bytes() {
+    let b = built(&two_rooms());
+    let want = concat!(
+        r#"{"defs":{},"game":"two-rooms","goal":{"reach":"region:vault"},"#,
+        r#""items":[{"id":1,"key":"key"},{"id":2,"key":"nothing"}],"#,
+        r#""locations":[{"id":2,"key":"chest"},{"id":1,"key":"shelf"}],"options":[],"#,
+        r#""regions":[{"can_stay":false,"checks":[{"loc":"shelf","rule":{"true":{}}}],"events":[],"#,
+        r#""exits":[{"rule":{"has":"key"},"to":"vault"}],"key":"hall","stays":[]},"#,
+        r#"{"can_stay":false,"checks":[{"loc":"chest","rule":{"true":{}}}],"events":[],"exits":[],"#,
+        r#""key":"vault","stays":[]}],"start":"hall","version":1,"x.time":{"slices":1,"start_mask":1}}"#,
+        "\n"
+    );
+    assert_eq!(b.json(), want);
+    let inst = b.default_instance().unwrap();
+    assert_eq!(inst.pool, ["key", "nothing"]);
+}
+
+#[test]
+fn building_the_same_world_twice_gives_the_same_bytes() {
+    let (a, b) = (built(&tidewell()), built(&tidewell()));
+    assert_eq!(a.json(), b.json());
+    assert!(a.json().len() > 1000);
+}
+
+#[test]
+fn the_example_world_round_trips_through_the_engine_with_no_warnings() {
+    let b = built(&tidewell());
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    // The upload check the server runs: a game, a version, and it compiles and prepares.
+    job::prepare(b.json().as_bytes()).unwrap();
+    let w = EngineWorld::load(&serde_json::from_str(b.json()).unwrap()).unwrap();
+    assert!(w.has_shuffles());
+    assert_eq!((w.items(), w.locations()), (7, 17));
+    let inst = b.default_instance().unwrap();
+    assert_eq!(inst.locations.len(), 17);
+    assert_eq!(inst.locked.get("old_chest").map(String::as_str), Some("chart"));
+    assert_eq!(inst.excluded, ["tide_pool"]);
+    assert_eq!(inst.pool.len(), 16);
+    assert_eq!(inst.pool.iter().filter(|i| *i == "shell").count(), 9);
+}
+
+/// Build the example, load it in the engine, fill seeds 1 to 50 at 1 and 4 players: every seed
+/// generates, and `generate` refuses a world a player cannot finish, so every seed is beatable.
+#[test]
+fn the_example_world_fills_beatable_for_seeds_1_to_50_at_1_and_4_players() {
+    let b = built(&tidewell());
+    let m: serde_json::Value = serde_json::from_str(b.json()).unwrap();
+    let inst = b.default_instance().unwrap();
+    for players in [1usize, 4] {
+        let p: Vec<Player> = (0..players)
+            .map(|k| Player { name: format!("P{k}"), instance: inst.clone() })
+            .collect();
+        for seed in 1..=50 {
+            let bundle = generate(&m, "s", &p, seed)
+                .unwrap_or_else(|e| panic!("{players} players, seed {seed}: {e}"));
+            assert_eq!(bundle.slots.len(), players);
+        }
+    }
+}
+
+#[test]
+fn other_option_values_build_instances_that_fill_beatable() {
+    let b = built(&tidewell());
+    let m: serde_json::Value = serde_json::from_str(b.json()).unwrap();
+    let opts: HashMap<String, i64> =
+        [("market_stalls", 0), ("start_gift", 1), ("pearls_needed", 3), ("tricky_climbs", 1)]
+            .map(|(k, v)| (k.to_owned(), v))
+            .into();
+    let inst = b.instance(&opts).unwrap();
+    assert_eq!(inst.locations.len(), 15);
+    assert_eq!(inst.start_inventory, ["lamp"]);
+    assert!(!inst.pool.contains(&"lamp".to_owned()));
+    for seed in 1..=10 {
+        let p = vec![Player { name: "P".into(), instance: inst.clone() }];
+        generate(&m, "s", &p, seed).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+    assert!(b.instance(&[("pearls_needed".to_owned(), 9)].into()).unwrap_err().contains("outside"));
+    assert!(b.instance(&[("nope".to_owned(), 1)].into()).unwrap_err().contains("unknown option"));
+}
+
+#[test]
+fn every_error_is_collected_not_only_the_first() {
+    let mut w = with_check_rule("bollard", "has(nope)", P);
+    w.regions[1].checks[2].rule = text("lamp", Pos::new(901, 1));
+    let all = errors(&w);
+    assert!(all.len() >= 2, "{all:?}");
+    assert!(all[0].starts_with("w:900:") && all[1].starts_with("w:901:"), "in file order: {all:?}");
+}
+
+#[test]
+fn a_rule_error_names_the_line_and_the_column_of_its_character() {
+    // `has(` is at column 5, so the bad name 4 characters in is at column 9.
+    fails(&with_check_rule("bollard", "has(nope)", P), "unknown item `nope`", P.right(4));
+    fails(
+        &with_check_rule("bollard", "has(oar) and", P),
+        "ends where a value was expected",
+        P.right(12),
+    );
+    fails(&with_check_rule("bollard", "a < b < c", P), "do not chain", P.right(6));
+}
+
+#[test]
+fn unknown_names_say_what_the_name_is() {
+    fails(&with_check_rule("bollard", "lamp", P), "is an item", P);
+    fails(&with_check_rule("bollard", "lamp", P), "has(lamp)", P);
+    fails(&with_check_rule("bollard", "dock", P), "is a region", P);
+    fails(&with_check_rule("bollard", "mystery", P), "unknown name `mystery`", P);
+    fails(&with_check_rule("bollard", "opt.nope", P), "unknown option `nope`", P);
+    fails(
+        &with_check_rule("bollard", "opt.start_gift == sword", P),
+        "not a value of option",
+        P.right(18),
+    );
+    fails(&with_check_rule("bollard", "opt.pearls_needed", P), "not a toggle", P);
+    fails(&with_check_rule("bollard", "at.wardens.cellar", P), "has no slot `cellar`", P);
+    fails(
+        &with_check_rule("bollard", "at.wardens.tower_door == shark", P),
+        "has no thing `shark`",
+        P.right(25),
+    );
+    fails(
+        &with_check_rule("bollard", "has(tools)", P),
+        "is an item group, not an item",
+        P.right(4),
+    );
+    fails(&with_check_rule("bollard", "zap(oar)", P), "unknown function", P);
+}
+
+#[test]
+fn a_name_declared_twice_is_an_error_at_the_second() {
+    let mut w = tidewell();
+    w.regions[0].checks[0].key = At::new("oar".into(), P);
+    fails(&w, "`oar` is already an item", P);
+    let mut w = tidewell();
+    w.regions[1].key = At::new("dock".into(), P);
+    fails(&w, "`dock` is already a region", P);
+    let mut w = tidewell();
+    w.items[0].key = At::new("nothing".into(), P);
+    fails(&w, "reserved", P);
+    let mut w = tidewell();
+    w.items[0].key = At::new("Oar-1".into(), P);
+    fails(&w, "not a valid item name", P);
+}
+
+#[test]
+fn a_region_no_exit_leads_to_is_an_error() {
+    let mut w = tidewell();
+    let f = F::default();
+    let mut island = f.region("far_island", vec![f.check("driftwood", "true")], vec![], &[]);
+    island.key.pos = P;
+    w.regions.push(island);
+    fails(&w, "region `far_island` cannot be reached", P);
+    let mut w = tidewell();
+    w.regions[0].exits[3].to = At::new("moon".into(), P);
+    fails(&w, "not a region", P);
+    let mut w = tidewell();
+    w.start = Some(At::new("moon".into(), P));
+    fails(&w, "start `moon` is not a region", P);
+}
+
+#[test]
+fn rules_that_could_turn_false_are_refused_d132() {
+    fails(&with_check_rule("bollard", "not has(oar)", P), "`not` over what the player holds", P);
+    fails(&with_check_rule("bollard", "not beacon_lit", P), "`not` over what the player holds", P);
+    fails(
+        &with_check_rule("bollard", "not at.wardens.tower_door", P),
+        "`not` over what the player holds",
+        P,
+    );
+    fails(&with_check_rule("bollard", "count(pearl) < 3", P), "can turn false", P);
+    fails(&with_check_rule("bollard", "count(pearl) == 2", P), "can turn false", P);
+    fails(&with_check_rule("bollard", "3 >= count(pearl)", P), "can turn false", P);
+    fails(&with_check_rule("bollard", "count(pearl) >= count(oar)", P), "can turn false", P);
+    fails(
+        &with_check_rule("bollard", "count(pearl) * opt.pearls_needed >= 2", P),
+        "a product that reads items",
+        P,
+    );
+    fails(
+        &with_check_rule("bollard", "count(pearl) div 0 >= 1", P),
+        "positive number",
+        P.right(17),
+    );
+    // Options, and name tests of a shuffle, may be negated and compared freely.
+    built(&with_check_rule("bollard", "not opt.tricky_climbs or opt.pearls_needed < 3", P));
+    built(&with_check_rule("bollard", "not at.wardens.tower_door == crab", P));
+    built(&with_check_rule("bollard", "2 <= count(pearl) and count(pearl) * 2 + 1 > 2", P));
+}
+
+#[test]
+fn a_rule_reads_only_its_own_world_d133() {
+    fails(
+        &with_check_rule("bollard", "has(other.bell)", P),
+        "reads only its own world",
+        P.right(4),
+    );
+    fails(&with_check_rule("bollard", "player2.beacon_lit", P), "D-133", P);
+}
+
+#[test]
+fn settled_fields_may_read_options_only_d134() {
+    let mut w = tidewell();
+    w.regions[0].checks[0].when = Some(text("has(oar)", P));
+    fails(&w, "`when` may read options only", P);
+    let mut w = tidewell();
+    w.regions[0].checks[0].no_progression = Some(text("opt.tricky_climbs and beacon_lit", P));
+    fails(&w, "`no_progression` may read options only", P.right(22));
+    let mut w = tidewell();
+    w.start_items[0].when = Some(text("has(oar)", P));
+    fails(&w, "`start_items` may read options only", P);
+    let mut w = tidewell();
+    w.regions[0].when = Some(text("at.wardens.tower_door == crab", P));
+    // A shuffle's result is not known when the instance is built: refused, not misread.
+    fails(&w, "cannot read a shuffle result yet", P);
+}
+
+#[test]
+fn reach_is_for_the_goal_only_and_the_engine_limits_are_build_errors() {
+    fails(&with_check_rule("bollard", "reach(dock)", P), "goal only", P);
+    fails(&with_check_rule("bollard", "has(pearl, 300)", P), "0 to 255", P.right(11));
+    fails(&with_check_rule("bollard", "count(pearl) >= 40000", P), "16-bit", P.right(16));
+    fails(
+        &with_check_rule("bollard", "opt.pearls_needed - 1 >= 0", P),
+        "`-` is not supported yet",
+        P,
+    );
+    fails(
+        &with_check_rule("bollard", "opt.pearls_needed mod 2 >= 0", P),
+        "`mod` is not supported yet",
+        P,
+    );
+    fails(&with_check_rule("bollard", "during(night)", P), "time context", P);
+    fails(&with_check_rule("bollard", "roll(price) >= 2", P), "`roll` is not supported", P);
+}
+
+#[test]
+fn every_short_form_lowers_to_the_engine_shape() {
+    let w = with_check_rule(
+        "bollard",
+        "has(pearl, 2) and has_all(oar, lamp) and has_any(lamp, oar) and level(oar) >= 1 and counter(beacon_lit) >= 1 and opt.start_gift in [none, lamp] and min(count(oar), 1) + max(1, 2) >= 2 and count(oar) * 2 div 2 >= 1",
+        P,
+    );
+    let b = built(&w);
+    let dock = &b.manifest["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "dock")
+        .unwrap()["checks"];
+    let rule = &dock.as_array().unwrap().iter().find(|c| c["loc"] == "bollard").unwrap()["rule"];
+    let want = serde_json::json!({"all": [
+        {"has": "pearl", "n": 2},
+        {"has_all": ["lamp", "oar"]},
+        {"has_any": ["lamp", "oar"]},
+        {"ge": [{"count": "oar"}, 1]},
+        {"ge": [{"counter": "beacon_lit"}, 1]},
+        {"any": [{"eq": [{"opt": "start_gift"}, 0]}, {"eq": [{"opt": "start_gift"}, 1]}]},
+        {"ge": [{"int": ["+", {"int": ["min", {"count": "oar"}, 1]}, {"int": ["max", 1, 2]}]}, 2]},
+        {"ge": [{"int": ["div", {"int": ["*", {"count": "oar"}, 2]}, 2]}, 1]},
+    ]});
+    assert_eq!(*rule, want);
+    // A group count is one sum of counts, which the engine keeps as one counter.
+    let grotto =
+        b.manifest["regions"].as_array().unwrap().iter().find(|r| r["key"] == "grotto").unwrap();
+    assert_eq!(
+        grotto["checks"][0]["rule"],
+        serde_json::json!({"ge": [{"int": ["+", {"count": "crowbar"}, {"count": "lamp"}, {"count": "oar"}]}, 2]})
+    );
+}
+
+#[test]
+fn and_inside_or_without_parentheses_is_a_warning() {
+    let b = built(&with_check_rule("bollard", "has(oar) or has(lamp) and has(crowbar)", P));
+    assert_eq!(b.warnings.len(), 1);
+    assert_eq!(b.warnings[0].pos, Some(P.right(12)));
+}
+
+#[test]
+fn defs_that_refer_to_themselves_are_an_error() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push((f.s("loop_a"), text("loop_b", P)));
+    w.defs.push((f.s("loop_b"), f.r("loop_a")));
+    let all = errors(&w).join("\n");
+    assert!(all.contains("refers to itself"), "{all}");
+}
+
+#[test]
+fn too_many_items_for_the_checks_is_a_build_error_naming_the_options() {
+    let mut w = tidewell();
+    w.items[3].count = Some(At::new(13, P));
+    let all = errors(&w).join("\n");
+    // 16 checks with the stalls on, 14 with them off: only the off setting fails.
+    assert!(all.contains("market_stalls = 0") && all.contains("items to place"), "{all}");
+    let mut w = tidewell();
+    w.items[4].count = Some(At::new(0, P));
+    fails(&w, "no copy left", w.regions[3].checks[0].holds.as_ref().unwrap().pos);
+    let mut w = tidewell();
+    w.start_items.push(Grant { item: At::new("ghost".into(), P), n: None, when: None });
+    fails(&w, "`ghost` in `start_items` is not an item", P);
+}
+
+#[test]
+fn shuffles_outside_the_engines_first_slice_are_build_errors() {
+    let mut w = tidewell();
+    w.shuffles[1].later.push(At::new("pin".into(), P));
+    fails(&w, "shuffle field `pin` is not supported yet", P);
+    let mut w = tidewell();
+    w.shuffles[0].check = Some(At::new("reach".into(), P));
+    fails(&w, "check `reach`", P);
+    let mut w = tidewell();
+    w.shuffles[1].coupled = Some(At::new(Rule::Const(true), P));
+    fails(&w, "only a shuffle that moves exits", P);
+    let mut w = tidewell();
+    w.shuffles[0].coupled = Some(text("opt.tricky_climbs", P));
+    fails(&w, "reads options is not supported", P);
+    let mut w = tidewell();
+    w.shuffles[0].slots = At::new(Members::Exits(vec![At::new("sideways".into(), P)]), P);
+    fails(&w, "neither an exit group nor an exit", P);
+    let mut w = tidewell();
+    w.shuffles[0].name = At::new("layout".into(), P);
+    fails(&w, "reserved for the engine", P);
+    let mut w = tidewell();
+    let Some(At { v: Members::Names(things), .. }) = &mut w.shuffles[1].things else { panic!() };
+    things[0].later.push(At::new("count".into(), P));
+    fails(&w, "thing field `count`", P);
+    // A rule cannot read where an exit shuffle put things.
+    fails(&with_check_rule("bollard", "at.doors.x", P), "moves exits", P);
+    // A permission row names real slots and things.
+    let mut w = tidewell();
+    let f = F::default();
+    let mut r = f.row(Verb::Only, &["tower_door"], &["shark"]);
+    r.object[0].pos = P;
+    w.shuffles[1].allow.push(r);
+    fails(&w, "no thing or group `shark`", P);
+    // A row the engine accepts builds: the tower door takes the eel only.
+    let mut w = tidewell();
+    w.shuffles[1].allow.push(f.row(Verb::Only, &["tower_door"], &["eel"]));
+    let b = built(&w);
+    assert_eq!(
+        b.manifest["shuffles"]["wardens"]["allow"][0],
+        serde_json::json!({"only": {"groups": [], "names": ["eel"]}, "slots": {"groups": [], "names": ["tower_door"]}})
+    );
+}
+
+#[test]
+fn fields_this_version_does_not_build_are_named() {
+    let mut w = tidewell();
+    w.later.push(At::new("rolls".into(), P));
+    fails(&w, "field `rolls` is not supported yet", P);
+    let mut w = tidewell();
+    w.format = Some(At::new("cgm-data/2".into(), P));
+    fails(&w, "not one this tool reads", P);
+    let mut w = tidewell();
+    w.goal = None;
+    assert!(errors(&w).iter().any(|e| e == "w: the world has no `goal`"));
+}
+
+#[test]
+fn the_front_end_is_one_function_and_reads_nothing_yet() {
+    let e = build("format: cgm-data/1\n", "world.yaml").unwrap_err();
+    assert_eq!(e.len(), 1);
+    assert!(e[0].to_string().starts_with("world.yaml: no front end reads world files yet"));
+}

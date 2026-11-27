@@ -1,0 +1,23 @@
+[package]
+name = "world-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The one source of limits (rule nesting, error count, pool test size).
+config = { path = "../config", default-features = false }
+# The engine: its per-seed instance type, its monotone rule for comparisons, and its compiler,
+# which every built manifest goes through as a last check.
+data-fill = { path = "../data-fill" }
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
