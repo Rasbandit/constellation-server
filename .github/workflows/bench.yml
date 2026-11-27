@@ -10,6 +10,8 @@ name: bench
 # (crates/server/src/worlds/tests/gen_bench.rs) and the seed-shape report at full size.
 # A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
 # through its concurrency group, cancel the run already in progress.
+# The bench builds examples, so data-fill's own dev-dependency turns on `cross-check` (one
+# branch per placement phase), and `memory-harness` counts allocations: not the exact product build.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -128,7 +130,7 @@ jobs:
             echo "One synthetic world per room, every player on it, in-memory store, no HTTP. Start: a job process that does nothing. Pipe in: the fill's input on its stdin, by difference. Load, fill and encode: the job's own steps. Rest: what the parts leave of the job (inferred by subtraction)."
             echo
             echo "| run | profile | players | start ms | pipe in ms | load ms | fill ms | encode ms | rest ms | job ms | prepared bytes | request bytes | seed bytes | reps |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
             jq -r 'select(.bench == "gen") | .split as $s | "| \(.run) | \(.profile) | \(.players) | \($s.start_ms) | \($s.pipe_in_ms) | \($s.load_ms) | \($s.fill_ms) | \($s.encode_ms) | \($s.rest_ms) | \($s.job_ms) | \($s.prepared_bytes) | \($s.request_bytes) | \($s.seed_bytes) | \(.reps) |"' gen-bench.jsonl
             echo
             echo "Own process against the fill pool (median of the three runs' medians, and in brackets the least and greatest sample):"
@@ -223,7 +225,7 @@ jobs:
       - name: summary
         run: |
           {
-            echo "### Base against head, worlds without shuffles, exact fill, one thread (measured on this runner, release build, 12 runs a side in turns; each run's fill ms is its own median)"
+            echo "### Base against head, worlds without shuffles, the fill (measured on this runner, release build, 12 runs a side in turns; each run's fill ms is its own median)"
             echo
             echo "| profile | players | base fill ms median | base range | head fill ms median | head range | head / base | base rule evals | head rule evals | same placements |"
             echo "|---|---|---|---|---|---|---|---|---|---|"
@@ -305,7 +307,7 @@ jobs:
             echo "guards: 8 things that one check in eight reads as a rule, against the heavy shape without it. entrances: a room on one loaded world. Room bytes per player is the heap the room keeps per player after setup; world bytes is one loaded world, which a room shares."
             echo
             echo "| shuffle | worlds | players | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | per world | restarts | room bytes per player plain | with | world bytes | peak RSS plain | with |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
             jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
               | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
               | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \($on.shuffle.restarts) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl

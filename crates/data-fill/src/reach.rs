@@ -503,7 +503,7 @@ impl<'w> Reach<'w> {
         self
     }
 
-    /// Mark the absent locations' checks done: done without a rank, as a sleeping check is.
+    /// Mark the absent locations' checks done: done without a rank.
     fn skip_absent(&mut self) {
         for &s in &self.plan.absent {
             self.done.insert(s as usize);
@@ -1223,7 +1223,7 @@ impl<'w> Reach<'w> {
 #[cfg(test)]
 impl Reach<'_> {
     /// The first difference between two states of one world and plan, value for value and
-    /// rank for rank (not only the fixed point), or `None`.
+    /// growth for growth in order (not only the fixed point), or `None`.
     pub(crate) fn differs(&self, o: &Self) -> Option<&'static str> {
         [
             (self.counts != o.counts, "counts"),

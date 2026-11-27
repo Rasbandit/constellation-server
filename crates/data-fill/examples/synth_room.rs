@@ -26,8 +26,8 @@
 //! parts of the encode are also timed alone: `validate_ms` (the check), and `hash_whole_ms`,
 //! the hash with the game's names and ids written again, which the encode does not pay.
 //! With feature `memory-harness`, `peak_heap_bytes` is the most live heap one fill allocated on
-//! the calling thread (`allocation-counter` counts per thread, so what worker threads allocate
-//! is left out: read it from a `--workers 1` run); without the feature, `null`.
+//! the calling thread (`allocation-counter` counts per thread; the fill runs on one); without
+//! the feature, `null`.
 //! `peak_rss_bytes` is the whole process's resident high-water mark when the row is printed
 //! (`VmHWM` of `/proc/self/status`, Linux only): it never falls, so it covers setup and every
 //! smaller room before the row; `null` where the file is not there. The same mark is also read

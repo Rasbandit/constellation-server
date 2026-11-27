@@ -991,20 +991,20 @@ fn a_coupled_door_listed_from_its_far_side_is_a_load_error_that_names_it() {
 }
 
 #[test]
-fn a_room_stages_the_same_on_one_thread_and_on_several() {
+fn a_room_stages_the_same_every_time() {
     let (m, inst) = doors();
     let w = World::load(&m).unwrap();
     let insts = vec![&inst; 9];
-    let (one, tables) = room(&[&w], &insts, 5).unwrap();
-    let (many, same) = room(&[&w], &insts, 5).unwrap();
+    let (once, tables) = room(&[&w], &insts, 5).unwrap();
+    let (again, same) = room(&[&w], &insts, 5).unwrap();
     assert_eq!(tables, same);
     let exits = |c: &data_fill::room::Compiled| {
         c.worlds.iter().map(|w| decode::manifest(w)["regions"].clone()).collect::<Vec<_>>()
     };
-    assert_eq!(exits(&one), exits(&many));
+    assert_eq!(exits(&once), exits(&again));
     assert!(tables.iter().any(|t| *t != tables[0]), "players differ");
     // A staged world shares what the seed did not change with the world it came from.
-    assert!(one.worlds.iter().all(|s| s.shares_with(&w)));
+    assert!(once.worlds.iter().all(|s| s.shares_with(&w)));
 }
 
 /// More fixed regions behind the shuffled exits than the layout index may hold.

@@ -319,10 +319,12 @@ pub fn fill_room_spheres(
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
-/// The fill's independent cross-check, for tests only (feature `cross-check`, which this
-/// crate's integration tests turn on): [`fill_room_spheres`] with every group placed against a
-/// fresh solve of its own state instead of by adding to one solve and taking the additions
-/// back ([`Steps::fresh_rounds`]). It must place every item where the fill does.
+/// The fill's cross-check, for tests only (feature `cross-check`, which this crate's
+/// integration tests turn on): [`fill_room_spheres`] with every group placed against a fresh
+/// solve of its own state instead of by adding to one solve and taking the additions back
+/// ([`Steps::fresh_rounds`]). It must place every item where the fill does. It is independent
+/// of how a group's state is reached (no journal, no undo); it shares round formation, `fits`,
+/// `pick`, repair and the solver, so it does not check the placement rule itself.
 ///
 /// # Errors
 /// As [`fill_room`].
@@ -557,9 +559,8 @@ fn fill_by(
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
     check(seats)?;
-    // Only a test asks for the fresh solves.
     #[cfg(not(any(test, feature = "cross-check")))]
-    let _ = fresh;
+    assert!(!fresh, "the fresh solves are built for tests only");
     let mut last = None;
     let mut s = Steps {
         room: Linked::new(seats),
@@ -948,8 +949,9 @@ impl Steps<'_, '_> {
     }
 
     /// Tests only: [`Steps::place`] by a fresh solve of every group's state, with nothing
-    /// added and taken back: the independent cross-check of [`Steps::split`], which must place
-    /// every item where this does. A divided group's first half is placed with the second half
+    /// added and taken back: the cross-check of how [`Steps::split`] reaches a group's state
+    /// (it shares round formation, `fits`, `pick` and repair), which must place every item
+    /// where this does. A divided group's first half is placed with the second half
     /// held too, then the second half as the next group.
     #[cfg(any(test, feature = "cross-check"))]
     fn fresh_rounds(
