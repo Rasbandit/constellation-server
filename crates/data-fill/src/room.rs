@@ -25,7 +25,8 @@
 //!
 //! Per-player state is owned by the room and shared data (`World`, `Plan`) is immutable and
 //! `Sync`; placing is sequential. Choices where the legacy multiplayer fill has options
-//! (see `docs/world-rules-section.md`): rounds of one item per player; one shared pool and one shuffled list of locations
+//! (see `docs/world-rules-section.md`): rounds of one item per player (a room stuck on every
+//! attempt by that rule gets attempts with rounds of one item, see [`fill_room`]); one shared pool and one shuffled list of locations
 //! over all players; an item with a placement group stays in its owner's world; progression
 //! never goes on an excluded location; every player's goal must hold (the exact fill asks for
 //! no accessibility beyond that; the opt-in modes have `Dials::goal_only`); no local-item
@@ -412,8 +413,10 @@ impl std::str::FromStr for Algorithm {
 
 /// Fill a room, on the path a room of its size takes ([`Path::of`]). Retries the whole fill
 /// with the next draws from `rng` when stuck: `max_attempts` times by the rule (a round takes
-/// one item from every player), then `config::FILL_UNSTICK_ATTEMPTS` times with rounds of one
-/// item, so [`RoomFilled::attempts`] may exceed `max_attempts`. A caller that wants another
+/// one item from every player), then, in a room of two or more players, up to
+/// `config::FILL_UNSTICK_ATTEMPTS` times with rounds of one item as far as
+/// `config::FILL_UNSTICK_BUDGET` pays for them, so [`RoomFilled::attempts`] and the attempts
+/// of [`FillError::Stuck`] may exceed `max_attempts` by that many. A caller that wants another
 /// path names it to [`fill_room_on`].
 ///
 /// # Errors
@@ -714,6 +717,33 @@ fn fill_by(
     seats: &[Seat<'_>],
     rng: &mut SpecRng,
     max_attempts: u32,
+    how: (bool, Path, Algorithm, bool),
+    want_spheres: bool,
+) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
+    let budget = config::FILL_UNSTICK_BUDGET;
+    fill_within(seats, rng, (max_attempts, budget), how, want_spheres)
+}
+
+/// How many attempts with rounds of one item a room gets once `max_attempts` by the rule were
+/// stuck: up to `config::FILL_UNSTICK_ATTEMPTS`, as many as `budget` pays for. An attempt
+/// costs its rounds (one per progression item) times the room's worlds, known before it
+/// starts and the same on every path and machine, so which rooms get the attempts never
+/// depends on a clock. None for one player: a round is one item there already, and the
+/// single-world fill has no such attempts.
+pub(crate) fn unstick_attempts(seats: &[Seat<'_>], max_attempts: u32, budget: u64) -> u32 {
+    if max_attempts == 0 || seats.len() < 2 {
+        return 0;
+    }
+    let rounds: u64 = seats.iter().map(|s| s.plan.progression.len() as u64).sum();
+    let cost = rounds.saturating_mul(seats.len() as u64).max(1);
+    u32::try_from(budget / cost).unwrap_or(u32::MAX).min(config::FILL_UNSTICK_ATTEMPTS)
+}
+
+/// [`fill_by`] with the work the attempts after `max_attempts` may cost ([`unstick_attempts`]).
+pub(crate) fn fill_within(
+    seats: &[Seat<'_>],
+    rng: &mut SpecRng,
+    (max_attempts, budget): (u32, u64),
     (extend, path, algorithm, per_player): (bool, Path, Algorithm, bool),
     want_spheres: bool,
 ) -> Result<(RoomFilled, Option<RoomSpheres>), FillError> {
@@ -744,10 +774,7 @@ fn fill_by(
     // Only a seed that ends stuck today goes past `max_attempts`: every seed that fills within
     // them draws and places what it always did. The attempts after that go on from the same
     // random stream with rounds of one item, which fill rooms the rule cannot (issue 212).
-    let tries = match max_attempts {
-        0 => 0,
-        n => n.saturating_add(config::FILL_UNSTICK_ATTEMPTS),
-    };
+    let tries = max_attempts.saturating_add(unstick_attempts(seats, max_attempts, budget));
     for attempt in 1..=tries {
         s.per_player = per_player && attempt <= max_attempts;
         match s.try_fill(rng) {

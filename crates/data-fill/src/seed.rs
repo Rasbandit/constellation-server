@@ -85,7 +85,8 @@ pub struct FillReport {
     pub placed_by_the_mode: bool,
     /// Attempts the mode gave up on.
     pub fallbacks: u32,
-    /// Full fills started.
+    /// Full fills started: above `config::FILL_MAX_ATTEMPTS` when the room was filled by an
+    /// attempt with rounds of one item (`config::FILL_UNSTICK_ATTEMPTS`).
     pub attempts: u32,
     /// Items a shuffle fill moved, and orders a level fill repaired, in the seed.
     pub swaps: u32,

@@ -114,11 +114,21 @@ jobs:
             fi
             tee -a bench-room.jsonl < hostile.jsonl
           done; done
-          # Issue 212: the chain and keys rooms the round rule cannot fill, which the attempts
-          # with rounds of one item fill (over `config::FILL_MAX_ATTEMPTS` attempts in the row).
+          # Issue 212: rooms the round rule cannot fill, which an attempt with rounds of one item
+          # fills (`attempts` above `max_attempts` in the row). Chain at 22 players and keys at
+          # 16 on all three paths, in the gated file: the gates below hold the carried and the
+          # split path against the forward path on them, and one more that such an attempt did
+          # the filling.
+          for room in "chain 22" "keys 16"; do for path in carry forward split; do
+            read -r profile players <<< "$room"
+            timeout 900 target/release/examples/synth_room --profile "$profile" --path "$path" \
+              --workers 1 --players "$players" --reps 1 | tee -a bench-room.jsonl
+          done; done
+          # The same shapes over sizes on the split path, in a file of their own: 100 players
+          # of keys is past `config::FILL_UNSTICK_BUDGET` and ends stuck (`--failed-row`).
           for profile in chain keys; do
-            target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
-              --players 16,22,100 --reps 1 --failed-row | tee -a bench-212.jsonl
+            timeout 600 target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
+              --players 16,22,64,100 --reps 1 --failed-row | tee -a bench-212.jsonl
           done
           # Other seeds: the two paths at 100 players on seeds 2 and 3 (the rows above are seed
           # 1), in a file of their own so that no table above matches them twice.
@@ -148,7 +158,7 @@ jobs:
             # and what such rounds cost on the heavy and light profiles at 100 players.
             for profile in chain keys; do
               target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
-                --players 18,20,24,26,28,32,40,50,64,80 --reps 1 --failed-row | tee -a bench-212.jsonl
+                --players 18,20,24,26,28,32,40,50,80 --reps 1 --failed-row | tee -a bench-212.jsonl
               timeout 600 target/release/examples/synth_room --profile "$profile" --path split \
                 --workers 1 --players 20,100 --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
                 || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within ten minutes\"}" | tee -a bench-212.jsonl
@@ -225,6 +235,13 @@ jobs:
             | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
                | "\(.s.profile) \(.s.world) \(.s.players)"]
             | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The rooms of issue 212 were filled by an attempt with rounds of one item on every
+          # path, so the two gates above compared such fills (same hash on carry, forward, split).
+          jq -s -e '
+            [.[] | select(.players != null and ((.profile == "chain" and .players == 22) or (.profile == "keys" and .players == 16)))] as $rows
+            | if ($rows | length) == 6 and ($rows | all(.attempts > .max_attempts and .beatable))
+                 and ($rows | map(.placements_hash) | unique | length) == 2
+              then true else error("rounds of one item: \($rows | map([.profile, .path, .attempts, .placements_hash]))") end' bench-room.jsonl
           # The same on the other seeds.
           jq -s -e '
             [.[] | select(.players != null)] as $rows
@@ -364,11 +381,11 @@ jobs:
               | "| \($four.profile) | \($four.world) | \($one.fill_ms) | \($four.fill_ms) | \($s.fill_ms) | \(($four.fill_ms / $s.fill_ms * 100 | round) / 100) |"' bench-room.jsonl
             if [ -s bench-212.jsonl ]; then
               echo
-              echo "#### Issue 212: chain and keys rooms (split path, one timed fill each; over 20 attempts: filled with rounds of one item)"
+              echo "#### Issue 212: chain and keys rooms (split path, one timed fill each; more attempts than the rule has: filled with rounds of one item)"
               echo
-              echo "| profile | round | players | result | attempts | fill ms | rounds |"
-              echo "|---|---|---|---|---|---|---|"
-              jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.round) | \(.players // .room) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.fill_ms // "") | \(.rounds // "") |"' bench-212.jsonl
+              echo "| profile | round | players | result | attempts | attempts the rule has | fill ms | rounds |"
+              echo "|---|---|---|---|---|---|---|---|"
+              jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.round) | \(.players // .room) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.max_attempts // "") | \(.fill_ms // "") | \(.rounds // "") |"' bench-212.jsonl
             fi
             echo
             echo "#### Other seeds, 100 players, a world per player (one timed fill per row)"

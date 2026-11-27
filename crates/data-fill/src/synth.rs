@@ -855,20 +855,26 @@ mod tests {
     }
 
     /// Rooms the round rule cannot fill (issue 212: one item from every player per round, all
-    /// placed against a state that holds none of them) are filled by the attempts that come
-    /// after the rule's, with rounds of one item: the chain world at 22 players and the keys
-    /// world at 16, the sizes measured stuck on every attempt. The result is what a fresh
-    /// solve of the whole room says, and every player's goal holds.
+    /// placed against a state that holds none of them) are filled by the attempt that comes
+    /// after the rule's, with rounds of one item (as many rounds as progression items, so no
+    /// late retry by the rule did it): the keys world of 500 checks at 22 players, stuck on
+    /// all `config::FILL_MAX_ATTEMPTS`, and the chain world at 22 players, given three attempts
+    /// by the rule here (the bench holds it at all twenty). The result is what a fresh solve
+    /// of the whole room says, and every player's goal holds.
     #[test]
     fn a_room_the_round_rule_cannot_fill_is_filled_with_rounds_of_one_item() {
         use crate::room::validate_room;
-        for (how, players) in [(Hostile::Chain, 22), (Hostile::Keys, 16)] {
-            let c = room(&Shape::hostile(how), 1, players, 1).unwrap();
+        let keys = Shape { checks: 500, ..Shape::hostile(Hostile::Keys) };
+        let cases = [(keys, config::FILL_MAX_ATTEMPTS), (Shape::hostile(Hostile::Chain), 3)];
+        for (shape, most) in cases {
+            let c = room(&shape, 1, 22, 1).unwrap();
             let (seats, mut rng) = (c.seats(), SpecRng::from_u64(1));
-            let (f, _) = fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS)
-                .unwrap_or_else(|e| panic!("{how:?}, {players} players: {e:?}"));
-            let at = format!("{how:?}, {players} players, {} attempts", f.attempts);
-            assert!(f.attempts > config::FILL_MAX_ATTEMPTS, "{at}: the rule was to be stuck");
+            let (f, _) = fill_room_spheres(&seats, &mut rng, most)
+                .unwrap_or_else(|e| panic!("{:?}: {e:?}", shape.hostile));
+            let at = format!("{:?}, {} attempts", shape.hostile, f.attempts);
+            assert_eq!(f.attempts, most + 1, "{at}: the rule stuck every time, then one fill");
+            let items: usize = c.plans.iter().map(|p| p.progression.len()).sum();
+            assert_eq!(f.rounds as usize, items, "{at}: a round was one item");
             assert!(f.all_beatable(), "{at}: {:?}", f.beatable);
             let fresh = validate_room(&seats, &f.placed).unwrap();
             assert_eq!((f.beatable, f.reached), fresh, "{at}");
@@ -902,7 +908,15 @@ mod tests {
                 assert_eq!(Ok(&split), on(&c, seed, path, 1).as_ref(), "{at}, {path:?}");
             }
         }
-        let c = room_with(&small(true), 23, 3, |p, inst| change("cramped", p, inst)).unwrap();
+        // A room no order can fill, and not in the confined pass: one location fewer takes
+        // progression than there are progression items, so every attempt is stuck at its last
+        // items, the ones with rounds of one item too. It ends after the bounded attempts.
+        let c = room_with(&tight, 23, 3, |p, inst| {
+            change("half", p, inst);
+            inst.excluded.push("l1".to_owned());
+        })
+        .unwrap();
+        assert!(c.plans.iter().all(|p| p.progression.iter().all(|i| !p.confined(*i))));
         let tries = config::FILL_MAX_ATTEMPTS + config::FILL_UNSTICK_ATTEMPTS;
         for path in paths {
             let e = on(&c, 1, path, config::FILL_MAX_ATTEMPTS).unwrap_err();
@@ -910,6 +924,62 @@ mod tests {
                 matches!(&e, crate::FillError::Stuck { attempts, .. } if *attempts == tries);
             assert!(stuck, "{path:?}: {e:?}");
         }
+    }
+
+    /// The attempts with rounds of one item are paid from a budget of work that is counted
+    /// before they start (rounds times worlds), never timed: a room whose attempt costs more
+    /// than the budget ends `Stuck` after the rule's attempts, as it did before there were
+    /// such attempts, on every path; a budget for one attempt gives one. A room of one player
+    /// gets none, and ends as the single-world fill of its world does.
+    #[test]
+    fn a_room_past_the_work_budget_ends_stuck_after_the_rules_attempts() {
+        use crate::room::{Algorithm, fill_within, unstick_attempts};
+        let tight = Shape { progression: 0.5, ..small(true) };
+        let c = room_with(&tight, 23, 8, |p, inst| change("half", p, inst)).unwrap();
+        let seats = c.seats();
+        let items: u64 = c.plans.iter().map(|p| p.progression.len() as u64).sum();
+        let cost = items * 8;
+        for (budget, extra) in [(0, 0), (cost - 1, 0), (cost, 1), (2 * cost, 2), (99 * cost, 3)] {
+            assert_eq!(unstick_attempts(&seats, 20, budget), extra, "budget {budget}");
+        }
+        assert_eq!(unstick_attempts(&seats, 0, 99 * cost), 0, "no attempts, none added");
+        assert_eq!(unstick_attempts(&seats[..1], 20, u64::MAX), 0, "one player");
+        // Seed 6 is stuck on its first attempt and fills with rounds of one item.
+        for path in [Path::Carry, Path::Forward { workers: 1 }, Path::Split] {
+            let fill = |budget| {
+                let how = (true, path, Algorithm::Exact, true);
+                fill_within(&seats, &mut SpecRng::from_u64(6), (1, budget), how, false)
+            };
+            let e = fill(cost - 1).map(|f| f.0.attempts).unwrap_err();
+            assert!(matches!(e, crate::FillError::Stuck { attempts: 1, .. }), "{path:?}: {e:?}");
+            assert_eq!(fill(cost).map(|f| f.0.attempts), Ok(2), "{path:?}");
+        }
+        // The synthetic rooms the budget was sized by: chain at 100 players is the largest
+        // chain room that gets an attempt, keys (187 items a player) stops at 73 players.
+        let pays =
+            |items: u64, players: u64| items * players * players <= config::FILL_UNSTICK_BUDGET;
+        assert!(pays(100, 100) && !pays(100, 101) && pays(187, 73) && !pays(187, 74));
+        // One player: stuck after the same attempts as the single-world fill.
+        let one = room_with(&small(true), 23, 1, |p, inst| change("cramped", p, inst)).unwrap();
+        let alone = crate::fill(&one.worlds[0], &one.plans[0], &mut SpecRng::from_u64(1), 20);
+        let (room, ..) = outcome(&one, 1, Path::Carry);
+        assert_eq!(room.unwrap_err(), format!("{:?}", alone.unwrap_err()));
+    }
+
+    /// Rooms that fill by the rule on a later attempt keep their seeds whatever comes after
+    /// the rule's attempts: pinned, placements and attempts (2 to 20 each).
+    #[test]
+    fn seeds_that_fill_on_a_retry_by_the_rule_are_pinned() {
+        let tight = Shape { progression: 0.5, ..small(true) };
+        let mut out = String::new();
+        for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
+            let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
+            let (f, ..) = outcome(&c, seed, Path::Split);
+            let f = f.unwrap();
+            assert!((2..=config::FILL_MAX_ATTEMPTS).contains(&f.2), "{players}: {} attempts", f.2);
+            out += &format!("{} {:?}\n", f.2, f.0);
+        }
+        assert_eq!(format!("{:016x}", crate::check::fnv1a(out.as_bytes())), "29a634d399d0c7ba");
     }
 
     /// Instance changes the identity test mixes, by name.

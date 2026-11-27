@@ -292,6 +292,8 @@ fn one(
         "spheres": sp.spheres.len(),
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
         "attempts": f.attempts,
+        // Above this, the room was filled by an attempt with rounds of one item (issue 212).
+        "max_attempts": config::FILL_MAX_ATTEMPTS,
         "beatable": f.all_beatable(),
         "placed_by_the_mode": mode == Algorithm::Exact || f.fast,
         // The same hash in two rows means the same placements (the `noskip` rows against theirs).
