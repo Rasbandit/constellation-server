@@ -547,6 +547,16 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             space.declare(errs, e, Sort::Event);
         }
     }
+    if w.regions.len() > config::WORLD_TABLE_MAX {
+        errs.whole(
+            format!(
+                "{} regions; the engine indexes at most {}",
+                w.regions.len(),
+                config::WORLD_TABLE_MAX
+            ),
+            "",
+        );
+    }
     if w.regions.is_empty() {
         errs.whole("the world has no regions", "");
     }
@@ -1175,15 +1185,26 @@ fn ids(errs: &mut Errs, given: &[Option<&At<i64>>], what: &str) -> Vec<i64> {
             );
         }
     }
+    if given.len() > config::WORLD_TABLE_MAX {
+        let most = config::WORLD_TABLE_MAX;
+        errs.whole(format!("{} {what}s; the engine indexes at most {most}", given.len()), "");
+    }
     let mut next = used.iter().max().map_or(1, |m| m + 1);
-    given
-        .iter()
-        .map(|id| match id {
+    let mut out = Vec::with_capacity(given.len());
+    for id in given {
+        out.push(match id {
             Some(id) => id.v,
             None => {
                 next += 1;
                 next - 1
             }
-        })
-        .collect()
+        });
+    }
+    if next - 1 > most {
+        errs.whole(
+            format!("{what} ids would pass 2^53 numbering on from the largest given"),
+            "give the new names ids from the ledger",
+        );
+    }
+    out
 }

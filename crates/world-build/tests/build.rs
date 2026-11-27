@@ -643,6 +643,9 @@ fn ledger_ids_are_kept_apart_from_names_and_the_rest_are_numbered_on() {
     let mut w = tidewell();
     w.regions[0].checks[0].id = Some(At::new(0, P));
     fails(&w, "check id 0 is outside", P);
+    let mut w = tidewell();
+    w.items[0].id = Some(At::new(1 << 53, P));
+    assert!(errors(&w).iter().any(|e| e.contains("item ids would pass 2^53")));
 }
 
 #[test]

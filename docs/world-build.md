@@ -67,6 +67,7 @@ Each error names the line, the column and what to do.
 - Shuffles, the engine's first slice: exit shuffles (`layout`) and free-name shuffles (`none`). Refused: `when`, `pin`, `vanilla`, `pool`, `after`, `kind`, `scope`, thing fields other than `rule` and `group`, row fields `again` and `when`, `check: reach`, a `coupled` that reads options, coupling on a name shuffle, the reserved names `layout` and `own_fill`, and any name a row or slot list does not have.
 - Nesting: a rule string nests at most 64 deep as written (a sum is one node however long), and lowering counts the defs a rule reaches against the engine's own cap of 256, so no input exhausts the stack. The engine counts a few short forms as one or two nodes more, so near the cap its own check may be the one that refuses; both messages say what to do.
 - Shuffles whose things' rules read each other in a cycle, a shuffle reading itself included.
+- Table sizes: at most 65,536 items, checks or regions (`WORLD_TABLE_MAX`, the engine's index width).
 - Fields the model carries but this version does not build (`rolls`, `contexts`, `require`, `stays`, ...) are reported as not supported yet.
 
 Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERRORS` (200 errors and 200 warnings, the rest counted in one last line), `RULE_MAX_PARTS` (255, the engine's), `WORLD_POOL_TEST_MAX_COMBINATIONS` (4,096), `WORLD_ITEM_COPIES_MAX` (32,767), `WORLD_OPTIONS_MAX` (256, the engine's), `WORLD_START_COPIES_MAX` (1,024). All design values except the engine's.
@@ -75,7 +76,7 @@ Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERR
 
 - **Output is the engine's manifest shape, not all of doc 16's canonical JSON.** The engine reads a subset (doc 16 section 3.5 table); fields it would ignore are not written. Doc 16's world-side fields (class, count, pool, `when`, `holds`, `no_progression`, placement, start items, assumed) go into the per-seed instance instead.
 - **Canonical text is compact**: no whitespace, a newline at the end.
-- **Ids**: an item's or check's `id` from the ledger when the model has one (1 to 2^53, each used once per table); the rest are numbered on from the largest given, in file order, so a world with no ledger is numbered from 1. Reading and writing the ledger file is the front end's job and is not built.
+- **Ids**: an item's or check's `id` from the ledger when the model has one (1 to 2^53, each used once per table); the rest are numbered on from the largest given, in file order, so a world with no ledger is numbered from 1. Ids that would pass 2^53 are an error. Numbering on from the largest given id is safe only while the ledger gives every name it has ever seen its id (so a deleted entry's id is never reused); reading and writing the ledger file is the front end's job and is not built.
 - **`nothing`** is added as an item (filler, the id after the largest) only when the world has no `fill_with`.
 - **Free slots are split by weight deterministically** (largest remainder, ties by key), since the seeded draw waits on D-47.
 - **A `holds` copy of a check that does not exist this seed stays in the pool.**
