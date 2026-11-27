@@ -1,7 +1,13 @@
 name: bench
-# Room fill scaling on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build.
-# Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints a table to
-# the job summary and uploads the JSON lines as an artifact; nothing here gates a merge yet.
+# The exact fill on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build:
+# light and heavy, 1, 10 and 100 players, one thread, as the engine was and as it is, on one
+# runner. Runs only on PRs labelled `perf` and on manual dispatch, never on every PR. It prints
+# tables to the job summary and uploads the JSON lines as an artifact. About three minutes;
+# the summary says how long the compile and each row took. Every run also holds the gates: the
+# engine variants, the two paths and skipping the checks of empty locations change no placement,
+# and the seed-shape report runs, at small sizes. The opt-in fill modes at every size, four
+# threads, rooms on one world and the seed-shape report at full size run only on a dispatch
+# with `full` set to `on`.
 # A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
 # through its concurrency group, cancel the run already in progress.
 on:
@@ -9,13 +15,15 @@ on:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
-      players: { description: "Player counts, comma separated", default: "1,10,20,50,100" }
+      players: { description: "Player counts, comma separated", default: "1,10,100" }
       checks: { description: "Checks per world", default: "1000" }
+      full: { description: "on: also the fill modes, four threads, one-world rooms, seed shape", default: "off" }
 concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
+  FULL: ${{ inputs.full || 'off' }}
 permissions:
   contents: read
 jobs:
@@ -31,100 +39,212 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
+      # Compiled apart from the rows, so the summary can say where the job's time goes.
+      - name: build
+        run: |
+          start=$SECONDS
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+          echo $((SECONDS - start)) > build_s
       # Inputs go through the environment, never into the script text. Both profiles of
-      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), each
-      # on both ways of placing rounds (`data_fill::room::Path`), the forward one on 1 thread and
-      # on 4, so the algorithm and the threads are timed apart and on one runner.
+      # `data_fill::synth`: light, and heavy (the test world's counts per check, clocks on), on
+      # one thread. Three engines per profile: as it is (bit rules, absent checks skipped), as it
+      # was (every rule as bytecode, absent checks evaluated) and bit rules alone. The carried
+      # path (`data_fill::room::Path::Carry`) only at 1 and 10 players: it is what a room under
+      # `config::ROOM_FORWARD_MIN_PLAYERS` takes, and at 100 players a row of it took half a minute.
       - name: synth_room
         env:
-          PLAYERS: ${{ inputs.players || '1,10,20,50,100' }}
+          PLAYERS: ${{ inputs.players || '1,10,100' }}
           CHECKS: ${{ inputs.checks || '1000' }}
         run: |
           set -o pipefail
-          # A room as the server generates it: every player on one world, prepared once and
-          # loaded from its stored form, on one thread, on the path a room of that size takes.
-          # First, so its peak RSS is not that of the per-player worlds below.
+          bench() { target/release/examples/synth_room "$@" | tee -a bench-room.jsonl; }
+          for profile in light heavy; do for engine in "bits skip" "bytecode check" "bits check"; do
+            read -r rules absent <<< "$engine"
+            bench --profile "$profile" --path carry --workers 1 --rules "$rules" --absent "$absent" \
+              --players 1,10 --checks "$CHECKS"
+            bench --profile "$profile" --path forward --workers 1 --rules "$rules" --absent "$absent" \
+              --players "$PLAYERS" --checks "$CHECKS"
+          done; done
+          # One region of deep rules (`Shape::wide`, 131 checks), carried, with and without bit rules.
+          for rules in bits bytecode; do
+            bench --profile wide --path carry --workers 1 --rules "$rules" --players 1,10
+          done
+          # The split path (`data_fill::room::Path::Split`) next to the forward path, same rooms
+          # and seed: a world per player, and a room as the server generates it, every player on
+          # one world, prepared once and loaded from its stored form (`--worlds one`), on both.
           for profile in light heavy; do
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path auto --workers 1 --worlds one \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
+            bench --profile "$profile" --path split --workers 1 --players "$PLAYERS" --checks "$CHECKS"
+            for path in forward split; do
+              bench --profile "$profile" --path "$path" --workers 1 --worlds one \
+                --players "$PLAYERS" --checks "$CHECKS"
+            done
           done
-          for profile in light heavy; do for run in "carry 1" "forward 1" "forward 4"; do
-            read -r path workers <<< "$run"
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path "$path" --workers "$workers" \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
+          # Worlds built to be hard for a fill (`data_fill::synth::Hostile`), forward against
+          # split: every item a key of a chain, one key in front of nine tenths of the world,
+          # half the items keys, a gate that needs all copies but one (every round's state is
+          # the whole world, any two rounds' shared state only its front: split's worst case),
+          # and as much progression as locations that take it.
+          for profile in chain gated keys brink tight; do for path in forward split; do
+            bench --profile "$profile" --path "$path" --workers 1 --players 1,10 --reps 3
           done; done
-          # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
-          # exact fill's rows above: with and without skipping the checks of empty locations.
-          for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile "$profile" --path forward --workers 1 --mode "$mode" \
-              --players "$PLAYERS" --checks "$CHECKS" \
-              | tee -a bench-room.jsonl
+          # The same at 100 players. A room that is stuck on every attempt prints a row that
+          # says so (`--failed-row`), and so does one that takes over two minutes.
+          for profile in chain gated keys brink; do for path in forward split; do
+            if ! timeout 120 target/release/examples/synth_room --profile "$profile" --path "$path" \
+                --workers 1 --players 100 --reps 1 --failed-row > hostile.jsonl; then
+              echo "{\"room\":100,\"profile\":\"$profile\",\"path\":\"$path\",\"seed\":1,\"failed\":\"no result within two minutes\"}" > hostile.jsonl
+            fi
+            tee -a bench-room.jsonl < hostile.jsonl
           done; done
-      # Shuffles (`data_fill::shuffle`) against the same fill without them, heavy worlds, one
-      # thread, the path a room of that size takes: an entrance shuffle of two-way doors (on
-      # the heavy shape without a time context, which an exit shuffle needs) and a `none`
-      # shuffle that rules read. Then the entrance rows again as the server generates a room,
-      # every player on one loaded world, for what a player costs in memory.
-      # Its own file, so the tables below keep the rows they select.
-      - name: shuffles
-        env:
-          CHECKS: ${{ inputs.checks || '1000' }}
-        run: |
-          set -o pipefail
-          run() {
-            cargo run --release --locked -p data-fill --features memory-harness --example synth_room -- \
-              --profile heavy --path auto --workers 1 --checks "$CHECKS" "$@" | tee -a bench-shuffle.jsonl
-          }
-          for entrances in off on; do run --players 1,100 --timeless on --entrances "$entrances"; done
-          for guards in off on; do run --players 1,100 --guards "$guards"; done
-          for entrances in off on; do
-            run --players 100 --worlds one --timeless on --entrances "$entrances"
+          # Other seeds: the two paths at 100 players on seeds 2 and 3 (the rows above are seed
+          # 1), in a file of their own so that no table above matches them twice.
+          for seed in 2 3; do for profile in light heavy; do for path in forward split; do
+            target/release/examples/synth_room --profile "$profile" --path "$path" --workers 1 \
+              --players 100 --checks "$CHECKS" --seed "$seed" --reps 1 | tee -a bench-seeds.jsonl
+          done; done; done
+          # The forward path on four threads at 100 players, to hold against split on one thread:
+          # every player on one world here, a world each below (at every size with `full`).
+          for profile in light heavy; do
+            bench --profile "$profile" --path forward --workers 4 --worlds one \
+              --players 100 --checks "$CHECKS"
+            if [ "$FULL" != on ]; then
+              bench --profile "$profile" --path forward --workers 4 --players 100 --checks "$CHECKS"
+            fi
           done
+          if [ "$FULL" = on ]; then
+            for profile in light heavy; do for run in "forward 4"; do
+              read -r path workers <<< "$run"
+              bench \
+                --profile "$profile" --path "$path" --workers "$workers" \
+                --players "$PLAYERS" --checks "$CHECKS"
+            done; done
+            # Measurements for issue 212 (rooms the round rule cannot fill), in a file of their
+            # own: the chain and keys worlds on the split path over room sizes, the same two at
+            # 100 players with rounds of one item (`--rounds single`, not the product's rule),
+            # and what such rounds cost on the heavy and light profiles at 100 players.
+            for profile in chain keys; do
+              target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
+                --players 16,18,20,22,24,26,28,32,40,50,64,80,100 --reps 1 --failed-row | tee -a bench-212.jsonl
+              timeout 600 target/release/examples/synth_room --profile "$profile" --path split \
+                --workers 1 --players 20,100 --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
+                || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within ten minutes\"}" | tee -a bench-212.jsonl
+            done
+            for profile in light heavy; do
+              timeout 900 target/release/examples/synth_room --profile "$profile" --path split \
+                --workers 1 --players 10,100 --checks "$CHECKS" --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
+                || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within fifteen minutes\"}" | tee -a bench-212.jsonl
+            done
+            # The opt-in fill modes (`data_fill::room::Algorithm`), one thread only, next to the
+            # exact fill's rows above: with and without skipping the checks of empty locations.
+            for profile in light heavy; do for mode in level level,noskip level,goal shuffle shuffle,noskip shuffle,goal; do
+              bench \
+                --profile "$profile" --path forward --workers 1 --mode "$mode" \
+                --players "$PLAYERS" --checks "$CHECKS"
+            done; done
+          else
+            # Every run: the modes that put empty locations' checks to sleep, with and without,
+            # at 1 and 10 players, for the gate below.
+            for profile in light heavy; do for mode in level level,noskip shuffle shuffle,noskip; do
+              bench \
+                --profile "$profile" --path forward --workers 1 --mode "$mode" \
+                --players 1,10 --checks "$CHECKS" --reps 1
+            done; done
+          fi
       # Skipping the checks of empty locations must not change a seed: every `noskip` row has to
-      # carry the placements hash of its skipping row.
+      # carry the placements hash of its skipping row, and there has to be such a row.
       - name: skipping changes no placement
         run: |
           jq -s -e '
-            [.[] | select(has("players") and .path == "forward" and .workers == 1)] as $rows
-            | [$rows[] | select(.mode | endswith(",noskip")) as $n
-               | ($rows[] | select(.profile == $n.profile and .players == $n.players
-                                   and .mode == ($n.mode | rtrimstr(",noskip")))) as $y
-               | select($y.placements_hash != $n.placements_hash)
-               | "\($n.profile) \($n.players) \($n.mode)"]
-            | if length == 0 then true else error("placements differ: \(.)") end' bench-room.jsonl
+            [.[] | select(has("players") and .rules == "bits" and .absent == "skip" and .path == "forward" and .workers == 1)] as $rows
+            | [$rows[] | select(.mode | endswith(",noskip")) | . as $n
+               | {n: $n, y: [$rows[] | select(.profile == $n.profile and .players == $n.players
+                                               and .mode == ($n.mode | rtrimstr(",noskip")))]}] as $pairs
+            | if ($pairs | length) == 0 then error("no noskip row") else . end
+            | [$pairs[] | select((.y | length) != 1 or .y[0].placements_hash != .n.placements_hash)
+               | "\(.n.profile) \(.n.players) \(.n.mode)"]
+            | if length == 0 then true else error("placements differ, or a row has no partner: \(.)") end' bench-room.jsonl
+      # Bit rules and skipping the absent locations' checks must not change a seed, and bit
+      # rules must not change how many rules are evaluated. Every variant row has to find its
+      # partners: a gate that compared nothing fails.
+      - name: the engine variants change no placement
+        run: |
+          jq -s -e '
+            [.[] | select(.players != null)] as $rows
+            | def twin($v; $absent): [$rows[] | select(.rules == "bits" and .absent == $absent and .profile == $v.profile
+                                   and .world == $v.world and .path == $v.path and .workers == $v.workers
+                                   and .mode == $v.mode and .players == $v.players)];
+              [$rows[] | select(.rules == "bytecode" or .absent == "check") | . as $v
+               | {v: $v, bits: twin($v; $v.absent), now: twin($v; "skip")}] as $pairs
+            | if ($pairs | length) == 0 then error("no variant row") else . end
+            | [$pairs[] | select((.bits | length) != 1 or (.now | length) != 1
+                                 or .v.placements_hash != .now[0].placements_hash or .v.rule_evals != .bits[0].rule_evals)
+               | "\(.v.profile) \(.v.path) \(.v.mode) \(.v.players) \(.v.rules) \(.v.absent)"]
+            | if length == 0 then true else error("variants differ, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The carried path and the forward path place the same, at every size both ran (the
+          # wide profile runs carried only).
+          jq -s -e '
+            [.[] | select(.players != null and .world == "each" and .mode == "exact" and .workers == 1 and .profile != "wide")] as $rows
+            | [$rows[] | select(.path == "carry") | . as $c
+               | {c: $c, f: [$rows[] | select(.path == "forward" and .profile == $c.profile and .rules == $c.rules
+                                               and .absent == $c.absent and .players == $c.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no carried row") else . end
+            | [$pairs[] | select((.f | length) != 1 or .c.placements_hash != .f[0].placements_hash)
+               | "\(.c.profile) \(.c.players) \(.c.rules) \(.c.absent)"]
+            | if length == 0 then true else error("paths differ, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The split path places what the forward path places, a world per player and one world.
+          jq -s -e '
+            [.[] | select(.players != null and .mode == "exact" and .workers == 1 and .rules == "bits" and .absent == "skip")] as $rows
+            | [$rows[] | select(.path == "split") | . as $s
+               | {s: $s, f: [$rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world
+                                               and .players == $s.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no split row") else . end
+            | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
+               | "\(.s.profile) \(.s.world) \(.s.players)"]
+            | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-room.jsonl
+          # The same on the other seeds.
+          jq -s -e '
+            [.[] | select(.players != null)] as $rows
+            | [$rows[] | select(.path == "split") | . as $s
+               | {s: $s, f: [$rows[] | select(.path == "forward" and .profile == $s.profile and .seed == $s.seed
+                                               and .players == $s.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no split row") else . end
+            | [$pairs[] | select((.f | length) != 1 or .s.placements_hash != .f[0].placements_hash)
+               | "\(.s.profile) seed \(.s.seed) \(.s.players)"]
+            | if length == 0 then true else error("split differs, or a row has no partner: \(.)") end' bench-seeds.jsonl
       # How the modes' seeds are shaped, against the exact fill on the same rooms and seeds, and
-      # on the two small fixture worlds against uniform beatable placements.
+      # on the two small fixture worlds against uniform beatable placements. Full size only on a
+      # dispatch with `full` on; every other run draws few seeds of three modes, enough to fail
+      # when a mode or the report stops working.
       - name: quality
         env:
           CHECKS: ${{ inputs.checks || '1000' }}
           MODES: exact level level,depth=100 level,depth=300 level,depth=-100 level,goal shuffle shuffle,depth=100 shuffle,depth=300 shuffle,depth=-100 shuffle,goal
         run: |
           set -o pipefail
-          fair() { cargo run --release --locked -p data-fill --bin fill-fairness -- "$@" > /dev/null; }
+          fair() { cargo run --release --locked -p data-fill --features memory-harness --bin fill-fairness -- "$@" > /dev/null; }
+          if [ "$FULL" = on ]; then
+            one=200; ten=20; fixture=10000; required=200
+          else
+            MODES="exact level shuffle"; one=10; ten=2; fixture=500; required=20
+          fi
           for profile in light heavy; do
-            fair --synth "$profile" --players 1 --checks "$CHECKS" --seeds 200 --required 5 --modes "$MODES" --out "quality-$profile-1.json"
-            fair --synth "$profile" --players 10 --checks "$CHECKS" --seeds 20 --modes "$MODES" --out "quality-$profile-10.json"
+            fair --synth "$profile" --players 1 --checks "$CHECKS" --seeds "$one" --required 5 --modes "$MODES" --out "quality-$profile-1.json"
+            fair --synth "$profile" --players 10 --checks "$CHECKS" --seeds "$ten" --modes "$MODES" --out "quality-$profile-10.json"
           done
           for world in fairness_world room_world; do
-            fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds 10000 --baseline 10000 --required 200 --modes "$MODES" --out "quality-$world.json"
+            fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds "$fixture" --baseline "$fixture" --required "$required" --modes "$MODES" --out "quality-$world.json"
           done
       - name: summary
         run: |
           {
-            echo "### Shuffles against the exact fill (heavy profile, one thread; measured on this runner, release build)"
+            echo "### Where the job's time went (measured: wall seconds on this runner)"
             echo
-            echo "Each row is a room with a shuffle against the same shape without it. entrances: two-way doors on the heavy shape without a time context. guards: a \`none\` shuffle of 8 things that one check in eight reads as a rule. Shuffle ms is what staging adds per seed over resolving the instances: the draws, the layout solve, the fold and the whole-world check of every player. The room with a shuffle fills other worlds (other layouts, or rules that read the shuffle), so its fill time differs for that reason too. Both shares are of the plain room's fill. Load ms is per room and covers its worlds' shuffle sections. Room bytes per player is the heap the room keeps per player after setup (plan, and a staged world's own exits); world bytes is one loaded world, which a room shares."
+            echo "Compile of the bench example, release: $(cat build_s) s. Rows: $(jq -s '[.[] | select(.players != null) | .row_s] | add | round' bench-room.jsonl) s over $(jq -s '[.[] | select(.players != null)] | length' bench-room.jsonl) rows (a row draws and prepares its worlds, fills once for the heap figure and then \`fill reps\` times for the median)."
             echo
-            echo "| shuffle | worlds | players | path | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | shuffle ms per world | shuffle, share of the plain fill % | shuffle plus the change in fill, share of the plain fill % | restarts | shuffled exits per world | load ms plain | load ms with | room bytes per player plain | with | world bytes | peak RSS plain | with |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
-              | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
-              | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \(($on.shuffle.shuffle_ms / $off.fill_ms * 1000 | round) / 10) | \((($on.shuffle.shuffle_ms + $on.fill_ms - $off.fill_ms) / $off.fill_ms * 1000 | round) / 10) | \($on.shuffle.restarts) | \($on.shuffle.exits) | \($off.load_ms) | \($on.load_ms) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl
+            echo "| profile | path | rules | absent checks | players | row s | fill ms (median) | fill reps |"
+            echo "|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null) | "| \(.profile) | \(.path) \(.mode) \(.workers) | \(.rules) | \(.absent) | \(.players) | \(.row_s) | \(.fill_ms) | \(.fill_reps) |"' bench-room.jsonl
+            if [ "$FULL" = on ]; then
             echo
             echo "### One game per room, one thread: what is done once per world and what each seed pays (measured on a GitHub-hosted ubuntu-latest runner, release build)"
             echo
@@ -135,8 +255,103 @@ jobs:
               echo
               echo "| players | path | prepare ms | load ms | setup ms | fill ms (median) | assemble ms | encode ms | of it: check ms | hash with the names written again ms (not paid) | open ms (server) | v1 import ms (before: encode and open) | prepared file bytes | seed bytes | peak heap bytes (fill) | peak RSS bytes after the fill | after the encode | at the end (with the comparison import) |"
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.open_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
+              jq -r --arg p "$profile" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "one" and .profile == $p) | "| \(.players) | \(.path) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed.assemble_ms) | \(.seed.encode_ms) | \(.seed.validate_ms) | \(.seed.hash_whole_ms) | \(.seed.open_ms) | \(.seed.import_v1_ms) | \(.prepared_bytes) | \(.seed.seed_bytes) | \(.peak_heap_bytes) | \(.peak_rss_after_fill_bytes) | \(.seed.peak_rss_after_encode_bytes) | \(.peak_rss_bytes) |"' bench-room.jsonl
             done
+            fi
+            echo
+            echo "### Rule evaluation before and after (same runner, same run, one thread, a world per player)"
+            echo
+            echo "Before: every rule as bytecode, the absent locations' checks evaluated (\`--rules bytecode --absent check\`). Bits: bit rules alone. After: bit rules, and a fill never evaluates the checks of locations that do not exist this seed. Fill ms are measured (median of 5); rule evals are counted by the solver; fill ns per eval is fill wall time over that count, so it carries the solver's bookkeeping; eval-only ns is evaluation alone, replayed on the first player's world with nothing held / with every progression item held (measured). Support checks as of a rank stay on the bytecode."
+            for profile in light heavy; do
+              echo
+              echo "#### Profile: $profile"
+              echo
+              echo "| mode | path | players | fill ms before | bits | after | before / after | rule evals before (counted) | after | after: as of a rank | after: answered by bit rules | fill ns per eval before | bits | after | eval-only ns before (nothing / all held) | after | peak heap bytes before | after |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r -s --arg p "$profile" '
+                [.[] | select(.players != null and .world == "each" and .workers == 1 and .profile == $p)] as $rows
+                | $rows[] | select(.rules == "bytecode" and .absent == "check") as $b
+                | ($rows[] | select(.rules == "bits" and .absent == "check" and .path == $b.path and .mode == $b.mode and .players == $b.players)) as $m
+                | ($rows[] | select(.rules == "bits" and .absent == "skip" and .path == $b.path and .mode == $b.mode and .players == $b.players)) as $a
+                | "| \($b.mode) | \($b.path) | \($b.players) | \($b.fill_ms) | \($m.fill_ms) | \($a.fill_ms) | \(if $a.fill_ms > 0 then ($b.fill_ms / $a.fill_ms * 100 | round) / 100 else "n/a" end) | \($b.rule_evals) | \($a.rule_evals) | \($a.rule_evals_ranked) | \($a.rule_evals_bits) | \($b.ns_per_eval) | \($m.ns_per_eval) | \($a.ns_per_eval) | \($b.eval_only.nothing_held.ns_per_eval) / \($b.eval_only.all_held.ns_per_eval) | \($a.eval_only.nothing_held.ns_per_eval) / \($a.eval_only.all_held.ns_per_eval) | \($b.peak_heap_bytes) | \($a.peak_heap_bytes) |"' bench-room.jsonl
+            done
+            echo
+            echo "#### The split path against the forward path (same runner, same run, one thread, exact fill, same placements)"
+            echo
+            echo "Forward: a fresh solve of every world per round. Split: one solve, then every round's state by adding to it and taking the additions back. World each: a world per player; one: every player on one world, as the server generates a room. Fill ms are measured (median of the fill reps; of 2 once a fill takes over a second); rule evals, journal steps undone and the journal's peak are counted; peak heap is measured for one fill on the calling thread."
+            echo
+            echo "| profile | world | players | fill ms forward | split | forward / split | rule evals forward | split | settle ms forward | split | journal steps undone | per world and round | journal peak steps per player | peak heap bytes per player forward | split |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players != null and .mode == "exact" and .workers == 1 and .rules == "bits" and .absent == "skip")] as $rows
+              | $rows[] | select(.path == "split") as $s
+              | ($rows[] | select(.path == "forward" and .profile == $s.profile and .world == $s.world and .players == $s.players)) as $f
+              | "| \($s.profile) | \($s.world) | \($s.players) | \($f.fill_ms) | \($s.fill_ms) | \(if $s.fill_ms > 0 then ($f.fill_ms / $s.fill_ms * 100 | round) / 100 else "n/a" end) | \($f.rule_evals) | \($s.rule_evals) | \($f.rounds_profile.settle_ms) | \($s.rounds_profile.settle_ms) | \($s.rounds_profile.undone) | \($s.rounds_profile.undone / $s.rounds_profile.world_solves | round) | \($s.rounds_profile.journal_peak / $s.players | round) | \(if $f.peak_heap_bytes then ($f.peak_heap_bytes / $f.players | round) else "n/a" end) | \(if $s.peak_heap_bytes then ($s.peak_heap_bytes / $s.players | round) else "n/a" end) |"' bench-room.jsonl
+            echo
+            echo "Rooms that were not filled (the fill's own error, or the two minute limit of this job):"
+            echo
+            jq -r 'select(.failed != null) | "- \(.profile), \(.room) players, \(.path): failed: \(.failed)"' bench-room.jsonl
+            echo
+            echo "#### Forward on four threads against split on one thread, 100 players (same run, measured)"
+            echo
+            echo "| profile | world | forward ms, 1 thread | forward ms, 4 threads | split ms, 1 thread | forward on 4 / split |"
+            echo "|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players == 100 and .mode == "exact" and .rules == "bits" and .absent == "skip" and (.profile == "light" or .profile == "heavy"))] as $rows
+              | $rows[] | select(.path == "forward" and .workers == 4) as $four
+              | ($rows[] | select(.path == "forward" and .workers == 1 and .profile == $four.profile and .world == $four.world)) as $one
+              | ($rows[] | select(.path == "split" and .profile == $four.profile and .world == $four.world)) as $s
+              | "| \($four.profile) | \($four.world) | \($one.fill_ms) | \($four.fill_ms) | \($s.fill_ms) | \(($four.fill_ms / $s.fill_ms * 100 | round) / 100) |"' bench-room.jsonl
+            if [ -s bench-212.jsonl ]; then
+              echo
+              echo "#### Issue 212: room sizes and rounds of one item (split path, one fill each; a measurement, not the product's rule)"
+              echo
+              echo "| profile | round | players | result | attempts | fill ms | rounds |"
+              echo "|---|---|---|---|---|---|---|"
+              jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.round) | \(.players // .room) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.attempts // "") | \(.fill_ms // "") | \(.rounds // "") |"' bench-212.jsonl
+            fi
+            echo
+            echo "#### Other seeds, 100 players, a world per player (one timed fill per row)"
+            echo
+            echo "| profile | seed | fill ms forward | split | forward / split | rule evals forward | split |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r -s '
+              [.[] | select(.players != null)] as $rows
+              | $rows[] | select(.path == "split") as $s
+              | ($rows[] | select(.path == "forward" and .profile == $s.profile and .seed == $s.seed and .players == $s.players)) as $f
+              | "| \($s.profile) | \($s.seed) | \($f.fill_ms) | \($s.fill_ms) | \(($f.fill_ms / $s.fill_ms * 100 | round) / 100) | \($f.rule_evals) | \($s.rule_evals) |"' bench-seeds.jsonl
+            echo
+            echo "#### Loading a world with and without its bit rules (measured; the engine as it is, forward path)"
+            echo
+            echo "Load ms is opening every world of the room from its stored form, which builds its bit rules. Bit rules ms is that build alone, done once more on the loaded worlds and timed. Without is the difference: what a load cost before bit rules. One sample per row."
+            echo
+            echo "| profile | players (worlds) | load ms | of it: bit rules ms | load ms per world | without bit rules | bit rules ms per world |"
+            echo "|---|---|---|---|---|---|---|"
+            jq -r 'def r: (. * 100 | round) / 100; select(.players != null and .world == "each" and .mode == "exact" and .path == "forward" and .workers == 1 and .rules == "bits" and .absent == "skip") | "| \(.profile) | \(.players) | \(.load_ms) | \(.bit_rules_ms) | \(.load_ms / .worlds | r) | \((.load_ms - .bit_rules_ms) / .worlds | r) | \(.bit_rules_ms / .worlds | r) |"' bench-room.jsonl
+            echo
+            echo "#### The rounds of the forward path (the engine as it is; one fill)"
+            echo
+            echo "A round solves every world afresh, then places one item per player. World solves, and the share of them that reached another set of locations than the round before, are counted. Set up (reset, start items, what locations hold), settle (run to the fixed point) and pick are measured wall time of one fill. Evaluation is estimated: counted evaluations times the measured eval-only ns with all held."
+            echo
+            echo "| profile | players | rounds | world solves | reached set changed share | set up ms | settle ms | pick ms | of settle: rule evaluation ms (estimated) |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null and .world == "each" and .mode == "exact" and .path == "forward" and .workers == 1 and .rules == "bits" and .absent == "skip") | .rounds_profile as $r | "| \(.profile) | \(.players) | \(.rounds) | \($r.world_solves) | \($r.changed_share) | \($r.set_up_ms) | \($r.settle_ms) | \($r.pick_ms) | \(.rule_evals * .eval_only.all_held.ns_per_eval / 1e6 | round) |"' bench-room.jsonl
+            echo
+            echo "#### Rule sites per class, first player's world (counted when the world is loaded)"
+            echo
+            echo "Constant: no atom a solve can change (a constant, or options only). Plain: an AND/OR of has-item, event-fired and region-reached. Counted: the same with a count above one or a sum of counts. Timed: either with a time window. Bytecode: any other shape, or more than \`config::RULE_BITS_MAX_TERMS\` terms."
+            echo
+            echo "| profile | rule sites | constant | plain | counted | timed | bytecode | bit rule bytes per world (counted) | atom set bytes per player | absent locations' check sites (skipped) | regions | never reachable | always-open exits | regions entered only by one open exit |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r -s '[.[] | select(.players != null and .rules == "bits" and .absent == "skip")] | group_by(.profile)[] | .[0] | .rules_report as $r
+              | "| \(.profile) | \($r.rule_sites) | \($r.classes.constant) | \($r.classes.plain) | \($r.classes.counted) | \($r.classes.timed) | \($r.classes.bytecode) | \($r.bit_rule_bytes_per_world) | \($r.atom_set_bytes_per_player) | \($r.absent_check_sites) | \($r.regions) | \($r.unreachable_regions) | \($r.always_open_exits) | \($r.regions_entered_only_by_one_open_exit) |"' bench-room.jsonl
+            echo
+            echo "#### One region of deep rules (profile wide: 131 checks and 6 events in one region, carried path)"
+            echo
+            echo "| rules | players | fill ms (median) | rule evals (counted) | as of a rank | answered by bit rules | fill ns per eval | eval-only ns (nothing / all held) | bytecode nodes per eval (nothing / all held) | removals | retractions per removal |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null and .profile == "wide") | "| \(.rules) | \(.players) | \(.fill_ms) | \(.rule_evals) | \(.rule_evals_ranked) | \(.rule_evals_bits) | \(.ns_per_eval) | \(.eval_only.nothing_held.ns_per_eval) / \(.eval_only.all_held.ns_per_eval) | \(.eval_only.nothing_held.nodes_per_eval) / \(.eval_only.all_held.nodes_per_eval) | \(.removals) | \(.retractions_per_removal.mean) |"' bench-room.jsonl
+            if [ "$FULL" = on ]; then
             echo
             echo "### Room fill scaling (same runner; a world per player)"
             echo
@@ -148,11 +363,11 @@ jobs:
               echo
               echo "#### Profile: $profile, path: $path, threads: $workers"
               echo
-              echo "| players | checks | clocks | prepare ms | load ms | setup ms | fill ms (median) | rule evals | ns/eval | threads | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes (calling thread) | beatable |"
-              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("players") and .world == "each" and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "| \(.players) | \(.checks) | \(.clocks) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.ns_per_eval) | \(.workers) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
+              echo "| players | checks | clocks | prepare ms | load ms | setup ms | fill ms (median) | rule evals (counted) | of them as of a rank (counted) | fill ns per eval (fill wall time / evals) | eval-only ns, nothing held (replay, measured) | eval-only ns, all held | bytecode nodes per eval, nothing held (counted) | all held | threads | solves | removals | retractions/removal mean | max | churn share | net lost | rounds | spheres | cross-world share | attempts | peak heap bytes (calling thread) | beatable |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "each" and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "| \(.players) | \(.checks) | \(.clocks) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.rule_evals) | \(.rule_evals_ranked) | \(.ns_per_eval) | \(.eval_only.nothing_held.ns_per_eval) | \(.eval_only.all_held.ns_per_eval) | \(.eval_only.nothing_held.nodes_per_eval) | \(.eval_only.all_held.nodes_per_eval) | \(.workers) | \(.solves) | \(.removals) | \(.retractions_per_removal.mean) | \(.retractions_per_removal.max) | \(.churn.share) | \(.churn.net_lost) | \(.rounds) | \(.spheres) | \(.cross_world_share) | \(.attempts) | \(.peak_heap_bytes) | \(.beatable) |"' bench-room.jsonl
               echo
-              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("fitted_exponent") and .world == "each" and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
+              jq -r --arg p "$profile" --arg t "$path" --argjson w "$workers" 'select(has("fitted_exponent") and .rules == "bits" and .absent == "skip" and .world == "each" and .mode == "exact" and .profile == $p and .path == $t and .workers == $w) | "Fitted exponent of fill ms over players: \(.fitted_exponent)"' bench-room.jsonl
             done; done
             echo
             echo "### Fill modes on one thread (same runner, same rooms and seed; exact is the forward path on 1 thread)"
@@ -164,7 +379,7 @@ jobs:
               echo
               echo "| mode | players | fill ms (median) | fill ms (worst of 5) | rule evals | mode evals | solves | placed by the mode | repairs | swaps | fallbacks | attempts | spheres | peak heap bytes | peak RSS bytes | placements hash |"
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-              jq -r --arg p "$profile" 'select(has("players") and .world == "each" and .profile == $p and .path == "forward" and .workers == 1) | "| \(.mode) | \(.players) | \(.fill_ms) | \(.fill_ms_runs | max) | \(.rule_evals) | \(.mode_rule_evals) | \(.solves) | \(.placed_by_the_mode) | \(.repairs) | \(.swaps) | \(.fallbacks) | \(.attempts) | \(.spheres) | \(.peak_heap_bytes) | \(.peak_rss_bytes) | \(.placements_hash) |"' bench-room.jsonl
+              jq -r --arg p "$profile" 'select(has("players") and .rules == "bits" and .absent == "skip" and .world == "each" and .profile == $p and .path == "forward" and .workers == 1) | "| \(.mode) | \(.players) | \(.fill_ms) | \(.fill_ms_runs | max) | \(.rule_evals) | \(.mode_rule_evals) | \(.solves) | \(.placed_by_the_mode) | \(.repairs) | \(.swaps) | \(.fallbacks) | \(.attempts) | \(.spheres) | \(.peak_heap_bytes) | \(.peak_rss_bytes) | \(.placements_hash) |"' bench-room.jsonl
             done
             echo
             echo "### Seed shape per mode (counted over fill seeds 1 to N of one room, over the seeds the mode placed itself; distances are from the exact fill on another stream of seeds, so the exact row is the noise floor)"
@@ -178,17 +393,19 @@ jobs:
               echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
               jq -r 'def r(n): if . == null then "n/a" else (. * n | round) / n end; .modes[] | "| \(.mode) | \(.failed) | \(.placed_by_the_mode) | \(.fell_back_seeds) | \(.untouched_share | r(1000)) | \(.swaps_per_seed | r(100)) | \(.repairs) | \(.fallback_attempts) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.location_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.progression_location_entropy_normalized | r(1000)) | \(.stuck_share_mean | r(1000)) | \(.stuck_share_worst_5_percent | r(1000)) | \(.against_exact.sphere_distribution_distance | r(1000)) | \(.against_exact.location_chi2_per_dof | r(100)) | \(.against_uniform.max_deviation.value | r(1000)) | \(.against_uniform.chi2 | r(1)) (\(.against_uniform.dof)) | \(.against_uniform.coverage_gaps | if . == null then "n/a" else length end) | \(.fill_ms_median | r(100)) | \(.fill_ms_worst_1_percent | r(100)) |"' "$q"
             done
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-room
           path: |
             bench-room.jsonl
-            bench-shuffle.jsonl
+            bench-seeds.jsonl
+            bench-212.jsonl
             quality-*.json
   # The base branch against this one on one runner: both builds of the bench, run in turns
-  # (which side goes first alternates), on the plain rows. Runners differ too much between jobs
-  # to compare two jobs' numbers.
+  # (which side goes first alternates), on worlds without shuffles, the path a room of that
+  # size takes. Runners differ too much between jobs to compare two jobs' numbers.
   bench-ab:
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -222,23 +439,27 @@ jobs:
       - name: summary
         run: |
           {
-            echo "### Base against head, plain worlds, exact fill, one thread (measured on this runner, release build, 4 runs a side in turns; each run's fill ms is its median of 5)"
+            echo "### Base against head, worlds without shuffles, exact fill, one thread (measured on this runner, release build, 4 runs a side in turns; each run's fill ms is its own median)"
             echo
-            echo "| profile | players | path | base fill ms median | base range | head fill ms median | head range | head / base |"
-            echo "|---|---|---|---|---|---|---|---|"
+            echo "| profile | players | path | base fill ms median | base range | head fill ms median | head range | head / base | same placements |"
+            echo "|---|---|---|---|---|---|---|---|---|"
             jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
               group_by([.profile, .players]) | .[]
               | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
-              | "| \(.[0].profile) | \(.[0].players) | \(.[0].path) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) |"' bench-ab.jsonl
+              | "| \(.[0].profile) | \(.[0].players) | \(.[0].path) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-ab
           path: bench-ab.jsonl
-  # The same doors-shaped worlds filled with their doors shuffled and with every door where
-  # the manifest has it, seed by seed: what a shuffled layout costs the fill, apart from what
-  # the shape costs. A seed whose room does not fill is recorded and skipped.
-  bench-layout:
+  # Shuffles (`data_fill::shuffle`), heavy worlds, one thread, the path a room of that size
+  # takes. The same doors-shaped worlds (no time context, which an exit shuffle needs) filled
+  # with their doors shuffled and with every door where the manifest has it, seed by seed:
+  # what a shuffled layout costs the fill, apart from what the shape costs. A `none` shuffle
+  # that rules read, against the same shape without it. And a room on one loaded world with
+  # and without an entrance shuffle, for what a player costs in memory. A room that does not
+  # fill prints a row that says so.
+  bench-shuffle:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (contains(github.event.pull_request.labels.*.name, 'perf') &&
@@ -250,35 +471,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { save-if: false }
       - run: cargo build --release --locked -p data-fill --features memory-harness --example synth_room
-      - name: shuffled against vanilla
+      - name: rows
         run: |
+          set -o pipefail
+          run() {
+            target/release/examples/synth_room --profile heavy --path auto --workers 1 --checks 1000 \
+              --failed-row "$@"
+          }
           for seed in 1 2 3 4 5 6 7 8 9 10; do for layout in vanilla on; do
-            if out=$(target/release/examples/synth_room --profile heavy --timeless on --entrances "$layout" \
-                --seed "$seed" --path auto --workers 1 --players 1,100 --checks 1000 --reps 3 2>&1); then
-              jq -c --argjson seed "$seed" 'select(has("players")) | . + {seed_n: $seed}' <<< "$out" | tee -a bench-layout.jsonl
-            else
-              jq -c -n --argjson seed "$seed" --arg layout "$layout" --arg e "$out" '{failed: $e, seed_n: $seed, layout: $layout}' | tee -a bench-layout.jsonl
-            fi
+            run --timeless on --entrances "$layout" --seed "$seed" --players 1,100 --reps 3 \
+              | jq -c --arg layout "$layout" 'select(has("players") or has("failed")) | . + {asked: $layout}' \
+              | tee -a bench-layout.jsonl
           done; done
+          for guards in off on; do run --guards "$guards" --players 1,100 | tee -a bench-shuffle.jsonl; done
+          for entrances in off on; do
+            run --timeless on --entrances "$entrances" --worlds one --players 100 | tee -a bench-shuffle.jsonl
+          done
       - name: summary
         run: |
           {
-            echo "### Shuffled doors against the same worlds with every door in place (heavy profile without a time context, 1,000 checks, 209 doors per world, one thread, seeds 1 to 10; measured on this runner, release build, each fill ms a median of 3)"
+            echo "### Shuffled doors against the same worlds with every door in place (heavy profile without a time context, 1,000 checks, 209 doors per world, one thread, seeds 1 to 10; measured on this runner, release build)"
             echo
             echo "Ratio is shuffled over vanilla, seed by seed. Staging ms is what the shuffles add before the fill, whole room."
             echo
-            echo "| players | seeds | vanilla fill ms median | range | shuffled fill ms median | range | ratio median | ratio range | rule evals ratio median | spheres vanilla median | spheres shuffled median | rounds vanilla | rounds shuffled | staging ms median |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "| players | path | seeds | vanilla fill ms median | range | shuffled fill ms median | range | ratio median | ratio range | rule evals ratio median | range | spheres vanilla median | shuffled | staging ms median | staging / vanilla fill |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
             jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
               def r3: (. * 1000 | round) / 1000;
               [.[] | select(has("players"))] | group_by(.players) | .[]
-              | (map(select(.layout == "vanilla")) | map({key: (.seed_n | tostring), value: .}) | from_entries) as $v
-              | [.[] | select(.layout == "shuffled" and $v[.seed_n | tostring] != null) | {s: ., v: $v[.seed_n | tostring]}] as $p
-              | "| \(.[0].players) | \($p | length) | \($p | map(.v.fill_ms) | med) | \($p | map(.v.fill_ms) | min) to \($p | map(.v.fill_ms) | max) | \($p | map(.s.fill_ms) | med) | \($p | map(.s.fill_ms) | min) to \($p | map(.s.fill_ms) | max) | \($p | map(.s.fill_ms / .v.fill_ms) | med | r3) | \($p | map(.s.fill_ms / .v.fill_ms) | min | r3) to \($p | map(.s.fill_ms / .v.fill_ms) | max | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | med | r3) | \($p | map(.v.spheres) | med) | \($p | map(.s.spheres) | med) | \($p | map(.v.rounds) | med) | \($p | map(.s.rounds) | med) | \($p | map(.s.shuffle.shuffle_ms) | med) |"' bench-layout.jsonl
+              | (map(select(.layout == "vanilla")) | map({key: (.seed | tostring), value: .}) | from_entries) as $v
+              | [.[] | select(.layout == "shuffled" and $v[.seed | tostring] != null) | {s: ., v: $v[.seed | tostring]}] as $p
+              | "| \(.[0].players) | \(.[0].path) | \($p | length) | \($p | map(.v.fill_ms) | med) | \($p | map(.v.fill_ms) | min) to \($p | map(.v.fill_ms) | max) | \($p | map(.s.fill_ms) | med) | \($p | map(.s.fill_ms) | min) to \($p | map(.s.fill_ms) | max) | \($p | map(.s.fill_ms / .v.fill_ms) | med | r3) | \($p | map(.s.fill_ms / .v.fill_ms) | min | r3) to \($p | map(.s.fill_ms / .v.fill_ms) | max | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | med | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | min | r3) to \($p | map(.s.rule_evals / .v.rule_evals) | max | r3) | \($p | map(.v.spheres) | med) | \($p | map(.s.spheres) | med) | \($p | map(.s.shuffle.shuffle_ms) | med) | \(($p | map(.s.shuffle.shuffle_ms) | med) / ($p | map(.v.fill_ms) | med) | r3) |"' bench-layout.jsonl
             echo
             echo "Rooms that did not fill: $(jq -s '[.[] | select(has("failed"))] | length' bench-layout.jsonl)"
+            echo
+            echo "### A \`none\` shuffle, and memory per player (same runner)"
+            echo
+            echo "guards: 8 things that one check in eight reads as a rule, against the heavy shape without it. entrances: a room on one loaded world. Room bytes per player is the heap the room keeps per player after setup; world bytes is one loaded world, which a room shares."
+            echo
+            echo "| shuffle | worlds | players | path | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | per world | restarts | room bytes per player plain | with | world bytes | peak RSS plain | with |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
+              | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
+              | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($on.path) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \($on.shuffle.restarts) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: bench-layout
-          path: bench-layout.jsonl
+          name: bench-shuffle
+          path: |
+            bench-layout.jsonl
+            bench-shuffle.jsonl

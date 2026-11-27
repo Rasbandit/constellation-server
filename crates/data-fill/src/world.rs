@@ -11,6 +11,7 @@ use bits::{BitSet, PackedRef, bytes_for, read};
 use seed_bundle::package::{SECTION_GAME, SECTION_RULES, SECTION_SHUFFLES, stored};
 use serde_json::Value;
 
+use crate::bitrules::Bits;
 use crate::section::{
     self, CMP_OPS, EXITS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths,
     node, sub,
@@ -149,6 +150,8 @@ pub struct World {
     /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
     /// `None` for a world that declares none, and for a seed's staged world.
     shuffles: Option<Arc<Bound>>,
+    /// The rules as bit rules, where they fit (computed at load).
+    bits: Arc<Bits>,
 }
 
 const ITEMS: usize = 0;
@@ -448,6 +451,7 @@ impl World {
             groups: (g_starts, g_items, g_caps),
             item_groups: Default::default(),
             shuffles: None,
+            bits: Arc::new(Bits::clone(&crate::bitrules::NONE)),
             game: game.into(),
             rules: Shared::default(),
         };
@@ -464,6 +468,7 @@ impl World {
         });
         w.hot.time_dep = td;
         w.check_index(&mut memo)?;
+        w.bits = Arc::new(Bits::of(&w));
         for k in [ITEMS, LOCS, N_REGIONS] {
             let mut v: Vec<u16> = (0..u16::try_from(w.names[k].spans.len()).unwrap_or(0)).collect();
             let bytes = if k == N_REGIONS { &w.rules } else { &w.game };
@@ -909,6 +914,19 @@ impl World {
         PackedRef::from_bytes(self.rules.get(l.at..).unwrap_or_default(), l.width, l.len)
             .and_then(|p| p.get(i))
             .unwrap_or(0)
+    }
+
+    /// For the bench only (feature `memory-harness`): build this world's bit rules again
+    /// (what a load does once) and return the bytes they take; the world is not changed.
+    #[cfg(feature = "memory-harness")]
+    #[must_use]
+    pub fn build_bit_rules(&self) -> usize {
+        Bits::of(self).bytes()
+    }
+
+    /// The rules as bit rules.
+    pub(crate) fn bits(&self) -> &Bits {
+        &self.bits
     }
 
     pub(crate) fn code(&self) -> &[u8] {
