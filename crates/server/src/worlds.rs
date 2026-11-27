@@ -7,7 +7,8 @@
 //! - [`legacy`]: the sidecar's path, with uploads inspected and worlds generated in the sandbox;
 //! - [`engine`]: the data-only path, with manifests prepared and worlds filled by `data_fill`, in
 //!   a capped child process or on a pooled worker ([`crate::pool`]);
-//! - [`jobs`]: a generation's queue slot, status, heartbeat and sweep, its run and its publishing;
+//! - [`jobs`]: a generation's queue slot, status, heartbeat and sweep, and its run;
+//! - [`publish`]: a finished generation's seed stored in the host and listed as a room;
 //! - [`view`]: a world's status, seed and room, for the accounts that may see them;
 //! - [`migrate`]: what a start moves in from the data folder of an older or stopped server.
 //!
@@ -62,6 +63,7 @@ mod engine;
 mod jobs;
 mod legacy;
 mod migrate;
+mod publish;
 mod uploads;
 mod view;
 
@@ -69,6 +71,7 @@ use engine::*;
 use jobs::*;
 pub(crate) use legacy::valid_module;
 use legacy::*;
+use publish::*;
 use uploads::*;
 use view::*;
 
