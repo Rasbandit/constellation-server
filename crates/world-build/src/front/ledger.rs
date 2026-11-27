@@ -45,7 +45,19 @@ fn read_table(v: &Value, what: &str, errs: &mut Errs) -> Table {
             );
             continue;
         }
-        out.insert(k.clone(), Entry { id, published: e["published"].as_bool().unwrap_or(false) });
+        let published = match e.get("published") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                errs.whole(
+                    format!("{LEDGER}: {what} {k:?} has `published` {other}, not true or false"),
+                    "the ledger is written by the tool; restore it from version control",
+                );
+                // Kept as published, the safe reading, though the build already fails.
+                true
+            }
+        };
+        out.insert(k.clone(), Entry { id, published });
     }
     out
 }

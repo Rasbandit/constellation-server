@@ -152,10 +152,10 @@ fn a_stuck_fill_names_the_item_and_its_player() {
             other => panic!("seed {seed}: {:?}", other.map(|x| x.1)),
         }
     }
-    // As text it reads as it always has, now with the player.
+    // As text, players count from 1 (Bo is the second).
     let text = String::from(generate_on(&on, "s", &p, 1).unwrap_err());
     assert!(
-        text.contains("Stuck") && text.contains("\"key\"") && text.contains("player: 1"),
+        text.contains("Stuck") && text.contains("\"key\"") && text.contains("player 2's item"),
         "{text}"
     );
 }

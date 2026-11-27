@@ -372,7 +372,14 @@ impl P<'_> {
                 self.k += 1;
                 Ok(At::new(n, pos))
             }
-            (Some(Tok::Minus), Some(Tok::Int(n))) => {
+            // The sign is glued to a number written without one (`-3`, not `- 3` or `- -3`).
+            (Some(Tok::Minus), Some(Tok::Int(n)))
+                if *n >= 0
+                    && self
+                        .toks
+                        .get(self.k + 1)
+                        .is_some_and(|t| t.pos.line == pos.line && t.pos.col == pos.col + 1) =>
+            {
                 let n = -*n;
                 // Written glued to its sign, as the lexer's own negative numbers are.
                 if let Some(g) = self.layout.glue.get_mut(self.k + 1) {
@@ -900,10 +907,14 @@ impl P<'_> {
                     } else if self.ctx("no_progression") {
                         let at = self.here();
                         self.k += 1;
-                        // A modifier word after it starts the next modifier, not a rule.
-                        let next = ["key", "was", "vanilla", "holds", "no_progression"]
-                            .iter()
-                            .any(|w| self.ctx(w));
+                        // A modifier after it starts the next modifier, not a rule: `key` then a
+                        // string, `was`/`vanilla`/`holds` then a name, or `no_progression`. So a
+                        // def named `key` is still a rule when it reads as one (`key and x`).
+                        let then = self.toks.get(self.k + 1).map(|t| &t.t);
+                        let next = self.ctx("no_progression")
+                            || (self.ctx("key") && matches!(then, Some(Tok::Str(_))))
+                            || (["was", "vanilla", "holds"].iter().any(|w| self.ctx(w))
+                                && matches!(then, Some(Tok::Name(_))));
                         let r = if self.rule_starts() && !next {
                             Some(self.rule(depth)?)
                         } else {

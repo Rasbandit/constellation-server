@@ -162,7 +162,10 @@ pub fn explain(e: GenerateError, players: &[Player]) -> String {
             "the filled world leaves {}goal unreachable\n  help: the goal needs something the world never gives; check the goal's rule and that every item it needs is in the pool",
             if players.len() > 1 { whose(player) } else { "the ".to_owned() }
         ),
-        other => String::from(other),
+        GenerateError::Fill(FillError::Instance(m)) | GenerateError::Message(m) => m,
+        GenerateError::Fill(FillError::Unstaged(what)) => {
+            format!("the engine did not stage the world's shuffles: {what}")
+        }
     }
 }
 

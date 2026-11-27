@@ -199,7 +199,7 @@ fn check_seeds_50_passes_on_the_example_world() {
     assert!(out.starts_with("50 of 50 seeds fill (seeds 1 to 50, 1 player)\n"), "{out}");
     assert!(
         out.contains("fill attempts over the seeds that filled: 50 (restarts: ")
-            && out.contains("fill time per seed"),
+            && out.contains("time per seed (fill, spoiler and seed file; measured)"),
         "{out}"
     );
     assert!(r.stderr.is_empty(), "{}", text(&r.stderr));
@@ -245,6 +245,17 @@ fn a_world_that_cannot_fill_fails_check_seeds_clearly() {
     assert!(!t.0.join("out").exists());
 }
 
+/// When the spoiler cannot be written, the seed written just before it is removed.
+#[test]
+fn a_seed_is_not_left_without_its_spoiler() {
+    let t = Temp::new("half");
+    std::fs::create_dir_all(t.0.join("out/tidewell_isle-3-spoiler.txt")).unwrap();
+    let ex = example();
+    let r = rando(&["generate", ex.to_str().unwrap(), "--seed", "3", "-o", &t.s("out")]);
+    assert_eq!(r.status.code(), Some(1));
+    assert!(!t.0.join("out/tidewell_isle-3.seed").exists(), "{}", text(&r.stderr));
+}
+
 #[test]
 fn bad_options_are_refused_by_name() {
     let t = Temp::new("opts");
@@ -269,7 +280,13 @@ fn bad_options_are_refused_by_name() {
     refused(&["--option", "tricky_climbs=maybe"], "it takes on or off");
     refused(&["--option", "tricky_climbs"], "an option is `name=value`");
     refused(&["--seed", "x"], "--seed takes a whole number");
-    refused(&["--players", "0"], "--players takes a number of at least 1");
+    refused(&["--players", "0"], "--players takes a number from 1 to 1024");
+    refused(&["--players", "1025"], "--players takes a number from 1 to 1024");
+    refused(
+        &["--seed", "9007199254740992"],
+        "--seed takes a whole number from 0 to 9007199254740991",
+    );
+    refused(&["--seed", "9007199254740991", "--check-seeds", "2"], "go past 9007199254740991");
     refused(&["--check-seeds", "0"], "--check-seeds takes a number of at least 1");
     refused(&["--format", "yaml"], "--format is text or json");
     std::fs::write(t.0.join("o.txt"), "# options\npearls_needed = 3\nnope = 1\n").unwrap();

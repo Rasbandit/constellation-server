@@ -101,20 +101,34 @@ fn the_example_files_are_already_in_canonical_layout() {
 }
 
 /// `fmt` (and the generated-file hash, which runs the same layout) is linear in a rule's
-/// size: a rule of 100,000 `and`/`or` parts (about 1.6 MB, the shape whose parentheses the
-/// formatter adds) formats in well under the bound. Before the fix every token scanned every
-/// parenthesis span, and this ran past 60 s (measured, debug build, review of 69c8f69).
+/// size, the shape whose parentheses the formatter adds: 4 times the parts takes well under
+/// 10 times as long (linear is about 4, quadratic about 16). The best of 3 runs each, so a
+/// busy runner does not decide it. Before the fix every token scanned every parenthesis span:
+/// 50,000 parts ran past 200 s (measured, debug build) and 100,000 past 60 s in review.
 #[test]
 fn fmt_of_a_huge_rule_is_linear() {
-    let parts: Vec<&str> = (0..50_000).map(|_| "has(k) and has(k)").collect();
-    let src = format!(
-        "world t\nstart a\nitem k progression\nregion a {{\n  check x: {}\n}}\ngoal reach(a)\n",
-        parts.join(" or ")
-    );
-    let t = std::time::Instant::now();
-    let once = format_text(&src, "w.rando").unwrap();
-    assert!(t.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t.elapsed());
-    assert_eq!(once.matches("(has(k) and has(k))").count(), 50_000);
+    let src = |n: usize| {
+        let parts: Vec<&str> = (0..n).map(|_| "has(k) and has(k)").collect();
+        format!(
+            "world t\nstart a\nitem k progression\nregion a {{\n  check x: {}\n}}\ngoal reach(a)\n",
+            parts.join(" or ")
+        )
+    };
+    let best = |text: &str| {
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                format_text(text, "w.rando").unwrap();
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let (small, big) = (src(5_000), src(20_000));
+    let (ts, tb) = (best(&small), best(&big));
+    assert!(tb < ts * 10, "5,000 parts {ts:?}, 20,000 parts {tb:?}");
+    let once = format_text(&big, "w.rando").unwrap();
+    assert_eq!(once.matches("(has(k) and has(k))").count(), 20_000);
     assert_eq!(format_text(&once, "w.rando").unwrap(), once);
 }
 
@@ -173,6 +187,17 @@ fn negative_numbers_where_a_number_is_expected() {
     let f = format_text(&text, "w.rando").unwrap();
     assert!(f.contains("range -3..3 = -1\n") && f.contains("  a -2\n"), "{f}");
     assert_eq!(format_text(&f, "w.rando").unwrap(), f);
+    // Only a sign glued to a plain number: `- -3`, `- 3` and a `-` ending a row are errors.
+    for bad in [
+        "option p: range - -3..5 = 4",
+        "option p: range - 3..4 = 3",
+        "table u(key: name, n: int) {\n  a -\n2\n}",
+    ] {
+        let ok_too = format!("{bad}\nregion a {{\n  check c\n}}");
+        assert!(build(&world(&ok_too), &Options::default()).is_err(), "{bad}");
+    }
+    // The same worlds with the sign glued build.
+    ok(&world("option p: range -3..5 = 4\nregion a {\n  check c\n}"));
 }
 
 /// A bare `no_progression` ends before the next modifier word, so `key` and `was` on the
@@ -189,6 +214,16 @@ fn a_bare_no_progression_ends_before_key_and_was() {
     for c in ["c1", "c2"] {
         assert!(inst.excluded.contains(&c.to_owned()), "{c}: {:?}", inst.excluded);
     }
+    // A def named like a modifier is still a rule where it reads as one.
+    let w = world(
+        "option o: toggle = on\ndef key = opt.o\ndef was = opt.o\nregion a {\n  check c1 no_progression key and true\n  check c2 no_progression was\n}",
+    );
+    let inst = ok(&w).default_instance().unwrap();
+    assert!(
+        inst.excluded.contains(&"c1".to_owned()) && inst.excluded.contains(&"c2".to_owned()),
+        "{:?}",
+        inst.excluded
+    );
 }
 
 #[test]
@@ -597,6 +632,43 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
     v4.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
     let l4: serde_json::Value = serde_json::from_str(ok(&v4).ledger.as_ref().unwrap()).unwrap();
     assert_eq!(l4["checks"]["three"], serde_json::json!({"id": 3, "retired": true}));
+    // A `published` that is not true or false is an error, not a missing guard.
+    let mut v5 = world("region a {\n  check second\n}");
+    v5.0.insert(
+        "ledger.json".into(),
+        b2.ledger.clone().unwrap().replace("\"published\":true", "\"published\":\"yes\""),
+    );
+    let all = errors(&v5).join("\n");
+    assert!(all.contains("has `published` \"yes\", not true or false"), "{all}");
+}
+
+/// A build whose manifest cannot be written writes no ledger, so `--publish` never records
+/// ids for a manifest nobody has.
+#[test]
+fn a_failed_build_writes_no_ledger() {
+    let root = std::env::temp_dir().join(format!("rando-ledger-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&root));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("world.rando"),
+        "world t\nstart a\nitem k progression\nregion a {\n  check c\n}\ngoal reach(a)\n",
+    )
+    .unwrap();
+    let run = |out: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rando"))
+            .args(["build", root.to_str().unwrap(), "--publish", "-o", out])
+            .output()
+            .unwrap()
+    };
+    let bad = run(root.join("missing/m.json").to_str().unwrap());
+    assert!(!bad.status.success());
+    assert!(!root.join("ledger.json").exists(), "the ledger was written by a failed build");
+    let good = run(root.join("m.json").to_str().unwrap());
+    assert!(good.status.success(), "{}", String::from_utf8_lossy(&good.stderr));
+    assert!(
+        std::fs::read_to_string(root.join("ledger.json")).unwrap().contains("\"published\":true")
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
@@ -742,6 +814,21 @@ fn always_true_comparisons_fold_away() {
     assert_eq!(rule("count(k) >= 0 and 0 <= count(k)"), truth);
     // What can still be false is kept.
     assert_eq!(rule("count(k) >= 1"), serde_json::json!({"ge": [{"count": "k"}, 1]}));
+    // An option can be negative, so a comparison with one is not folded.
+    let b = ok(&world("option o: range -3..3 = 0\nregion a {\n  check c: count(k) >= opt.o\n}"));
+    assert_eq!(
+        region(&b, "a")["checks"][0]["rule"],
+        serde_json::json!({"ge": [{"count": "k"}, {"opt": "o"}]})
+    );
+    // A folded comparison still reads what the player holds: `not` over it, and a field that
+    // reads options only, refuse it as they refuse `count(k) >= 1`.
+    for bad in [
+        "region a {\n  check c: not (count(k) >= 0)\n}",
+        "region a {\n  check c when count(k) >= 0\n}",
+        "region a {\n  check c when has(k) or true\n}",
+    ] {
+        assert!(build(&world(bad), &Options::default()).is_err(), "{bad}");
+    }
     let both = rule("has(k) and count(junk) >= 1");
     assert_eq!(both["all"].as_array().map(Vec::len), Some(2), "{both}");
 }

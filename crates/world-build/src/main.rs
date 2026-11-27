@@ -177,9 +177,6 @@ fn main() -> ExitCode {
     }
     let write = |p: &Path, text: &str| write_file(p, text.as_bytes());
     let mut steps = Vec::new();
-    if let Some(l) = &built.ledger {
-        steps.push(write(&dir.join(LEDGER), l));
-    }
     match &out {
         Some(p) => steps.push(write(p, built.json())),
         None => print!("{}", built.json()),
@@ -191,6 +188,13 @@ fn main() -> ExitCode {
                 .and_then(|i| world_build::canon::to_string(&i))
                 .and_then(|t| write(p, &t)),
         );
+    }
+    // The ledger last, and only when the rest is written: a build that failed must not record
+    // ids (or publish them) for a manifest nobody has.
+    if steps.iter().all(Result::is_ok)
+        && let Some(l) = &built.ledger
+    {
+        steps.push(write(&dir.join(LEDGER), l));
     }
     let failed: Vec<String> = steps.into_iter().filter_map(Result::err).collect();
     failed.iter().for_each(|e| eprintln!("error: {e}"));
@@ -216,10 +220,19 @@ impl Gen {
             v.parse::<u64>().map_err(|_| format!("{what} takes a whole number, not `{v}`"))
         };
         match flag {
-            "--seed" => self.seed = Some(num("--seed")?),
+            "--seed" => {
+                let n = Some(num("--seed")?).filter(|n| *n <= config::SEED_NUMBER_MAX);
+                self.seed = Some(n.ok_or_else(|| {
+                    format!("--seed takes a whole number from 0 to {}", config::SEED_NUMBER_MAX)
+                })?);
+            }
             "--players" => {
-                let n = u32::try_from(num("--players")?).ok().filter(|n| *n >= 1);
-                self.players = Some(n.ok_or("--players takes a number of at least 1")?);
+                let n = u32::try_from(num("--players")?).ok().filter(|n| {
+                    *n >= 1 && usize::try_from(*n).is_ok_and(|n| n <= config::ROOM_MAX_PLAYERS)
+                });
+                self.players = Some(n.ok_or_else(|| {
+                    format!("--players takes a number from 1 to {}", config::ROOM_MAX_PLAYERS)
+                })?);
             }
             "--check-seeds" => {
                 let n = Some(num("--check-seeds")?).filter(|n| *n >= 1);
@@ -259,8 +272,8 @@ fn pair(v: &str) -> Result<(String, String), String> {
 #[cfg(feature = "engine")]
 fn random_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
-    // Within 2^53, so the number survives any JSON reader.
-    std::collections::hash_map::RandomState::new().build_hasher().finish() & ((1 << 53) - 1)
+    // `SEED_NUMBER_MAX` is 2^53 - 1, all ones, so the mask keeps the number in range.
+    std::collections::hash_map::RandomState::new().build_hasher().finish() & config::SEED_NUMBER_MAX
 }
 
 #[cfg(feature = "engine")]
@@ -288,10 +301,17 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
     let players = g.players.unwrap_or(1);
     if let Some(count) = g.check_seeds {
         let from = g.seed.unwrap_or(1);
+        let Some(last) = from.checked_add(count - 1).filter(|l| *l <= config::SEED_NUMBER_MAX)
+        else {
+            eprintln!(
+                "error: seeds {from} and the {count} after it go past {}",
+                config::SEED_NUMBER_MAX
+            );
+            return ExitCode::from(2);
+        };
         let c = generator.check_seeds(&options, players, from, count);
         let mut ms: Vec<f64> = c.times.iter().map(|t| t.as_secs_f64() * 1000.0).collect();
         ms.sort_by(f64::total_cmp);
-        let last = from.saturating_add(count - 1);
         let s = if players == 1 { "" } else { "s" };
         println!(
             "{} of {} seeds fill (seeds {from} to {last}, {players} player{s})",
@@ -303,7 +323,7 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
         );
         if let (Some(lo), Some(hi)) = (ms.first(), ms.last()) {
             println!(
-                "fill time per seed (measured): fastest {lo:.0} ms, median {:.0} ms, slowest {hi:.0} ms",
+                "time per seed (fill, spoiler and seed file; measured): fastest {lo:.0} ms, median {:.0} ms, slowest {hi:.0} ms",
                 ms[ms.len() / 2]
             );
         }
@@ -341,7 +361,15 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
     let written = std::fs::create_dir_all(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))
         .and_then(|()| write_file(&seed_path, &made.file))
-        .and_then(|()| write_file(&spoiler_path, spoiler.as_bytes()));
+        .and_then(|()| {
+            // A seed without its spoiler is not left behind.
+            write_file(&spoiler_path, spoiler.as_bytes()).map_err(|e| {
+                match std::fs::remove_file(&seed_path) {
+                    Ok(()) => e,
+                    Err(r) => format!("{e}; {} is left behind: {r}", seed_path.display()),
+                }
+            })
+        });
     if let Err(e) = written {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;

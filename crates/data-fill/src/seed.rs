@@ -104,10 +104,15 @@ impl From<String> for GenerateError {
     }
 }
 
-/// The error as the text a caller reports: what it read before this was typed.
+/// The error as the text a caller reports. Players are counted from 1 here, as people count
+/// them; the fields count from 0.
 impl From<GenerateError> for String {
     fn from(e: GenerateError) -> Self {
         match e {
+            GenerateError::Fill(FillError::Stuck { item, player, attempts }) => format!(
+                "Stuck: player {}'s item {item:?} had no reachable location left after {attempts} attempts",
+                player + 1
+            ),
             GenerateError::Fill(f) => f.into(),
             GenerateError::Unbeatable { player } => {
                 format!("player {} cannot reach their goal", player + 1)

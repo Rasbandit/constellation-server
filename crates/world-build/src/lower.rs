@@ -486,8 +486,13 @@ impl<'a> Lower<'a> {
                 let mut any_true = false;
                 for x in xs {
                     match self.b(x, mode) {
-                        // An always-true part adds nothing to an `and`, and settles an `or`.
-                        Some((v, _)) if v == t() => any_true = true,
+                        // An always-true part adds nothing to an `and`, and settles an `or`. What
+                        // it read still counts: a field that may read options only still refuses
+                        // `count(x) >= 0`, and `not` over it is still refused.
+                        Some((v, s)) if v == t() => {
+                            any_true = true;
+                            state |= s;
+                        }
                         Some((v, s)) => {
                             parts.push(v);
                             state |= s;
@@ -499,7 +504,7 @@ impl<'a> Lower<'a> {
                     return None;
                 }
                 if (!and && any_true) || parts.is_empty() {
-                    return Some((t(), false));
+                    return Some((t(), state));
                 }
                 if and && any_true && parts.len() == 1 {
                     return parts.pop().map(|v| (v, state));
@@ -678,7 +683,7 @@ impl<'a> Lower<'a> {
             Cmp::Eq | Cmp::Ne => false,
         };
         if always {
-            return Some((t(), false));
+            return Some((t(), xs || ys));
         }
         let key = rule_ops::CMP_OPS[op.index()];
         Some((json!({key: [x, y]}), xs || ys))

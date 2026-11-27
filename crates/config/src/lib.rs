@@ -459,6 +459,10 @@ pub const RULE_MAX_PARTS: usize = 255;
 /// ids keep to so every client holds them exactly (a format value, not a limit).
 pub const ID_MAX: i64 = (1 << 53) - 1;
 
+/// Largest seed number `rando generate` takes or draws: 2^53 - 1, so the number in a JSON
+/// spoiler reads back exactly in any JSON reader (a format value, not a limit).
+pub const SEED_NUMBER_MAX: u64 = (1 << 53) - 1;
+
 /// Deepest that blocks (`for`, `region`, `extend`) may nest in a `.rando` file: the parser and
 /// the expansion recurse once per block (a design value; a world nests three or four deep).
 pub const WORLD_BLOCK_MAX_DEPTH: usize = 32;
