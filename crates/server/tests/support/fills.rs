@@ -37,7 +37,7 @@ pub fn head(names: &[&str], instance: &Instance, rng: u64, algorithm: Algorithm)
         rng_seed: rng,
         workers: config::GENERATION_WORKERS,
         algorithm,
-        seed_max_bytes: 1 << 24,
+        seed_max_bytes: config::Limits::DESIGN.bundle_max_bytes,
     };
     serde_json::to_vec(&fill).unwrap()
 }
