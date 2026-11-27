@@ -191,3 +191,25 @@ fn a_check_in_several_regions_gives_each_modifier_once() {
         "`drop` is already a check in region `a`",
     );
 }
+
+/// Two exits between the same two rooms are two ways in, each with its rule; in a world with
+/// a shuffle each has its own door, and its key names the door (`region:to:door`).
+#[test]
+fn several_exits_to_one_region_each_keep_their_rule_and_door() {
+    let b = ok(&world(
+        "region a {\n  check c\n  exit b: has(k)\n  exit b: has(junk)\n}\nregion b {\n  exit a\n}",
+    ));
+    assert_eq!(region(&b, "a")["exits"].as_array().unwrap().len(), 2);
+    let doors = "shuffle s {\n  slots exits(g)\n  coupled\n}\nregion a {\n  check c\n  exit b door front group g\n  exit b: has(k) door back group g\n}\nregion b {\n  exit a door front\n  exit a door back\n}";
+    let b = ok(&world(doors));
+    let a = region(&b, "a");
+    let keys: Vec<&str> =
+        a["exits"].as_array().unwrap().iter().map(|e| e["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&"a:b:front") && keys.contains(&"a:b:back"), "{keys:?}");
+    fails(
+        &world(&doors.replace("  exit b: has(k) door back group g", "  exit b: has(k) group g")),
+        &format!("world.rando:{}:8", line(8)),
+        "each needs its own `door`",
+    );
+}

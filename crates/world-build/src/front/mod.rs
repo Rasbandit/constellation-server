@@ -1253,13 +1253,16 @@ impl X {
                         ch.rule = new;
                     }
                     Target::Exit(r, c) => {
+                        // Every exit to that region: several are several ways in.
                         let Some(i) = region(&mut self.world, &r.v) else { return false };
-                        let Some(x) =
-                            self.world.regions[i].exits.iter_mut().find(|x| x.to.v == c.v)
-                        else {
+                        let mut found = false;
+                        for x in self.world.regions[i].exits.iter_mut().filter(|x| x.to.v == c.v) {
+                            x.rule = new.clone();
+                            found = true;
+                        }
+                        if !found {
                             return false;
-                        };
-                        x.rule = new;
+                        }
                     }
                     Target::Def(d) => {
                         let Some(def) = self.world.defs.iter_mut().find(|x| x.name.v == d.v) else {

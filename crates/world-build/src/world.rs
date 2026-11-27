@@ -819,16 +819,32 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             events.push(json!({"event": e.v, "rule": both(&when, rule)}));
         }
         let mut exits = Vec::new();
-        let mut to_seen = HashSet::new();
+        // Several exits to one region are several ways in. A shuffle keys each exit, so in a
+        // world with one each of them names its own door, and the door joins its key.
+        let mut ways: HashMap<&str, usize> = HashMap::new();
+        r.exits.iter().for_each(|x| *ways.entry(x.to.v.as_str()).or_default() += 1);
+        let mut doors_seen: HashSet<(&str, &str)> = HashSet::new();
         for x in &r.exits {
+            let parallel = ways.get(x.to.v.as_str()).copied().unwrap_or(0) > 1;
             if !region_of.contains(x.to.v.as_str()) {
                 lw.errs().err(x.to.pos, format!("exit to `{}`, which is not a region", x.to.v), "");
-            } else if !to_seen.insert(x.to.v.clone()) {
-                lw.errs().err(
-                    x.to.pos,
-                    format!("region `{}` has two exits to `{}`", r.key.v, x.to.v),
-                    "join their rules with `or`",
-                );
+            } else if parallel && shuffled {
+                match &x.door {
+                    None => lw.errs().err(
+                        x.to.pos,
+                        format!(
+                            "region `{}` has several exits to `{}`; in a world with a shuffle each needs its own `door`",
+                            r.key.v, x.to.v
+                        ),
+                        "give each a `door`, or join their rules with `or`",
+                    ),
+                    Some(d) if !doors_seen.insert((x.to.v.as_str(), d.v.as_str())) => lw.errs().err(
+                        d.pos,
+                        format!("region `{}` has two exits to `{}` through door `{}`", r.key.v, x.to.v, d.v),
+                        "each exit to one region names its own door",
+                    ),
+                    Some(_) => {}
+                }
             }
             let rule = lw.rule(&x.rule, Mode::Rule).map_or_else(truth, |v| v.0);
             sites.push((x.rule.pos, Some(r.key.v.as_str()), truth(), rule.clone()));
@@ -841,7 +857,10 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
             }
             let mut e = json!({"rule": both(&when, both(&to_when, rule)), "to": x.to.v});
-            let key = format!("{}:{}", r.key.v, x.to.v);
+            let key = match (&x.door, parallel) {
+                (Some(d), true) => format!("{}:{}:{}", r.key.v, x.to.v, d.v),
+                _ => format!("{}:{}", r.key.v, x.to.v),
+            };
             for (field, v) in [("door", &x.door), ("group", &x.group)] {
                 if let Some(v) = v {
                     name_ok(lw.errs(), v, field);
