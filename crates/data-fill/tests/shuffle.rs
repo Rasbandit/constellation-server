@@ -839,20 +839,23 @@ fn layouts_that_fail_the_check_are_rejected_on_the_same_attempts_as_before() {
     );
 }
 
-/// A staged world is an ordinary world to every way the room fill places its rounds: taking
-/// items back (carried), a fresh forward solve per round, and the split path with its journal
-/// all read the seed's exits and the seed's `none` results, and decide the same placements and
-/// spheres. Hand-written and synthetic worlds, an entrance shuffle and a `none` shuffle, 1 and
+/// A staged world is an ordinary world to the room fill: the fill, with its journal, and its
+/// cross-check, a fresh solve per round (`room::fill_room_fresh`), both read the seed's exits
+/// and the seed's `none` results, and decide the same placements and spheres. Hand-written and synthetic worlds, an entrance shuffle and a `none` shuffle, 1 and
 /// 10 players, 30 seeds each. A room of worlds without shuffles staged through the same call
 /// fills as it does resolved directly.
 #[test]
-fn a_shuffled_room_fills_the_same_on_the_carried_forward_and_split_paths() {
-    use data_fill::room::{Compiled, Path, fill_room_on};
-    let fill = |c: &Compiled, seed: u64, path: Path| {
+fn a_shuffled_room_fills_the_same_by_a_solve_per_round() {
+    use data_fill::room::{Compiled, fill_room_fresh, fill_room_spheres};
+    let fill = |c: &Compiled, seed: u64, fresh: bool| {
         let mut rng = SpecRng::from_u64(seed);
-        let (f, sp) = fill_room_on(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS, path)
-            .unwrap_or_else(|e| panic!("seed {seed}, {path:?}: {e:?}"));
-        assert!(f.all_beatable(), "seed {seed}, {path:?}");
+        let (f, sp) = if fresh {
+            fill_room_fresh(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS)
+        } else {
+            fill_room_spheres(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS)
+        }
+        .unwrap_or_else(|e| panic!("seed {seed}, fresh {fresh}: {e:?}"));
+        assert!(f.all_beatable(), "seed {seed}, fresh {fresh}");
         (f.placed, sp, f.attempts)
     };
     let doors_shape =
@@ -874,12 +877,8 @@ fn a_shuffled_room_fills_the_same_on_the_carried_forward_and_split_paths() {
             let insts = vec![inst; players];
             for seed in 1..=30 {
                 let (c, tables) = room(&[&w], &insts, seed, 1).unwrap();
-                let carried = fill(&c, seed, Path::Carry);
-                for path in
-                    [Path::Forward { workers: 1 }, Path::Forward { workers: 4 }, Path::Split]
-                {
-                    assert_eq!(carried, fill(&c, seed, path), "{players} players, seed {seed}");
-                }
+                let fresh = fill(&c, seed, true);
+                assert_eq!(fresh, fill(&c, seed, false), "{players} players, seed {seed}");
                 rooms += 1;
                 layouts.insert(format!("{tables:?}"));
             }
@@ -893,8 +892,8 @@ fn a_shuffled_room_fills_the_same_on_the_carried_forward_and_split_paths() {
     let direct = Compiled::shared(w.clone(), &insts, 1).unwrap();
     let (staged, tables) = room(&[&w], &insts, 9, 1).unwrap();
     assert!(tables.iter().all(|t| t.is_empty()));
-    for path in [Path::Carry, Path::Split] {
-        assert_eq!(fill(&direct, 9, path), fill(&staged, 9, path), "{path:?}");
+    for fresh in [false, true] {
+        assert_eq!(fill(&direct, 9, fresh), fill(&staged, 9, fresh), "fresh {fresh}");
     }
 }
 

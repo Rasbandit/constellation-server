@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::bitrules::{CLASSES, NONE};
 use crate::fold::{Folded, fold};
-use crate::reach::{Reach, eval_static, eval_statics, saturation};
+use crate::reach::{Reach, eval_static, eval_statics};
 use crate::section::{CHECKS, EXITS};
 use crate::world::World;
 
@@ -97,8 +97,6 @@ pub struct Plan {
     /// Per world item: its placement group, if it has one.
     item_group: Vec<Option<u32>>,
     loc_group: Vec<Option<u32>>,
-    /// Per item: held count past which no rule reads more copies (see [`Plan::saturated_at`]).
-    saturated: Vec<i64>,
     /// Per item: copies that exist this seed (pool, locked, self-granting checks, start).
     copies: Vec<i64>,
     /// Clock slices the start inventory alone owns (all slices when clocks do not restrict).
@@ -288,7 +286,6 @@ impl Plan {
             rest,
             item_group,
             loc_group,
-            saturated: vec![i64::MAX; w.items()],
             copies: Vec::new(),
             owned_start: w.time.all,
         };
@@ -296,7 +293,7 @@ impl Plan {
             // A state reads this while it is built, and the first one is this very probe.
             plan.owned_start = plan.base(w, &[]).compute_owned();
         }
-        // Bound the search by every copy that can exist this seed.
+        // Every copy that can exist this seed: a state sizes its lists by it.
         let mut copies = vec![0i64; w.items()];
         let placed = plan.progression.iter().chain(&plan.rest);
         let fixed = plan.locked.iter().chain(&plan.self_grants).map(|x| &x.1);
@@ -312,12 +309,6 @@ impl Plan {
         }
         for (i, n) in &plan.start {
             add(*i, *n)?;
-        }
-        let mut kinds = plan.progression.clone();
-        kinds.sort_unstable();
-        kinds.dedup();
-        for i in kinds {
-            plan.saturated[i as usize] = saturation(w, &plan, i, copies[i as usize]);
         }
         plan.copies = copies;
         Ok(plan)
@@ -432,21 +423,9 @@ impl Plan {
         self
     }
 
-    /// Start copies of `item` (the start inventory's and the logic start's).
-    pub(crate) fn start_copies(&self, item: u16) -> i64 {
-        self.start.iter().filter(|(i, _)| *i == item).map(|(_, n)| *n).sum()
-    }
-
     /// Copies of `item` that exist this seed.
     pub(crate) fn copies(&self, item: usize) -> usize {
         self.copies.get(item).map_or(0, |n| usize::try_from(*n).unwrap_or(0))
-    }
-
-    /// The held count of a progression item from which no rule reads more copies: 0 when no
-    /// rule reads it, `i64::MAX` when none (and for items that are not progression).
-    #[must_use]
-    pub fn saturated_at(&self, item: u16) -> i64 {
-        self.saturated.get(item as usize).copied().unwrap_or(i64::MAX)
     }
 
     /// A state holding the start items plus `extra`, where reaching a location collects what
@@ -535,19 +514,13 @@ impl Plan {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
-    use spec_rng::SpecRng;
 
     /// Duplicated items read with thresholds (`has n`, a floor division, a capped sum), one
     /// item no rule reads, one item a rule can never be satisfied by alone, a region whose
     /// way in can be held up by an item found inside it (support that is not a derivation),
     /// events of two regions lighting one counter that a check and an exit read, and a stay
-    /// rule that gates a later slice.
-    fn world() -> (World, Instance) {
-        world_with(false)
-    }
-
-    /// With `clocks`, a later slice of the day is owned only with `charm`, and a region opens in
-    /// that slice.
+    /// rule that gates a later slice. With `clocks`, a later slice of the day is owned only
+    /// with `charm`, and a region opens in that slice.
     pub(crate) fn world_with(clocks: bool) -> (World, Instance) {
         let checks = |ls: &[(&str, serde_json::Value)]| -> Vec<serde_json::Value> {
             ls.iter().map(|(l, r)| json!({"loc": l, "rule": r})).collect()
@@ -615,51 +588,5 @@ pub(crate) mod tests {
             ..Instance::default()
         };
         (World::load(&m).unwrap(), inst)
-    }
-
-    #[test]
-    fn saturation_is_the_count_past_which_no_rule_reads_an_item() {
-        let (w, inst) = world();
-        let plan = Plan::new(&w, &inst).unwrap();
-        let at = |k: &str| plan.saturated_at(w.item(k).unwrap());
-        assert_eq!(at("key"), 2, "an exit needs 1, a check needs 2");
-        assert_eq!(at("coin"), 3, "a def needs 2, a capped sum needs 3");
-        assert_eq!(at("gem"), 0, "no rule reads it");
-        assert_eq!(at("boot"), i64::MAX, "a sum it can never satisfy alone keeps it read");
-        assert_eq!(at("rune"), 2, "an alternative of an `any` saturates on its own");
-    }
-
-    #[test]
-    fn removing_held_items_one_by_one_matches_a_fresh_solve() {
-        for clocks in [false, true] {
-            let (w, inst) = world_with(clocks);
-            let plan = Plan::new(&w, &inst).unwrap();
-            let (mut lit, mut waited) = (false, false);
-            let late = w.loc("l15").unwrap();
-            for seed in 1u64..=100 {
-                let mut rng = SpecRng::from_u64(seed);
-                let mut items = plan.progression.clone();
-                rng.shuffle(&mut items);
-                let mut locs = plan.included.clone();
-                rng.shuffle(&mut locs);
-                // Some items placed, the rest held from the start and taken back one by one.
-                let cut = items.len() / 3;
-                let mut placed = vec![None; w.locations()];
-                for (l, i) in locs.iter().zip(&items[..cut]) {
-                    placed[*l as usize] = Some(*i);
-                }
-                let mut held = items[cut..].to_vec();
-                let mut r = plan.state(&w, &held, &placed);
-                lit |= r.counters.iter().any(|c| *c >= 2);
-                waited |= r.reached(late);
-                while let Some(i) = held.pop() {
-                    r.remove(i);
-                    let fresh = plan.state(&w, &held, &placed);
-                    let what = format!("seed {seed}, clocks {clocks}, {} left", held.len());
-                    crate::reach::assert_same(&w, &r, &fresh, &what);
-                }
-            }
-            assert!(lit && waited, "the counter and the stay rule were exercised");
-        }
     }
 }

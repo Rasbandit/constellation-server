@@ -223,13 +223,12 @@ fn the_result_is_the_same_with_one_worker_and_with_many() {
     assert!(outputs.windows(2).all(|p| p[0] == p[1]));
 }
 
-/// The fixture world on both ways of placing rounds: carried, forward on one thread and on
-/// three, and the path a room takes by itself (the split path, `room::Path::of`). Placements, spheres, attempts and rounds are
-/// the same, or the error is.
+/// The fixture world filled, against its cross-check (`room::fill_room_fresh`, a fresh solve
+/// of every group's state): placements, spheres, attempts and rounds are the same, or the
+/// error is; and a fill that worked solved the room once, never once per round.
 #[test]
-fn the_fixture_fills_the_same_carried_and_forward() {
-    use data_fill::room::{Path, fill_room_on};
-    let mut split = 0;
+fn the_fixture_fills_what_a_solve_per_round_fills() {
+    let mut filled = 0;
     for n in [1usize, 2, 3, 7, 8, 9, 12] {
         let r = players(n, 1);
         let seats = r.seats();
@@ -241,24 +240,18 @@ fn the_fixture_fills_the_same_carried_and_forward() {
                 }
                 Err(e) => (Err(format!("{e:?}")), 0),
             };
-            let on =
-                |path| shown(fill_room_on(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, path));
-            let (carried, _) = on(Path::Carry);
-            for workers in [1, 3] {
-                assert_eq!(carried, on(Path::Forward { workers }).0, "{n} players, seed {seed}");
-            }
-            let (auto, solves) =
+            let (fresh, _) =
+                shown(room::fill_room_fresh(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
+            let (got, solves) =
                 shown(fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
-            assert_eq!(carried, auto, "{n} players, seed {seed}: the room's own path");
-            // A fill that worked solved once, carried or split: never once per round.
-            if carried.is_ok() {
+            assert_eq!(got, fresh, "{n} players, seed {seed}");
+            if got.is_ok() {
                 assert_eq!(solves, 1, "{n} players");
             }
-            assert_eq!(carried, on(Path::Split).0, "{n} players, seed {seed}");
-            split += u32::from(carried.is_ok());
+            filled += u32::from(got.is_ok());
         }
     }
-    assert!(split > 0, "rooms filled on the split path");
+    assert!(filled > 0, "rooms filled");
 }
 
 #[test]

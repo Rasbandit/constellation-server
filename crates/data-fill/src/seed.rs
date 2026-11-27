@@ -195,11 +195,10 @@ fn fill_on(
         (room::Compiled::shared(on.0.clone(), &insts, workers)?, Vec::new())
     };
     let seats = room.seats();
-    let (filled, spheres) = room::fill_room_on(
+    let (filled, spheres) = room::fill_room_spheres(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
         config::FILL_MAX_ATTEMPTS,
-        room::Path::of(seats.len(), workers),
     )
     .map_err(|e| format!("{e:?}"))?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {

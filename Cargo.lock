@@ -323,6 +323,7 @@ dependencies = [
  "allocation-counter",
  "bits",
  "config",
+ "data-fill",
  "seed-bundle",
  "serde",
  "serde_json",

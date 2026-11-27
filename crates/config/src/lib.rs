@@ -395,26 +395,13 @@ pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
 
 /// Threads one generation asks its fill for (`workers` of the fill request): one, so a
-/// generation costs one core and many run side by side. A room's fill runs on one thread on
-/// the path a room takes by itself (`data_fill::room::Path::of`). The forward path, which can
-/// use threads, stays for a caller that names it, up to [`ROOM_FORWARD_WORKERS`] (results
-/// never depend on the number).
+/// generation costs one core and many run side by side. A room's fill itself always runs on
+/// one thread.
 pub const GENERATION_WORKERS: usize = 1;
 
 /// Worker threads that compile worlds and resolve instances of a room's players in parallel
 /// before a multiworld fill (a design value; results never depend on this number).
 pub const FILL_SETUP_WORKERS: usize = 4;
-
-/// Most threads the players' states of a room run on while a round is solved forward: a fill
-/// takes the worker count of its request, at most this many and at most the cores the process
-/// may use (a design value; results never depend on the number).
-pub const ROOM_FORWARD_WORKERS: usize = 4;
-
-/// Rule evaluations ahead of one step of a forward solve (queued regions and sites over the
-/// room's states; every rule site of the room for the first step of a solve) from which the
-/// step starts threads; below it the states run on the caller's thread, since starting threads
-/// would cost more than the step (a design value, not measured).
-pub const ROOM_FORWARD_MIN_PENDING: usize = 2048;
 
 /// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
 /// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
@@ -423,12 +410,12 @@ pub const FILL_DISPLACE_TRIES: usize = 32;
 
 /// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
 /// of moves, one solve's worth more per move for the pass over the rounds after it, and per
-/// divided round the evaluations of the attempt's first solve in rank order with none of the
-/// rounds' items (`data_fill::room`, `charge_division`), all counted the same on every path.
+/// divided round the evaluations of the attempt's first solve with none of the rounds' items
+/// (`data_fill::room`, `charge_division`), counted the same by the fill and its cross-check.
 /// Within the budget means at most this much spent: once more is spent, checked before each
 /// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
 /// it), and so is any later one that needs a move or a division. A budget of work, not of
-/// time: a seed is the same on every machine and path. A design value with a margin over the
+/// time: a seed is the same on every machine. A design value with a margin over the
 /// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
 /// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
 /// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about

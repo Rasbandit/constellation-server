@@ -1,9 +1,8 @@
 //! `synth_room [--profile light|heavy|wide|chain|gated|keys|brink|tight|mixed] [--rules bits|bytecode] [--absent skip|check]
-//! [--path auto|carry|forward|split] [--workers 4] [--players 1,10,20,50,100]
+//! [--workers 1] [--players 1,10,20,50,100]
 //! [--checks 1000] [--layers 6] [--branching 2] [--progression 0.19] [--clocks on|off]
 //! [--seed 1] [--reps 5] [--worlds each|one] [--failed-row] [--entrances on|off|vanilla] [--guards on|off] [--timeless on|off]`: room fill scaling on synthetic worlds ([`data_fill::synth`]; the
-//! heavy profile has clocks on). `--path` forces one way of placing rounds
-//! ([`data_fill::room::Path`]); `auto` is what a room of that size takes. One JSON object per player count, then one with the
+//! heavy profile has clocks on). One JSON object per player count, then one with the
 //! exponent of fill time fitted over the player counts (least squares on the logs).
 //!
 //! What is done once per world version is timed apart from what every seed pays. Once per
@@ -35,9 +34,8 @@
 //! after the fills (`peak_rss_after_fill_bytes`) and, with `--worlds one`, after the encode
 //! (`peak_rss_after_encode_bytes`), before the comparison import that only this harness runs.
 //!
-//! `rule_evals` are counted by the solver, `rule_evals_ranked` the removals' support checks among
-//! them, and `ns_per_eval` is the fill's wall time over that count, so it carries the solver's
-//! bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
+//! `rule_evals` are counted by the solver, and `ns_per_eval` is the fill's wall time over that
+//! count, so it carries the solver's bookkeeping. `eval_only` is evaluation alone on the first player's world ([`Reach::replay`]:
 //! every exit, event and check rule of the reached regions, timed over `REPLAYS` passes), with
 //! nothing held and with every progression item held, and the bytecode nodes and def bodies an
 //! evaluation reads (counted).
@@ -74,7 +72,7 @@
 use std::time::Instant;
 
 use data_fill::prepared::{Prepared, SEED_MAX_BYTES, build, seed_game};
-use data_fill::room::{Compiled, Path, Seat, cross_world_share, fill_room_on, plans};
+use data_fill::room::{Compiled, Seat, cross_world_share, fill_room_spheres, plans};
 use data_fill::seed::{Player, assemble_on, encode_on};
 use data_fill::synth::{Hostile, Shape, world};
 use data_fill::{Instance, Plan, World};
@@ -171,13 +169,12 @@ fn one(
     seed: u64,
     players: usize,
     reps: usize,
-    (path, workers, one_world): (Option<Path>, usize, bool),
+    (workers, one_world): (usize, bool),
     (bits, skip, vanilla): (bool, bool, bool),
 ) -> Result<Value, String> {
     let row = Instant::now();
     // A mixed room's switches are its first shape's (no mixed shape has doors or guards).
     let shape = &shapes[0];
-    let path = path.unwrap_or(Path::of(players, workers));
     let count = if one_world { 1 } else { players };
     let drawn: Vec<(Value, Instance)> = (0..count as u64)
         .map(|p| {
@@ -263,7 +260,7 @@ fn one(
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_on(&seats, &mut rng, config::FILL_MAX_ATTEMPTS, path)
+        fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS)
     };
     let t = Instant::now();
     let (first, heap) = peak(fill);
@@ -326,18 +323,9 @@ fn one(
         .collect();
     let replay = json!({"nothing_held": eval_only(&seats[0], &[]),
                         "all_held": eval_only(&seats[0], &pool)});
-    let work = s.summary(1, u64::from(f.solves));
     let mut out = json!({
         "players": players,
-        "path": match path {
-            Path::Carry => "carry",
-            Path::Forward { .. } => "forward",
-            Path::Split => "split",
-        },
-        "workers": match path {
-            Path::Carry | Path::Split => 1,
-            Path::Forward { workers } => workers,
-        },
+        "workers": workers,
         "solves": f.solves,
         "checks": shape.checks,
         "clocks": shape.clocks && !shape.timeless,
@@ -352,17 +340,12 @@ fn one(
         "fill_ms": (fill_ms * 10.0).round() / 10.0,
         "fill_ms_runs": times.iter().map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>(),
         "rule_evals": s.evals,
-        "rule_evals_ranked": s.ranked,
         "rule_evals_bits": s.bits,
         "rules": if bits { "bits" } else { "bytecode" },
         "absent": if skip { "skip" } else { "check" },
         "rules_report": seats[0].plan.rules_report(seats[0].w),
         "eval_only": replay,
         "ns_per_eval": (fill_ms * 1e6 / s.evals.max(1) as f64 * 10.0).round() / 10.0,
-        "removals": s.removals,
-        "retractions": s.retractions,
-        "retractions_per_removal": work["retractions_per_removal"],
-        "churn": work["churn"],
         "rounds": f.rounds,
         "spheres": sp.spheres.len(),
         "cross_world_share": (crossed as f64 / all.max(1) as f64 * 1e3).round() / 1e3,
@@ -479,15 +462,7 @@ fn main() -> Result<(), String> {
     } else {
         vec![shape]
     };
-    let workers: usize = arg(&args, "--workers", config::ROOM_FORWARD_WORKERS)?;
-    let path_arg = arg(&args, "--path", "auto".to_owned())?;
-    let path = match path_arg.as_str() {
-        "auto" => None,
-        "carry" => Some(Path::Carry),
-        "forward" => Some(Path::Forward { workers }),
-        "split" => Some(Path::Split),
-        x => return Err(format!("--path: auto, carry, forward or split, got {x}")),
-    };
+    let workers: usize = arg(&args, "--workers", 1)?;
     let one_world = match arg(&args, "--worlds", "each".to_owned())?.as_str() {
         "each" => false,
         "one" => true,
@@ -510,12 +485,12 @@ fn main() -> Result<(), String> {
     // `--failed-row`: a room that cannot be filled prints a row saying so, and the run goes on.
     let failed_row = args.iter().any(|a| a == "--failed-row");
     for n in players {
-        let row = one(&shapes, seed, n, reps, (path, workers, one_world), engine);
+        let row = one(&shapes, seed, n, reps, (workers, one_world), engine);
         let mut row = match row {
             Err(e) if failed_row => {
                 println!(
                     "{}",
-                    json!({"room": n, "profile": profile, "path": path_arg, "seed": seed,
+                    json!({"room": n, "profile": profile, "seed": seed,
                            "failed": e})
                 );
                 continue;
@@ -529,7 +504,7 @@ fn main() -> Result<(), String> {
     let fitted = exponent(&points);
     println!(
         "{}",
-        json!({"profile": profile, "path": path_arg, "workers": workers,
+        json!({"profile": profile, "workers": workers,
                "rules": if engine.0 { "bits" } else { "bytecode" },
                "absent": if engine.1 { "skip" } else { "check" },
                "world": if one_world { "one" } else { "each" },

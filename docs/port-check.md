@@ -163,6 +163,8 @@ Two things this run found. The start inventory of the player with shuffled clock
 
 ### Scaling with players
 
+As of 2026-11-26 the fill has one path, the split path (one solve, then every group's state by adding to it and taking the additions back), at every room size and for confined items too. The carried path (truth maintenance) and the forward path (a fresh solve per round, on threads) described below were removed; the tables are history. A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`).
+
 `measure_room` (feature `memory-harness`) fills a room of N players of the test world (the two instances in turn, so the 10 and 20 player rooms repeat settings), release build, one fill of seed 1, `systemd-run -p CPUQuota=200%`; the world is loaded once and shared; fill time is the median of five fills; engine peak heap is the counting allocator's peak, world load included.
 
 | Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
