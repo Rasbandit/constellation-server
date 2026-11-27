@@ -1008,15 +1008,23 @@ fn room_of(n: u32, rich: bool) -> Value {
                 })
                 .collect();
             let mut s = json!({
-                "id": id(k), "team": 0, "name": format!("P{k}"), "kind": "player",
+                "id": id(k), "team": if rich { k % 2 } else { 0 }, "name": format!("P{k}"),
+                "kind": if rich && k % 4 == 1 { "spectator" } else { "player" },
                 "game": if k % 3 == 2 { "H" } else { "G" },
                 "minimum_client_version": {"major": 0, "minor": 5, "build": k},
                 "group_members": [], "locations": locations, "slot_data": {}, "start_inventory": [],
             });
             if rich {
-                s["name"] = json!(format!("P{k} \"quoted\" \\ é\n"));
-                s["slot_data"] = json!({"z": 1.5, "a": {"b": null, "a": "q\"é\u{1}"}, "big": 1e300,
-                                        "list": [{"y": -0.25, "x": [true, {}]}], "n": -7});
+                // Quotes, a backslash, control characters, U+007F, U+2028, an emoji (outside
+                // the basic plane), and a long name.
+                s["name"] = json!(format!(
+                    "P{k} \"quoted\" \\ é\n\t\u{0}\u{1f}\u{7f}\u{2028}\u{2029} \u{1f600}{}",
+                    "long ".repeat(200)
+                ));
+                s["slot_data"] = json!({"z": 1.5, "a": {"b": null, "a": "q\"é\u{1}\u{1f600}\u{2028}"},
+                                        "big": 1e300, "list": [{"y": -0.25, "x": [true, {}]}], "n": -7,
+                                        "key \"q\" \\ \n\u{2028}\u{1f600}": -0.0, "past i64": u64::MAX});
+                s["group_members"] = json!([id(0), id(n - 1)]);
                 s["start_inventory"] = json!([7, 7]);
                 s["entrances"] = json!({"-5": "Cave \"x\"", "9": "Well", "1000": "Attic", "100": "Cave \"x\""});
             }
@@ -1025,7 +1033,7 @@ fn room_of(n: u32, rich: bool) -> Value {
         .collect();
     let connect: serde_json::Map<String, Value> = slots
         .iter()
-        .map(|s| (s["name"].as_str().unwrap().to_owned(), json!([0, s["id"]])))
+        .map(|s| (s["name"].as_str().unwrap().to_owned(), json!([s["team"], s["id"]])))
         .collect();
     let names: serde_json::Map<String, Value> =
         ids.iter().map(|l| (format!("L{l}"), json!(l))).collect();
@@ -1091,4 +1099,95 @@ fn the_streamed_hash_is_the_tree_hash_and_the_seed_bytes_do_not_depend_on_order(
         assert_ne!(b.hash().unwrap(), hash);
         assert_eq!(b.hash().unwrap(), tree_hash_with_games(&b, &games));
     }
+}
+
+/// Where a hand-written separator or number could differ from the tree's: no slots, a slot
+/// without locations, no connect names, and placements at the ends of every number's range
+/// (bundles nobody validated, built as values). The streamed hash is the tree's and the
+/// text's on each.
+#[test]
+fn the_streamed_hash_is_the_tree_hash_on_empty_lists_and_extreme_numbers() {
+    let whole = SeedBundle::from_json(&room_of(3, true).to_string()).unwrap();
+    let placed = |location, item, receiver, flags, sphere| Placed {
+        location,
+        item,
+        receiver,
+        flags,
+        sphere,
+    };
+    let edits: [fn(&mut SeedBundle); 5] = [
+        |b| b.slots.clear(),
+        |b| b.slots[1].locations.clear(),
+        |b| b.slots.iter_mut().for_each(|s| s.locations.clear()),
+        |b| b.connect_names.clear(),
+        |b| b.slots[0].locations.truncate(1),
+    ];
+    for (k, edit) in edits.into_iter().enumerate() {
+        let mut b = whole.clone();
+        edit(&mut b);
+        if k == 4 {
+            b.slots[2].locations = vec![
+                placed(-crate::MAX_ID, crate::MAX_ID, 0, 0, Some(u32::MAX)),
+                placed(crate::MAX_ID, -crate::MAX_ID, u32::MAX, 255, Some(0)),
+                placed(i64::MIN, i64::MAX, 1, 7, None),
+                placed(i64::MAX, i64::MIN, u32::MAX, u8::MAX, Some(u32::MAX)),
+                placed(0, 0, 0, 0, None),
+            ];
+            b.slots[2].start_inventory = vec![i64::MIN, 0, i64::MAX];
+            b.slots[2].id = u32::MAX;
+            b.format = u32::MAX;
+        }
+        let text = serde_json::to_string(&b).unwrap();
+        let games = canonical_of(&b.games);
+        let hash = tree_hash_with_games(&b, &games);
+        assert_eq!(hash, hash_of(&text), "case {k}: the oracle is the text's hash");
+        assert_eq!(b.hash().unwrap(), hash, "case {k}");
+        assert_eq!(b.hash_with_games(&games).unwrap(), hash, "case {k}");
+    }
+}
+
+/// `encode` takes a bundle nobody validated. Two slots of one id: a placement for that id is
+/// resolved against the first of them in file order (the scan this replaced found the same
+/// one), so the item must be one of the first slot's game.
+#[test]
+fn a_repeated_slot_id_resolves_to_the_first_slot_of_that_id() {
+    let mut v = room_of(2, false);
+    v["slots"][1]["id"] = json!(1);
+    v["slots"][1]["game"] = json!("H");
+    v["slots"][1]["locations"] = json!([]);
+    // Item 8 is G's only: slot P0 plays G, slot P1 plays H.
+    v["slots"][0]["locations"] = json!([{"location": 100, "item": 8, "receiver": 1, "flags": 0}]);
+    let mut b: SeedBundle = serde_json::from_value(v).unwrap();
+    assert!(b.validate().unwrap_err().to_string().contains("slot id 1 repeats"));
+    let first = encode(&b, &[0; 32], 1 << 26).unwrap();
+    assert_eq!(encode(&b, &[0; 32], 1 << 26).unwrap().seed, first.seed, "the same bytes again");
+    b.slots.reverse();
+    let e = encode(&b, &[0; 32], 1 << 26).unwrap_err().to_string();
+    assert!(e.contains("names something it lacks"), "{e}");
+}
+
+/// A receiver past 255 slots takes more than a byte: 300 slots, each sending to two others,
+/// round trip. The format's bound on slots is its 16-bit count in the header (`u16_of` in
+/// `encode_on`): 65,536 slots are refused there. (A room is capped far lower, at
+/// `config::ROOM_MAX_PLAYERS`, by the fill.)
+#[test]
+fn a_room_over_255_slots_round_trips_and_one_over_65535_is_refused() {
+    let mut v: Value = serde_json::from_str(&wide(4, 300, 0)).unwrap();
+    for (k, s) in v["slots"].as_array_mut().unwrap().iter_mut().enumerate() {
+        s["locations"] = json!([
+            {"location": 1 + k % 4, "item": 1, "receiver": 1 + (k + 299) % 300, "flags": 0},
+            {"location": 1 + (k + 1) % 4, "item": 1, "receiver": 300 - k, "flags": 1}]);
+    }
+    let text = v.to_string();
+    let (seed, data) = opened(&text);
+    assert_eq!(seed.bit_widths().1, 9, "299 as a position takes nine bits");
+    let mut want = SeedBundle::from_json(&text).unwrap();
+    for s in &mut want.slots {
+        s.locations.sort_by_key(|p| p.location);
+    }
+    assert_eq!(seed.to_v1(&data).unwrap(), want);
+
+    let many = SeedBundle::from_json(&wide(1, 65_536, 0)).unwrap();
+    let e = encode(&many, &[0; 32], 1 << 26).unwrap_err().to_string();
+    assert!(e.contains("too many slots"), "{e}");
 }

@@ -479,6 +479,7 @@ jobs:
           # A base whose bench does not print the seed's timings (`seed_file`: main before the
           # PR of #202, where the room's seed number overwrote them) is measured with this
           # branch's bench source on the base's library; later bases print them themselves.
+          # To be removed once that PR is on main (see #202): no base needs it after.
           grep -q '"seed_file"' ../base/crates/data-fill/examples/synth_room.rs \
             || cp crates/data-fill/examples/synth_room.rs ../base/crates/data-fill/examples/synth_room.rs
           cargo build --release --locked -p data-fill --features memory-harness --example synth_room
