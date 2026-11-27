@@ -1400,6 +1400,35 @@ mod tests {
         assert!(crossed > 0, "no item crossed worlds");
     }
 
+    /// Rooms of layered worlds whose gates are weighted sums (`Shape::sums`): the fill places
+    /// what a fresh solve of every round places, and every seed is beatable.
+    #[test]
+    fn weighted_sum_gates_fill_as_a_fresh_solve_per_round_and_are_beatable() {
+        use crate::synth::{Shape, Sums, world};
+        let light = Shape { checks: 120, layers: 3, sums: Sums::Weighted, ..Shape::default() };
+        // 240 checks: at 120 the heavy world gets stuck on seed 8 with plain-count sums too.
+        let heavy = Shape { checks: 240, layers: 3, sums: Sums::Weighted, ..Shape::heavy() };
+        for (shape, players) in [(light, 1), (light, 3), (heavy, 2)] {
+            for seed in 1u64..=10 {
+                let built: Vec<_> = (0..players).map(|p| world(&shape, seed, p)).collect();
+
+                let manifests: Vec<_> = built.iter().map(|b| &b.0).collect();
+                let insts: Vec<_> = built.iter().map(|b| &b.1).collect();
+                let c = Compiled::new(&manifests, &insts).unwrap();
+                let seats = c.seats();
+                let (a, sa) =
+                    fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
+                let oracle = (config::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
+                let (b, sb) =
+                    fill_room_test(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, oracle)
+                        .unwrap();
+                assert_eq!((&a.placed, &sa), (&b.placed, &sb), "{players} players, seed {seed}");
+                let (beatable, _) = validate_room(&seats, &a.placed).unwrap();
+                assert!(beatable.iter().all(|x| *x), "{players} players, seed {seed}");
+            }
+        }
+    }
+
     #[test]
     fn rounds_take_the_last_item_of_each_players_pile() {
         let g = |to, item| Given { to, item };

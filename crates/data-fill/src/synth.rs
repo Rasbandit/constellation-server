@@ -73,6 +73,20 @@ pub struct Shape {
     /// Confined items: every copy of `p0` may only go to the group `home`, two locations in
     /// five ([`confine`]`(_, 5, 2)`).
     pub confined: bool,
+    /// Half the gates of the layered world are a sum of the copies of three kinds ([`Sums`]).
+    pub sums: Sums,
+}
+
+/// The sum gates of [`Shape::sums`]: drawn alike, so the two worlds differ only in weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sums {
+    /// No sum gates: the worlds as before the flag.
+    #[default]
+    Off,
+    /// `count(a) + count(b) + count(c) >= t`.
+    Counts,
+    /// The same three kinds weighted 1 to 4, at least `t` times the first kind's weight.
+    Weighted,
 }
 
 /// Worlds where taking one item out of what is held changes much of what is reached, or where
@@ -118,6 +132,7 @@ impl Default for Shape {
             timeless: false,
             guards: false,
             confined: false,
+            sums: Sums::Off,
         }
     }
 }
@@ -397,7 +412,23 @@ fn drawn(shape: &Shape, seed: u64, player: u64) -> (Value, Instance) {
             events[r].push(json!({"event": format!("c{c}"), "rule": has(&mut pick)}));
         }
     }
+    // `t` copies of the first kind alone meet it, so every gate still holds with the whole pool.
+    let sum = |pick: &mut dyn FnMut(usize) -> usize| {
+        let kinds3 = [pick(kinds), pick(kinds), pick(kinds)];
+        let weights = kinds3.map(|_| 1 + pick(4));
+        let t = 1 + pick(copies(kinds3[0]));
+        let weighted = shape.sums == Sums::Weighted;
+        let mut terms = vec![json!("+")];
+        terms.extend(kinds3.iter().zip(weights).map(|(k, w)| {
+            let c = json!({"count": p(*k)});
+            if weighted { json!({"int": ["*", c, w]}) } else { c }
+        }));
+        json!({"ge": [{"int": terms}, if weighted { t * weights[0] } else { t }]})
+    };
     let gate = |d: usize, pick: &mut dyn FnMut(usize) -> usize| {
+        if shape.sums != Sums::Off && pick(2) == 0 {
+            return sum(pick);
+        }
         let first = match pick(20) {
             0..=7 => has(pick),
             8..=11 => json!({"any": [has(pick), has(pick)]}),
