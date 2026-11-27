@@ -100,6 +100,24 @@ fn the_example_files_are_already_in_canonical_layout() {
     }
 }
 
+/// `fmt` (and the generated-file hash, which runs the same layout) is linear in a rule's
+/// size: a rule of 100,000 `and`/`or` parts (about 1.6 MB, the shape whose parentheses the
+/// formatter adds) formats in well under the bound. Before the fix every token scanned every
+/// parenthesis span, and this ran past 60 s (measured, debug build, review of 69c8f69).
+#[test]
+fn fmt_of_a_huge_rule_is_linear() {
+    let parts: Vec<&str> = (0..50_000).map(|_| "has(k) and has(k)").collect();
+    let src = format!(
+        "world t\nstart a\nitem k progression\nregion a {{\n  check x: {}\n}}\ngoal reach(a)\n",
+        parts.join(" or ")
+    );
+    let t = std::time::Instant::now();
+    let once = format_text(&src, "w.rando").unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t.elapsed());
+    assert_eq!(once.matches("(has(k) and has(k))").count(), 50_000);
+    assert_eq!(format_text(&once, "w.rando").unwrap(), once);
+}
+
 #[test]
 fn every_syntax_error_in_a_file_is_reported_with_its_line_and_column() {
     let files =
@@ -124,6 +142,53 @@ fn a_reserved_word_is_a_name_in_backticks() {
     ));
     assert_eq!(region(&b, "a")["checks"][0]["rule"], serde_json::json!({"has": "group"}));
     fails(&world("item group progression"), &format!("world.rando:{}:6", line(1)), "reserved word");
+}
+
+/// A `-` before a number where a number is expected is part of it (a range's ends, a table
+/// cell), and `fmt` keeps it glued; between two values it is still `-`.
+#[test]
+fn negative_numbers_where_a_number_is_expected() {
+    let body = "option o: range -3..3 = -1\ntable t(key: name, n: int) {\n  a -2\n  b 5\n}\nregion a {\n  for r in t where r.n < 0 { check {r.key}_neg }\n  for i in 2..3 { check s{i}: count(k) >= i -1 }\n}";
+    let b = ok(&world(body));
+    let keys: Vec<String> = region(&b, "a")["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["loc"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(keys.contains(&"a_neg".to_owned()) && !keys.contains(&"b_neg".to_owned()), "{keys:?}");
+    // `i -1` after a name is subtraction: `s3` needs 2.
+    let s3 = region(&b, "a")["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["loc"] == "s3")
+        .unwrap()["rule"]
+        .clone();
+    assert_eq!(s3, serde_json::json!({"ge": [{"count": "k"}, 2]}));
+    assert_eq!((b.option_value("o", "-3"), b.option_value("o", "3")), (Ok(-3), Ok(3)));
+    assert!(b.option_value("o", "-4").is_err());
+    assert_eq!(b.manifest["options"][0]["default"], -1);
+    let text = format!("{}\n", body);
+    let f = format_text(&text, "w.rando").unwrap();
+    assert!(f.contains("range -3..3 = -1\n") && f.contains("  a -2\n"), "{f}");
+    assert_eq!(format_text(&f, "w.rando").unwrap(), f);
+}
+
+/// A bare `no_progression` ends before the next modifier word, so `key` and `was` on the
+/// next line stay what they are.
+#[test]
+fn a_bare_no_progression_ends_before_key_and_was() {
+    let w = world(
+        "region a {\n  check c1 no_progression\n    key \"row-1\"\n  check c2 no_progression\n    was old\n  check c3 no_progression true\n}",
+    );
+    let b = ok(&w);
+    let l: serde_json::Value = serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap();
+    assert!(l["checks"].get("row-1").is_some(), "{l}");
+    let inst = b.default_instance().unwrap();
+    for c in ["c1", "c2"] {
+        assert!(inst.excluded.contains(&c.to_owned()), "{c}: {:?}", inst.excluded);
+    }
 }
 
 #[test]
@@ -182,12 +247,10 @@ fn a_family_over_a_table_and_ranges_expands_to_plain_checks() {
     let rule = |k: &str| checks.iter().find(|c| c["loc"] == k).unwrap()["rule"].clone();
     assert_eq!(
         rule("ash_ante1_stake1"),
-        serde_json::json!({"all": [{"has": "ash_deck"}, {"ge": [{"count": "joker"}, 0]}]})
+        // `count(joker) >= 0` always holds, so it folds away.
+        serde_json::json!({"has": "ash_deck"})
     );
-    assert_eq!(
-        rule("oak_ante8_stake2"),
-        serde_json::json!({"all": [{"true": {}}, {"ge": [{"count": "joker"}, 5]}]})
-    );
+    assert_eq!(rule("oak_ante8_stake2"), serde_json::json!({"ge": [{"count": "joker"}, 5]}));
     assert_eq!(b.default_instance().unwrap().locations.len(), 96);
     // A `where` that folds at build time drops the combinations it rules out.
     let folded =
@@ -497,6 +560,45 @@ fn an_unclosed_block_does_not_hide_the_errors_after_it() {
     assert!(all.iter().any(|e| e.starts_with(&format!("world.rando:{}:", line(7)))), "{all:#?}");
 }
 
+/// `build --publish` marks every declared id published in the ledger. A later build keeps a
+/// published id on its key (a `was` rename carries it and the mark), and refuses to drop a
+/// published entry; an unpublished one is still retired as before.
+#[test]
+fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
+    let publish = Options { publish: true, ..Options::default() };
+    let v1 = world("region a {\n  check one\n  check two\n}");
+    let b1 = build(&v1, &publish).unwrap();
+    let l1: serde_json::Value = serde_json::from_str(b1.ledger.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        l1["checks"]["one"],
+        serde_json::json!({"id": 1, "published": true, "retired": false})
+    );
+    assert_eq!(l1["items"]["k"]["published"], true);
+    // Without `--publish` nothing is marked.
+    let plain: serde_json::Value = serde_json::from_str(ok(&v1).ledger.as_ref().unwrap()).unwrap();
+    assert!(plain["checks"]["one"].get("published").is_none(), "{plain}");
+    // A rename keeps the id and the mark; a new check is not published by a plain build.
+    let mut v2 = world("region a {\n  check one\n  check second was two\n  check three\n}");
+    v2.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    let b2 = ok(&v2);
+    let l2: serde_json::Value = serde_json::from_str(b2.ledger.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        l2["checks"]["second"],
+        serde_json::json!({"id": 2, "published": true, "retired": false})
+    );
+    assert_eq!(l2["checks"]["three"], serde_json::json!({"id": 3, "retired": false}));
+    // Dropping a published check is an error naming it; dropping the unpublished one is fine.
+    let mut v3 = world("region a {\n  check second\n}");
+    v3.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
+    let all = errors(&v3).join("\n");
+    assert!(all.contains("published check `one` (id 1) is no longer declared"), "{all}");
+    assert!(!all.contains("`three`"), "{all}");
+    let mut v4 = world("region a {\n  check one\n  check second\n}");
+    v4.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
+    let l4: serde_json::Value = serde_json::from_str(ok(&v4).ledger.as_ref().unwrap()).unwrap();
+    assert_eq!(l4["checks"]["three"], serde_json::json!({"id": 3, "retired": true}));
+}
+
 #[test]
 fn the_ledger_refuses_renames_and_keys_that_would_move_an_id() {
     let mut w = world("region a {\n  check c3 was c1\n  check c1\n}");
@@ -619,6 +721,29 @@ fn a_link_out_of_the_world_folder_is_refused() {
     assert!(!run.status.success(), "{run:?}");
     assert!(!root.join("outside.json").exists(), "wrote through the ledger link");
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A comparison that holds whatever the player has (`count(x) >= 0`) is the rule `true`, and
+/// an always-true part drops out of an `and` (settles an `or`), so the engine gets the rule
+/// that is left.
+#[test]
+fn always_true_comparisons_fold_away() {
+    let rule = |r: &str| {
+        let b = ok(&world(&format!("region a {{\n  check c: {r}\n}}")));
+        region(&b, "a")["checks"][0]["rule"].clone()
+    };
+    let has_k = serde_json::json!({"has": "k"});
+    let truth = serde_json::json!({"true": {}});
+    assert_eq!(rule("has(k) and count(k) >= 0"), has_k);
+    assert_eq!(rule("count(k) >= 0 and has(k) and true"), has_k);
+    assert_eq!(rule("0 <= count(k)"), truth);
+    assert_eq!(rule("count(k) * 3 + count(junk) > -1"), truth);
+    assert_eq!(rule("has(k) or count(k) >= 0"), truth);
+    assert_eq!(rule("count(k) >= 0 and 0 <= count(k)"), truth);
+    // What can still be false is kept.
+    assert_eq!(rule("count(k) >= 1"), serde_json::json!({"ge": [{"count": "k"}, 1]}));
+    let both = rule("has(k) and count(junk) >= 1");
+    assert_eq!(both["all"].as_array().map(Vec::len), Some(2), "{both}");
 }
 
 #[test]

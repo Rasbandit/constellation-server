@@ -1,7 +1,9 @@
 //! The id ledger (design doc 18 section 2.11): `ledger.json`, written only by the tool,
 //! append-only. Items and checks are numbered separately, each keyed by a stable key (the
 //! name, or a written `key "..."`), never by position. A `was` moves an old key's id to its
-//! new name. A key no longer declared is retired, and its id is never given again.
+//! new name. A key no longer declared is retired, and its id is never given again. A build to
+//! publish marks every declared key published; a published key may be renamed with `was` but
+//! never dropped, since seeds and clients already carry its id.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -14,8 +16,15 @@ use crate::world::Errs;
 /// Largest id: inside 2^53 - 1, the range world ids keep to.
 const MAX_ID: i64 = config::ID_MAX;
 
-/// One table of the ledger: key to (id, retired).
-type Table = BTreeMap<String, (i64, bool)>;
+/// One entry of a ledger table.
+#[derive(Clone, Copy)]
+struct Entry {
+    id: i64,
+    published: bool,
+}
+
+/// One table of the ledger: key to its entry (retired or not is recomputed each build).
+type Table = BTreeMap<String, Entry>;
 
 fn read_table(v: &Value, what: &str, errs: &mut Errs) -> Table {
     let mut out = Table::new();
@@ -36,17 +45,19 @@ fn read_table(v: &Value, what: &str, errs: &mut Errs) -> Table {
             );
             continue;
         }
-        out.insert(k.clone(), (id, e["retired"].as_bool().unwrap_or(false)));
+        out.insert(k.clone(), Entry { id, published: e["published"].as_bool().unwrap_or(false) });
     }
     out
 }
 
 /// Give every declared item and check of `w` its id from the ledger, numbering new keys after
-/// the largest id ever given; returns the ledger to write back.
+/// the largest id ever given; returns the ledger to write back. With `publish`, every declared
+/// key is marked published.
 pub(crate) fn assign(
     w: &mut World,
     idents: &[Ident],
     files: &dyn Files,
+    publish: bool,
     errs: &mut Errs,
 ) -> String {
     let game = w.game.as_ref().map(|g| g.v.clone()).unwrap_or_default();
@@ -75,7 +86,7 @@ pub(crate) fn assign(
     let mut out = json!({"world": game});
     for (check, field) in [(false, "items"), (true, "checks")] {
         let mut table = read_table(&old[field], &field[..field.len() - 1], errs);
-        let mut next = table.values().map(|x| x.0).max().unwrap_or(0) + 1;
+        let mut next = table.values().map(|x| x.id).max().unwrap_or(0) + 1;
         // What is declared after overlays: a removed check or item is retired.
         let present: HashSet<&str> = if check {
             w.regions.iter().flat_map(|r| &r.checks).map(|c| c.key.v.as_str()).collect()
@@ -122,30 +133,44 @@ pub(crate) fn assign(
                 );
                 continue;
             }
-            let id = match (
+            let entry = match (
                 table.get(&key).copied(),
                 i.was.as_ref().and_then(|o| table.get(o).copied().map(|e| (o, e))),
             ) {
-                (Some((id, _)), _) => id,
-                (None, Some((o, (id, _)))) => {
+                (Some(e), _) => e,
+                (None, Some((o, e))) => {
                     let o = o.clone();
                     table.remove(&o);
-                    id
+                    e
                 }
                 (None, None) => {
                     next += 1;
-                    next - 1
+                    Entry { id: next - 1, published: false }
                 }
             };
+            let id = entry.id;
             if id > MAX_ID {
                 errs.err(i.pos, "the ledger has no ids left", "");
             }
-            table.insert(key, (id, false));
+            table.insert(key, Entry { id, published: entry.published || publish });
             ids.insert(i.name.clone(), id);
         }
         let mut written = serde_json::Map::new();
-        for (k, (id, _)) in &table {
-            written.insert(k.clone(), json!({"id": id, "retired": !used.contains(k)}));
+        let what = &field[..field.len() - 1];
+        for (k, e) in &table {
+            let retired = !used.contains(k);
+            if retired && e.published {
+                errs.whole(
+                    format!("published {what} `{k}` (id {}) is no longer declared", e.id),
+                    "seeds and clients already carry its id: declare it again, or rename it with `was`",
+                );
+            }
+            let mut entry = json!({"id": e.id, "retired": retired});
+            // Written only when set, so a ledger never published reads as before.
+            if e.published {
+                entry["published"] = json!(true);
+            }
+            written.insert(k.clone(), entry);
         }
         out[field] = Value::Object(written);
         if check {

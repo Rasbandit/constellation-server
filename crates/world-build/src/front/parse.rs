@@ -362,11 +362,23 @@ impl P<'_> {
         }
     }
 
+    /// A whole number, with a `-` before it read as its sign: where a number is expected, a
+    /// `-` cannot be subtraction (the lexer reads `-` after a name or number as `-`).
     fn int(&mut self, what: &str) -> R<At<i64>> {
-        match self.peek() {
-            Some(Tok::Int(n)) => {
-                let (n, pos) = (*n, self.here());
+        let pos = self.here();
+        match (self.peek(), self.toks.get(self.k + 1).map(|t| &t.t)) {
+            (Some(Tok::Int(n)), _) => {
+                let n = *n;
                 self.k += 1;
+                Ok(At::new(n, pos))
+            }
+            (Some(Tok::Minus), Some(Tok::Int(n))) => {
+                let n = -*n;
+                // Written glued to its sign, as the lexer's own negative numbers are.
+                if let Some(g) = self.layout.glue.get_mut(self.k + 1) {
+                    *g = true;
+                }
+                self.k += 2;
                 Ok(At::new(n, pos))
             }
             _ => Err((self.here(), format!("expected {what}, found {}", self.got()))),
@@ -888,7 +900,15 @@ impl P<'_> {
                     } else if self.ctx("no_progression") {
                         let at = self.here();
                         self.k += 1;
-                        let r = if self.rule_starts() { Some(self.rule(depth)?) } else { None };
+                        // A modifier word after it starts the next modifier, not a rule.
+                        let next = ["key", "was", "vanilla", "holds", "no_progression"]
+                            .iter()
+                            .any(|w| self.ctx(w));
+                        let r = if self.rule_starts() && !next {
+                            Some(self.rule(depth)?)
+                        } else {
+                            None
+                        };
                         c.no_progression = Some((at, r));
                     } else if self.word("placement") {
                         self.k += 1;
@@ -1052,9 +1072,8 @@ impl P<'_> {
                     self.k += 1;
                     Cell::Name(n)
                 }
-                (Col::Int, Some(Tok::Int(n))) => {
-                    self.k += 1;
-                    Cell::Int(n)
+                (Col::Int, Some(Tok::Int(_) | Tok::Minus)) => {
+                    Cell::Int(self.int("a whole number")?.v)
                 }
                 (Col::Bool, Some(Tok::Kw(b @ ("true" | "false")))) => {
                     self.k += 1;

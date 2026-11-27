@@ -482,8 +482,12 @@ impl<'a> Lower<'a> {
                 let mut parts = Vec::with_capacity(xs.len());
                 let mut state = false;
                 let mut ok = true;
+                let and = matches!(e.e, E::And(_));
+                let mut any_true = false;
                 for x in xs {
                     match self.b(x, mode) {
+                        // An always-true part adds nothing to an `and`, and settles an `or`.
+                        Some((v, _)) if v == t() => any_true = true,
                         Some((v, s)) => {
                             parts.push(v);
                             state |= s;
@@ -491,8 +495,16 @@ impl<'a> Lower<'a> {
                         None => ok = false,
                     }
                 }
-                let key = if matches!(e.e, E::And(_)) { "all" } else { "any" };
-                ok.then(|| (json!({key: parts}), state))
+                if !ok {
+                    return None;
+                }
+                if (!and && any_true) || parts.is_empty() {
+                    return Some((t(), false));
+                }
+                if and && any_true && parts.len() == 1 {
+                    return parts.pop().map(|v| (v, state));
+                }
+                Some((json!({if and { "all" } else { "any" }: parts}), state))
             }
             E::Call(f, args) if self.names.defs.get(f).is_some_and(|d| !d.0.is_empty()) => {
                 let (v, state) = self.call_def(f, args, e.at)?;
@@ -656,6 +668,17 @@ impl<'a> Lower<'a> {
                 }
             };
             return self.err(at, "this comparison can turn false as the player collects (rules are monotone, format rule a, D-132)", help);
+        }
+        // Always true whatever the player holds (`count(x) >= 0`): the rule `true`.
+        let always = match op {
+            Cmp::Ge => floor(a).zip(fold(b)).is_some_and(|(a, b)| a >= b),
+            Cmp::Gt => floor(a).zip(fold(b)).is_some_and(|(a, b)| a > b),
+            Cmp::Le => fold(a).zip(floor(b)).is_some_and(|(a, b)| a <= b),
+            Cmp::Lt => fold(a).zip(floor(b)).is_some_and(|(a, b)| a < b),
+            Cmp::Eq | Cmp::Ne => false,
+        };
+        if always {
+            return Some((t(), false));
         }
         let key = rule_ops::CMP_OPS[op.index()];
         Some((json!({key: [x, y]}), xs || ys))
@@ -1010,6 +1033,35 @@ fn subst(e: &Expr, map: &HashMap<&str, &Expr>) -> Expr {
         todo.extend(x.children_mut());
     }
     out
+}
+
+/// The least value a number expression can take, when it is known: counts, levels and
+/// counters start at 0 and only grow, so a sum or nonnegative multiple of them is at least the
+/// same of their least values. `None` for anything else (an option can be negative).
+fn floor(e: &Expr) -> Option<i64> {
+    if let Some(n) = fold(e) {
+        return Some(n);
+    }
+    match &e.e {
+        E::Call(f, _) if matches!(f.as_str(), "count" | "level" | "counter" | "group_count") => {
+            Some(0)
+        }
+        E::Sum(xs) => xs.iter().try_fold(0i64, |s, x| s.checked_add(floor(x)?)),
+        E::Arith(Arith::Mul, a, b) => {
+            let (w, x) = match (fold(a), fold(b)) {
+                (Some(w), None) => (w, b),
+                (None, Some(w)) => (w, a),
+                _ => return None,
+            };
+            let f = floor(x)?;
+            (w >= 0 && f >= 0).then(|| f.checked_mul(w)).flatten()
+        }
+        E::Call(f, xs) if (f == "min" || f == "max") && !xs.is_empty() => {
+            let v: Vec<i64> = xs.iter().map(floor).collect::<Option<_>>()?;
+            if f == "min" { v.into_iter().min() } else { v.into_iter().max() }
+        }
+        _ => None,
+    }
 }
 
 /// The value of an expression over numbers alone, or `None`.

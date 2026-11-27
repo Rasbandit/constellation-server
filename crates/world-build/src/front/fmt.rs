@@ -34,8 +34,17 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
     let comments: Vec<_> =
         ast.comments.iter().filter(|c| with_comments && c.before >= from).collect();
     let mut ci = 0;
-    let open: Vec<usize> = ast.layout.parens.iter().map(|p| p.0).collect();
-    let close: Vec<usize> = ast.layout.parens.iter().map(|p| p.1 - 1).collect();
+    // Parentheses to add before and after each token, counted once: a scan of every span per
+    // token was quadratic in a rule's size.
+    let (mut open, mut close) = (vec![0usize; toks.len()], vec![0usize; toks.len()]);
+    for &(a, b) in &ast.layout.parens {
+        if let Some(n) = open.get_mut(a) {
+            *n += 1;
+        }
+        if let Some(n) = b.checked_sub(1).and_then(|c| close.get_mut(c)) {
+            *n += 1;
+        }
+    }
     for i in from..=toks.len() {
         // Comments that come before this token.
         while let Some(c) = comments.get(ci).filter(|c| c.before == i) {
@@ -83,13 +92,9 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
             out.push(' ');
         }
         need_break = false;
-        for _ in open.iter().filter(|o| **o == i) {
-            out.push('(');
-        }
+        out.extend(std::iter::repeat_n('(', open[i]));
         out.push_str(&text(&t.t));
-        for _ in close.iter().filter(|c| **c == i) {
-            out.push(')');
-        }
+        out.extend(std::iter::repeat_n(')', close[i]));
         last_line = t.pos.line;
     }
     if !out.ends_with('\n') {

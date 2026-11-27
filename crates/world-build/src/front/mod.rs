@@ -98,7 +98,8 @@ impl Files for Mem {
 pub struct Options {
     /// Accept a generated file whose content no longer matches its hash (local experiments).
     pub allow_edited: bool,
-    /// Building to publish: edited generated files are refused whatever `allow_edited` says.
+    /// Building to publish: edited generated files are refused whatever `allow_edited` says,
+    /// and the ledger marks every declared id published (never to be dropped after).
     pub publish: bool,
 }
 
@@ -132,7 +133,7 @@ pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
     x.apply_overlays();
     x.visibility();
     x.generated(files, opts);
-    let ledger = ledger::assign(&mut x.world, &x.idents, files, &mut x.errs);
+    let ledger = ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs);
     x.world.files.clone_from(&x.paths);
     let (world, errs) = (x.world, x.errs);
     if !errs.errors.is_empty() {
