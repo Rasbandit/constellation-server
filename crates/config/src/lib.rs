@@ -335,6 +335,12 @@ pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
 /// the next draws of the seed's random stream; a design value).
 pub const FILL_MAX_ATTEMPTS: u32 = 20;
 
+/// Further fills a room's seed may start once [`FILL_MAX_ATTEMPTS`] of them were stuck, with
+/// rounds of one item in place of one item from every player (`data_fill::room`; issue 212).
+/// A room that fills within the first attempts never comes here, so its seed is what it was.
+/// A design value: the rooms measured for the issue fill on the first such attempt.
+pub const FILL_UNSTICK_ATTEMPTS: u32 = 3;
+
 /// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
 /// sections the file holds and what is in them. Raise it with any change to that. A world is
 /// also prepared again by every new server build, so this guards builds that share a version

@@ -411,8 +411,10 @@ impl std::str::FromStr for Algorithm {
 }
 
 /// Fill a room, on the path a room of its size takes ([`Path::of`]). Retries the whole fill
-/// with the next draws from `rng` when stuck. A caller that wants another path names it to
-/// [`fill_room_on`].
+/// with the next draws from `rng` when stuck: `max_attempts` times by the rule (a round takes
+/// one item from every player), then `config::FILL_UNSTICK_ATTEMPTS` times with rounds of one
+/// item, so [`RoomFilled::attempts`] may exceed `max_attempts`. A caller that wants another
+/// path names it to [`fill_room_on`].
 ///
 /// # Errors
 /// [`FillError`] when every attempt is stuck, the counts do not match, or there are no or too
@@ -739,7 +741,15 @@ fn fill_by(
         profile: Rounds::default(),
         last: vec![Vec::new(); seats.len()],
     };
-    for attempt in 1..=max_attempts {
+    // Only a seed that ends stuck today goes past `max_attempts`: every seed that fills within
+    // them draws and places what it always did. The attempts after that go on from the same
+    // random stream with rounds of one item, which fill rooms the rule cannot (issue 212).
+    let tries = match max_attempts {
+        0 => 0,
+        n => n.saturating_add(config::FILL_UNSTICK_ATTEMPTS),
+    };
+    for attempt in 1..=tries {
+        s.per_player = per_player && attempt <= max_attempts;
         match s.try_fill(rng) {
             Ok(placed) => {
                 let (beatable, reached) = s.room.report();
@@ -770,7 +780,7 @@ fn fill_by(
             Err(e) => return Err(e),
         }
     }
-    Err(FillError::Stuck { item: last.unwrap_or_default(), attempts: max_attempts })
+    Err(FillError::Stuck { item: last.unwrap_or_default(), attempts: tries })
 }
 
 /// A duration as nanoseconds, for the round profile.
@@ -1187,8 +1197,9 @@ struct Steps<'a, 'w> {
     stats: Stats,
     extend: bool,
     path: Path,
-    /// A round takes one item from every player (the rule); `false` only for measurements:
-    /// rounds of one item.
+    /// A round takes one item from every player (the rule); `false`: rounds of one item, for
+    /// the attempts after the rule's were all stuck (`config::FILL_UNSTICK_ATTEMPTS`) and for
+    /// measurements.
     per_player: bool,
     algorithm: Algorithm,
     /// The caller wants the spheres: every check has to be evaluated by the end.
@@ -1313,7 +1324,8 @@ impl Steps<'_, '_> {
         if proof.is_none() && self.path == Path::Split {
             self.split(&groups(prog, self.per_player), &mut locs, &mut placed, &mut prev)?;
         } else if proof.is_none() {
-            self.restrictive(&groups(prog, true), &[], &mut locs, &mut placed, &mut prev)?;
+            let rounds = groups(prog, self.per_player);
+            self.restrictive(&rounds, &[], &mut locs, &mut placed, &mut prev)?;
         }
         scatter(&free, &mut rest, &mut placed, rng);
         // The finished room, for the beatability check: collect the last placed item and the

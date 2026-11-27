@@ -854,6 +854,64 @@ mod tests {
         }
     }
 
+    /// Rooms the round rule cannot fill (issue 212: one item from every player per round, all
+    /// placed against a state that holds none of them) are filled by the attempts that come
+    /// after the rule's, with rounds of one item: the chain world at 22 players and the keys
+    /// world at 16, the sizes measured stuck on every attempt. The result is what a fresh
+    /// solve of the whole room says, and every player's goal holds.
+    #[test]
+    fn a_room_the_round_rule_cannot_fill_is_filled_with_rounds_of_one_item() {
+        use crate::room::validate_room;
+        for (how, players) in [(Hostile::Chain, 22), (Hostile::Keys, 16)] {
+            let c = room(&Shape::hostile(how), 1, players, 1).unwrap();
+            let (seats, mut rng) = (c.seats(), SpecRng::from_u64(1));
+            let (f, _) = fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS)
+                .unwrap_or_else(|e| panic!("{how:?}, {players} players: {e:?}"));
+            let at = format!("{how:?}, {players} players, {} attempts", f.attempts);
+            assert!(f.attempts > config::FILL_MAX_ATTEMPTS, "{at}: the rule was to be stuck");
+            assert!(f.all_beatable(), "{at}: {:?}", f.beatable);
+            let fresh = validate_room(&seats, &f.placed).unwrap();
+            assert_eq!((f.beatable, f.reached), fresh, "{at}");
+        }
+    }
+
+    /// The attempts with rounds of one item draw from the seed's stream where the stuck ones
+    /// left it, on every path: the carried, the forward (one thread and four) and the split
+    /// path place the same, twice over. Rooms whose first attempt is stuck, given one attempt
+    /// by the rule. And a room nothing can fill (more copies of a confined item than its
+    /// group has locations) still ends stuck, after the bounded number of attempts.
+    #[test]
+    fn rounds_of_one_item_after_the_stuck_attempts_place_the_same_on_every_path() {
+        let on = |c: &Compiled, seed: u64, path: Path, most: u32| {
+            let mut rng = SpecRng::from_u64(seed);
+            fill_room_on(&c.seats(), &mut rng, most, path)
+                .map(|(f, sp)| (f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached))
+        };
+        let paths =
+            [Path::Carry, Path::Forward { workers: 1 }, Path::Forward { workers: 4 }, Path::Split];
+        let tight = Shape { progression: 0.5, ..small(true) };
+        for (players, seed) in [(3, 4), (8, 6), (9, 7), (12, 6)] {
+            let c = room_with(&tight, 23, players, |p, inst| change("half", p, inst)).unwrap();
+            let at = format!("{players} players, seed {seed}");
+            let split = on(&c, seed, Path::Split, 1).unwrap_or_else(|e| panic!("{at}: {e:?}"));
+            assert!(split.2 > 1 && split.4.iter().all(|b| *b), "{at}: {} attempts", split.2);
+            // A round was one item: as many rounds as progression items.
+            let items: usize = c.plans.iter().map(|p| p.progression.len()).sum();
+            assert_eq!(split.3 as usize, items, "{at}");
+            for path in paths {
+                assert_eq!(Ok(&split), on(&c, seed, path, 1).as_ref(), "{at}, {path:?}");
+            }
+        }
+        let c = room_with(&small(true), 23, 3, |p, inst| change("cramped", p, inst)).unwrap();
+        let tries = config::FILL_MAX_ATTEMPTS + config::FILL_UNSTICK_ATTEMPTS;
+        for path in paths {
+            let e = on(&c, 1, path, config::FILL_MAX_ATTEMPTS).unwrap_err();
+            let stuck =
+                matches!(&e, crate::FillError::Stuck { attempts, .. } if *attempts == tries);
+            assert!(stuck, "{path:?}: {e:?}");
+        }
+    }
+
     /// Instance changes the identity test mixes, by name.
     fn change(what: &str, p: u64, inst: &mut Instance) {
         let has = |k: &str| what.split('+').any(|w| w == k);

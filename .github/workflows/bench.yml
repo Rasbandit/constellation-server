@@ -105,14 +105,21 @@ jobs:
             bench --profile "$profile" --path "$path" --workers 1 --players 1,10 --reps 3
           done; done
           # The same at 100 players. A room that is stuck on every attempt prints a row that
-          # says so (`--failed-row`), and so does one that takes over two minutes.
-          for profile in chain gated keys brink; do for path in forward split; do
+          # says so (`--failed-row`), and so does one that takes over two minutes. Not chain
+          # and keys: the round rule cannot fill them at this size (issue 212), see below.
+          for profile in gated brink; do for path in forward split; do
             if ! timeout 120 target/release/examples/synth_room --profile "$profile" --path "$path" \
                 --workers 1 --players 100 --reps 1 --failed-row > hostile.jsonl; then
               echo "{\"room\":100,\"profile\":\"$profile\",\"path\":\"$path\",\"seed\":1,\"failed\":\"no result within two minutes\"}" > hostile.jsonl
             fi
             tee -a bench-room.jsonl < hostile.jsonl
           done; done
+          # Issue 212: the chain and keys rooms the round rule cannot fill, which the attempts
+          # with rounds of one item fill (over `config::FILL_MAX_ATTEMPTS` attempts in the row).
+          for profile in chain keys; do
+            target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
+              --players 16,22,100 --reps 1 --failed-row | tee -a bench-212.jsonl
+          done
           # Other seeds: the two paths at 100 players on seeds 2 and 3 (the rows above are seed
           # 1), in a file of their own so that no table above matches them twice.
           for seed in 2 3; do for profile in light heavy; do for path in forward split; do
@@ -141,7 +148,7 @@ jobs:
             # and what such rounds cost on the heavy and light profiles at 100 players.
             for profile in chain keys; do
               target/release/examples/synth_room --profile "$profile" --path split --workers 1 \
-                --players 16,18,20,22,24,26,28,32,40,50,64,80,100 --reps 1 --failed-row | tee -a bench-212.jsonl
+                --players 18,20,24,26,28,32,40,50,64,80 --reps 1 --failed-row | tee -a bench-212.jsonl
               timeout 600 target/release/examples/synth_room --profile "$profile" --path split \
                 --workers 1 --players 20,100 --reps 1 --failed-row --rounds single | tee -a bench-212.jsonl \
                 || echo "{\"room\":100,\"profile\":\"$profile\",\"round\":\"one item\",\"failed\":\"no result within ten minutes\"}" | tee -a bench-212.jsonl
@@ -357,7 +364,7 @@ jobs:
               | "| \($four.profile) | \($four.world) | \($one.fill_ms) | \($four.fill_ms) | \($s.fill_ms) | \(($four.fill_ms / $s.fill_ms * 100 | round) / 100) |"' bench-room.jsonl
             if [ -s bench-212.jsonl ]; then
               echo
-              echo "#### Issue 212: room sizes and rounds of one item (split path, one fill each; a measurement, not the product's rule)"
+              echo "#### Issue 212: chain and keys rooms (split path, one timed fill each; over 20 attempts: filled with rounds of one item)"
               echo
               echo "| profile | round | players | result | attempts | fill ms | rounds |"
               echo "|---|---|---|---|---|---|---|"
