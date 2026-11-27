@@ -183,6 +183,9 @@ jobs:
   # (which side goes first alternates), on worlds without shuffles. Runners differ too much
   # between jobs to compare two jobs' numbers.
   bench-ab:
+    permissions:
+      contents: read
+      pull-requests: read
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (contains(github.event.pull_request.labels.*.name, 'perf') &&
@@ -270,14 +273,30 @@ jobs:
               | "| \(.[0].profile) | \(.[0].players) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(select(.side == "base").rule_evals) | unique) | \(map(select(.side == "head").rule_evals) | unique) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab-confined.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
       # Fails the job when base and head place differently on any row, or the seed's bytes
-      # differ. A PR that means to change placements (D-140 allows it) says so, and this step
-      # is red on it.
+      # differ: the guard for a refactor. A PR that changes placements on purpose (D-140 allows
+      # it) carries the label `changes-placements`, and the step lists the rows and passes. The
+      # label is read when the step runs, so adding it and re-running this job is enough.
       - name: base and head place the same
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          for f in bench-ab.jsonl bench-ab-confined.jsonl; do
-            jq -s -e 'group_by([.profile, .players]) | all(map(.placements_hash) | unique | length == 1)' "$f"
-          done
-          jq -s -e 'group_by([.profile, .players]) | all(map([.placements_hash, .seed_file.seed_bytes]) | unique | length == 1)' bench-ab-seed.jsonl
+          differ=$(
+            for f in bench-ab.jsonl bench-ab-confined.jsonl; do
+              jq -s -r --arg f "$f" 'group_by([.profile, .players])[] | select(map(.placements_hash) | unique | length > 1) | "\($f): \(.[0].profile) \(.[0].players) players"' "$f"
+            done
+            jq -s -r 'group_by([.profile, .players])[] | select(map([.placements_hash, .seed_file.seed_bytes]) | unique | length > 1) | "bench-ab-seed.jsonl: \(.[0].profile) \(.[0].players) players"' bench-ab-seed.jsonl
+          )
+          [ -z "$differ" ] && { echo "base and head place the same on every row"; exit 0; }
+          echo "Rows where base and head place differently:"; echo "$differ"
+          { echo "### Rows where base and head place differently"; echo; echo "$differ" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+          labels=""; [ -n "$PR" ] && labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name')
+          if grep -qx changes-placements <<<"$labels"; then
+            echo "Label changes-placements is on: passing."
+          else
+            echo "::error::base and head place differently; add the label changes-placements if that is meant"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: bench-ab

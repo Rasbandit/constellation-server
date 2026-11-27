@@ -22,6 +22,7 @@ By opening a pull request you agree that:
 - Conventional commits, subject at most 50 characters (the hook checks).
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
 - The engine is in early development. The same seed must give the same result within one version on every machine and on every path that exists; results may change between versions. A test that pins exact output is a snapshot: when a change to generation moves it, update it on purpose in a commit that says so ("re-pin after ..."), and list it in the PR. Nobody has to prove that no pin changed.
+- The `perf` bench's base-against-head job fails when base and head place differently on any row. A PR that changes placements on purpose adds the label `changes-placements`: the job then lists the rows that differ and passes. The label is read when the job runs, so add it and re-run the job.
 - CI must be green before merge. `just check` is optional while this is a POC.
 - One reviewer who is not the author approves each PR.
 - Lints are default (POC mode). No `unsafe`.
