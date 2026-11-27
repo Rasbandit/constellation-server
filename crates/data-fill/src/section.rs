@@ -292,6 +292,26 @@ fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
         .collect()
 }
 
+/// A group's members with one entry per item, so adding a copy costs one step per group: terms
+/// of one item and cap add their weights (at most `config::RULE_GROUP_MAX_MEMBERS` times
+/// `config::RULE_WEIGHT_MAX`). `None` when one item is named with two caps, which no single
+/// (cap, weight) says: that sum stays bytecode.
+fn merged(members: Vec<(u16, Option<u16>, u16)>) -> Option<Vec<(u16, Option<u16>, u32)>> {
+    let mut out: Vec<(u16, Option<u16>, u32)> = Vec::with_capacity(members.len());
+    let mut at: HashMap<u16, usize> = HashMap::new();
+    for (item, cap, w) in members {
+        match at.get(&item) {
+            Some(&k) if out[k].1 != cap => return None,
+            Some(&k) => out[k].2 += u32::from(w),
+            None => {
+                at.insert(item, out.len());
+                out.push((item, cap, u32::from(w)));
+            }
+        }
+    }
+    Some(out)
+}
+
 /// An operand of `size` (1 or 2) bytes, little-endian.
 fn put(out: &mut Vec<u8>, v: u16, size: u8) {
     out.extend_from_slice(&v.to_le_bytes()[..usize::from(size)]);
@@ -365,7 +385,7 @@ struct Compiler<'m> {
     code: Vec<u8>,
     dedupe: HashMap<Vec<u8>, u32>,
     /// Item groups: (item, cap, weight) members, `None` for an uncapped count.
-    groups: Vec<Vec<(u16, Option<u16>, u16)>>,
+    groups: Vec<Vec<(u16, Option<u16>, u32)>>,
     /// The world's shuffles: what an `at` read stands for ([`crate::shuffle`]).
     shuffles: Option<&'m Decl>,
     w: Widths,
@@ -721,7 +741,7 @@ pub(crate) fn compiled(m: &Value) -> R<Compiled> {
     for g in &c.groups {
         starts.push(starts[starts.len() - 1] + small::<u32>(g.len(), "group members")?);
     }
-    let members: Vec<&(u16, Option<u16>, u16)> = c.groups.iter().flatten().collect();
+    let members: Vec<&(u16, Option<u16>, u32)> = c.groups.iter().flatten().collect();
     put_packed(&mut subs[sub::GROUPS], &starts);
     put_packed(&mut subs[sub::GROUPS], &members.iter().map(|m| u32::from(m.0)).collect::<Vec<_>>());
     put_packed(
@@ -730,10 +750,7 @@ pub(crate) fn compiled(m: &Value) -> R<Compiled> {
     );
     // Only a world with a weight other than 1 has the list, so other sections keep their bytes.
     if members.iter().any(|m| m.2 != 1) {
-        put_packed(
-            &mut subs[sub::GROUPS],
-            &members.iter().map(|m| u32::from(m.2)).collect::<Vec<_>>(),
-        );
+        put_packed(&mut subs[sub::GROUPS], &members.iter().map(|m| m.2).collect::<Vec<_>>());
     }
 
     let mut out = Vec::new();
@@ -1149,17 +1166,19 @@ impl<'m> Compiler<'m> {
                     config::RULE_GROUP_MAX_MEMBERS
                 ));
             }
-            r.items.extend(members.iter().map(|m| m.0));
-            let g = match self.groups.iter().position(|x| *x == members) {
-                Some(g) => g,
-                None => {
-                    self.groups.push(members);
-                    self.groups.len() - 1
-                }
-            };
-            out.push(op::GROUP);
-            out.extend_from_slice(&small::<u16>(g, "item groups")?.to_le_bytes());
-            return Ok(());
+            if let Some(members) = merged(members) {
+                r.items.extend(members.iter().map(|m| m.0));
+                let g = match self.groups.iter().position(|x| *x == members) {
+                    Some(g) => g,
+                    None => {
+                        self.groups.push(members);
+                        self.groups.len() - 1
+                    }
+                };
+                out.push(op::GROUP);
+                out.extend_from_slice(&small::<u16>(g, "item groups")?.to_le_bytes());
+                return Ok(());
+            }
         }
         match arity {
             Some(n) if args.len() != n => return Err(format!("{p}: {name} takes two operands")),

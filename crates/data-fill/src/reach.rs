@@ -804,6 +804,8 @@ impl<'w> Reach<'w> {
         let bits = self.rules;
         bits.set(&mut self.atoms, ITEM, i, after);
         for &(g, cap, weight) in self.w.item_groups(i) {
+            // Cannot overflow: the loader bounds a group's weights to under 2^31 in all, and
+            // copies of an item to the locations of a room, so a sum stays under 2^63.
             let (g, cap) = (usize::from(g), i64::from(cap));
             self.groups[g] += i64::from(weight) * (after.min(cap) - before.min(cap));
             bits.set(&mut self.atoms, GROUP, g, self.groups[g]);

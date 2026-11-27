@@ -147,7 +147,7 @@ pub struct World {
     /// the section has them; every weight is 1 without).
     groups: (List, List, List, Option<List>),
     /// Per item, the groups it is a member of with its cap and weight there (computed at load).
-    item_groups: (Shared<u32>, Shared<(u16, u16, u16)>),
+    item_groups: (Shared<u32>, Shared<(u16, u16, u32)>),
     /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
     /// `None` for a world that declares none, and for a seed's staged world.
     shuffles: Option<Arc<Bound>>,
@@ -402,7 +402,13 @@ impl World {
         let (g_starts, e) = list(b, gd.start, gd.end)?;
         let (g_items, e) = list(b, e, gd.end)?;
         let (g_caps, e) = list(b, e, gd.end)?;
-        let g_weights = (e < gd.end).then(|| list(b, e, gd.end)).transpose()?.map(|w| w.0);
+        let (g_weights, e) = match (e < gd.end).then(|| list(b, e, gd.end)).transpose()? {
+            Some((w, e)) => (Some(w), e),
+            None => (None, e),
+        };
+        if e != gd.end {
+            return Err(bad("bytes after the item group lists"));
+        }
         let lc = dir[sub::LOCATIONS].clone();
         let (vanilla, _) = list(b, lc.start, lc.end)?;
         let t = dir[sub::TIME].start;
@@ -539,10 +545,16 @@ impl World {
             || self.at(starts, n) as usize != items.len
             || caps.len != items.len
             || weights.is_some_and(|w| w.len != items.len)
+            // One encoding per world: a list of only 1s is written as no list.
+            || weights.is_some_and(|w| (0..w.len).all(|k| self.at(w, k) == 1))
         {
             return Err(bad("item group lists"));
         }
-        let mut per: Vec<Vec<(u16, u16, u16)>> = vec![Vec::new(); self.counts[ITEMS]];
+        let mut per: Vec<Vec<(u16, u16, u32)>> = vec![Vec::new(); self.counts[ITEMS]];
+        // What merged terms can add up to (`section::merged`). It keeps every sum far inside
+        // `i64`: under 2^31 per copy of an item, and copies are bounded by locations.
+        let total_max =
+            config::RULE_WEIGHT_MAX.unsigned_abs() * config::RULE_GROUP_MAX_MEMBERS as u64;
         for g in 0..n {
             let (a, z) = (self.at(starts, g) as usize, self.at(starts, g + 1) as usize);
             if a > z {
@@ -551,20 +563,24 @@ impl World {
             if z - a > config::RULE_GROUP_MAX_MEMBERS {
                 return Err(bad("item group has too many members"));
             }
+            let mut total = 0u64;
             for k in a..z {
                 let i = self.at(items, k) as usize;
                 let cap = self.at(caps, k);
                 let cap =
                     if cap == 0 { u16::MAX } else { u16::try_from(cap - 1).unwrap_or(u16::MAX) };
                 let weight = self.weight(k);
-                if i64::from(weight) > config::RULE_WEIGHT_MAX {
-                    return Err(bad("group weight out of range"));
+                total += u64::from(weight);
+                if total > total_max {
+                    return Err(bad("group weights out of range"));
                 }
-                per.get_mut(i).ok_or_else(|| bad("group member out of range"))?.push((
-                    u16::try_from(g).unwrap_or(0),
-                    cap,
-                    u16::try_from(weight).unwrap_or(0),
-                ));
+                let g = u16::try_from(g).unwrap_or(0);
+                let of = per.get_mut(i).ok_or_else(|| bad("group member out of range"))?;
+                // One entry per item and group, so a copy costs one step per group.
+                if of.last().is_some_and(|x| x.0 == g) {
+                    return Err(bad("item named twice in one group"));
+                }
+                of.push((g, cap, weight));
             }
         }
         let mut at = vec![0u32];
@@ -587,20 +603,20 @@ impl World {
     pub(crate) fn group_members(
         &self,
         g: usize,
-    ) -> impl Iterator<Item = (u16, Option<u16>, u16)> + '_ {
+    ) -> impl Iterator<Item = (u16, Option<u16>, u32)> + '_ {
         let (starts, items, caps, _) = self.groups;
         (self.at(starts, g) as usize..self.at(starts, g + 1) as usize).map(move |k| {
             let cap = self.at(caps, k);
             (
                 u16::try_from(self.at(items, k)).unwrap_or(0),
                 cap.checked_sub(1).map(|c| u16::try_from(c).unwrap_or(0)),
-                u16::try_from(self.weight(k)).unwrap_or(0),
+                self.weight(k),
             )
         })
     }
 
     /// Groups item `i` is a member of, with its cap (`u16::MAX` for none) and weight there.
-    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16, u16)] {
+    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16, u32)] {
         let (at, m) = &self.item_groups;
         &m[at[i] as usize..at[i + 1] as usize]
     }

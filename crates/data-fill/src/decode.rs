@@ -134,14 +134,28 @@ fn i(w: &World, pc: usize) -> (Value, usize) {
         Node::Count(x) => (json!({"count": w.item_key(x)}), at),
         Node::Counter(c) => (json!({"counter": w.counter_key(usize::from(c))}), at),
         Node::Group(g) => {
+            // Terms the compiler merges back into these members: a weight past the largest
+            // literal in parts of at most that, and a lone member with a zero-weight twin (the
+            // compiler makes a group of two terms or more).
+            let most = u32::try_from(config::RULE_WEIGHT_MAX).unwrap_or(u32::MAX);
             let mut args = vec![json!("+")];
-            args.extend(w.group_members(usize::from(g)).map(|(item, cap, weight)| {
+            for (item, cap, weight) in w.group_members(usize::from(g)) {
                 let copies = match cap {
                     None => json!({"count": w.item_key(item)}),
                     Some(c) => json!({"int": ["min", {"count": w.item_key(item)}, c]}),
                 };
-                if weight == 1 { copies } else { json!({"int": ["*", copies, weight]}) }
-            }));
+                let mut parts = vec![most; (weight / most) as usize];
+                if weight % most > 0 || parts.is_empty() {
+                    parts.insert(0, weight % most);
+                }
+                if parts.len() == 1 && w.group_members(usize::from(g)).nth(1).is_none() {
+                    parts.push(0);
+                }
+                args.extend(parts.into_iter().map(|p| match p {
+                    1 => copies.clone(),
+                    p => json!({"int": ["*", copies.clone(), p]}),
+                }));
+            }
             (json!({"int": args}), at)
         }
         Node::Opt(o) => (json!({"opt": w.option_key(usize::from(o))}), at),
