@@ -135,7 +135,6 @@ pub fn two_rooms() -> World {
 
 /// Tidewell Isle: 9 regions, 17 checks, 4 options, a coupled entrance shuffle over three
 /// doors from the dock, and a shuffle of two wardens whose rules the exits behind them read.
-#[allow(clippy::too_many_lines)]
 pub fn tidewell() -> World {
     let f = F::default();
     let opt = |key: &str, ty: &str, values: &[&str], range: Option<(i64, i64)>, default: Lit| Opt {

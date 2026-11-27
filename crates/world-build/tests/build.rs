@@ -411,3 +411,103 @@ fn the_front_end_is_one_function_and_reads_nothing_yet() {
     assert_eq!(e.len(), 1);
     assert!(e[0].to_string().starts_with("world.yaml: no front end reads world files yet"));
 }
+
+#[test]
+fn long_arithmetic_and_deep_def_chains_are_errors_not_stack_overflows() {
+    let long = "count(oar)".to_owned() + &" * 1".repeat(100_000) + " >= 1";
+    assert!(errors(&with_check_rule("bollard", &long, P)).iter().any(|e| e.contains("deep")));
+    let wide = "count(oar)".to_owned() + &" + count(oar)".repeat(10_000) + " >= 1";
+    fails(&with_check_rule("bollard", &wide, P), "terms in one sum", P);
+    // 64 defs, each 60 `not`s over the one before: every rule within its own cap, the chain not.
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push((f.s("d0"), f.r("opt.tricky_climbs")));
+    for k in 1..64 {
+        w.defs.push((f.s(&format!("d{k}")), f.r(&("not ".repeat(60) + &format!("d{}", k - 1)))));
+    }
+    let all = errors(&w).join("\n");
+    assert!(all.contains("nest more than 256 deep, counting the defs"), "{all}");
+}
+
+#[test]
+fn a_def_in_a_settled_field_is_inlined_and_checked_as_that_field() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.defs.push((f.s("stalls_on"), f.r("opt.market_stalls")));
+    for c in w.regions[1].checks.iter_mut().filter(|c| c.when.is_some()) {
+        c.when = Some(f.r("stalls_on"));
+    }
+    let b = built(&w);
+    assert_eq!(b.default_instance().unwrap().locations.len(), 17);
+    assert_eq!(b.instance(&[("market_stalls".to_owned(), 0)].into()).unwrap().locations.len(), 15);
+    // A def cannot carry a shuffle read, or a state read, into a settled field.
+    let mut w = tidewell();
+    w.defs.push((f.s("crab_up"), text("at.wardens.tower_door == crab", P)));
+    w.regions[0].checks[0].when = Some(f.r("crab_up"));
+    fails(&w, "cannot read a shuffle result yet", P);
+    let mut w = tidewell();
+    w.regions[0].checks[0].when = Some(f.r("can_climb"));
+    assert!(errors(&w).iter().any(|e| e.contains("`when` may read options only")));
+}
+
+#[test]
+fn a_def_with_an_error_is_reported_once_where_it_is() {
+    let mut w = with_check_rule("bollard", "bad and bad", Pos::new(901, 1));
+    w.defs.push((At::new("bad".into(), Pos::new(899, 1)), text("has(nope)", P)));
+    let all = errors(&w);
+    assert_eq!(all.len(), 1, "{all:#?}");
+    assert!(all[0].starts_with("w:900:9: unknown item `nope`"), "{all:#?}");
+}
+
+#[test]
+fn the_pool_test_tries_middle_values_of_a_range() {
+    let mut w = tidewell();
+    let f = F::default();
+    w.items[3].count = Some(f.at(13));
+    for c in w.regions[1].checks.iter_mut().filter(|c| c.when.is_some()) {
+        c.when = Some(f.r("opt.pearls_needed != 2"));
+    }
+    let all = errors(&w).join("\n");
+    assert!(all.contains("pearls_needed = 2") && all.contains("items to place"), "{all}");
+}
+
+#[test]
+fn start_items_are_capped_before_any_copy_is_written() {
+    let mut w = tidewell();
+    w.items[5].count = Some(At::new(5000, P));
+    w.start_items.push(Grant {
+        item: At::new("shell".into(), P),
+        n: Some(At::new(5000, P)),
+        when: None,
+    });
+    let all = errors(&w).join("\n");
+    assert!(all.contains("start item copies, at most 1024"), "{all}");
+}
+
+#[test]
+fn a_shuffle_that_reads_its_own_result_is_an_error() {
+    let mut w = tidewell();
+    let Some(At { v: Members::Names(things), .. }) = &mut w.shuffles[1].things else { panic!() };
+    things[0].rule = Some(text("at.wardens.grotto_gate", Pos::new(5, 1)));
+    let pos = w.shuffles[1].name.pos;
+    fails(&w, "reads its own result", pos);
+}
+
+#[test]
+fn an_item_group_lists_each_item_once() {
+    let mut w = tidewell();
+    w.item_groups[0].1.push(At::new("oar".into(), P));
+    fails(&w, "is in item group `tools` twice", P);
+}
+
+#[test]
+fn past_the_error_cap_the_rest_are_counted() {
+    let mut w = tidewell();
+    let f = F::default();
+    for c in w.regions.iter_mut().flat_map(|r| &mut r.checks) {
+        c.rule = f.r("has(nope) and ".repeat(20).trim_end_matches(" and "));
+    }
+    let all = errors(&w);
+    assert_eq!(all.len(), config::WORLD_BUILD_MAX_ERRORS + 1);
+    assert!(all.last().unwrap().contains("140 more errors"), "{:?}", all.last());
+}

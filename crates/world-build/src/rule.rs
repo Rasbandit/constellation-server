@@ -32,8 +32,6 @@ impl Cmp {
 /// An arithmetic operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arith {
-    /// `+`
-    Add,
     /// `-`
     Sub,
     /// `*`
@@ -76,7 +74,9 @@ pub enum E {
     Cmp(Cmp, Box<Expr>, Box<Expr>),
     /// `a in [b, c]`.
     In(Box<Expr>, Vec<Expr>),
-    /// `a + b` and the rest.
+    /// `a + b + ...`: one node for a chain, so a long sum does not nest.
+    Sum(Vec<Expr>),
+    /// `a - b`, `a * b`, `a div b`, `a mod b`.
     Arith(Arith, Box<Expr>, Box<Expr>),
 }
 
@@ -98,6 +98,9 @@ enum Tok {
     Star,
 }
 
+/// Words that are operators, so a `-` right after one starts a literal.
+const KEYWORDS: [&str; 6] = ["and", "or", "not", "in", "div", "mod"];
+
 fn lex(src: &str) -> Result<Vec<(Tok, usize)>, Fail> {
     let chars: Vec<char> = src.chars().collect();
     let mut out: Vec<(Tok, usize)> = Vec::new();
@@ -105,8 +108,11 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, Fail> {
     while i < chars.len() {
         let c = chars[i];
         let start = i;
-        let operand_before =
-            matches!(out.last(), Some((Tok::Name(_) | Tok::Int(_) | Tok::Close | Tok::RBrack, _)));
+        let operand_before = match out.last() {
+            Some((Tok::Name(n), _)) => !KEYWORDS.contains(&n.as_str()),
+            Some((Tok::Int(_) | Tok::Close | Tok::RBrack, _)) => true,
+            _ => false,
+        };
         let tok = match c {
             c if c.is_whitespace() => {
                 i += 1;
@@ -250,6 +256,11 @@ fn ex(e: E, at: usize) -> Expr {
     Expr { e, at, paren: false }
 }
 
+/// One term as itself, several as a sum.
+fn chain(mut terms: Vec<Expr>, at: usize) -> Expr {
+    if terms.len() == 1 { terms.remove(0) } else { ex(E::Sum(terms), at) }
+}
+
 impl P {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.k).map(|x| &x.0)
@@ -345,35 +356,53 @@ impl P {
         Ok(ex(e, at))
     }
 
+    /// A chain of `+` is one [`E::Sum`]; each `-` nests, so it counts against the depth cap.
     fn sum(&mut self) -> Result<Expr, Fail> {
-        let mut left = self.product()?;
-        loop {
-            let op = match self.peek() {
-                Some(Tok::Plus) => Arith::Add,
-                Some(Tok::Minus) => Arith::Sub,
-                _ => return Ok(left),
-            };
-            self.k += 1;
-            let right = self.product()?;
-            let at = left.at;
-            left = ex(E::Arith(op, Box::new(left), Box::new(right)), at);
-        }
+        let first = self.product()?;
+        let at = first.at;
+        let mut terms = vec![first];
+        let mut nested = 0;
+        let out = loop {
+            match self.peek() {
+                Some(Tok::Plus) => {
+                    self.k += 1;
+                    terms.push(self.product()?);
+                }
+                Some(Tok::Minus) => {
+                    self.k += 1;
+                    self.enter()?;
+                    nested += 1;
+                    let left = chain(std::mem::take(&mut terms), at);
+                    let right = self.product()?;
+                    terms.push(ex(E::Arith(Arith::Sub, Box::new(left), Box::new(right)), at));
+                }
+                _ => break chain(terms, at),
+            }
+        };
+        self.depth -= nested;
+        Ok(out)
     }
 
+    /// Each `*`, `div` and `mod` nests, so it counts against the depth cap.
     fn product(&mut self) -> Result<Expr, Fail> {
         let mut left = self.atom()?;
+        let mut nested = 0;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => Arith::Mul,
                 Some(Tok::Name(n)) if n == "div" => Arith::Div,
                 Some(Tok::Name(n)) if n == "mod" => Arith::Mod,
-                _ => return Ok(left),
+                _ => break,
             };
             self.k += 1;
+            self.enter()?;
+            nested += 1;
             let right = self.atom()?;
             let at = left.at;
             left = ex(E::Arith(op, Box::new(left), Box::new(right)), at);
         }
+        self.depth -= nested;
+        Ok(left)
     }
 
     /// Comma-separated expressions up to `close`.
@@ -451,9 +480,9 @@ mod tests {
                 format!("({s} {} {})", sx(a), sx(b))
             }
             E::In(a, xs) => format!("(in {} {})", sx(a), list("list", xs)),
+            E::Sum(xs) => list("+", xs),
             E::Arith(op, a, b) => {
                 let s = match op {
-                    Arith::Add => "+",
                     Arith::Sub => "-",
                     Arith::Mul => "*",
                     Arith::Div => "div",
@@ -519,6 +548,9 @@ mod tests {
         // A minus right after an operand is subtraction; elsewhere it starts a literal.
         assert_eq!(p("opt.a -3 >= 0"), "(>= (- opt.a 3) 0)");
         assert_eq!(p("min(-3, 2) >= -1"), "(>= (min -3 2) -1)");
+        assert_eq!(p("a or -3 > 1"), "(or a (> -3 1))");
+        assert_eq!(p("not -1 < opt.k and -2 < 0"), "(and (not (< -1 opt.k)) (< -2 0))");
+        assert_eq!(p("a + b - c + d"), "(+ (- (+ a b) c) d)");
     }
 
     #[test]
@@ -556,10 +588,15 @@ mod tests {
         let n = config::WORLD_RULE_MAX_DEPTH;
         let ok = "(".repeat(n - 1) + "a" + &")".repeat(n - 1);
         assert!(parse(&ok).is_ok());
+        // A sum does not nest, however long.
+        assert!(parse(&("a".to_owned() + &" + a".repeat(10_000))).is_ok());
         for deep in [
             "(".repeat(100_000) + "a" + &")".repeat(100_000),
             "not ".repeat(100_000) + "a",
             "has(".repeat(100_000) + "a" + &")".repeat(100_000),
+            "a".to_owned() + &" * a".repeat(100_000),
+            "a".to_owned() + &" div 2".repeat(100_000),
+            "a".to_owned() + &" - 1".repeat(100_000),
         ] {
             assert!(fail(&deep).1.contains("deep"));
         }

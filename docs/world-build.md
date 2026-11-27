@@ -39,7 +39,7 @@ Run the tests: `cargo test -p world-build`. The end-to-end test builds Tidewell,
 | `not a` | `not` | Options and shuffle name tests only (D-132). |
 | `has(x)`, `has(x, n)` | `has`, with `n` only when it is not 1 | `n` a literal, 0 to 255 (engine limit). |
 | `has_all(..)`, `has_any(..)` | same, items sorted | |
-| a def's name | `ref` | Cycles are errors. |
+| a def's name | `ref` | Cycles are errors. Inlined in fields settled from options. |
 | an event's name | `counter >= 1` | |
 | `opt.k` (toggle) | `opt.k != 0` | Other option types must be compared. |
 | `opt.k == value` (choice) | `eq` with the value's position | Also `!=` and `opt.k in [a, b]`. |
@@ -61,11 +61,13 @@ Each error names the line, the column and what to do.
 - Format rule b (D-133): dotted names that are not options or shuffle reads.
 - Format rule c (D-134): check and region `when`, `no_progression`, `start_items` and `assumed` conditions read options only, never state or a shuffle result.
 - Items: class, count bounds, `fill_with` items and weights, `holds` with no copy left, start items, placement sets (an item in one set).
-- Pool (doc 16 section 3.4): every combination of the options the counts read (ranges at their two ends), up to 4,096; too many items for the checks names the options.
+- Pool (doc 16 section 3.4): every combination of the options the counts read; past 4,096, every combination of each option's lowest and highest value; past that, each option alone at its two ends, with a warning. Too many items for the checks names the settings. Counts are checked before any copy is written out, and start items are capped.
 - Shuffles, the engine's first slice: exit shuffles (`layout`) and free-name shuffles (`none`). Refused: `when`, `pin`, `vanilla`, `pool`, `after`, `kind`, `scope`, thing fields other than `rule` and `group`, row fields `again` and `when`, `check: reach`, a `coupled` that reads options, coupling on a name shuffle, the reserved names `layout` and `own_fill`, and any name a row or slot list does not have.
+- Nesting: a rule string nests at most 64 deep as written (a sum is one node however long), and lowering counts the defs a rule reaches against the engine's own cap of 256, so no input exhausts the stack.
+- Shuffles whose things' rules read each other in a cycle, a shuffle reading itself included.
 - Fields the model carries but this version does not build (`rolls`, `contexts`, `require`, `stays`, ...) are reported as not supported yet.
 
-Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERRORS` (200), `WORLD_POOL_TEST_MAX_COMBINATIONS` (4,096). All design values.
+Limits are in `crates/config`: `WORLD_RULE_MAX_DEPTH` (64), `WORLD_BUILD_MAX_ERRORS` (200, the rest counted in one last line), `WORLD_POOL_TEST_MAX_COMBINATIONS` (4,096), `WORLD_ITEM_COPIES_MAX` (32,767), `WORLD_OPTIONS_MAX` (256, the engine's), `WORLD_START_COPIES_MAX` (1,024). All design values except the engine's.
 
 ## Choices made where doc 16 is silent
 

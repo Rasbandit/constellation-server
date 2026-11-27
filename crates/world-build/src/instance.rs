@@ -8,7 +8,7 @@ use data_fill::Instance;
 use serde_json::Value;
 
 use crate::lower::OptTy;
-use crate::world::{Errs, Model, NOTHING};
+use crate::world::{Errs, Model, NOTHING, OptM};
 
 /// An options-only integer expression's value (the build lets nothing else into these).
 fn int(v: &Value, o: &HashMap<&str, i64>) -> Option<i64> {
@@ -71,11 +71,7 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
     let mut o: HashMap<&str, i64> = HashMap::new();
     for opt in &m.options {
         let v = given.get(&opt.key).copied().unwrap_or(opt.default);
-        let (lo, hi) = match &opt.ty {
-            OptTy::Toggle => (0, 1),
-            OptTy::Choice(vs) => (0, i64::try_from(vs.len()).unwrap_or(1) - 1),
-            OptTy::Range(lo, hi) => (*lo, *hi),
-        };
+        let (lo, hi) = bounds(&opt.ty);
         if !(lo..=hi).contains(&v) {
             return Err(format!("option {:?}: {v} is outside {lo} to {hi}", opt.key));
         }
@@ -104,10 +100,11 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
             inst.location_groups.insert(c.key.clone(), s.clone());
         }
     }
+    let mut granted = Vec::new();
     for g in &m.start_items {
         if holds(&g.when)? {
-            inst.start_inventory.extend((0..g.n).map(|_| g.item.clone()));
             *taken.entry(&g.item).or_default() += g.n;
+            granted.push(g);
         }
     }
     for g in &m.assumed {
@@ -115,8 +112,11 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
             *inst.logic_start.entry(g.item.clone()).or_default() += g.n;
         }
     }
+    // Every count is checked before any copy is written out, so a world's numbers never
+    // decide how much memory this takes: the pool is at most the checks, the start items at
+    // most their cap.
     let mut placed = 0i64;
-    for (key, class, count) in &m.items {
+    for (key, _, count) in &m.items {
         let n = count - taken.get(key.as_str()).copied().unwrap_or(0);
         if n < 0 {
             return Err(format!(
@@ -124,13 +124,24 @@ pub(crate) fn of(m: &Model, given: &HashMap<String, i64>) -> Result<Instance, St
                 count - n
             ));
         }
-        inst.pool.extend((0..n).map(|_| key.clone()));
-        inst.pool_class.insert(key.clone(), class.clone());
         placed += n;
     }
     let slots = i64::try_from(inst.locations.len() - inst.locked.len()).unwrap_or(i64::MAX);
     if placed > slots {
         return Err(format!("{placed} items to place and {slots} checks to hold them"));
+    }
+    let start: i64 = granted.iter().map(|g| g.n).sum();
+    let most = config::WORLD_START_COPIES_MAX;
+    if start > i64::try_from(most).unwrap_or(i64::MAX) {
+        return Err(format!("{start} start item copies, at most {most}"));
+    }
+    for g in granted {
+        inst.start_inventory.extend((0..g.n).map(|_| g.item.clone()));
+    }
+    for (key, class, count) in &m.items {
+        let n = count - taken.get(key.as_str()).copied().unwrap_or(0);
+        inst.pool.extend((0..n).map(|_| key.clone()));
+        inst.pool_class.insert(key.clone(), class.clone());
     }
     for (k, n) in split(slots - placed, &m.fill_with) {
         inst.pool.extend((0..n).map(|_| k.clone()));
@@ -167,48 +178,85 @@ fn read_options(m: &Model) -> Vec<String> {
 }
 
 /// Doc 16 section 3.4: too many items for the checks is an error at build time. Every
-/// combination of the options the counts read is tried (a range at its two ends), up to
-/// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`]; past it the test is skipped with a warning.
+/// combination of the options the counts read is tried; when there are more than
+/// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
+/// highest value; when those are still too many, each option alone at its two ends (with a
+/// warning). Generation checks the actual settings again.
 pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
-    let keys = read_options(m);
-    let values: Vec<Vec<i64>> = keys
-        .iter()
-        .filter_map(|k| m.options.iter().find(|o| o.key == *k))
-        .map(|o| match &o.ty {
-            OptTy::Toggle => vec![0, 1],
-            OptTy::Choice(vs) => (0..i64::try_from(vs.len()).unwrap_or(0)).collect(),
-            OptTy::Range(lo, hi) if lo == hi => vec![*lo],
-            OptTy::Range(lo, hi) => vec![*lo, *hi],
-        })
-        .collect();
-    let combos = values.iter().try_fold(1usize, |n, v| n.checked_mul(v.len()));
+    let opts: Vec<&OptM> =
+        read_options(m).iter().filter_map(|k| m.options.iter().find(|o| o.key == *k)).collect();
     let most = config::WORLD_POOL_TEST_MAX_COMBINATIONS;
-    if combos.is_none_or(|n| n > most) {
+    let ends = |o: &OptM| {
+        let (lo, hi) = bounds(&o.ty);
+        if lo == hi { vec![lo] } else { vec![lo, hi] }
+    };
+    // Sizes first: a range's values are written out only when they fit.
+    let sizes: Vec<u128> = opts
+        .iter()
+        .map(|o| bounds(&o.ty))
+        .map(|(lo, hi)| (hi - lo + 1).unsigned_abs().into())
+        .collect();
+    let fits = |sizes: &[u128]| {
+        sizes.iter().try_fold(1u128, |n, s| n.checked_mul(*s)).is_some_and(|n| n <= most as u128)
+    };
+    let grid: Vec<Vec<i64>> = if fits(&sizes) {
+        opts.iter()
+            .map(|o| {
+                let (lo, hi) = bounds(&o.ty);
+                (lo..=hi).collect()
+            })
+            .collect()
+    } else if fits(&opts.iter().map(|o| ends(o).len() as u128).collect::<Vec<_>>()) {
+        opts.iter().map(|o| ends(o)).collect()
+    } else {
         errs.warn_whole(
-            format!("the pool test was skipped: over {most} option combinations"),
+            format!(
+                "the pool test tried each option alone at its two ends: over {most} combinations"
+            ),
             "generation still checks the pool for the actual settings",
         );
+        for o in &opts {
+            for v in ends(o) {
+                if !fill(m, &[(o.key.clone(), v)], errs) {
+                    return;
+                }
+            }
+        }
         return;
-    }
-    let mut at = vec![0usize; values.len()];
+    };
+    let mut at = vec![0usize; grid.len()];
     loop {
-        let given: HashMap<String, i64> =
-            keys.iter().zip(&at).zip(&values).map(|((k, i), v)| (k.clone(), v[*i])).collect();
-        if let Err(e) = of(m, &given) {
-            let mut set: Vec<String> = given.iter().map(|(k, v)| format!("{k} = {v}")).collect();
-            set.sort();
-            let with =
-                if set.is_empty() { String::new() } else { format!(" with {}", set.join(", ")) };
-            errs.whole(
-                format!("the pool does not fit{with}: {e}"),
-                "lower item counts or start items, or add checks",
-            );
+        let given: Vec<(String, i64)> =
+            opts.iter().zip(&at).zip(&grid).map(|((o, i), v)| (o.key.clone(), v[*i])).collect();
+        if !fill(m, &given, errs) {
             return;
         }
-        let Some(k) = (0..at.len()).find(|k| at[*k] + 1 < values[*k].len()) else { return };
+        let Some(k) = (0..at.len()).find(|k| at[*k] + 1 < grid[*k].len()) else { return };
         at[k] += 1;
         at[..k].iter_mut().for_each(|x| *x = 0);
     }
+}
+
+/// An option's lowest and highest value.
+fn bounds(ty: &OptTy) -> (i64, i64) {
+    match ty {
+        OptTy::Toggle => (0, 1),
+        OptTy::Choice(vs) => (0, i64::try_from(vs.len()).unwrap_or(1) - 1),
+        OptTy::Range(lo, hi) => (*lo, *hi),
+    }
+}
+
+/// Whether the pool fits with `given`; when not, the error, naming the settings.
+fn fill(m: &Model, given: &[(String, i64)], errs: &mut Errs) -> bool {
+    let Err(e) = of(m, &given.iter().cloned().collect()) else { return true };
+    let mut set: Vec<String> = given.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+    set.sort();
+    let with = if set.is_empty() { String::new() } else { format!(" with {}", set.join(", ")) };
+    errs.whole(
+        format!("the pool does not fit{with}: {e}"),
+        "lower item counts or start items, or add checks",
+    );
+    false
 }
 
 #[cfg(test)]

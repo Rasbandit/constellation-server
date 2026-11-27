@@ -91,10 +91,23 @@ pub(crate) struct Lower<'a> {
     errs: &'a mut Errs,
     /// Lowered defs by name, for the manifest.
     pub defs: BTreeMap<String, Value>,
-    /// Per def: `None` while it is being lowered (a cycle guard), else whether it reads state.
-    state: HashMap<String, Option<bool>>,
+    /// Per def: being lowered (a cycle guard), failed, or done and whether it reads state.
+    state: HashMap<String, DefState>,
+    /// Per lowered def: how deep its body nests, defs it reaches included.
+    below: HashMap<String, usize>,
     place: Place,
-    def_depth: usize,
+    /// Rule nodes open in the recursion, defs reached through a name included.
+    depth: usize,
+    /// The deepest the recursion went since it was last reset (per def body).
+    peak: usize,
+}
+
+/// Where a def's lowering stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefState {
+    Busy,
+    Failed,
+    Done(bool),
 }
 
 type L = Option<(Value, bool)>;
@@ -109,7 +122,16 @@ fn t() -> Value {
 impl<'a> Lower<'a> {
     pub(crate) fn new(names: &'a Names, errs: &'a mut Errs) -> Self {
         let place = Place { base: Pos::default(), one_line: true };
-        Lower { names, errs, defs: BTreeMap::new(), state: HashMap::new(), place, def_depth: 0 }
+        Lower {
+            names,
+            errs,
+            defs: BTreeMap::new(),
+            state: HashMap::new(),
+            below: HashMap::new(),
+            place,
+            depth: 0,
+            peak: 0,
+        }
     }
 
     pub(crate) fn errs(&mut self) -> &mut Errs {
@@ -132,6 +154,11 @@ impl<'a> Lower<'a> {
     /// A rule as written in the file: `true`, `false`, or a rule string. Returns the tree and
     /// whether it reads state (items, events, counters, reached regions).
     pub(crate) fn rule(&mut self, n: &RuleAt, mode: Mode) -> L {
+        self.rule_as(n, mode, true)
+    }
+
+    /// [`Lower::rule`], warning about mixed `and` and `or` only when `warn`.
+    fn rule_as(&mut self, n: &RuleAt, mode: Mode, warn: bool) -> L {
         let text = match &n.v {
             Rule::Const(b) => return Some((json!({b.to_string(): {}}), false)),
             Rule::Text(text) => text,
@@ -141,7 +168,7 @@ impl<'a> Lower<'a> {
         let out = match parse(text) {
             Err((at, msg)) => self.err(at, msg, ""),
             Ok(parsed) => {
-                for at in parsed.mixed {
+                for at in parsed.mixed.into_iter().filter(|_| warn) {
                     let p = self.pos(at);
                     self.errs.warn(
                         p,
@@ -156,11 +183,16 @@ impl<'a> Lower<'a> {
         out
     }
 
-    /// The tree for a def by name and whether it reads state, lowering it on first use.
+    /// Whether a def reads state, lowering it on first use. The recursion it adds counts
+    /// against the one depth cap whether the def is lowered now or was earlier.
     fn def(&mut self, name: &str, at: usize) -> Option<bool> {
-        match self.state.get(name) {
-            Some(Some(state)) => return Some(*state),
-            Some(None) => {
+        match self.state.get(name).copied() {
+            Some(DefState::Done(state)) => {
+                let below = self.below.get(name).copied().unwrap_or(0);
+                self.deep(self.depth + below, at)?;
+                return Some(state);
+            }
+            Some(DefState::Busy) => {
                 self.err(
                     at,
                     format!("def `{name}` refers to itself through other defs"),
@@ -168,22 +200,52 @@ impl<'a> Lower<'a> {
                 );
                 return None;
             }
+            // Its own error is reported where it is.
+            Some(DefState::Failed) => return None,
             None => {}
         }
-        if self.def_depth >= config::WORLD_RULE_MAX_DEPTH {
-            let most = config::WORLD_RULE_MAX_DEPTH;
-            self.err(at, format!("defs refer to defs more than {most} deep"), "");
+        let node = self.names.defs.get(name)?.clone();
+        self.state.insert(name.to_owned(), DefState::Busy);
+        let (base, outer) = (self.depth, self.peak);
+        self.peak = base;
+        let out = self.rule(&node, Mode::Rule);
+        self.below.insert(name.to_owned(), self.peak - base);
+        self.peak = self.peak.max(outer);
+        let Some((v, state)) = out else {
+            self.state.insert(name.to_owned(), DefState::Failed);
+            return None;
+        };
+        self.defs.insert(name.to_owned(), v);
+        self.state.insert(name.to_owned(), DefState::Done(state));
+        Some(state)
+    }
+
+    /// The recursion reaches `deep` nodes: within the engine's cap, or an error. Lowering
+    /// recurses once per node, so this is what bounds its stack, as the engine's own cap
+    /// bounds the loader's.
+    fn deep(&mut self, deep: usize, at: usize) -> Option<()> {
+        self.peak = self.peak.max(deep);
+        let most = config::RULES_MAX_DEPTH as usize;
+        if deep > most {
+            self.err(
+                at,
+                format!("rules nest more than {most} deep, counting the defs they use"),
+                "flatten a def chain, or split the rule",
+            );
             return None;
         }
-        let node = self.names.defs.get(name)?.clone();
-        self.state.insert(name.to_owned(), None);
-        self.def_depth += 1;
-        let out = self.rule(&node, Mode::Rule);
-        self.def_depth -= 1;
-        let (v, state) = out?;
-        self.defs.insert(name.to_owned(), v);
-        self.state.insert(name.to_owned(), Some(state));
-        Some(state)
+        Some(())
+    }
+
+    /// One level deeper for the duration of `f`.
+    fn nested(&mut self, at: usize, f: impl FnOnce(&mut Self) -> L) -> L {
+        self.depth += 1;
+        let out = match self.deep(self.depth, at) {
+            Some(()) => f(self),
+            None => None,
+        };
+        self.depth -= 1;
+        out
     }
 
     /// Lower every def, used or not, so each is checked and in the manifest.
@@ -285,14 +347,14 @@ impl<'a> Lower<'a> {
 
     /// A rule node.
     fn b(&mut self, e: &Expr, mode: Mode) -> L {
-        let out = self.b_inner(e, mode)?;
+        let out = self.nested(e.at, |s| s.b_inner(e, mode))?;
         self.state_ok(mode, e.at, out.1).then_some(out)
     }
 
     fn b_inner(&mut self, e: &Expr, mode: Mode) -> L {
         match &e.e {
             E::Bool(b) => Some((json!({b.to_string(): {}}), false)),
-            E::Int(_) | E::Arith(..) => {
+            E::Int(_) | E::Sum(_) | E::Arith(..) => {
                 self.err(e.at, "a number is not a rule", "compare it, as in `count(x) >= 2`")
             }
             E::Name(n) => match self.dotted(n, e.at)? {
@@ -306,6 +368,12 @@ impl<'a> Lower<'a> {
                 Dotted::Bare(n) => match self.sort_of(n) {
                     Some(Sort::Def) => {
                         let state = self.def(n, e.at)?;
+                        if let Mode::Static(_) = mode {
+                            // A settled field is folded from options by the per-seed step, which
+                            // reads no defs: the body goes inline, checked as that field.
+                            let node = self.names.defs.get(n)?.clone();
+                            return self.rule_as(&node, mode, false);
+                        }
                         Some((json!({"ref": n}), state))
                     }
                     Some(Sort::Event) => Some((json!({"ge": [{"counter": n}, 1]}), true)),
@@ -565,6 +633,10 @@ impl<'a> Lower<'a> {
 
     /// An integer node, and whether it reads state.
     fn i(&mut self, e: &Expr) -> L {
+        self.nested(e.at, |s| s.i_inner(e))
+    }
+
+    fn i_inner(&mut self, e: &Expr) -> L {
         match &e.e {
             E::Int(n) => {
                 if i16::try_from(*n).is_err() {
@@ -596,6 +668,7 @@ impl<'a> Lower<'a> {
                 }
             }
             E::Call(f, args) => self.int_call(f, args, e.at),
+            E::Sum(xs) => self.sum(xs, e.at),
             E::Arith(op, x, y) => self.arith(*op, x, y, e.at),
             _ => self.err(e.at, "expected a number here, found a rule", ""),
         }
@@ -656,6 +729,34 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A sum: one `+` node over every term, parenthesized sums included (a sum of counts is
+    /// then one counter read for the engine).
+    fn sum(&mut self, xs: &[Expr], at: usize) -> L {
+        let mut terms = Vec::new();
+        let mut todo: Vec<&Expr> = xs.iter().rev().collect();
+        while let Some(t) = todo.pop() {
+            match &t.e {
+                E::Sum(inner) => todo.extend(inner.iter().rev()),
+                _ => terms.push(t),
+            }
+        }
+        if terms.len() > usize::from(u8::MAX) {
+            return self.err(
+                at,
+                format!("{} terms in one sum; the engine takes at most 255", terms.len()),
+                "",
+            );
+        }
+        let mut out = vec![json!("+")];
+        let mut state = false;
+        for t in terms {
+            let (v, s) = self.i(t)?;
+            out.push(v);
+            state |= s;
+        }
+        Some((json!({"int": out}), state))
+    }
+
     fn arith(&mut self, op: Arith, x: &Expr, y: &Expr, at: usize) -> L {
         match op {
             Arith::Sub | Arith::Mod => {
@@ -665,28 +766,6 @@ impl<'a> Lower<'a> {
                     format!("`{s}` is not supported yet: the engine cannot evaluate it"),
                     "doc 16 allows it over options only, folded before the fill, which the engine does not do yet",
                 )
-            }
-            Arith::Add => {
-                // A chain of sums is one sum, so a sum of counts stays one counter read.
-                let mut terms = vec![x, y];
-                while let Some(k) =
-                    terms.iter().position(|t| matches!(t.e, E::Arith(Arith::Add, ..)) && !t.paren)
-                {
-                    let E::Arith(_, a, b) = &terms[k].e else { break };
-                    let (a, b) = (a.as_ref(), b.as_ref());
-                    terms.splice(k..=k, [a, b]);
-                }
-                let mut out = vec![json!("+")];
-                let mut state = false;
-                for t in terms {
-                    let (v, s) = self.i(t)?;
-                    out.push(v);
-                    state |= s;
-                }
-                if out.len() > usize::from(u8::MAX) + 1 {
-                    return self.err(at, "more than 255 terms in one sum", "");
-                }
-                Some((json!({"int": out}), state))
             }
             Arith::Mul | Arith::Div => {
                 let (a, sa) = self.i(x)?;

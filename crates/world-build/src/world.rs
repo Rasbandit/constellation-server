@@ -29,11 +29,13 @@ pub(crate) struct Errs {
     file: String,
     pub errors: Vec<Error>,
     pub warnings: Vec<Error>,
+    /// Errors and warnings past the cap, dropped.
+    dropped: usize,
 }
 
 impl Errs {
     fn new(file: &str) -> Self {
-        Errs { file: file.to_owned(), errors: Vec::new(), warnings: Vec::new() }
+        Errs { file: file.to_owned(), errors: Vec::new(), warnings: Vec::new(), dropped: 0 }
     }
 
     fn make(&self, pos: Option<Pos>, msg: impl Into<String>, help: &str) -> Error {
@@ -41,7 +43,8 @@ impl Errs {
         Error { file: self.file.clone(), pos, msg: msg.into(), help }
     }
 
-    /// An error at `pos`; past [`config::WORLD_BUILD_MAX_ERRORS`] they are counted, not kept.
+    /// An error at `pos`. Past [`config::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
+    /// are dropped and [`Errs::finish`] says how many.
     pub(crate) fn err(&mut self, pos: Pos, msg: impl Into<String>, help: &str) {
         self.push(Some(pos), msg, help);
     }
@@ -55,17 +58,40 @@ impl Errs {
         if self.errors.len() < config::WORLD_BUILD_MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.errors.push(e);
+        } else {
+            self.dropped += 1;
         }
     }
 
     pub(crate) fn warn(&mut self, pos: Pos, msg: impl Into<String>, help: &str) {
-        let e = self.make(Some(pos), msg, help);
-        self.warnings.push(e);
+        self.warning(Some(pos), msg, help);
     }
 
     pub(crate) fn warn_whole(&mut self, msg: impl Into<String>, help: &str) {
-        let e = self.make(None, msg, help);
-        self.warnings.push(e);
+        self.warning(None, msg, help);
+    }
+
+    fn warning(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
+        if self.warnings.len() < config::WORLD_BUILD_MAX_ERRORS {
+            let e = self.make(pos, msg, help);
+            self.warnings.push(e);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// The errors in file order, and one more line for what the cap dropped.
+    fn finish(mut self) -> Vec<Error> {
+        self.errors.sort_by_key(|e| e.pos);
+        if self.dropped > 0 {
+            let e = self.make(
+                None,
+                format!("{} more errors and warnings not shown", self.dropped),
+                "fix these and build again",
+            );
+            self.errors.push(e);
+        }
+        self.errors
     }
 }
 
@@ -209,12 +235,9 @@ pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
             Err(e) => errs.whole(format!("the manifest is not canonical: {e}"), ""),
         }
     }
-    let mut list = errs.errors;
-    list.sort_by_key(|e| e.pos);
-    Err(list)
+    Err(errs.finish())
 }
 
-#[allow(clippy::too_many_lines)] // one pass in section order reads best as one function
 fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     later(errs, &w.later, "field");
     // Header.
@@ -265,10 +288,11 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     // Options: their own namespace, read as `opt.<key>`.
     let mut names = Names::default();
     let mut options = Vec::new();
-    if w.options.len() > 256 {
+    let most = config::WORLD_OPTIONS_MAX;
+    if w.options.len() > most {
         errs.err(
-            w.options[256].key.pos,
-            format!("{} options; the engine reads at most 256", w.options.len()),
+            w.options[most].key.pos,
+            format!("{} options; the engine reads at most {most}", w.options.len()),
             "",
         );
     }
@@ -389,11 +413,11 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             }
         };
         let count = match &it.count {
-            Some(c) if (0..=32_767).contains(&c.v) => c.v,
+            Some(c) if (0..=config::WORLD_ITEM_COPIES_MAX).contains(&c.v) => c.v,
             Some(c) => {
                 errs.err(
                     c.pos,
-                    format!("count {} is outside 0 to 32767", c.v),
+                    format!("count {} is outside 0 to {}", c.v, config::WORLD_ITEM_COPIES_MAX),
                     "doc 16 section 5.3 bounds copies of one item",
                 );
                 continue;
@@ -412,8 +436,15 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             errs.err(k.pos, format!("`{}` in `fill_with` is not an item", k.v), "");
         } else if !seen.insert(k.v.clone()) {
             errs.err(k.pos, format!("`{}` is in `fill_with` twice", k.v), "");
-        } else if wt.v < 1 || wt.v > 32_767 {
-            errs.err(wt.pos, "a fill weight is a whole number from 1 to 32767", "");
+        } else if wt.v < 1 || wt.v > config::WORLD_ITEM_COPIES_MAX {
+            errs.err(
+                wt.pos,
+                format!(
+                    "a fill weight is a whole number from 1 to {}",
+                    config::WORLD_ITEM_COPIES_MAX
+                ),
+                "",
+            );
         } else {
             fill_with.push((k.v.clone(), wt.v));
         }
@@ -429,8 +460,24 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         if members.is_empty() {
             errs.err(g.pos, format!("item group `{}` is empty", g.v), "");
         }
-        for m in members.iter().filter(|m| !is_item(&m.v)) {
-            errs.err(m.pos, format!("`{}` in item group `{}` is not an item", m.v, g.v), "");
+        let mut seen = HashSet::new();
+        for m in members {
+            if !is_item(&m.v) {
+                errs.err(m.pos, format!("`{}` in item group `{}` is not an item", m.v, g.v), "");
+            } else if !seen.insert(m.v.as_str()) {
+                errs.err(m.pos, format!("`{}` is in item group `{}` twice", m.v, g.v), "");
+            }
+        }
+        if members.len() > usize::from(u8::MAX) {
+            errs.err(
+                g.pos,
+                format!(
+                    "item group `{}` has {} items; a sum the engine reads has at most 255",
+                    g.v,
+                    members.len()
+                ),
+                "",
+            );
         }
         names.item_groups.insert(g.v.clone(), members.iter().map(|m| m.v.clone()).collect());
     }
@@ -655,10 +702,10 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
                 continue;
             }
-            if !(0..=32_767).contains(&n) {
+            if !(0..=config::WORLD_ITEM_COPIES_MAX).contains(&n) {
                 lw.errs().err(
                     g.n.as_ref().map_or(g.item.pos, |n| n.pos),
-                    "a grant is 0 to 32767 copies",
+                    format!("a grant is 0 to {} copies", config::WORLD_ITEM_COPIES_MAX),
                     "",
                 );
                 continue;
@@ -682,6 +729,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             shuffles.insert(sh.name.v.clone(), v);
         }
     }
+    reads_cycle(&mut lw, w, &shuffles);
     let defs = std::mem::take(&mut lw.defs);
     drop(lw);
 
@@ -750,7 +798,6 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
 
 /// One shuffle as the engine's first slice reads it (`data_fill::shuffle`): exit slots
 /// (`layout`), or free-name slots whose things may carry rules (`none`).
-#[allow(clippy::too_many_lines)] // the two kinds side by side
 fn shuffle(
     lw: &mut Lower<'_>,
     sh: &crate::model::Shuffle,
@@ -982,4 +1029,82 @@ fn row(verb: Verb, subject: Value, object: Value) -> Value {
         Verb::DenyIn => ("things", "deny_in"),
     };
     json!({s: subject, v: object})
+}
+
+/// Every shuffle a lowered rule reads with `at`, by name.
+fn reads(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(o) => {
+            o.iter().for_each(|(k, x)| match (k.as_str(), x.as_array().map(Vec::as_slice)) {
+                ("at", Some([Value::String(s), _])) => {
+                    out.insert(s.clone());
+                }
+                _ => reads(x, out),
+            })
+        }
+        Value::Array(a) => a.iter().for_each(|x| reads(x, out)),
+        _ => {}
+    }
+}
+
+/// A shuffle runs after every shuffle its things' rules read (doc 17 section 4.3), so the reads
+/// may not go round in a cycle, a shuffle reading itself included. Defs a rule names are
+/// followed, since a read through a def is still a read.
+fn reads_cycle(lw: &mut Lower<'_>, w: &World, built: &Map<String, Value>) {
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (name, sh) in built {
+        let mut out = BTreeSet::new();
+        reads(&sh["things"], &mut out);
+        let mut seen_defs = BTreeSet::new();
+        let mut todo = refs(&sh["things"]);
+        while let Some(d) = todo.pop() {
+            if seen_defs.insert(d.clone())
+                && let Some(body) = lw.defs.get(&d)
+            {
+                reads(body, &mut out);
+                todo.extend(refs(body));
+            }
+        }
+        edges.insert(name.clone(), out);
+    }
+    for sh in &w.shuffles {
+        // A walk from this shuffle that comes back to it is a cycle.
+        let start = &sh.name.v;
+        let mut seen = BTreeSet::new();
+        let mut todo: Vec<&String> = edges.get(start).into_iter().flatten().collect();
+        while let Some(n) = todo.pop() {
+            if n == start {
+                lw.errs().err(
+                    sh.name.pos,
+                    format!(
+                        "shuffle `{start}` reads its own result, directly or through other shuffles"
+                    ),
+                    "a shuffle runs after every shuffle its things' rules read; break the cycle",
+                );
+                break;
+            }
+            if seen.insert(n) {
+                todo.extend(edges.get(n).into_iter().flatten());
+            }
+        }
+    }
+}
+
+/// Every def a lowered rule names.
+fn refs(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![v];
+    while let Some(v) = todo.pop() {
+        match v {
+            Value::Object(o) => {
+                if let Some(Value::String(d)) = o.get("ref") {
+                    out.push(d.clone());
+                }
+                todo.extend(o.values());
+            }
+            Value::Array(a) => todo.extend(a),
+            _ => {}
+        }
+    }
+    out
 }

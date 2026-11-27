@@ -440,6 +440,17 @@ pub const WORLD_RULE_MAX_DEPTH: usize = 64;
 /// file in one pass, bounded so a broken file cannot print without end).
 pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
 
+/// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
+/// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
+pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;
+
+/// Most options a world may declare: the engine's limit, an option being one byte in a rule.
+pub const WORLD_OPTIONS_MAX: usize = 256;
+
+/// Most start item copies one seed's instance may grant in all, so a world's numbers never
+/// decide how much memory the per-seed step takes (a design value: start items are a handful).
+pub const WORLD_START_COPIES_MAX: usize = 1024;
+
 /// Most option combinations the build tool's pool test tries (design doc 16 section 3.4): past
 /// it the test is skipped with a warning, and generation still checks the actual settings (a
 /// design value).
