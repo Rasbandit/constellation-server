@@ -159,9 +159,7 @@ impl Worlds {
             }
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
-        let game = game_folder(kind, &meta);
-        let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-        self.store.upload_put(&row, &bytes).await.map_err(|e| store_failed(&e))?;
+        self.store_upload(kind, key, &meta, &bytes).await.map_err(|e| store_failed(&e))?;
         if remove {
             // The file first: a record without its file is finished on the next start (above).
             remove_files(vec![file, record.to_owned()]).await?;

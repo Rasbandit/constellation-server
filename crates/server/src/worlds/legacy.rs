@@ -123,9 +123,7 @@ pub(super) async fn inspect_and_store(
         meta[k] = v;
     }
     let key = manifests::key_of(id).ok_or_else(|| internal("an upload id that is not hex"))?;
-    let game = game_folder(kind, &meta);
-    let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-    w.store.upload_put(&row, body).await.map_err(store_error)?;
+    w.store_upload(kind, key, &meta, body).await.map_err(store_error)?;
     Ok(meta)
 }
 

@@ -89,10 +89,7 @@ fn worlds(root: &Path, limits: Limits) -> Worlds {
 async fn stored(w: &Worlds, kind: Kind, body: &[u8], mut meta: Value) -> Value {
     let id = content_id(body);
     meta["id"] = json!(id);
-    let key = manifests::key_of(&id).unwrap();
-    let game = game_folder(kind, &meta);
-    let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
-    w.store.upload_put(&row, body).await.unwrap();
+    w.store_upload(kind, manifests::key_of(&id).unwrap(), &meta, body).await.unwrap();
     meta
 }
 

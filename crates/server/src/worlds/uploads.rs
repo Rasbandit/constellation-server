@@ -140,6 +140,20 @@ impl Worlds {
         let file = self.store.upload_bytes(kind.store(), &key).await;
         file.map_err(|e| format!("upload {id}: {e:?}"))?.ok_or(format!("no upload {id}"))
     }
+
+    /// Store an upload: its file under `key`, with its record `meta` and the game folder made
+    /// from it.
+    pub(super) async fn store_upload(
+        &self,
+        kind: Kind,
+        key: log::BlobKey,
+        meta: &Value,
+        bytes: &[u8],
+    ) -> Result<(), log::StoreError> {
+        let game = game_folder(kind, meta);
+        let row = UploadRecord { kind: kind.store(), id: key, game, meta: meta.to_string() };
+        self.store.upload_put(&row, bytes).await
+    }
 }
 
 /// Ids are the lowercase hex of a SHA-256: checked before any id reaches a path.
