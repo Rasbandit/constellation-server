@@ -309,7 +309,6 @@ pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
     }
 }
 
-/// An option's lowest and highest value.
 /// The value `text` gives option `key`, as an author writes it: `on`/`off` (or `true`/`false`)
 /// for a toggle, a value's name for a choice, a whole number for a range.
 pub(crate) fn option_value(m: &Model, key: &str, text: &str) -> Result<i64, String> {
@@ -361,6 +360,7 @@ pub(crate) fn option_defaults(m: &Model) -> Vec<(String, i64)> {
     m.options.iter().map(|o| (o.key.clone(), o.default)).collect()
 }
 
+/// An option's lowest and highest value.
 fn bounds(ty: &OptTy) -> (i64, i64) {
     match ty {
         OptTy::Toggle => (0, 1),

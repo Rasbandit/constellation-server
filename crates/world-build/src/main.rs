@@ -9,6 +9,10 @@
 //!   [--publish]`: check, then write the canonical manifest (to standard output without `-o`)
 //!   and `ledger.json` back into `dir`; `--instance` also writes the per-seed instance at the
 //!   options' defaults.
+//! - `rando generate [dir] [--seed N] [--players N] [--option name=value ...] [--options file]
+//!   [-o out/] [--format text|json] [--check-seeds K]`: build in memory with the checks of
+//!   `build`, fill a room of N copies with the engine's fill and write `<world>-<seed>.seed` and
+//!   a spoiler log into `out/`; `--check-seeds K` fills K seeds instead and reports how it went.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -103,12 +107,13 @@ fn main() -> ExitCode {
     let mut dir = PathBuf::from(".");
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
     let (mut opts, mut check_only) = (Options::default(), false);
-    let mut g = Gen::default();
+    let (mut g, mut gen_flags) = (Gen::default(), false);
     let mut rest = args[1..].iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--seed" | "--players" | "--option" | "--options" | "--format" | "--check-seeds" => {
                 let Some(v) = rest.next() else { return usage() };
+                gen_flags = true;
                 if let Err(e) = g.set(a, v) {
                     eprintln!("error: {e}");
                     return ExitCode::from(2);
@@ -128,6 +133,12 @@ fn main() -> ExitCode {
             s if s.starts_with('-') => return usage(),
             s => dir = PathBuf::from(s),
         }
+    }
+    // A flag of one command given to another is a mistake, not something to ignore.
+    if (gen_flags && verb != "generate")
+        || (verb == "generate" && (instance.is_some() || check_only))
+    {
+        return usage();
     }
     if verb == "fmt" {
         return fmt(&dir, check_only);
@@ -197,7 +208,10 @@ impl Gen {
                 let n = u32::try_from(num("--players")?).ok().filter(|n| *n >= 1);
                 self.players = Some(n.ok_or("--players takes a number of at least 1")?);
             }
-            "--check-seeds" => self.check_seeds = Some(num("--check-seeds")?.max(1)),
+            "--check-seeds" => {
+                let n = Some(num("--check-seeds")?).filter(|n| *n >= 1);
+                self.check_seeds = Some(n.ok_or("--check-seeds takes a number of at least 1")?);
+            }
             "--format" => match v {
                 "json" => self.json = true,
                 "text" => self.json = false,
@@ -261,16 +275,19 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
         let c = generator.check_seeds(&options, players, from, count);
         let mut ms: Vec<f64> = c.times.iter().map(|t| t.as_secs_f64() * 1000.0).collect();
         ms.sort_by(f64::total_cmp);
-        let last = from + count - 1;
+        let last = from.saturating_add(count - 1);
         let s = if players == 1 { "" } else { "s" };
         println!(
             "{} of {} seeds fill (seeds {from} to {last}, {players} player{s})",
             c.filled, c.tried
         );
-        println!("fill attempts: {} (restarts: {})", c.attempts, c.restarts);
+        println!(
+            "fill attempts over the seeds that filled: {} (restarts: {})",
+            c.attempts, c.restarts
+        );
         if let (Some(lo), Some(hi)) = (ms.first(), ms.last()) {
             println!(
-                "fill time per seed: fastest {lo:.0} ms, median {:.0} ms, slowest {hi:.0} ms",
+                "fill time per seed (measured): fastest {lo:.0} ms, median {:.0} ms, slowest {hi:.0} ms",
                 ms[ms.len() / 2]
             );
         }
@@ -292,7 +309,13 @@ fn generate(built: &world_build::Built, g: &Gen, out: Option<&Path>) -> ExitCode
     };
     let dir = out.unwrap_or(Path::new("."));
     let spoiler = if g.json {
-        world_build::canon::to_string(&made.spoiler).unwrap_or_default()
+        match world_build::canon::to_string(&made.spoiler) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         spoiler_text(&made.spoiler)
     };

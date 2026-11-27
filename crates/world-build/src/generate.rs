@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use data_fill::FillError;
 use data_fill::prepared::{self, Prepared, SEED_MAX_BYTES};
-use data_fill::seed::{FillReport, Player, encode_on, generate_on};
+use data_fill::seed::{FillReport, GenerateError, Player, encode_on, generate_on};
 use seed_bundle::SeedBundle;
 use serde_json::{Value, json};
 
@@ -59,7 +60,7 @@ impl<'b> Generator<'b> {
     /// at random stream `seed`. The same arguments always give the same seed and spoiler.
     ///
     /// # Errors
-    /// A bad instance, or a fill that cannot finish, said for an author ([`explain`]).
+    /// A bad instance, or a seed the engine cannot make, said for an author ([`explain`]).
     pub fn run(
         &self,
         options: &HashMap<String, i64>,
@@ -72,7 +73,7 @@ impl<'b> Generator<'b> {
             .collect();
         let name = format!("{}-{seed}", self.prepared.game());
         let (mut bundle, report) =
-            generate_on(&self.prepared, &name, &players, seed).map_err(|e| explain(&e))?;
+            generate_on(&self.prepared, &name, &players, seed).map_err(|e| explain(e, &players))?;
         let spoiler = self.spoiler(&bundle, options, seed, &report);
         let file = encode_on(&self.prepared, &mut bundle, SEED_MAX_BYTES)?;
         Ok(Seed { seed, name, file, spoiler, report })
@@ -141,29 +142,28 @@ impl<'b> Generator<'b> {
     }
 }
 
-/// A fill error said for an author: what went wrong, and what to try. The engine reports a
-/// stuck fill in its error's debug form (`Stuck { item: "x", attempts: n }`), read here.
-// shortcut: reads the engine's error text, since `generate_on` returns a String; upgrade when
-// the engine returns a typed error.
+/// A seed the engine could not make, said for an author: what went wrong, and what to try.
+/// `players` names whose item or goal it was when the room holds more than one.
 #[must_use]
-pub fn explain(e: &str) -> String {
-    if let Some(rest) = e.split("Stuck { item: \"").nth(1) {
-        let item = rest.split('"').next().unwrap_or("?");
-        return format!(
-            "the fill could not place item `{item}`: no reachable location was left for it\n  help: give `{item}` more places it can go early (checks with looser rules, or fewer items that need the same places), or lower its count"
-        );
+pub fn explain(e: GenerateError, players: &[Player]) -> String {
+    let whose = |p: usize| match players.get(p) {
+        Some(x) if players.len() > 1 => format!("{}'s ", x.name),
+        _ => String::new(),
+    };
+    match e {
+        GenerateError::Fill(FillError::Stuck { item, player, attempts }) => format!(
+            "the fill could not place {}item `{item}` after {attempts} attempts: no reachable location was left for it\n  help: give `{item}` more places it can go early (checks with looser rules, or fewer items that need the same places), or lower its count",
+            whose(player)
+        ),
+        GenerateError::Fill(FillError::Count { items, locations }) => format!(
+            "{items} items to place and {locations} free checks\n  help: the two must match; `rando check` names the settings"
+        ),
+        GenerateError::Unbeatable { player } => format!(
+            "the filled world leaves {}goal unreachable\n  help: the goal needs something the world never gives; check the goal's rule and that every item it needs is in the pool",
+            if players.len() > 1 { whose(player) } else { "the ".to_owned() }
+        ),
+        other => String::from(other),
     }
-    if e.contains("cannot reach their goal") {
-        return format!(
-            "{e}\n  help: the goal needs something the filled world never gives; check the goal's rule and that every item it needs is in the pool"
-        );
-    }
-    if e.contains("Count {") {
-        return format!(
-            "{e}\n  help: the items to place and the free checks differ in number; `rando check` names the settings"
-        );
-    }
-    e.to_owned()
 }
 
 /// The spoiler log for people: options, every placement by region and by item, the play order
@@ -235,13 +235,18 @@ pub fn spoiler_text(s: &Value) -> String {
     }
     if let Some(sh) = s["shuffles"].as_object().filter(|m| !m.is_empty()) {
         line(&mut out, "\nShuffle results".into());
-        for (player, table) in sh {
+        // Per player, each shuffle by name: its slots and what each got, in key order.
+        let pad = if multi { "    " } else { "  " };
+        for (player, tables) in sh {
             if multi {
                 line(&mut out, format!("  {player}"));
             }
-            for (k, v) in table.as_object().into_iter().flatten() {
-                let v = v.as_str().map_or_else(|| v.to_string(), str::to_owned);
-                line(&mut out, format!("    {k} -> {v}"));
+            for (name, table) in tables.as_object().into_iter().flatten() {
+                line(&mut out, format!("{pad}{name}"));
+                for (slot, got) in table.as_object().into_iter().flatten() {
+                    let got = got.as_str().map_or_else(|| got.to_string(), str::to_owned);
+                    line(&mut out, format!("{pad}  {slot} -> {got}"));
+                }
             }
         }
     }

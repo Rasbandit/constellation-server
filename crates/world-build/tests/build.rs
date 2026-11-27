@@ -2,6 +2,7 @@
 //! fills beatable, the canonical bytes are pinned, and every check names its place.
 
 mod lang;
+mod seeds;
 mod support;
 
 use std::collections::HashMap;
@@ -287,7 +288,7 @@ fn reach_is_for_the_goal_only_and_the_engine_limits_are_build_errors() {
 fn every_short_form_lowers_to_the_engine_shape() {
     let w = with_check_rule(
         "bollard",
-        "has(pearl, 2) and has_all(oar, lamp) and has_any(lamp, oar) and level(oar) >= 1 and counter(beacon_lit) >= 1 and opt.start_gift in [none, lamp] and min(count(oar), 1) + max(1, 2) >= 2 and count(oar) * 2 div 2 >= 1",
+        "has(pearl, 2) and has_all(oar, lamp) and has_any(lamp, oar) and level(oar) >= 1 and counter(beacon_lit) >= 1 and opt.start_gift in [none, lamp] and min(count(oar), 1) + max(1, 2) >= 3 and count(oar) * 2 div 2 >= 1",
         P,
     );
     let b = built(&w);
@@ -305,8 +306,8 @@ fn every_short_form_lowers_to_the_engine_shape() {
         {"ge": [{"count": "oar"}, 1]},
         {"ge": [{"counter": "beacon_lit"}, 1]},
         {"any": [{"eq": [{"opt": "start_gift"}, 0]}, {"eq": [{"opt": "start_gift"}, 1]}]},
-        // `max(1, 2)` reads numbers only, so it folds to 2.
-        {"ge": [{"int": ["+", {"int": ["min", {"count": "oar"}, 1]}, 2]}, 2]},
+        // `max(1, 2)` reads numbers only, so it folds to 2 (`>= 3`: at least 2 always holds).
+        {"ge": [{"int": ["+", {"int": ["min", {"count": "oar"}, 1]}, 2]}, 3]},
         {"ge": [{"int": ["div", {"int": ["*", {"count": "oar"}, 2]}, 2]}, 1]},
     ]});
     assert_eq!(*rule, want);
