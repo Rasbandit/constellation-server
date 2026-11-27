@@ -251,7 +251,7 @@ fn fill_reports_count_mismatch_and_impossible_seeds() {
     inst.location_groups = HashMap::from([("flower".to_owned(), "town".to_owned())]);
     let plan = Plan::new(&w, &inst).unwrap();
     let err = fill((&w, &plan, &inst), &mut SpecRng::from_seed([0; 32]), 3).unwrap_err();
-    assert_eq!(err, FillError::Stuck { item: "charm".to_owned(), attempts: 3 });
+    assert_eq!(err, FillError::Stuck { item: "charm".to_owned(), player: 0, attempts: 3 });
 }
 
 #[test]

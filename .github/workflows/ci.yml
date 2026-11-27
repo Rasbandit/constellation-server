@@ -51,9 +51,21 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - if: steps.scope.outputs.code != 'false'
         run: cargo fmt --all --check
-      # Every library's unit tests but the fill engine's: the next step runs those.
+      # Every library's unit tests but the fill engine's and the build tool's: the next steps
+      # run those.
       - if: steps.scope.outputs.code != 'false'
-        run: cargo test --workspace --exclude data-fill --lib --locked
+        run: cargo test --workspace --exclude data-fill --exclude world-build --lib --locked
+      # The world build tool's unit and integration tests (the example world filled end to end).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo test -p world-build --tests --locked
+      # The build tool without the engine (doc 18 section 5.2): it must still build.
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo check -p world-build --no-default-features --locked
+      # Without the engine, `rando generate` refuses clearly and exits non-zero.
+      - if: steps.scope.outputs.code != 'false'
+        run: |
+          if out=$(cargo run -q -p world-build --no-default-features --locked --bin rando -- generate 2>&1); then exit 1; fi
+          echo "$out" | grep -q "built without the engine"
       # The data-only fill engine's unit, integration and binary tests (damaged sections,
       # fixtures, fairness), once.
       - if: steps.scope.outputs.code != 'false'

@@ -269,7 +269,7 @@ fn one(
     // A fill of over a second is timed twice more, not `reps` times: its noise is small
     // against it, and the job's time goes to these rows.
     let reps = if ms(t) > 1e3 { reps.min(2) } else { reps };
-    let (f, sp) = first.map_err(|e| format!("{players} players: {e:?}"))?;
+    let (f, sp) = first.map_err(|e| format!("{players} players: {}", String::from(e)))?;
     if !f.all_beatable() {
         return Err(format!("{players} players: not beatable: {:?}", f.beatable));
     }

@@ -609,11 +609,12 @@ fn fill_by(
                 };
                 return Ok((filled, sp));
             }
-            Err(FillError::Stuck { item, .. }) => last = Some(item),
+            Err(FillError::Stuck { item, player, .. }) => last = Some((item, player)),
             Err(e) => return Err(e),
         }
     }
-    Err(FillError::Stuck { item: last.unwrap_or_default(), attempts: max_attempts })
+    let (item, player) = last.unwrap_or_default();
+    Err(FillError::Stuck { item, player, attempts: max_attempts })
 }
 
 /// A duration as nanoseconds, for the round profile.
@@ -1028,7 +1029,11 @@ impl Steps<'_, '_> {
     ) -> Result<(), FillError> {
         let seats = self.room.seats;
         let w = seats[usize::from(item.to)].w;
-        let stuck = || FillError::Stuck { item: w.item_key(item.item).to_owned(), attempts: 1 };
+        let stuck = || FillError::Stuck {
+            item: w.item_key(item.item).to_owned(),
+            player: usize::from(item.to),
+            attempts: 1,
+        };
         let mut tried = Vec::new();
         // The pass over the rounds left after a move starts with a fresh solve of about this
         // state: charged as this first solve again, the same for the fill and its cross-check
@@ -1112,7 +1117,11 @@ impl Steps<'_, '_> {
         if self.repair_evals > self.repair_budget {
             let g = group[0];
             let w = self.room.seats[usize::from(g.to)].w;
-            return Err(FillError::Stuck { item: w.item_key(g.item).to_owned(), attempts: 1 });
+            return Err(FillError::Stuck {
+                item: w.item_key(g.item).to_owned(),
+                player: usize::from(g.to),
+                attempts: 1,
+            });
         }
         Ok(())
     }
@@ -1165,6 +1174,7 @@ impl Steps<'_, '_> {
                 let w = seats[usize::from(item.to)].w;
                 return Err(FillError::Stuck {
                     item: w.item_key(item.item).to_owned(),
+                    player: usize::from(item.to),
                     attempts: 1,
                 });
             };
@@ -1461,7 +1471,7 @@ mod tests {
         for seed in 1..=5 {
             let got = fill_room_spheres(&c.seats(), &mut rng(seed), config::FILL_MAX_ATTEMPTS);
             assert!(
-                matches!(got, Err(FillError::Stuck { ref item, attempts }) if item == "key" && attempts == config::FILL_MAX_ATTEMPTS),
+                matches!(got, Err(FillError::Stuck { ref item, attempts, .. }) if item == "key" && attempts == config::FILL_MAX_ATTEMPTS),
                 "seed {seed}: {:?}",
                 got.err()
             );

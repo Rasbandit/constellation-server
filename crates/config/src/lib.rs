@@ -441,6 +441,68 @@ pub const FILL_CAPACITY_ORDERS: u32 = 30;
 /// thing, a group, an exit key, a door).
 pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 
+/// Deepest a rule string may nest (parentheses, `not`, function arguments), as written: the
+/// provisional author cap of design doc 16 (question 2, a design value), well inside the
+/// engine's [`RULES_MAX_DEPTH`].
+pub const WORLD_RULE_MAX_DEPTH: usize = 64;
+
+/// Most errors one build reports before it stops collecting (a design value: enough to fix a
+/// file in one pass, bounded so a broken file cannot print without end).
+pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
+
+/// Most parts one rule node of the engine takes: the parts of an `all` or `any`, the items of
+/// `has_any` and `has_all`, the operands of a sum, `min` or `max`, and `n` in `has` (the
+/// engine's limit, one byte).
+pub const RULE_MAX_PARTS: usize = 255;
+
+/// Largest item or location id on the wire and in a world's ledger: 2^53 - 1, the range world
+/// ids keep to so every client holds them exactly (a format value, not a limit).
+pub const ID_MAX: i64 = (1 << 53) - 1;
+
+/// Largest seed number `rando generate` takes or draws: 2^53 - 1, so the number in a JSON
+/// spoiler reads back exactly in any JSON reader (a format value, not a limit).
+pub const SEED_NUMBER_MAX: u64 = (1 << 53) - 1;
+
+/// Deepest that blocks (`for`, `region`, `extend`) may nest in a `.rando` file: the parser and
+/// the expansion recurse once per block (a design value; a world nests three or four deep).
+pub const WORLD_BLOCK_MAX_DEPTH: usize = 32;
+
+/// Most items, checks or regions one world may declare: the engine's 16-bit index width
+/// (design doc 16 section 5.3).
+pub const WORLD_TABLE_MAX: usize = 65_536;
+
+/// Largest `.rando` file (or table file) the build tool reads, bytes: the input is untrusted,
+/// and a world of a few thousand checks is well under a megabyte (a design value).
+pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most files (modules and table files) one world may read (a design value).
+pub const WORLD_MODULES_MAX: usize = 256;
+
+/// Most declarations the families of one world may expand to, so a product of a few long
+/// lists cannot run away (a design value: the survey's largest family is a few thousand).
+pub const WORLD_FAMILY_MAX: usize = 100_000;
+
+/// Stack of the thread a world build runs on, bytes: lowering recurses once per rule node, up
+/// to [`RULES_MAX_DEPTH`] nodes deep through defs, at several frames a node (a design value,
+/// well over what that depth takes in a debug build; only the pages used are committed).
+pub const WORLD_BUILD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
+/// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
+pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;
+
+/// Most options a world may declare: the engine's limit, an option being one byte in a rule.
+pub const WORLD_OPTIONS_MAX: usize = 256;
+
+/// Most start item copies one seed's instance may grant in all, so a world's numbers never
+/// decide how much memory the per-seed step takes (a design value: start items are a handful).
+pub const WORLD_START_COPIES_MAX: usize = 1024;
+
+/// Most option combinations the build tool's pool test tries (design doc 16 section 3.4): past
+/// it the test is skipped with a warning, and generation still checks the actual settings (a
+/// design value).
+pub const WORLD_POOL_TEST_MAX_COMBINATIONS: usize = 4096;
+
 /// The generator version a data-only seed records (what clients of the compatible protocol
 /// expect; a format value, not a limit).
 pub const SEED_GENERATOR_VERSION: (u32, u32, u32) = (0, 6, 8);

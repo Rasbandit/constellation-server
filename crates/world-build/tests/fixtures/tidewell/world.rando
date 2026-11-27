@@ -1,0 +1,32 @@
+# Tidewell Isle: a small world invented for the build tool's tests. No game's names, data or
+# logic. The entry file holds the world, its options and what spans the regions.
+world tidewell_isle "Tidewell Isle" version 1
+use items
+use regions/coast
+use regions/lighthouse
+start dock
+
+option tricky_climbs: toggle = off
+option pearls_needed: range 1..3 = 2
+option market_stalls: toggle = on
+option start_gift: choice(none, lamp) = none
+
+start_item lamp when opt.start_gift == lamp
+def can_climb = has(crowbar) or opt.tricky_climbs
+group tools = { oar, lamp, crowbar }
+
+# The three doors out of the dock lead somewhere new each seed, both ways.
+shuffle doors {
+  slots exits(outside)
+  coupled
+  check layout
+}
+
+# Two wardens guard the tower and the grotto; which one stands where is drawn per seed.
+shuffle wardens {
+  slots tower_door, grotto_gate
+  thing crab: has(crowbar)
+  thing eel: has(lamp)
+}
+
+goal beacon_lit and count(pearl) >= opt.pearls_needed

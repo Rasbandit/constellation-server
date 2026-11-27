@@ -1,0 +1,45 @@
+use items
+
+region dock {
+  check bollard
+  check net_pile
+  check tide_pool no_progression
+  exit market door market_door group outside
+  exit old_mill door mill_door group outside
+  exit sea_cave: has(oar) door cave_mouth group outside
+  exit lighthouse: has(oar)
+}
+
+region market {
+  for s in [fruit, fish] {
+    check {s}_stall when opt.market_stalls
+  }
+  check notice_board
+  exit dock door market_door group inside
+}
+
+region old_mill {
+  check millstone
+  check flour_sacks: has(crowbar)
+  exit dock door mill_door group inside
+  exit mill_cellar: has(crowbar)
+}
+
+region mill_cellar {
+  check old_chest holds chart
+  check cobweb_corner
+  exit old_mill
+}
+
+region sea_cave {
+  check dripping_ledge
+  check rock_pool: has(lamp)
+  exit dock door cave_mouth group inside
+  exit grotto: at.wardens.grotto_gate
+}
+
+region grotto {
+  check pearl_bed: has(lamp)
+  check glowing_niche: group_count(tools) >= 2
+  exit sea_cave
+}

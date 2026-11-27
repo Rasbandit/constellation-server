@@ -1036,7 +1036,7 @@ mod tests {
             };
         for budget in [0, 1] {
             match fill_room_budget(&seats, &mut rng(), (1, budget), false) {
-                Err(crate::FillError::Stuck { item, attempts: 1 }) => {
+                Err(crate::FillError::Stuck { item, attempts: 1, .. }) => {
                     assert!(item.starts_with('k'));
                 }
                 other => panic!("budget {budget}: {:?}", other.map(|f| f.attempts)),
@@ -1166,7 +1166,7 @@ mod tests {
         .unwrap();
         for fresh in [false, true] {
             match filled(&c, 1, 3, fresh).map(|x| x.0.placed) {
-                Err(crate::FillError::Stuck { item, attempts: 3 }) => {
+                Err(crate::FillError::Stuck { item, attempts: 3, .. }) => {
                     assert!(item.starts_with('k'))
                 }
                 other => panic!("fresh {fresh}: {other:?}"),
