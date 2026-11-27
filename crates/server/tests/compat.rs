@@ -461,7 +461,10 @@ mod scenarios {
             .await
             .unwrap_or_else(|e| panic!("{e}; log:\n{}", server.log().join("\n")));
         assert_eq!(connected["checked_locations"], json!([loc]));
-        let loads = server.wait_for_logs("room in memory", 2).unwrap().len();
+        // A connect's loads are logged before its `websocket accepted`, so once the second
+        // accept is read every load so far is too; nothing connects after it to load again.
+        server.wait_for_logs(&format!("websocket accepted key={alpha}"), 2).unwrap();
+        let loads = server.log().iter().filter(|l| l.contains("room in memory")).count();
         assert_eq!(loads, 2, "loaded on the first connect and again after it idled");
         drop(std::fs::remove_dir_all(&dir));
     }

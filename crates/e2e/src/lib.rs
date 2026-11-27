@@ -46,7 +46,8 @@ pub fn fixture() -> Res<SeedBundle> {
 /// A running server process. Killed on drop if not stopped.
 #[derive(Debug)]
 pub struct Server {
-    child: Child,
+    /// Locked only so a wait that sees the server exit can read its status through `&self`.
+    child: Mutex<Child>,
     /// Where it listens.
     pub addr: SocketAddr,
     log: Arc<(Mutex<Vec<String>>, Condvar)>,
@@ -108,7 +109,7 @@ impl Server {
             let lines = log.0.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
             format!("server never logged its address; log:\n{lines}")
         })?;
-        Ok(Self { child, addr, log, closed })
+        Ok(Self { child: Mutex::new(child), addr, log, closed })
     }
 
     /// `ws://` URL of the edge.
@@ -137,21 +138,30 @@ impl Server {
     /// it to stderr first, but the thread reading stderr may not have pushed it yet.
     ///
     /// # Errors
-    /// When fewer lines appear within the guard timeout.
+    /// When fewer lines appear within the guard timeout, or at once when the server exits
+    /// first (with its exit status).
     pub fn wait_for_logs(&self, needle: &str, n: usize) -> Res<Vec<String>> {
         let (lines, cv) = &*self.log;
         let (guard, _) = cv
             .wait_timeout_while(lines.lock().unwrap_or_else(PoisonError::into_inner), GUARD, |l| {
                 l.iter().filter(|x| x.contains(needle)).count() < n
+                    && !self.closed.load(Ordering::SeqCst)
             })
             .unwrap_or_else(PoisonError::into_inner);
         let found: Vec<String> = guard.iter().filter(|x| x.contains(needle)).cloned().collect();
         let all = guard.join("\n");
         drop(guard);
-        if found.len() < n {
-            return Err(format!("{} of {n} log lines with {needle:?}; log:\n{all}", found.len()));
+        if found.len() >= n {
+            return Ok(found);
         }
-        Ok(found)
+        let got = format!("{} of {n} log lines with {needle:?}", found.len());
+        if !self.closed.load(Ordering::SeqCst) {
+            return Err(format!("{got} after {GUARD:?}; log:\n{all}"));
+        }
+        // Its stderr closed, so it has exited (as in `wait_exit`): the wait returns at once.
+        let status = self.child.lock().unwrap_or_else(PoisonError::into_inner).wait();
+        let status = status.map_or_else(|e| e.to_string(), |s| s.to_string());
+        Err(format!("{got}: the server exited ({status}); log:\n{all}"))
     }
 
     /// Send SIGTERM and wait for the exit.
@@ -159,8 +169,9 @@ impl Server {
     /// # Errors
     /// When the signal cannot be sent or the process does not exit.
     pub fn stop(mut self) -> Res<ExitStatus> {
-        sigterm(self.child.id())?;
-        self.child.wait().map_err(|e| e.to_string())
+        let child = self.child();
+        sigterm(child.id())?;
+        child.wait().map_err(|e| e.to_string())
     }
 
     /// Wait for the server to exit on its own (its stderr closing is the signal) and return
@@ -180,7 +191,7 @@ impl Server {
         if !self.closed.load(Ordering::SeqCst) {
             return Err(format!("server still running after {GUARD:?}; log:\n{all}"));
         }
-        self.child.wait().map_err(|e| e.to_string())
+        self.child().wait().map_err(|e| e.to_string())
     }
 
     /// `kill -9`: SIGKILL, no shutdown path runs. Returns once the process is gone.
@@ -189,16 +200,22 @@ impl Server {
     /// When the signal cannot be sent or the wait fails.
     pub fn kill(mut self) -> Res<ExitStatus> {
         // std's `Child::kill` sends SIGKILL on Unix.
-        self.child.kill().map_err(|e| e.to_string())?;
-        self.child.wait().map_err(|e| e.to_string())
+        let child = self.child();
+        child.kill().map_err(|e| e.to_string())?;
+        child.wait().map_err(|e| e.to_string())
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.child.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         // Already exited after `stop`, or a failed test: either way make sure it is gone.
-        drop(self.child.kill());
-        drop(self.child.wait());
+        let child = self.child();
+        drop(child.kill());
+        drop(child.wait());
     }
 }
 
@@ -508,6 +525,18 @@ mod tests {
         assert_eq!(listening_addr(line), "127.0.0.1:38441".parse().ok());
         assert_eq!(listening_addr("INFO server: websocket accepted deflate=true"), None);
         assert_eq!(listening_addr("listening addr=nonsense"), None);
+    }
+
+    #[test]
+    fn a_log_wait_on_a_server_that_exited_fails_at_once_with_its_status() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "echo 'listening addr=127.0.0.1:1' >&2; echo 'died' >&2; exit 3"]);
+        c.stderr(Stdio::piped());
+        let server = Server::spawn(c).unwrap();
+        let begun = std::time::Instant::now();
+        let err = server.wait_for_log("never logged").unwrap_err();
+        assert!(begun.elapsed() < GUARD / 2, "waited {:?}", begun.elapsed());
+        assert!(err.contains("exited (exit status: 3)") && err.contains("died"), "{err}");
     }
 }
 
