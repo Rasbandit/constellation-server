@@ -96,7 +96,7 @@ pub struct Args {
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
-     --port <port> [--host <ip>] [--public-host <name>] \
+     --port <port> [--host <ip>] [--public-host <name | ws(s)://host:port>] \
      [--web-dir <path>] [--data-dir <path> [--trusted-proxy-header <name>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
@@ -104,16 +104,25 @@ pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms 
      CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; \
      CONSTELLATION_SIGNUP=closed stops new sign-ups)";
 
-/// Check a `--public-host` value: a bare host name, or a `ws://` / `wss://` URL that is only
-/// `host:port` (a port is required: Archipelago clients use 38281 when none is typed; an
-/// optional trailing `/` is allowed; no user info, path, query or spaces).
+/// Check a `--public-host` value: a bare host (a name or a bracketed IPv6 address, no port), or
+/// a `ws://` / `wss://` URL that is only `host:port` (a port is required: Archipelago clients
+/// use 38281 when none is typed; an optional trailing `/` is allowed; no user info, path,
+/// query, spaces or control characters).
 fn public_host_value(v: String) -> Result<String, String> {
-    const MSG: &str = "--public-host needs a host name or a URL like wss://host:443";
-    let plain = |s: &str| {
-        !s.is_empty() && !s.contains(['/', '?', '#', '@']) && !s.contains(char::is_whitespace)
+    let host_ok = |h: &str| {
+        !h.is_empty()
+            && !h.contains(['/', '?', '#', '@'])
+            && !h.contains(|c: char| c.is_whitespace() || c.is_control())
+            && match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                Some(ip) => ip.parse::<std::net::Ipv6Addr>().is_ok(),
+                None => !h.contains([':', '[', ']']),
+            }
     };
     match v.split_once("://") {
-        None if plain(&v) => Ok(v),
+        None if host_ok(&v) => Ok(v),
+        None => Err("--public-host needs a host name with no port (bracket an IPv6 address); \
+                     for a port use a URL like wss://host:port"
+            .to_owned()),
         Some(("ws" | "wss", rest)) => {
             let authority = rest.strip_suffix('/').unwrap_or(rest);
             let port_ok = |p: &str| {
@@ -122,13 +131,11 @@ fn public_host_value(v: String) -> Result<String, String> {
                     && p.parse::<u16>().is_ok_and(|n| n > 0)
             };
             match authority.rsplit_once(':') {
-                Some((host, port)) if plain(authority) && !host.is_empty() && port_ok(port) => {
-                    Ok(v)
-                }
-                _ => Err(MSG.to_owned()),
+                Some((host, port)) if host_ok(host) && port_ok(port) => Ok(v),
+                _ => Err("--public-host needs a URL like wss://host:443".to_owned()),
             }
         }
-        _ => Err(MSG.to_owned()),
+        _ => Err("--public-host needs a host name or a URL like wss://host:443".to_owned()),
     }
 }
 
@@ -1632,11 +1639,24 @@ mod tests {
             "play example",
             "x/y",
             "wss://[::1]",
+            "wss://:443",
+            "wss://::1:443",
+            "wss://a:b:443",
+            "play.example:443",
+            "wss:x",
+            "::1",
+            "[::1",
+            "x\u{1b}[31m",
+            "wss://x\u{7f}:443",
         ] {
             assert!(parse(&format!("--bundle x --port 1 --public-host {bad}")).is_err(), "{bad}");
         }
-        for ok in ["ws://x:80", "wss://play.example:443/", "wss://[::1]:443", "play.example"] {
+        for ok in
+            ["ws://x:80", "wss://play.example:443/", "wss://[::1]:443", "play.example", "[::1]"]
+        {
             assert!(parse(&format!("--bundle x --port 1 --public-host {ok}")).is_ok(), "{ok}");
         }
+        let err = parse("--bundle x --port 1 --public-host play.example:443").unwrap_err();
+        assert!(err.contains("wss://host:port"), "{err}");
     }
 }
