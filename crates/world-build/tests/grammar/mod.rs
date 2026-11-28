@@ -535,6 +535,18 @@ mod review {
         ));
     }
 
+    /// An exit of a removed region may not have a door, which the engine pairs whether a
+    /// shuffle moves it or not (second delta check).
+    #[test]
+    fn an_exit_of_a_removed_region_has_no_door() {
+        let files = world(&OPTIONAL.replace(
+            "region c when opt.vault {\n  check c1\n  exit b\n",
+            "region c when opt.vault {\n  check c1\n  exit b door hatch\n",
+        ));
+        let all = errors(&files);
+        assert!(all.iter().any(|e| e.contains("cannot have a `door` yet")), "{all:#?}");
+    }
+
     /// A shuffle may not move an exit into a removed region, whatever names it (a group here),
     /// though the exit itself may have a group.
     #[test]
