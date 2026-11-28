@@ -6,7 +6,7 @@
 //! [`config::WORLD_RULE_MAX_DEPTH`], arithmetic chains included, so no input can exhaust the
 //! stack. Names are not resolved here: that is the lowering's job (`crate::lower`).
 
-use crate::lex::{Tok, Token, lex, show};
+use crate::lex::{Kind, Tok, Token, lex, show};
 use crate::model::Pos;
 
 pub use rando_syntax::Cmp;
@@ -123,7 +123,7 @@ pub type Fail = (Pos, String);
 /// # Errors
 /// The first syntax error.
 pub fn parse(text: &str, base: Pos) -> Result<Expr, Fail> {
-    let (toks, _) = lex(text, base)?;
+    let (toks, _) = lex(text, base, Kind::World)?;
     if toks.is_empty() {
         return Err((base, "the rule is empty; write `true` for no requirement".into()));
     }
@@ -594,11 +594,12 @@ mod tests {
 
     #[test]
     fn a_rule_in_a_file_stops_at_the_first_token_it_cannot_use() {
-        let (toks, _) = lex("has(a) and b\n  check c when opt.x", Pos::new(1, 1)).unwrap();
+        let (toks, _) =
+            lex("has(a) and b\n  check c when opt.x", Pos::new(1, 1), Kind::World).unwrap();
         let (e, end) = parse_in(&toks, 0, toks.len()).unwrap();
         assert_eq!(sx(&e), "(and (has a) b)");
         assert_eq!(toks[end].t, Tok::Kw("check"));
-        let (toks, _) = lex("a b", Pos::new(1, 1)).unwrap();
+        let (toks, _) = lex("a b", Pos::new(1, 1), Kind::World).unwrap();
         assert_eq!(parse_in(&toks, 0, toks.len()).unwrap().1, 1);
     }
 

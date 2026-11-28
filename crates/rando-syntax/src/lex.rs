@@ -28,6 +28,16 @@ pub const CHECK_MODIFIERS: [&str; 5] = ["key", "was", "vanilla", "holds", "no_pr
 /// More words a rule reads as operators or constants: reserved as well.
 pub const RULE_WORDS: [&str; 5] = ["in", "div", "mod", "true", "false"];
 
+/// Which language a file is in: it decides which words are keywords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A world file (`.rando`): [`RESERVED`] and [`RULE_WORDS`] are keywords.
+    World,
+    /// A settings file (`.randoset`, design doc 20 section 2.1): no keywords, every word is a
+    /// name; the settings parser reads its own words by their text where they may stand.
+    Settings,
+}
+
 /// One token kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tok {
@@ -60,6 +70,9 @@ pub enum Tok {
     Plus,
     Minus,
     Star,
+    /// `%`, after a chance in a settings file (design doc 20 section 2.1). A world file has no
+    /// place for it, so its parser refuses it.
+    Percent,
 }
 
 /// A token and where it is.
@@ -75,6 +88,10 @@ pub struct Token {
     pub nl: bool,
     /// Its length in characters.
     pub len: usize,
+    /// Its first byte in the source.
+    pub off: usize,
+    /// Its length in bytes: the token's text is `src[off..off + size]`.
+    pub size: usize,
 }
 
 /// A comment and where it is: `before` is the index of the token after it.
@@ -88,6 +105,10 @@ pub struct Comment {
     pub before: usize,
     /// It is the only thing on its line.
     pub own_line: bool,
+    /// Its first byte in the source.
+    pub off: usize,
+    /// Its length in bytes: the text is `src[off..off + size]`.
+    pub size: usize,
 }
 
 /// What a token is, in words.
@@ -115,6 +136,7 @@ pub fn show(t: &Tok) -> String {
         Tok::Plus => "`+`".into(),
         Tok::Minus => "`-`".into(),
         Tok::Star => "`*`".into(),
+        Tok::Percent => "`%`".into(),
     }
 }
 
@@ -125,12 +147,15 @@ fn keyword(w: &str) -> Option<&'static str> {
 /// A lex error: where and why.
 pub type Fail = (Pos, String);
 
-/// The tokens and comments of `src`, whose first character is at `base`.
+/// The tokens and comments of `src`, a file of `kind`, whose first character is at `base`.
 ///
 /// # Errors
 /// The first character that starts no token.
-pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
+pub fn lex(src: &str, base: Pos, kind: Kind) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
     let chars: Vec<char> = src.chars().collect();
+    // The byte offset of each character, and of the end.
+    let bytes: Vec<usize> = src.char_indices().map(|(b, _)| b).chain([src.len()]).collect();
+    let span = |from: usize, to: usize| (bytes[from], bytes[to] - bytes[from]);
     let (mut toks, mut comments): (Vec<Token>, Vec<Comment>) = (Vec::new(), Vec::new());
     let (mut line, mut col) = (base.line, base.col);
     let (mut i, mut glued, mut nl) = (0, false, true);
@@ -150,7 +175,8 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
         if c == '#' {
             let end = chars[i..].iter().position(|x| *x == '\n').map_or(chars.len(), |p| i + p);
             let text: String = chars[i..end].iter().collect();
-            comments.push(Comment { text, pos: at, before: toks.len(), own_line: nl });
+            let (off, size) = span(i, end);
+            comments.push(Comment { text, pos: at, before: toks.len(), own_line: nl, off, size });
             step(end - i, &mut col);
             (i, glued) = (end, false);
             continue;
@@ -173,6 +199,7 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
             '/' => (Tok::Slash, 1),
             '+' => (Tok::Plus, 1),
             '*' => (Tok::Star, 1),
+            '%' => (Tok::Percent, 1),
             '.' if next == Some('.') => (Tok::DotDot, 2),
             '=' if next == Some('>') => (Tok::Arrow, 2),
             '=' if next == Some('=') => (Tok::Cmp(Cmp::Eq), 2),
@@ -255,11 +282,13 @@ pub fn lex(src: &str, base: Pos) -> Result<(Vec<Token>, Vec<Comment>), Fail> {
                 if chars.get(end) == Some(&'.') && chars.get(end + 1) != Some(&'.') {
                     return Err((at, format!("`{word}.` is not a name")));
                 }
-                (keyword(&word).map_or(Tok::Name(word), Tok::Kw), end - i)
+                let kw = if kind == Kind::World { keyword(&word) } else { None };
+                (kw.map_or(Tok::Name(word), Tok::Kw), end - i)
             }
             c => return Err((at, format!("unexpected character `{c}`"))),
         };
-        toks.push(Token { t, pos: at, glued, nl, len });
+        let (off, size) = span(i, i + len);
+        toks.push(Token { t, pos: at, glued, nl, len, off, size });
         step(len, &mut col);
         (i, glued, nl) = (i + len, true, false);
     }
@@ -286,12 +315,90 @@ mod tests {
     use super::*;
 
     fn kinds(src: &str) -> Vec<Tok> {
-        lex(src, Pos::new(1, 1)).unwrap().0.into_iter().map(|t| t.t).collect()
+        lex(src, Pos::new(1, 1), Kind::World).unwrap().0.into_iter().map(|t| t.t).collect()
+    }
+
+    fn settings(src: &str) -> Vec<Tok> {
+        lex(src, Pos::new(1, 1), Kind::Settings).unwrap().0.into_iter().map(|t| t.t).collect()
+    }
+
+    #[test]
+    fn a_settings_file_has_no_keywords() {
+        let src = "goal = true\ncheck in for `when` match not";
+        let names: Vec<Tok> = ["goal", "true", "check", "in", "for", "when", "match", "not"]
+            .into_iter()
+            .map(|n| Tok::Name(n.into()))
+            .collect();
+        let got: Vec<Tok> = settings(src).into_iter().filter(|t| *t != Tok::Eq).collect();
+        assert_eq!(got, names);
+        assert!(
+            RESERVED.iter().chain(&RULE_WORDS).all(|w| settings(w) == [Tok::Name((*w).into())])
+        );
+        assert_eq!(kinds("goal = true")[2], Tok::Kw("true"));
+        assert_eq!(kinds("check")[0], Tok::Kw("check"));
+    }
+
+    #[test]
+    fn every_token_and_comment_knows_its_bytes() {
+        let src = "a = \"h\u{e9}llo \u{1f600}\" # caf\u{e9}\r\n  b += [x, y]\r\n# end\r\nc = 1..8";
+        let (toks, comments) = lex(src, Pos::new(1, 1), Kind::Settings).unwrap();
+        let texts: Vec<&str> = toks.iter().map(|t| &src[t.off..t.off + t.size]).collect();
+        assert_eq!(
+            texts,
+            [
+                "a",
+                "=",
+                "\"h\u{e9}llo \u{1f600}\"",
+                "b",
+                "+",
+                "=",
+                "[",
+                "x",
+                ",",
+                "y",
+                "]",
+                "c",
+                "=",
+                "1",
+                "..",
+                "8"
+            ]
+        );
+        for t in &toks {
+            assert_eq!(src[t.off..t.off + t.size].chars().count(), t.len, "{t:?}");
+        }
+        for c in &comments {
+            assert_eq!(&src[c.off..c.off + c.size], c.text, "{c:?}");
+        }
+        assert!(comments[0].text.starts_with("# caf\u{e9}"));
+        assert_eq!(comments[1].pos, Pos::new(3, 1));
+        assert_eq!(toks[3].pos, Pos::new(2, 3));
+    }
+
+    #[test]
+    fn percent_is_a_token_and_plus_equals_is_plus_glued_to_equals() {
+        assert_eq!(
+            settings("chance(a 50%)"),
+            [
+                Tok::Name("chance".into()),
+                Tok::Open,
+                Tok::Name("a".into()),
+                Tok::Int(50),
+                Tok::Percent,
+                Tok::Close
+            ]
+        );
+        assert_eq!(kinds("50%"), [Tok::Int(50), Tok::Percent]);
+        assert_eq!(show(&Tok::Percent), "`%`");
+        let (t, _) = lex("k += [a]\nk -= [b]", Pos::new(1, 1), Kind::Settings).unwrap();
+        assert_eq!((&t[1].t, &t[2].t, t[2].glued), (&Tok::Plus, &Tok::Eq, true));
+        assert_eq!((&t[7].t, &t[8].t, t[8].glued), (&Tok::Minus, &Tok::Eq, true));
     }
 
     #[test]
     fn tokens_keep_their_place_glue_and_line_breaks() {
-        let (t, c) = lex("check {d.key}_x: has(a) # note\n  exit b", Pos::new(1, 1)).unwrap();
+        let (t, c) =
+            lex("check {d.key}_x: has(a) # note\n  exit b", Pos::new(1, 1), Kind::World).unwrap();
         assert_eq!(t[0].t, Tok::Kw("check"));
         assert_eq!((t[1].t.clone(), t[1].glued), (Tok::LBrace, false));
         assert_eq!((t[2].t.clone(), t[2].glued), (Tok::Name("d.key".into()), true));
@@ -341,10 +448,10 @@ mod tests {
 
     #[test]
     fn bad_characters_are_errors_with_their_place() {
-        assert_eq!(lex("a\n  3.5", Pos::new(1, 1)).unwrap_err().0, Pos::new(2, 3));
-        assert_eq!(lex("é", Pos::new(4, 9)).unwrap_err().0, Pos::new(4, 9));
-        assert!(lex("\"open", Pos::new(1, 1)).is_err());
-        assert!(lex("a.", Pos::new(1, 1)).is_err());
-        assert!(lex("``", Pos::new(1, 1)).is_err());
+        assert_eq!(lex("a\n  3.5", Pos::new(1, 1), Kind::World).unwrap_err().0, Pos::new(2, 3));
+        assert_eq!(lex("é", Pos::new(4, 9), Kind::World).unwrap_err().0, Pos::new(4, 9));
+        assert!(lex("\"open", Pos::new(1, 1), Kind::World).is_err());
+        assert!(lex("a.", Pos::new(1, 1), Kind::World).is_err());
+        assert!(lex("``", Pos::new(1, 1), Kind::World).is_err());
     }
 }

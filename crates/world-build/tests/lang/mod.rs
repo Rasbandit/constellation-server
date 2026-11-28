@@ -126,6 +126,15 @@ fn a_reserved_word_is_a_name_in_backticks() {
     fails(&world("item group progression"), &format!("world.rando:{}:6", line(1)), "reserved word");
 }
 
+/// `%` is a token for settings files (doc 20 section 2.1); a world file has no place for it,
+/// so the parser refuses it where it stands.
+#[test]
+fn a_percent_sign_in_a_world_is_a_syntax_error_at_its_place() {
+    let files = world("region a {\n  check x: count(k) >= 50%\n}");
+    fails(&files, &format!("world.rando:{}:26", line(2)), "`%`");
+    fails(&world("option o: range 0..9 = 5%"), &format!("world.rando:{}:25", line(1)), "`%`");
+}
+
 /// A `-` before a number where a number is expected is part of it (a range's ends, a table
 /// cell), and `fmt` keeps it glued; between two values it is still `-`.
 #[test]
