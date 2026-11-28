@@ -751,6 +751,8 @@ fn a_malformed_lock_is_an_error_never_a_fresh_numbering() {
         good.replace("\"checks\":{\"one\":{\"id\":8,\"retired\":false},\"two\":{\"id\":9,\"retired\":false}}", "\"checks\":[]"),
         good.replace(",\"world\":\"t\"", ""),
         good.replace("\"items\":{", "\"items\":null,\"x\":{"),
+        // Only an unknown top-level key; everything else is a good lock.
+        good.replace(",\"world\":\"t\"", ",\"world\":\"t\",\"x\":1"),
         good.replace("{\"id\":8,\"retired\":false}", "8"),
     ] {
         let all = errors(&with(&bad)).join("\n");
@@ -1039,4 +1041,26 @@ fn a_weighted_sum_is_written_in_the_engine_form() {
     let rule = &region(&b, "a")["checks"][0]["rule"];
     assert_eq!(rule["ge"][1], 5, "{rule}");
     assert!(rule.to_string().contains(r#"["*",{"count":"k"},3]"#), "{rule}");
+}
+
+/// A name must contain a letter: `_`, `__` and `_9` are refused as the game key on the `world`
+/// line (and as every other name, by the shared `name_shape`; `rando.toml` is tested in `pack`).
+#[test]
+fn a_name_without_a_letter_is_refused() {
+    for name in ["_", "__", "_9"] {
+        let w = mem(&[(
+            "world.rando",
+            &format!(
+                "world {name}\nstart a\nitem k progression\nregion a {{\n  check c\n}}\ngoal reach(a)\n"
+            ),
+        )]);
+        let all = errors(&w).join("\n");
+        // `_` alone is the wildcard token, refused by the parser; the rest by the name rule.
+        let want = if name == "_" {
+            "found `_`".to_owned()
+        } else {
+            format!("`{name}` is not a game key")
+        };
+        assert!(all.contains(&want), "{name}: {all}");
+    }
 }

@@ -381,6 +381,13 @@ fn rando_toml_caps_are_limits_and_a_repeated_asset_is_refused() {
     };
     assert!(world_build::meta::parse(TOML, &d).is_ok());
     has(TOML, &config::Limits { world_name_max_bytes: 3, ..d }, "`world.name`");
+    for name in ["_", "__", "_9", "9a"] {
+        has(
+            &TOML.replace("name = \"tide\"", &format!("name = \"{name}\"")),
+            &d,
+            "`world.name` is required",
+        );
+    }
     has(TOML, &config::Limits { world_version_max_bytes: 3, ..d }, "`world.version`");
     has(TOML, &config::Limits { world_authors_max: 0, ..d }, "`world.authors` takes 1 to 0");
     has(TOML, &config::Limits { world_author_max_chars: 3, ..d }, "1 to 3 characters");

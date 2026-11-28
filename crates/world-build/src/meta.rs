@@ -129,7 +129,7 @@ pub fn parse(text: &str, l: &Limits) -> Result<Meta, Vec<String>> {
         name.as_ref().is_some_and(|n| {
             !n.is_empty() && n.len() <= most && crate::world::name_shape(n)
         }),
-        || format!("`world.name` is required: a `.rando` name (lowercase letters, digits and `_`, not starting with a digit) of at most {most} bytes"),
+        || format!("`world.name` is required: a `.rando` name (lowercase letters, digits and `_`, not starting with a digit, with at least one letter) of at most {most} bytes"),
     );
     let version = p.string(w, "version");
     if let Some(v) = &version {

@@ -77,17 +77,14 @@ fn read_table(v: &Value, what: &str, errs: &mut Errs) -> Table {
 /// (this world), `items` and `checks` (objects), optional `format` (1) and `note`, nothing else.
 /// A lock without `format` is the earlier shape, read as format 1.
 fn checked(old: &Value, game: &str, errs: &mut Errs) {
-    let n = errs.errors.len();
     let Some(o) = old.as_object() else {
-        if !old.is_null() || errs.errors.len() == n {
-            bad(errs, format!("is {old}, not a JSON object"));
-        }
+        bad(errs, format!("is {old}, not a JSON object"));
         return;
     };
     for k in
         o.keys().filter(|k| !["format", "note", "world", "items", "checks"].contains(&k.as_str()))
     {
-        bad(errs, format!("has an unknown key `{k}`"));
+        bad(errs, format!("has an unknown top-level key `{k}`"));
     }
     if let Some(f) = o.get("format")
         && f.as_i64() != Some(FORMAT)
@@ -157,7 +154,8 @@ pub(crate) fn assign(
             }
             serde_json::from_str(&text).unwrap_or_else(|e| {
                 bad(errs, format!("is not valid JSON: {e}"));
-                Value::Null
+                // Reported; read as empty, and the build fails on the error.
+                json!({"world": game, "items": {}, "checks": {}})
             })
         }
     };

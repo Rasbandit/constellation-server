@@ -183,10 +183,12 @@ pub(crate) struct Model {
     pub defs: BTreeMap<String, Value>,
 }
 
-/// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*`, at most
-/// [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule, shared with `rando.toml`'s `name`.
+/// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*` with at least one
+/// letter, at most [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule, shared with
+/// `rando.toml`'s `name`.
 pub(crate) fn name_shape(s: &str) -> bool {
     s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.bytes().any(|b| b.is_ascii_lowercase())
         && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
@@ -199,7 +201,7 @@ fn name_ok(errs: &mut Errs, n: &At<String>, what: &str) -> bool {
         errs.err(
             n.pos,
             format!("`{s}` is not a valid {what} name"),
-            &format!("a name is lowercase letters, digits and `_`, starts with a letter or `_`, at most {most} bytes"),
+            &format!("a name is lowercase letters, digits and `_`, starts with a letter or `_`, holds at least one letter, at most {most} bytes"),
         );
         return false;
     }
@@ -377,7 +379,8 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
     let game = match &w.game {
         Some(g) => {
-            let ok = !g.v.is_empty()
+            // At least one letter, as every name ([`name_shape`]).
+            let ok = g.v.bytes().any(|b| b.is_ascii_lowercase())
                 && g.v.len() <= config::MANIFEST_NAME_MAX_BYTES
                 && g.v.bytes().all(|b| {
                     b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
@@ -386,7 +389,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 errs.err(
                     g.pos,
                     format!("`{}` is not a game key", g.v),
-                    "a game key is lowercase letters, digits, `_` and `-`",
+                    "a game key is lowercase letters, digits, `_` and `-`, with at least one letter",
                 );
             }
             g.v.clone()
