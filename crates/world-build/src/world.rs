@@ -522,6 +522,9 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 "write `cosmetic` or `knowledge`, or nothing for an option that changes the seed",
             );
         }
+        if let Some(l) = o.label.as_ref().filter(|l| l.v.trim().is_empty()) {
+            errs.err(l.pos, "an option's label cannot be empty", "write the text, or leave it out");
+        }
         names.options.insert(o.key.v.clone(), ty.clone());
         options.push(OptM {
             key: o.key.v.clone(),

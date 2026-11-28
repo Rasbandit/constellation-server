@@ -263,6 +263,17 @@ fn the_adventure_trial_world_settings_schema_matches_the_golden_file() {
     assert!(want.contains("\"hut_door\""), "the shuffled doors are listed");
 }
 
+/// An item whose copies read options has no `copies` in the schema: there is no one number.
+#[test]
+fn the_settings_schema_leaves_out_copies_that_read_options() {
+    let b = ok(&Dir(root("gloam_delve")));
+    let v: serde_json::Value = serde_json::from_str(&b.settings_schema().unwrap()).unwrap();
+    let items = v["items"].as_array().unwrap();
+    let shard = items.iter().find(|i| i["name"] == "ember_shard").cloned();
+    assert_eq!(shard, Some(serde_json::json!({"name": "ember_shard"})));
+    assert!(items.iter().filter(|i| i["name"] != "ember_shard").all(|i| i["copies"].is_i64()));
+}
+
 #[test]
 fn the_adventure_trial_world_fills_beatable_at_its_option_extremes() {
     let b = ok(&Dir(root("cinderfall")));

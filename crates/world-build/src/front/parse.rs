@@ -343,6 +343,11 @@ impl P<'_> {
         }
     }
 
+    /// A plain name next, on the same line as the token before it.
+    fn name_on_line(&self) -> bool {
+        self.toks.get(self.k).is_some_and(|t| matches!(t.t, Tok::Name(_)) && !t.nl)
+    }
+
     fn got(&self) -> String {
         self.peek().map_or_else(|| "the end of the file".to_owned(), show)
     }
@@ -844,15 +849,20 @@ impl P<'_> {
             None
         };
         // A scope word on the same line (checked by the build), then the player-facing label.
-        let scope = match self.toks.get(self.k) {
-            Some(t) if matches!(t.t, Tok::Name(_)) && !t.nl => Some(self.name("the scope")?),
-            _ => None,
-        };
+        let scope = if self.name_on_line() { Some(self.name("the scope")?) } else { None };
         let label = if matches!(self.peek(), Some(Tok::Str(_))) {
             Some(self.string("the option's label")?)
         } else {
             None
         };
+        if self.name_on_line() {
+            let why = if label.is_some() {
+                "the scope goes before the label"
+            } else {
+                "an option takes one scope"
+            };
+            return Err((self.here(), format!("{why}, found {}", self.got())));
+        }
         Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default, scope, label })
     }
 

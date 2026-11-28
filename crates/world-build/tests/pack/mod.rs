@@ -438,8 +438,8 @@ fn rando_toml_name_follows_the_game_key_rule() {
 }
 
 /// `settings.json` (doc 20 section 5): every option with its kind, values or bounds, default,
-/// scope (`seed` when none is written) and label, then the item, place and door names, in
-/// canonical JSON. Each part after an option's type is optional, in the order default, scope,
+/// scope (`seed` when none is written) and label (a string key into `strings`, which holds the
+/// text), then the items with their copies, and the place and door names, in canonical JSON. Each part after an option's type is optional, in the order default, scope,
 /// label.
 #[test]
 fn the_settings_schema_keeps_option_scope_and_label() {
@@ -456,13 +456,17 @@ fn the_settings_schema_keeps_option_scope_and_label() {
             "format": "schema/1", "world": "tide", "version": "1.2.0",
             "options": [
                 {"key": "lamp_color", "kind": "choice", "values": ["teal", "amber"],
-                 "default": "teal", "scope": "cosmetic", "label": "Lamp color"},
+                 "default": "teal", "scope": "cosmetic", "label": "opt.lamp_color.label"},
                 {"key": "hints", "kind": "toggle", "default": false, "scope": "knowledge"},
                 {"key": "n", "kind": "range", "min": 1, "max": 3, "default": 2, "scope": "seed",
-                 "label": "Count"},
+                 "label": "opt.n.label"},
                 {"key": "plain", "kind": "toggle", "default": true, "scope": "seed"},
             ],
-            "items": ["k"], "places": ["c"], "doors": [],
+            "strings": {
+                "opt.lamp_color.label": {"en": "Lamp color"},
+                "opt.n.label": {"en": "Count"},
+            },
+            "items": [{"name": "k", "copies": 1}], "places": ["c"], "doors": [],
         })
     );
     // Without `rando.toml` there is no name or version to put in it.

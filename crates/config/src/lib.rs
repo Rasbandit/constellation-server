@@ -231,8 +231,8 @@ pub struct Limits {
     pub package_max_entries: usize,
     /// Longest entry path in a world package, bytes (doc 19 section 5.2, design value).
     pub package_max_path_bytes: usize,
-    /// Largest `settings.json` in a world package, bytes (doc 20 section 5, design value: its
-    /// names are the manifest's, so half the manifest cap leaves room for the labels).
+    /// Largest `settings.json` in a world package, bytes (doc 20 section 5, a design value,
+    /// not derived: it repeats the manifest's names and adds labels).
     pub package_max_settings_bytes: usize,
     /// Bytes of manifests the server keeps in memory for generation (least recently used go
     /// first); the database holds every one (design value).
