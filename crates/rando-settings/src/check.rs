@@ -128,7 +128,7 @@ pub fn check(f: &File, s: &Schema, file: &str, l: &Limits) -> (Layer, Vec<Diagno
     for line in &f.body {
         c.line(line, &mut layer);
     }
-    (layer, c.errs)
+    (layer, crate::capped(c.errs, file))
 }
 
 struct C<'a> {
@@ -1511,6 +1511,17 @@ pub(crate) mod tests {
         let (layer, more) = check(&f, &lanternfall(), "mira-lanternfall.randoset", &L);
         e.extend(more);
         (layer, e)
+    }
+
+    #[test]
+    fn check_errors_past_the_cap_are_counted_not_kept() {
+        let over = rando_limits::MAX_ERRORS + 7;
+        let body: String = (0..over).map(|i| format!("no_such_option_{i} = on\n")).collect();
+        let (f, e) = parse(&format!("settings for lanternfall\n{body}"), "f", &L);
+        assert!(e.is_empty(), "{e:?}");
+        let (_, e) = check(&f, &lanternfall(), "f", &L);
+        assert_eq!(e.len(), rando_limits::MAX_ERRORS + 1, "{:?}", e.last());
+        assert!(e[rando_limits::MAX_ERRORS].msg.contains("7 more errors not shown"), "{e:?}");
     }
 
     /// The body under a header, checked: every message as printed.

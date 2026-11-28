@@ -289,9 +289,11 @@ pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
 /// engine's [`RULES_MAX_DEPTH`].
 pub const WORLD_RULE_MAX_DEPTH: usize = 64;
 
-/// Most errors one build reports before it stops collecting (a design value: enough to fix a
-/// file in one pass, bounded so a broken file cannot print without end).
-pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
+/// Most errors (and, apart, warnings) one world build, one settings parse or one settings check
+/// reports before it stops collecting; past it one more line says how many were dropped (a
+/// design value: enough to fix a file in one pass, bounded so a broken file cannot print
+/// without end).
+pub const MAX_ERRORS: usize = 200;
 
 /// Most parts one rule node of the engine takes: the parts of an `all` or `any`, the items of
 /// `has_any` and `has_all`, the operands of a sum, `min` or `max`, and `n` in `has` (the

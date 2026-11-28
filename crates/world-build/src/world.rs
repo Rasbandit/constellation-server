@@ -49,7 +49,7 @@ impl Errs {
         Error::new(file.cloned().unwrap_or_default(), pos, msg.into(), help)
     }
 
-    /// An error at `pos`. Past [`rando_limits::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
+    /// An error at `pos`. Past [`rando_limits::MAX_ERRORS`] errors (or warnings) the rest
     /// are dropped and [`Errs::finish`] says how many.
     pub(crate) fn err(&mut self, pos: Pos, msg: impl Into<String>, help: &str) {
         self.push(Some(pos), msg, help);
@@ -72,7 +72,7 @@ impl Errs {
         if !self.seen.insert((pos, msg.clone())) {
             return;
         }
-        if self.errors.len() < rando_limits::WORLD_BUILD_MAX_ERRORS {
+        if self.errors.len() < rando_limits::MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.errors.push(e);
         } else {
@@ -93,7 +93,7 @@ impl Errs {
         if !self.seen.insert((pos, msg.clone())) {
             return;
         }
-        if self.warnings.len() < rando_limits::WORLD_BUILD_MAX_ERRORS {
+        if self.warnings.len() < rando_limits::MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.warnings.push(e);
         } else {
@@ -104,8 +104,11 @@ impl Errs {
     /// The warnings, and one more line for what the cap dropped.
     pub(crate) fn warnings_list(mut self) -> Vec<Error> {
         if self.dropped_warnings > 0 {
-            let e =
-                self.make(None, format!("{} more warnings not shown", self.dropped_warnings), "");
+            let e = self.make(
+                None,
+                rando_syntax::more_not_shown(self.dropped_warnings, "warnings"),
+                "",
+            );
             self.warnings.push(e);
         }
         // Every warning leaves through here, so this is the one place they are marked.
@@ -132,7 +135,7 @@ impl Errs {
         if self.dropped > 0 {
             let e = self.make(
                 None,
-                format!("{} more errors not shown", self.dropped),
+                rando_syntax::more_not_shown(self.dropped, "errors"),
                 "fix these and build again",
             );
             self.errors.push(e);

@@ -120,6 +120,13 @@ impl Diagnostic {
     }
 }
 
+/// The line that stands for the `n` errors or warnings (`what`) dropped past a cap: one text for
+/// the world build and the settings language.
+#[must_use]
+pub fn more_not_shown(n: usize, what: &str) -> String {
+    alloc::format!("{n} more {what} not shown")
+}
+
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.pos {

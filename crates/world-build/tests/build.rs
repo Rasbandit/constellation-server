@@ -513,7 +513,7 @@ fn past_the_error_cap_the_rest_are_counted() {
         c.rule = f.r("has(nope) and ".repeat(20).trim_end_matches(" and "));
     }
     let all = errors(&w);
-    assert_eq!(all.len(), rando_limits::WORLD_BUILD_MAX_ERRORS + 1);
+    assert_eq!(all.len(), rando_limits::MAX_ERRORS + 1);
     assert!(all.last().unwrap().contains("140 more errors"), "{:?}", all.last());
 }
 
@@ -589,7 +589,7 @@ fn past_the_warning_cap_the_rest_are_counted() {
         c.rule = f.r(&mixed);
     }
     let b = built(&w);
-    assert_eq!(b.warnings.len(), rando_limits::WORLD_BUILD_MAX_ERRORS + 1);
+    assert_eq!(b.warnings.len(), rando_limits::MAX_ERRORS + 1);
     assert!(b.warnings.last().unwrap().msg.contains("4 more warnings"), "{:?}", b.warnings.last());
 }
 

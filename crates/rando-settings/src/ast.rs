@@ -399,7 +399,7 @@ pub fn parse(src: &str, file: &str, l: &Limits) -> (File, Vec<Diagnostic>) {
         );
         p.errs.push(diag(file, "settings.limit", None, msg, None));
     }
-    let errs = p.errs;
+    let errs = crate::capped(p.errs, file);
     out.toks = toks;
     out.comments = comments;
     (out, errs)
@@ -1473,6 +1473,16 @@ connect cave_mouth to mill_door one_way
         assert_eq!(e.len(), 1);
         assert!(e[0].starts_with("f.randoset:3:1: a `player` line belongs in the header"), "{e:?}");
         assert!(e[0].contains("help: move this line up"));
+    }
+
+    #[test]
+    fn errors_past_the_cap_are_counted_not_kept() {
+        let over = rando_limits::MAX_ERRORS + 50;
+        let src = format!("settings for w\n{}", "goal find\n".repeat(over));
+        let e = errs(&src);
+        assert_eq!(e.len(), rando_limits::MAX_ERRORS + 1, "{:?}", e.last());
+        assert!(e[rando_limits::MAX_ERRORS].contains("50 more errors not shown"), "{e:?}");
+        assert_eq!(errs(&format!("settings for w\n{}", "goal find\n".repeat(3))).len(), 3);
     }
 
     #[test]

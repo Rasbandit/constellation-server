@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use rando_syntax::{Diagnostic, Pos, Severity};
 
@@ -42,4 +43,22 @@ pub(crate) fn diag(
         key: Some(key.into()),
         severity: Severity::Error,
     }
+}
+
+/// `errs` cut to [`rando_limits::MAX_ERRORS`], with one more line saying how many were dropped,
+/// so a broken file cannot return errors without end.
+pub(crate) fn capped(mut errs: Vec<Diagnostic>, file: &str) -> Vec<Diagnostic> {
+    let max = rando_limits::MAX_ERRORS;
+    if errs.len() > max {
+        let msg = rando_syntax::more_not_shown(errs.len() - max, "errors");
+        errs.truncate(max);
+        errs.push(diag(
+            file,
+            "settings.limit",
+            None,
+            msg,
+            Some("fix these and check again".into()),
+        ));
+    }
+    errs
 }

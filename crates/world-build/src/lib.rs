@@ -169,7 +169,7 @@ fn cascade(e: &Error, broken: &std::collections::HashSet<String>) -> bool {
 /// Check `w`, a world read from `file`, and build its manifest.
 ///
 /// # Errors
-/// Every error found, in file order, up to [`rando_limits::WORLD_BUILD_MAX_ERRORS`].
+/// Every error found, in file order, up to [`rando_limits::MAX_ERRORS`].
 pub fn build_model(w: &model::World, file: &str) -> Result<Built, Vec<Error>> {
     world::build(w, file)
 }
