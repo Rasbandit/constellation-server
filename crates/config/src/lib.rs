@@ -231,6 +231,9 @@ pub struct Limits {
     pub package_max_entries: usize,
     /// Longest entry path in a world package, bytes (doc 19 section 5.2, design value).
     pub package_max_path_bytes: usize,
+    /// Largest `settings.json` in a world package, bytes (doc 20 section 5, design value: its
+    /// names are the manifest's, so half the manifest cap leaves room for the labels).
+    pub package_max_settings_bytes: usize,
     /// Bytes of manifests the server keeps in memory for generation (least recently used go
     /// first); the database holds every one (design value).
     pub manifest_cache_bytes: usize,
@@ -653,6 +656,7 @@ impl Limits {
         package_max_bytes: 40 * 1024 * 1024,
         package_max_entries: 512,
         package_max_path_bytes: 255,
+        package_max_settings_bytes: 4 * 1024 * 1024,
         manifest_cache_bytes: 64 * 1024 * 1024,
         list_page_max: 200,
         catalogue_name_max_bytes: 100,
@@ -1342,6 +1346,7 @@ mod tests {
             (16 << 20, 40 << 20, 512)
         );
         assert_eq!(l.package_max_path_bytes, 255);
+        assert_eq!(l.package_max_settings_bytes, 4 << 20);
         assert_eq!((l.gen_concurrency, l.gen_queue_max), (1, 64));
         assert_eq!(
             (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),

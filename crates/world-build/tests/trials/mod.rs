@@ -250,6 +250,19 @@ fn the_adventure_trial_world_builds_keeps_its_ids_and_confines_its_keys() {
     assert_eq!(on.locations.len(), inst.locations.len() + 9);
 }
 
+/// Cinderfall's settings schema is pinned byte for byte: the settings checker's tests (doc 20,
+/// `rando-settings`) read the same committed file, so a change to the schema's shape shows here
+/// first.
+#[test]
+fn the_adventure_trial_world_settings_schema_matches_the_golden_file() {
+    let b = ok(&Dir(root("cinderfall")));
+    let golden =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cinderfall.settings.json");
+    let want = std::fs::read_to_string(&golden).unwrap_or_default();
+    assert_eq!(b.settings_schema().unwrap(), want, "{}", golden.display());
+    assert!(want.contains("\"hut_door\""), "the shuffled doors are listed");
+}
+
 #[test]
 fn the_adventure_trial_world_fills_beatable_at_its_option_extremes() {
     let b = ok(&Dir(root("cinderfall")));

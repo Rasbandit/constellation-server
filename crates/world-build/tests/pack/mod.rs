@@ -187,6 +187,7 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
             "assets/art/map.png",
             "manifest.json",
             "meta.json",
+            "settings.json",
             "sha256.txt",
             "source/data/more.csv",
             "source/more.rando",
@@ -209,6 +210,7 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
     // The manifest is what `build` writes; the lock in the package marks the ids published.
     let built = build(&dir, &Options { publish: true, ..Options::default() }).unwrap();
     assert_eq!(e["manifest.json"], built.json().as_bytes());
+    assert_eq!(e["settings.json"], built.settings_schema().unwrap().as_bytes());
     assert_eq!(e["source/rando.lock"], a.lock.as_bytes());
     assert!(a.lock.contains("\"published\":true"), "{}", a.lock);
     // `meta.json` is the normalised `rando.toml`: canonical, defaults filled, asset paths
@@ -363,6 +365,10 @@ fn pack_refuses_past_the_package_caps() {
         "source/src/tide.rando is a path over 20 bytes",
     );
     refused(config::Limits { package_max_source_bytes: 100, ..d }, "the source is over 100 bytes");
+    refused(
+        config::Limits { package_max_settings_bytes: 50, ..d },
+        "settings.json is over 50 bytes",
+    );
     refused(config::Limits { package_max_bytes: 1000, ..d }, "the package is over 1000 bytes");
     refused(
         config::Limits { world_assets_max_bytes: 20, ..d },
@@ -429,4 +435,36 @@ fn rando_toml_name_follows_the_game_key_rule() {
         let e = world_build::meta::parse(&toml, &config::Limits::DESIGN).unwrap_err().join("\n");
         assert!(e.contains("`world.name` is required"), "{bad}: {e}");
     }
+}
+
+/// `settings.json` (doc 20 section 5): every option with its kind, values or bounds, default,
+/// scope (`seed` when none is written) and label, then the item, place and door names, in
+/// canonical JSON. Each part after an option's type is optional, in the order default, scope,
+/// label.
+#[test]
+fn the_settings_schema_keeps_option_scope_and_label() {
+    let body = "option lamp_color: choice(teal, amber) = teal cosmetic \"Lamp color\"\n\
+                option hints: toggle knowledge\noption n: range 1..3 = 2 \"Count\"\n\
+                option plain: toggle = on seed\n";
+    let b = ok(&mem(&[("rando.toml", TOML), ("src/tide.rando", &format!("{body}{WORLD}"))]));
+    let text = b.settings_schema().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(world_build::canon::to_string(&v).unwrap(), text);
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "format": "schema/1", "world": "tide", "version": "1.2.0",
+            "options": [
+                {"key": "lamp_color", "kind": "choice", "values": ["teal", "amber"],
+                 "default": "teal", "scope": "cosmetic", "label": "Lamp color"},
+                {"key": "hints", "kind": "toggle", "default": false, "scope": "knowledge"},
+                {"key": "n", "kind": "range", "min": 1, "max": 3, "default": 2, "scope": "seed",
+                 "label": "Count"},
+                {"key": "plain", "kind": "toggle", "default": true, "scope": "seed"},
+            ],
+            "items": ["k"], "places": ["c"], "doors": [],
+        })
+    );
+    // Without `rando.toml` there is no name or version to put in it.
+    assert!(ok(&mem(&[("world.rando", WORLD)])).settings_schema().is_err());
 }
