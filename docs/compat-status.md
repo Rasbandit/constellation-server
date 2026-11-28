@@ -1,6 +1,6 @@
 # Compatibility status: the Archipelago-compatible edge
 
-What `edge-compat` supports today, checked against Archipelago's protocol document (`docs/network protocol.md` in the Archipelago repository, read at the 0.6.8 checkout pinned by Archipela-Go, 2026-11-16). Internal note; anything external needs the review in the design repo's `CLAUDE.md`.
+What `edge-compat` supports today, checked against Archipelago's protocol document (`docs/network protocol.md` in the Archipelago repository, read at the 0.6.8 checkout pinned by Archipela-Go, tag `0.6.8`, commit `54803be0`, 2026-11-16; every `MultiServer.py`, `NetUtils.py`, `Main.py` and `Utils.py` line cited below is at that commit). Internal note; anything external needs the review in the design repo's `CLAUDE.md`.
 
 Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client), `restart::` is `crates/server/tests/restart.rs` (real binary on Postgres, killed and restarted), `ap::` is `crates/e2e-ap/src/lib.rs` (the real binary driven by `archipelago_rs` 3.0.1), `cc::` is `tools/ap-client-check/check_common_client.py` (the real binary driven by Archipelago's own `CommonClient` from the pinned checkout, `just ap-client-check`, local only), `unit::` is `crates/edge-compat/src/tests.rs` (a session over a real room task), `core::` is `crates/room-core` (`src/tests.rs`, `src/kv/tests.rs`).
 
@@ -32,7 +32,7 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 | `RoomInfo` | Sent first. `version` is 0.6.8, the protocol level we implement. `permissions` are all disabled because release, collect and remaining are not implemented, whatever the seed chose. `tags` is empty. `games` lists the seed's games and the generic `Archipelago` game when the seed carries its package (every imported seed does), with its checksum. | `e2e::room_info_arrives_first_and_names_the_fixture_seed`, `unit::the_first_frame_is_room_info_with_checksums_and_no_password`, `unit::the_archipelago_game_is_listed_and_its_package_is_served_without_name_groups` |
 | `ConnectionRefused` | All five documented errors. | see `Connect` |
 | `Connected` | `team`, `slot`, `players`, `missing_locations`, `checked_locations`, `slot_data` (unless the client asked for none), `slot_info`, `hint_points` (earned less spent, see hints). | `e2e::connected_lists_the_slot_and_every_location_as_missing`, `unit::slot_data_is_left_out_when_the_client_does_not_ask` |
-| `NetworkItem`, `NetworkPlayer`, `NetworkSlot` | Sent with `"class"` set to the type name, as the reference server does; its client library only builds these types from tagged objects (without the tag `CommonClient` read no player names and dropped the connection on the first print naming a player). | `unit::network_items_players_and_slots_carry_their_class`, `cc::` |
+| `NetworkItem`, `NetworkPlayer`, `NetworkSlot` | Sent with `"class"` set to the type name, as the reference server does (`NetUtils.py:98-107`); its client library builds these types from tagged objects. | `unit::network_items_players_and_slots_carry_their_class`, `cc::` |
 | `ReceivedItems` | Index semantics per the document: index 0 on connect, `Sync` and `ConnectUpdate` is the whole inventory; live items carry the next index, one packet per room batch. Own-world items only with `items_handling` bit 1. A session that falls behind the room resyncs from its cursor and gets the missed items with the right indexes, without disconnecting. | `e2e::a_reconnect_resends_every_item_from_index_zero_and_sync_agrees`, `unit::an_own_item_comes_back_only_to_a_client_that_wants_own_items`, `unit::a_slow_session_resyncs_from_its_cursor_and_gets_every_item_once_in_order` |
 | `LocationInfo` | Supported. | see `LocationScouts` |
 | `RoomUpdate` | `checked_locations` (new ones) and `hint_points` after a check; `hint_points` alone to the finder and the receiver of a new hint (`MultiServer.py:955-960`). Nothing else changes yet. | `e2e::a_check_of_another_slots_item_is_delivered_to_that_slot_with_its_index`, `unit::hints::hint_points_grow_with_checks_and_drop_by_the_cost_per_paid_hint` |
@@ -56,24 +56,11 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 
 ## Not implemented yet
 
-Release, collect and remaining (and their `!` commands); `CreateHints`; every `!` command but `!hint` and `!hint_location`; group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; `TagsChanged` prints; TLS (put a terminator in front). The plan and build order: `docs/protocol-plan.md`.
-
-## Where the protocol document and the reference server differ, and what we do
-
-Read at the 0.6.8 checkout (reference behavior read from code, not run). We follow what real clients need, usually the server.
-
-| Topic | Document | Reference server | Ours |
-|---|---|---|---|
-| Reserved prefix | a key "can never start with `_read`" | refuses only `_read_` (`MultiServer.py:2286`), so `_readme` is a key | as the server |
-| `default`, `floor`, `ceil` without `value` | `value` is ignored | reads `value` for every operation; a missing one ends the connection (`MultiServer.py:2297`) | accepted without `value` |
-| `Set` without `default` | silent | starts from 0 (`MultiServer.py:2292`) | as the server |
-| `SetReply.slot` on read-only keys | listed without exception | left out (`MultiServer.py:966, 972`) | as the server |
-| `class` on `NetworkItem`, `NetworkPlayer`, `NetworkSlot` | not mentioned | always sent (`NetUtils.py:98-107`); its client needs it | as the server |
-| Bad `Set`, `Get` arguments (unknown operation, non-string key, a refused operation) | silent | an exception ends the connection (`MultiServer.py:994-1005`) | `InvalidPacket` `arguments`, the connection stays open |
+Release, collect and remaining (and their `!` commands); `CreateHints`; every `!` command but `!hint` and `!hint_location`; group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; `TagsChanged` prints; TLS (put a terminator in front).
 
 ## Hints
 
-Read at the 0.6.8 checkout, from code, not run. Ours: `crates/room-core/src/hint.rs` (the table, the points, the events), `crates/edge-compat/src/hints.rs` (wire, names, texts).
+Reference behaviour read at commit `54803be0` (tag `0.6.8`), from code, not run. Ours: `crates/room-core/src/hint.rs` (the table, the points, the events), `crates/edge-compat/src/hints.rs` (wire, names, texts).
 
 - **What a hint is.** One per (finding slot, location), so the same hint asked twice is one hint and creates no event. Item, receiver and flags come from the placement, the entrance from the bundle, `found` from the checks: a check marks the hint found for both sides. Hints are per slot; a slot belongs to one team, and every imported seed has team 0, as the reference loads it (`MultiServer.py:563-575`). `core::hint::tests::an_identical_hint_is_one_hint_within_and_across_requests`, `core::hint::tests::a_check_marks_a_hint_found_for_both_sides`.
 - **Points.** A hint costs a slot 0 when the seed's `hint_cost` is 0, else at least 1: `hint_cost` percent of its world size, computed in floating point and truncated like the reference (`MultiServer.py:816-819`; so 29 percent of 100 locations is 28, checked with Python 3). Points are `location_check_points` per checked location of the slot's own world, less the cost per paid hint (`MultiServer.py:1929-1936`). Only `!hint` and `!hint_location` pay; scouts are free. With a cost, one new unfound hint per command, and only with points of at least the cost; with no cost, every one, still counted as used (`MultiServer.py:1848-1879`). `core::hint::tests::the_cost_of_a_hint_follows_the_reference_float_rule`, `core::hint::tests::a_paid_request_creates_only_the_first_new_hint_when_the_slot_can_pay`, `core::hint::tests::free_hints_create_every_new_hint_and_still_count_as_used`, `core::hint::tests::properties::hint_points_match_the_model_and_never_buy_more_than_one_paid_hint` (property test against an independent model), `unit::hints::bang_hint_pays_for_one_new_hint_per_command_when_hints_cost_points`, `unit::hints::bang_hint_is_free_and_returns_all_when_hint_cost_is_zero`.
@@ -81,29 +68,29 @@ Read at the 0.6.8 checkout, from code, not run. Ours: `crates/room-core/src/hint
 - **Start hints** (the generator's start hints and start location hints, `Main.py:281-312`) come from the bundle and are part of the fresh room, not log events. `unit::hints::start_hints_from_the_seed_are_readable_on_first_connect`, `core::hint::tests::start_hints_are_in_the_fresh_room_and_a_bad_one_is_refused`.
 - **Durability.** New hints and status changes are room events in the log (Postgres in production), replayed on restart; a reply about a hint waits until that hint is durable (the hold rule). `restart::hints_and_points_survive_kill_9`, `core::hint::tests::a_reply_about_a_known_hint_waits_until_that_hint_is_durable`, `core::hint::tests::hints_fold_back_to_the_same_state_and_validate`.
 
-Deviations from the reference server:
+Where ours is narrower:
 
-- **Names.** An exact name, else the one name equal ignoring case; several equal ignoring case, or none, is answered "no such name". The reference ranks every name by Damerau-Levenshtein ratio and takes a close enough match, or answers with a "did you mean" suggestion that its text client turns into an autocompletion (`Utils.py:676-742`); we have neither the fuzzy match nor the suggestion. `unit::hints::bang_hint_with_an_unknown_name_says_so_and_costs_nothing`.
-- **Two names, one id.** The room keeps one name per id (the first in name order), so `!hint` finds an item or location only under that name; the reference matches every name in its table.
-- **Ties.** Candidates of the same sphere and locality go in (slot, location) order; the reference shuffles them with the room's random seeded by the seed name (`MultiServer.py:1858`), so which of several equal hints comes first can differ.
-- **One record per location.** The reference keeps hints in a set of records whose equality includes the status and `found` (`NetUtils.py:393-419`), so in some sequences it can hold two records for one location (inferred from reading; not reproduced). Ours never does.
-- **`UpdateHint` with a missing or `null` status** changes nothing without checking who asks; the reference checks the asker first and refuses a non-receiver even then (`MultiServer.py:2172-2180`). The reference also ends the connection on a missing `status`; ours does not.
-- **`create_as_hint`** takes integers and booleans; the reference's `int()` also takes floats and numeric strings (`MultiServer.py:2088`).
-- **Texts.** The `Hint` print keeps the reference's part types and fields (`NetUtils.py:421-442`) in our own wording; every `CommandResult` text is our own wording.
+- **Names.** An exact name, else the one name equal ignoring case; several equal ignoring case, or none, is answered "no such name". No fuzzy match and no "did you mean" suggestion. `unit::hints::bang_hint_with_an_unknown_name_says_so_and_costs_nothing`.
+- **Two names, one id.** The room keeps one name per id (the first in name order), so `!hint` finds an item or location only under that name.
+- **Ties.** Candidates of the same sphere and locality go in (slot, location) order, so which of several equal hints comes first is fixed.
+- **One record per location.** Ours keeps exactly one hint record per (finding slot, location).
+- **`UpdateHint` with a missing or `null` status** changes nothing, without checking who asks, and the connection stays open.
+- **`create_as_hint`** takes integers and booleans only.
+- **Texts.** The `Hint` print keeps the protocol's part types and fields in our own wording; every `CommandResult` text is our own wording.
 - **Prints are not durable.** Like chat, `Hint` prints are fanned out once; a connection whose queue is full misses them (its `_read_hints_` key still converges).
 
 Forward only: a log that holds a hint event (`HintAdded`, `HintStatus`) cannot be folded by a server built before hints, so rolling back after the first hint leaves that room unable to start. Older logs and snapshots read forward (an older snapshot shape replays from the log).
 
 Accepted risk (see #47): `UpdateHint` can toggle a status forever, and each change is a logged event. The hint bucket bounds it at about one event per second per slot (estimate: about 86 400 small events a day per slot, not measured).
 
-## Data storage: deviations from the reference server
+## Data storage: limits of ours
 
-- Numbers are `i64` and `f64`. A result outside `i64` (Python integers are unbounded), a float that is not finite, or a non-real power is refused; an integer above `i64::MAX` in a request is refused too. Risk: a client relying on integers above 2^63 gets `InvalidPacket` (real magnitudes not verified).
-- A write is all or nothing; the reference can leave a list half changed when a later operation fails (in-place helpers, `MultiServer.py:127-155`).
-- `mod` with a string is refused (Python formats the string).
-- `update` accepts lists that hold lists or objects (Python refuses unhashable elements); `update` of an object takes an object or a list of `[key, value]` pairs with string keys (Python also takes other key types and two-character strings).
+- Numbers are `i64` and `f64`. A result outside `i64`, a float that is not finite, or a non-real power is refused; an integer above `i64::MAX` in a request is refused too. Risk: a client relying on integers above 2^63 gets `InvalidPacket` (real magnitudes not verified).
+- A write is all or nothing: a refused operation stores nothing.
+- `mod` with a string is refused.
+- `update` accepts lists that hold lists or objects; `update` of an object takes an object or a list of `[key, value]` pairs with string keys.
 - Objects keep their keys sorted, not in insertion order (no client depending on key order found; not verified broadly).
-- The client status is not saved across a restart (the reference saves it); the goal is.
+- The client status is not saved across a restart; the goal is.
 - A watcher whose queue fell behind can miss client status changes: they are not in the log, so a resync does not bring them back, and the watcher keeps the old value until the next change or a `Get` (the same resync gap as `original_value` above).
 
 ## Accepted risk: the log is not compacted (see #47)
@@ -113,7 +100,3 @@ Every data storage write is logged with its whole value, and subscribe and resta
 ## Known deviation: applied cursors are not persisted
 
 Doc 02 D3 asks for each slot's applied cursor (`applied_seq`, what the client confirmed) to be persisted at most once a second. Today the runtime does not write acks to the store (`crates/runtime/src/lib.rs`, module docs), so `slot_cursors` stays empty and a restart starts every slot's applied cursor at 0. Nothing a client sees depends on it yet: the compatible edge resends the whole inventory from index 0 on every connect, which is what the protocol document asks for. Follow-up: batch acks into the room's next append (`AppendBatch::cursors`, already stored and restored on start) or a once-a-second flush, before any feature reads the applied cursor (resume from a cursor, delivery metrics).
-
-## Known interop finding (not a defect of our server)
-
-`archipelago_rs` 3.0.1 as vendored uses `soketto` 0.8.1, which inflates each compressed message by finishing a deflate stream that has no final block. `flate2` 1.1.11 rejects that ("incomplete deflate stream"), so with `flate2` 1.1.11 every compressed frame fails, against any compressing server. `crates/e2e-ap` pins `flate2 = "=1.1.10"`, the version the Archipela-Go app locks. Inferred from `flate2` 1.1.11's own tests and reproduced here; not checked against Archipelago's server.

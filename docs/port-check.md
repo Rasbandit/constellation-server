@@ -9,7 +9,7 @@ Both are generic. The only world-specific code is a small Python adapter you wri
 
 ## What you need
 
-1. The manifest of your port (doc 07 shape plus the `x.` extensions in `data-only-world-experiment.md`, see #71). Location and item keys in the manifest are the keys every exchange below uses.
+1. The manifest of your port (doc 07 shape plus the `x.` extensions, see #71). Location and item keys in the manifest are the keys every exchange below uses.
 2. A Python environment where the legacy world runs.
 3. An adapter file (next section). Keep it next to your world, not in this repository, if the legacy world's license does not allow redistribution.
 
@@ -129,7 +129,7 @@ The adapter gains these (every player number is 1 based; the keys are manifest k
 
 The seed-shape column gains `cross_world_progression_share`: per player, the share of their progression items that lie in other players' worlds, for the legacy rooms and ours (a flag when a player's mean differs by more than 0.15). The tier 1 sanity fills are not run for rooms; `fill-fairness` measures a room (below).
 
-Run (K = 5, three players of the 1516-location test world: clock shuffle off, on, off; two further logic-affecting options each; the settings are in the adapter's yaml files, kept next to it):
+Run (K = 5, a room of three players; each player's settings are in the adapter's yaml files, kept next to it):
 
 ```sh
 target/release/port-check --manifest my_world.manifest.json \
@@ -137,80 +137,12 @@ target/release/port-check --manifest my_world.manifest.json \
   --out port-check-room --seeds 5 --ours 5 --inventories 150 --sanity-seeds 0
 ```
 
-Result (K = 5 legacy rooms, 5 of ours, 150 inventories; the legacy generation takes 64 to 96 s per room, so the run is about 7 minutes; our engine's share of it is 4 s):
-
-| Check | Result |
-|---|---|
-| `reachability` | 180 of 180 inventories identical (per player: locations, regions with time masks, events) |
-| `legacy_seeds_replayed` | 5 of 5: same spheres over the whole room (20 to 34 spheres), all beatable |
-| `port_seeds_judged_by_legacy` | 5 of 5: no violations, same spheres, all beatable |
-| `determinism` | 5 of 5 seeds, three fills each, byte-identical |
-
-Seed shape (informational), legacy rooms against ours, 5 and 5 rooms, player 1 / 2 / 3:
-
-| | Legacy | Ours |
-|---|---|---|
-| Spheres per room, mean (min to max) | 25.4 (20 to 34) | 25.6 (20 to 33) |
-| Progression items per sphere, mean | 34.8 | 34.5 |
-| Key item depth, mean fraction of the room's spheres | 0.43 | 0.51 |
-| Share of a player's progression in other worlds | 0.632 / 0.640 / 0.633 | 0.637 / 0.652 / 0.648 |
-| Share if placed uniformly over three worlds | 0.667 | 0.667 |
-
-The 178 per-item and per-region flags the report lists are single-item means over five rooms and are noise at this sample size; the sphere counts and shares above are the numbers to watch. Before the rounds below, the same run had 30.8 spheres and a key item depth of 0.47 (rooms that were longer than the legacy ones); a fill of one item at a time is the more accurate assumed fill, and the legacy default of one item per player at a time is biased towards earlier locations by design.
-
-Two things this run found. The start inventory of the player with shuffled clocks was a night clock, and the engine owned the first time slice with it (the solver does not): fixed, with a unit test, in this PR (a related case, issue #94, stays open). And the first run of ours was one item at a time; the rounds of one item per player come from reading the legacy fill.
-
-
 ### Scaling with players
 
-As of 2026-11-26 the fill has one path, the split path (one solve, then every group's state by adding to it and taking the additions back), at every room size and for confined items too. The carried path (truth maintenance) and the forward path (a fresh solve per round, on threads) described below were removed; the tables are history. A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`).
+The fill has one method, the exact (assumed) fill (D-138), on one path at every room size and for confined items too: the room is solved once, then every group's state (a confined item, or a round) is reached by adding to that solve and taking the additions back (`room.rs`, `Steps::split`). A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`). Same instance, seed and engine version give the same bytes; a new engine version may change them (D-140).
 
-`measure_room` (feature `memory-harness`) fills a room of N players of the test world (the two instances in turn, so the 10 and 20 player rooms repeat settings), release build, one fill of seed 1, `systemd-run -p CPUQuota=200%`; the world is loaded once and shared; fill time is the median of five fills; engine peak heap is the counting allocator's peak, world load included.
+Current numbers come from the `bench-room` CI job (`.github/workflows/bench.yml`): synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`), a light and a heavy profile (the heavy one with more regions and rules per check, time slices and clocks on), release build, one thread; it runs on PRs labelled `perf` and on manual dispatch.
 
-| Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 22.1 | 19.3 | 19.3 | 0.096 | 252 | 14 | 0.00 | 0.71 |
-| 2 | 40.5 | 70.5 | 35.3 | 0.227 | 309 | 14 | 0.51 | 1.01 |
-| 3 | 60.0 | 130.0 | 43.3 | 0.456 | 429 | 19 | 0.66 | 1.37 |
-| 10 | 203.5 | 1 060 | 106 | 3.78 | 1 083 | 49 | 0.87 | 3.83 |
-| 20 (extra) | 386.6 | 3 597 | 180 | 10.6 | 1 551 | 77 | 0.92 | 7.37 |
-
-- **Memory per added player: about 350 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.37 MB, linear: 291 KB for the second player, then 346 to 351 KB each.
-- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and a generation in the product runs it on `config::GENERATION_WORKERS` threads (one; the tools use `config::FILL_SETUP_WORKERS`). (History: since 2026-11-26 setup runs on one thread in every caller, and the worker count is gone.)
-- **Fill time per added player grows with the room on the carried path** (rooms under 8 players since the forward path below): 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
-- The cheap changes (a min-heap of suspects over players, a worklist of players with something to run, piles indexed by owner) are in: placements are byte-identical to before them (61 fills over 1, 2, 3 and 10 players, clock on and off, and the three-player fixture) and the time dropped 10 to 12 percent at 10 and 20 players. What is left is rule evaluation (the evaluations column is unchanged), not bookkeeping.
-- Every fill in this table is one full solve, then incremental steps (`solves` 1 in all rows). That holds on the carried path; the forward path solves once per round (next section).
-
-
-### Rooms of 8 players or more: a forward solve per round
-
-The table above is the carried path (`room::Path::Carry`). At the time of this table, a room of 8 players or more placed its rounds on `room::Path::Forward` (every room now takes `room::Path::Split`): the room is solved afresh for each round with none of the round's items held, forward only, each player's state on one of `config::ROOM_FORWARD_WORKERS` (4) threads. The placements are the same on both paths: a round's state is the unique least fixed point for what is held and placed, and placing reads only what it reaches (tests `a_forward_solve_per_round_places_what_truth_maintenance_does` and `the_forward_path_is_the_same_with_one_worker_and_with_many`).
-
-The test world cannot be committed, so CI measures synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`). The heavy profile follows the test world's counts per check (0.21 regions, 2.4 rule sites, 0.07 defs, 45 time slices, clocks on, 2.4 nodes per rule site against about 2.6). Measured on one GitHub-hosted runner by the `bench-room` job (release build, one seed per size, fill ms as the median of 5, 2026-11-26, commit 7944108); runs on other runners differed by about 20 percent. "Carried" is this branch's carried path on one thread. Rule evaluations are the same for any thread count.
-
-| Profile | Players | Carried: fill ms | Carried: rule evaluations | Forward, 1 thread: fill ms | Forward, 4 threads: fill ms | Forward: rule evaluations |
-|---|---|---|---|---|---|---|
-| light | 1 | 3.4 | 43,855 | 6.5 | 6.9 | 253,458 |
-| light | 10 | 112.0 | 1,117,203 | 91.7 | 78.5 | 2,687,618 |
-| light | 20 | 278.0 | 2,553,983 | 207.2 | 140.9 | 5,361,691 |
-| light | 50 | 1,351.2 | 11,441,303 | 558.3 | 332.4 | 13,425,303 |
-| light | 100 | 3,707.2 | 27,459,539 | 1,193.6 | 651.0 | 26,840,369 |
-| heavy | 1 | 18.1 | 149,132 | 26.1 | 26.3 | 488,289 |
-| heavy | 10 | 587.0 | 4,204,093 | 356.8 | 236.3 | 5,364,638 |
-| heavy | 20 | 1,636.9 | 11,060,637 | 707.1 | 412.4 | 10,518,266 |
-| heavy | 50 | 8,095.2 | 48,917,059 | 1,856.4 | 1,031.1 | 26,224,539 |
-| heavy | 100 | 28,567.6 | 145,327,726 | 4,137.5 | 2,406.7 | 52,251,328 |
-
-Fitted exponent of fill time over players: carried 1.52 (light) and 1.59 (heavy); forward 1.13 and 1.09 on one thread, 0.98 and 0.96 on four. At 100 players of the heavy profile the forward solve alone is 6.9 times faster than the carried path, and four threads add 1.7 times. Peak heap in the job's table counts the calling thread only; read it from the one-thread rows.
-
-- **How close the heavy profile is to the test world.** The test world's fills above, scaled by checks (1,000 of 1,516), are 12.7, 699 and 2,373 ms at 1, 10 and 20 players. The heavy profile's carried fills are 18.1, 587 and 1,637 ms in this run (43 percent above, 16 and 31 percent below); two earlier runs gave 18.5, 582 and 1,606 ms and 21.8, 702 and 1,913 ms (72 percent above, level, 19 percent below). The rooms are near; one player is heavier than the test world per check, and the profile grows more slowly from 1 to 10 players (about 32 times against 55). The two were measured on different machines, so the comparison is rough. Rule evaluations, which do not depend on the machine: 149 thousand, 4.2 million and 11.1 million against the test world's 96 thousand, 3.78 million and 10.6 million (not scaled).
-- **Where the two paths cross is not measured** between 1 and 10 players; the forward path is slower for one player and faster at 10 on both profiles. 8 is a cautious pick.
-- **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
-- The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
-
-## Opt-in fill modes (removed)
-
-Two opt-in fill modes, level fill and shuffle then repair, were built and measured here (commit 20d879c, 2026-11-25): about one forward solve each instead of one per round, 24 to 27 times faster than the exact fill at 100 players, at the cost of seeds that spread items measurably unlike the exact fill. Under D-138 the product has one fill method, so both were removed with their dials, constants, bench rows and tests. Their design, tables and seed-shape numbers are in `git` history (this section at that commit). `fill-fairness --shape on` reports the exact fill's seed shape on one room.
 
 ## Fairness
 
@@ -254,7 +186,7 @@ target/release/fill-fairness --world crates/data-fill/tests/fixtures/fairness_wo
 | room, three players (10 000, 10 000 of 54 388) | rounds | uniform, beatable for all | 0.136 (player 1's coin, player 2's vault) | 6, all player 2's vault | 9 218 (176), 0 | z = 1.18, not flagged |
 | room, three players (4 000, 4 000 of 21 897), one item at a time | one item at a time | same | 0.044 (player 1's coin, player 2's vault) | 0 | 519 (176), 9e-35 | z = -1.53, not flagged |
 
-As for one player, a small p-value on its own is expected: assumed fill is not uniform over beatable rooms. The room numbers to watch are the largest gap and the coverage map. The six gaps are one location: player 2's vault needs all three of player 2's progression items (hall door with the lamp, then the vault door), and in a round every player's last item is taken out of the state, so while each of the three players still has an item to place that location is unreachable for every item. The baseline puts another player's item there in 4 to 8 percent of rooms; the fill never does. That is the bias towards earlier locations the rounds are meant to have, magnified by a fixture whose players have only three progression items each; on the test world (hundreds of items per player) the sphere counts and shares above match the legacy rooms.
+As for one player, a small p-value on its own is expected: assumed fill is not uniform over beatable rooms. The room numbers to watch are the largest gap and the coverage map. The six gaps are one location: player 2's vault needs all three of player 2's progression items (hall door with the lamp, then the vault door), and in a round every player's last item is taken out of the state, so while each of the three players still has an item to place that location is unreachable for every item. The baseline puts another player's item there in 4 to 8 percent of rooms; the fill never does. That is the bias towards earlier locations the rounds are meant to have, magnified by a fixture whose players have only three progression items each.
 
 
 ## Limits

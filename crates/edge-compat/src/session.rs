@@ -493,7 +493,7 @@ impl Session {
             room.room.subscribe(j.cursor).await.map_err(|_| Closed)?;
         j.live = live;
         // The log has no notes: watchers get `null` for `original_value` and no pass-through
-        // fields for the writes they missed (docs/protocol-plan.md 1.4).
+        // fields for the writes they missed.
         let mut packets = events_packets(&room, j, &history, &[]);
         packets.extend(self.refresh_hints().await.map_err(|_| Closed)?);
         Ok(if packets.is_empty() { Vec::new() } else { vec![wire::frame(&packets)] })

@@ -54,7 +54,7 @@ Then, in order:
 
 **Indexes.** A game's location ids and item ids, sorted ascending, give the dense indexes: index `i` is the `i`th smallest id. Record `r` of a slot belongs to the `r`th set bit of its presence set, so the location is implicit. To find location id `x`: binary search the game's location ids for its index `i`, check presence bit `i`, and count the set bits below `i` to get `r`.
 
-Worked example (the real one-slot MM world): 2641 locations, 237 items and one slot give `wi` = 8 (the largest item index is 236), `wr` = 0 (one receiver) and `wf` = 2 (flags up to 2). So 1516 placements take 10 bits each, 1895 bytes in total, and the presence set takes 42 words (336 bytes).
+Worked example (a one-slot world): 2641 locations, 237 items and one slot give `wi` = 8 (the largest item index is 236), `wr` = 0 (one receiver) and `wf` = 2 (flags up to 2). So 1516 placements take 10 bits each, 1895 bytes in total, and the presence set takes 42 words (336 bytes).
 
 ## Hint block
 

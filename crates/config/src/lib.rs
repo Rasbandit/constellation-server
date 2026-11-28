@@ -123,7 +123,7 @@ pub struct Limits {
     /// Postgres `idle_in_transaction_session_timeout`: the server ends a session that sits in
     /// an open transaction this long, releasing its locks (design value).
     pub db_idle_in_transaction_timeout_ms: u64,
-    /// Longest data storage key, bytes (estimate, docs/protocol-plan.md 1.5).
+    /// Longest data storage key, bytes (estimate).
     pub kv_max_key_bytes: usize,
     /// Largest stored value, serialized as JSON, bytes (estimate).
     pub kv_max_value_bytes: usize,
@@ -152,8 +152,8 @@ pub struct Limits {
     /// (estimate; a room past it refuses writes with `room.storage_full`).
     pub kv_max_room_log_bytes: u64,
     /// Packets that write hints (scouts that create hints, `UpdateHint`) a slot may send in a
-    /// burst. Each can log events, so it has its own bucket; `!hint` shares chat's (estimate,
-    /// docs/protocol-plan.md 2.5).
+    /// burst. Each can log events, so it has its own bucket; `!hint` shares chat's
+    /// (estimate).
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,

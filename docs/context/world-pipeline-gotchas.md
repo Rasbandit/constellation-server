@@ -22,7 +22,7 @@ Pipeline on main:
 5. v2 encode into the store (Postgres `game_packages` and `room_seeds`, migration 0003).
 6. A room is created.
 
-Proof: `just e2e-full`. It uses real files in `~/Downloads`; never commit them.
+Proof: `just e2e-full`. It takes your own files as arguments; never commit them.
 
 ## Auth
 Every `/api` route needs a session cookie (sign up at `/api/signup`).

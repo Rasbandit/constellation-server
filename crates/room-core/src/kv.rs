@@ -1,4 +1,4 @@
-//! The room's key-value store: what each data storage operation does (docs/protocol-plan.md 1.2).
+//! The room's key-value store: what each data storage operation does.
 //!
 //! Clients compatible with Archipelago expect the operations to behave like the reference
 //! server's, which evaluates them with Python operators (`MultiServer.py:174-197`, helpers at

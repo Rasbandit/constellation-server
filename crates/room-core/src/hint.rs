@@ -1,4 +1,4 @@
-//! Hints (docs/protocol-plan.md section 2): which locations a slot knows the item of, their
+//! Hints: which locations a slot knows the item of, their
 //! status, and the points that buy them.
 //!
 //! A hint is keyed by the slot whose world holds the location and the location, as the

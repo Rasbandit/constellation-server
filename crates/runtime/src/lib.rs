@@ -29,7 +29,7 @@ pub enum Published {
     Events {
         /// The events.
         events: Arc<[Event]>,
-        /// Non-durable notes about some of these events (docs/protocol-plan.md section 0.5).
+        /// Non-durable notes about some of these events.
         /// A subscriber that resyncs from the log gets the events without them.
         notes: Arc<[Note]>,
     },
@@ -200,7 +200,7 @@ impl RoomHandle {
 
     /// Run a read-only query on the room state, after every message sent before it. Nothing is
     /// written. The answer can reach the caller before events published earlier have left its
-    /// queue (docs/protocol-plan.md section 0.4).
+    /// queue.
     ///
     /// # Errors
     /// [`RoomError::Unavailable`] when the room task has stopped.

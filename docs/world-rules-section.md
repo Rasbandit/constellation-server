@@ -1,6 +1,6 @@
 # The rules section of a game package
 
-Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions in `data-only-world-experiment.md`, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). The package around it is the v2 package file (`seed_bundle::package::file_bytes` and `stored`, uncompressed so the sections are read in place); the game section inside it is still this crate's stand-in (below).
+Internal to the engine and unstable (D-126): it may change in any release. Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). The package around it is the v2 package file (`seed_bundle::package::file_bytes` and `stored`, uncompressed so the sections are read in place); the game section inside it is still this crate's stand-in (below).
 
 ## Two layers: authors and the machine
 
@@ -12,33 +12,13 @@ Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loa
 
 The compiler (`section::compile`) runs once per world version and is the only code that reads the manifest. Its errors name the manifest path in author terms, for example `regions["menu"].checks["gift"].rule.has: unknown item "nope"`, never a byte offset or an index. `data-fill decode <package>` (`decode::manifest`) prints the manifest the section encodes, names restored from the game section and the names subsection, so a porter can see what the engine sees; compiling that output gives the same section bytes (tested).
 
-## Why: where a generation spends time and memory today
+## Why: where a generation spends time and memory
 
-Measured at the time with the `measure` example (`--example measure -- <manifest> <instance> 1`, feature `memory-harness`; removed since with the separate one-world fill: `measure_room` with one player now times the fill, which is a room of one) on the experiment's test world (manifest 830 KB of JSON: 2641 locations of which 1516 exist this seed, 237 items, 318 regions, 45 time slices, 3685 rule sites, 107 defs). "Peak" is live heap above the phase start, "held" what the phase leaves live. Allocator overhead per block is not counted. Two instances (clock shuffle off and on); times vary about 20% run to run on the shared box.
+When the engine read the JSON manifest directly, on a large world:
 
-| Phase | Time | Allocated | Peak | Held |
-|---|---|---|---|---|
-| read manifest file | 1 ms | 0.83 MB | 0.83 MB | 0.83 MB |
-| parse manifest into `serde_json::Value` | 23 to 24 ms | 13.2 MB | 12.9 MB | 12.9 MB |
-| parse instance (typed, the engine part) | 4 to 6 ms | 0.44 MB | 0.28 MB | 0.27 MB |
-| compile (`World::load`: fold options, build rule trees) | 8 ms | 1.8 MB | 0.93 MB | 0.91 MB |
-| drop the JSON inputs | 7 ms | | | -16.7 MB |
-| dependency index (`Index::new`) | 1 ms | 0.36 MB | 0.15 MB | 0.14 MB |
-| plan (`Plan::new`) | 0.5 ms | 0.09 MB | 0.06 MB | 0.06 MB |
-| fill (288 to 293 solves) | 110 to 230 ms | 12.3 MB | 0.07 MB | 0.01 MB |
-| validate (one solve) | 0.5 to 1.4 ms | 0.04 MB | 0.04 MB | 0 |
-| write placements JSON | 0.3 ms | 0.36 MB | 0.25 MB | 0 |
-| **engine process peak** | | | **17.9 MB** | |
-| test oracle: read and parse the recorded solves | 13 to 19 ms | 14.8 MB | 10.7 MB | |
-| test oracle: 42 solves | 9 to 20 ms | 1.8 MB | 0.04 MB | |
-
-What it means:
-
-1. **Memory: the JSON tree.** The manifest as a `Value` is 12.9 MB, 15.6 times its text, and it is the whole engine peak. About half of the text is location records whose names and types the engine never reads. The compiled world after it is 0.91 MB.
-2. **Memory: what stays.** After the inputs are dropped, the engine holds 1.39 MB: compiled rule trees as boxed enums (24 bytes per node, about 9 500 nodes after folding, most behind their own allocation), key strings (96 KB), key-to-index hash maps, and the dependency index as one `Vec` per item. A solve adds 42 KB, the fill 69 KB. So the fill itself is already small; the floor is the representation of the world.
-3. **Time: the fill.** 85 to 90% of the engine time. Each assumed-fill step solves from scratch (about 3 900 rule evaluations, about 100 ns each, a tree walk through `Box` pointers and `defs` references). 15% of a solve is setup (fresh buffers, start items, holding every placed item). Clock shuffle doubles the fill because time masks grow in more steps.
-
-The test oracle (recorded legacy solves in the instance file, 2.8 of its 2.9 MB) costs more memory than the engine and is kept out of every number above the line.
+1. **Memory: the JSON tree.** The manifest parsed into `serde_json::Value` was many times its text and was the whole engine peak; most of the text was location records whose names and types the engine never reads. The compiled world after it was a small fraction of that.
+2. **Memory: what stays.** After the inputs are dropped, the engine held compiled rule trees as boxed enums (most nodes behind their own allocation), key strings, key-to-index hash maps and the dependency index as one `Vec` per item. The fill itself was already small; the floor was the representation of the world.
+3. **Time: the fill.** Most of the engine time. Each assumed-fill step solved from scratch, a tree walk through `Box` pointers and `defs` references.
 
 ## Shape
 
@@ -83,11 +63,11 @@ Item and location indexes are manifest order in this implementation, and the gam
 | 14 | names | string lists (`u16` count, then `u16` length and UTF-8 per key) of region, counter, def, option and roll keys. Needed to bind a seed given by key (options, rolls) and for reports; never read by a solve |
 | 15 | item groups | packed group starts, packed member items, packed caps (0 = no cap, else cap + 1), then packed weights (one per member) only when some weight is not 1; without the list every weight is 1, so a world with no weighted sum keeps its bytes. A group names each item once (terms of one item are merged, below). The loader refuses a weights list of another length than the members or of only 1s (one encoding per world), bytes after the lists, an item named twice in one group, a group whose weights add up to more than `config::RULE_WEIGHT_MAX` x `config::RULE_GROUP_MAX_MEMBERS`, and a group of more than `config::RULE_GROUP_MAX_MEMBERS` members: the item sets a `GROUP` sum reads |
 
-Rules for writers: every offset points inside the section; every index is below its count; defs form a DAG (no def reaches itself); no rule nests deeper than `config::RULES_MAX_DEPTH` (256) nodes, counting the defs it reaches through `ref`, so the recursive evaluators stay inside a thread stack (the compiler applies the same cap; the test world nests 16 deep); every rule is monotone (below). `World::from_package` rejects a section that breaks any of these before a solve starts, in one pass (each def and each shared rule offset is checked once), and never panics on damaged bytes (tested by flipping every byte of a package).
+Rules for writers: every offset points inside the section; every index is below its count; defs form a DAG (no def reaches itself); no rule nests deeper than `config::RULES_MAX_DEPTH` (256) nodes, counting the defs it reaches through `ref`, so the recursive evaluators stay inside a thread stack (the compiler applies the same cap); every rule is monotone (below). `World::from_package` rejects a section that breaks any of these before a solve starts, in one pass (each def and each shared rule offset is checked once), and never panics on damaged bytes (tested by flipping every byte of a package).
 
 ### Bytecode
 
-Prefix order, byte aligned (rules are about 27 KB here, so bit packing them would save little and cost a slower decoder). One opcode byte, then fixed operands. Item, location and def operands are 1 byte when their count is at most 256 and 2 bytes otherwise (read from the header, fixed per section).
+Prefix order, byte aligned (rules are small on large worlds, so bit packing them would save little and cost a slower decoder). One opcode byte, then fixed operands. Item, location and def operands are 1 byte when their count is at most 256 and 2 bytes otherwise (read from the header, fixed per section).
 
 | Opcode | Operands | Meaning |
 |---|---|---|
@@ -130,13 +110,13 @@ The seed brings option values, roll values and the instance (existing locations,
 
 - option values `i32` per option, roll values `i16` per roll slot;
 - `BitSet`s over locations: exists, excluded; placement group per location and per item (packed);
-- the fold (`fold.rs`): one pass over the bytecode with options and rolls known writes a folded copy (constant parts removed, a site or def that folds to a constant points at offset 0 or 1) and a rule offset per site, def and half-day. About 40 KB on this world; a solve reads only the folded copy.
+- the fold (`fold.rs`): one pass over the bytecode with options and rolls known writes a folded copy (constant parts removed, a site or def that folds to a constant points at offset 0 or 1) and a rule offset per site, def and half-day. Small on a large world; a solve reads only the folded copy.
 
 ### Per solve
 
 | State | Form |
 |---|---|
-| copies per item, counter values, group sums | `i64` each (2 KB here; narrower types would save little) |
+| copies per item, counter values, group sums | `i64` each (narrower types would save little) |
 | time mask per region | `u64` per region (a `BitSet` of at most 64 slices in one word); 0 = not reached |
 | reached locations | `BitSet` over locations |
 | what a location gives when reached | borrowed from the fill's placement array, not copied per solve |
@@ -146,7 +126,7 @@ The seed brings option values, roll values and the instance (existing locations,
 
 The fill keeps one solve state and resets it between steps: a fill step allocates nothing (tested). Items added before a run do not walk their dependency lists, because the first visit of a region evaluates all its sites anyway; the clock rules, which run before any visit, are rechecked once at the start of the run.
 
-The loader also unpacks the indexes a solve walks every step (site targets, region ranges, item and counter to sites, time-dependent sites, about 70 KB here) into plain arrays; the packed bytes stay the source of truth for checks and decoding.
+The loader also unpacks the indexes a solve walks every step (site targets, region ranges, item and counter to sites, time-dependent sites) into plain arrays; the packed bytes stay the source of truth for checks and decoding.
 
 ## Complexity contract
 
@@ -158,66 +138,25 @@ The format makes a bad big-O impossible rather than unlikely:
 - **Group sums are counters**: "N of these items", weighted or not, costs O(groups the item is in) per collected item and O(1) per read in a solve, never a scan of the group.
 - **No name lookups at generation time**: every key is a dense index in the section; keys are resolved once per seed when the instance is bound (`Plan::new`), never in a solve.
 - **Per fill: O(progression items x per-solve cost)** for the assumed fill (at most one solve per placed progression item), plus O(locations) for the filler.
-- **History (removed 2026-11-26): one solve state per fill, kept exact by truth maintenance.** The fill now reaches every group's state by adding to one solve and taking the additions back (`Reach::undo_to`, see the room section); what follows describes the engine before that. Assumed fill takes one item back per step, which is not monotone, so the naive way is a fresh solve per step. Instead every fact the state holds carries a rank, unique and increasing in derivation order: a site that held (an exit, event or check), a half-day rule that held, and a growth of a region's mask (the slices one support added at once: the start, an exit passing its source's slices, or waiting forward). A collected copy has the rank of the check that reached its location. The state as of rank `k` is every fact of rank below `k`, and each fact holds in the state as of its own rank, so the ranks are a derivation. A step goes like this:
-  1. *Carry*: placing the previous item at a reached location only adds, so hold it and run the worklist from the current fixed point (only the sites that read it are rechecked).
-  2. *Saturated*: `Plan::new` computes per progression item the held count past which no rule reads more copies (the fewest copies that make every test reading it true with nothing else held; "never" when none up to the copies that exist does). Rules are monotone, so with that many still held, taking a copy back changes nothing: take it back and go on.
-  3. *Retract* (`Reach::remove`): otherwise check the facts that read the item, lowest rank first, each against the state as of its own rank minus the copy. Checking as of the fact's own rank, not against the current state, is what keeps this exact: support that runs through the fact itself (an item found behind the site) is of higher rank and never counts. A fact that still holds keeps its place; one that does not is retracted, and the facts that read it are checked in turn, along the item, counter, location, exit and region indexes.
-  4. *Re-derive*: the retracted sites and half-days are the only ones that can hold again, because the new fixed point is inside the old one. The worklist evaluates only those (and the regions that lost a slice); what holds again gets a new rank.
-
-  Mask growths are kept as a short list per region (one entry per support and rank), not a rank per slice: support checks, cascades and "the mask as of a rank" walk growths. The lists reserve a few entries per region and keep their capacity across resets (fixed per-slice arrays would cost 114 KB per state on the test world).
-
-  Reads as of a rank (the take-back path only) are bounded per call but not O(1): an item count or a counter is a binary search over the ranks of its copies or of its fired events (O(log copies), O(log events)); a group sum is O(members x log copies); a region's mask as of a rank walks its growths (a few, at most one per support and rank); the owned clocks as of a rank walk the half-day rules (O(half-days), 6 on the test world). Retracting a half-day checks the growths of every region once (O(regions + growths)), and it happens at most once per half-day per step.
-
-  The state carries over between placement phases, so a fill runs one full solve; beatability and the sphere report are read off the final state. Placements are byte-identical to a fresh solve per step: the `golden` example matches 40 of 40 recorded fills of the test world, and the unit test `carrying_the_fixed_point_keeps_every_placement` fills 200 seeds both ways on a world with thresholds, an `any` held up from inside, and clocks. `removal_does_not_keep_support_that_runs_through_itself` and `removal_retracts_only_what_depended_on_the_item` pin the two halves of the retraction.
+- **Per group, no fresh solve.** The fill reaches each group's state from one solve by adding to it and taking the additions back (`Reach::mark`, `Reach::undo_to`): rules are monotone, so only additions follow a mark, and undoing them restores that fixed point value for value.
 
 ### Several players (a room)
 
-As of 2026-11-26 a room has one path: one solve, then every group's state (a confined item, or a round) by adding to it and taking the additions back; the carried and forward paths and truth maintenance named below were removed, and a fresh solve of every group's state is a test-only cross-check. `room.rs` fills the worlds of several players together; nothing above changes for one player (as of 2026-11-26 the single-player fill is gone and one player fills as a room of one, which moves an item in place where that fill started over, see Rounds).
+The fill has one method, the exact (assumed) fill (D-138), on one path for every room size (`room.rs`, `Steps::split`); one player fills as a room of one. A fresh solve of every group's state is a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`; `adding_to_a_room_and_taking_it_back_matches_a_fresh_solve`). Same seed, settings and engine version give the same result on every machine; a new engine version may change it (D-140).
 
-- **One state per player, linked by messages.** Each player has their own `Reach` over their own world and plan. A location that holds an item of another player does not collect it; reaching it sends the owner's state a copy "found at the rank of that location". The owner's state continues incrementally, and what it reaches may send copies on. On the carried path (`room::Path::Carry`, for a caller that names it, and confined items in any room) no state is ever rebuilt after the first solve (`RoomFilled::solves` is 1, tested).
-- **One rank sequence for the room.** The states take ranks from one counter that the room hands from state to state, so a rank orders every derivation in the room and the support check "as of the fact's rank" stays exact across worlds. A copy that moves to a later rank (its location is reached another way) is moved in the receiver by a message; a location that is no longer reached takes its copy back.
-- **Taking an item back** (assumed fill) is the single-player walk over all states at once: the owner's state queues the facts that read the copy; suspects are checked lowest rank first over every state; a retracted location tells the state that holds its item to queue that item's readers; then every state that lost something re-derives only what it lost (the others are gated the same way when a copy is handed back). The result equals a fresh solve of the whole room (`taking_items_back_across_players_matches_a_fresh_solve`, `carrying_the_room_keeps_every_placement`).
+- **One state per player, linked by messages.** Each player has their own `Reach` over their own world and plan. A location that holds an item of another player does not collect it; reaching it sends the owner's state a copy. The owner's state continues incrementally, and what it reaches may send copies on.
+- **One rank sequence for the room.** The states take ranks from one counter that the room hands from state to state, so a rank orders every derivation in the room.
+- **Groups.** Items are placed in groups (one confined item, or a round), each against a state that holds none of the group: the room is solved once with none of the groups' items, then each group's state is reached by adding what it holds and taking it back after.
 - **Per room, per solve: O(sum over players of the single-player cost)**; messages are one per reached location holding another player's item.
-- **Per room, per fill, carried path (`room::Path::Carry`): O(items x cost of one removal)**, and a removal in a room reaches across worlds, so the fill is about **O(players^1.7)** in total (measured, table in `docs/port-check.md`, issue #93). This is worse than linear and is stated, not hidden: the number of steps grows with players, and so does what one step retracts.
-- **Memory is linear**: the world and its section are shared; each added player adds a plan and a state, about 350 KB on the test world, measured (`measure_room`).
-- **The forward path solves each round afresh** (`room::Path::Forward`, for a caller that names it; every room the server fills takes the split path, `room::Path::Split`: one solve, then each round's state by adding to it and taking the additions back) instead of taking its items back: forward only, every player's state to its own fixed point on `config::ROOM_FORWARD_WORKERS` threads, then what they found handed over in player order, until nothing changes. The thread count is the fill request's `workers`, at most `config::ROOM_FORWARD_WORKERS` and the cores the process may use; a step starts threads only with `config::ROOM_FORWARD_MIN_PENDING` evaluations ahead, and a thread the system refuses leaves its share to the calling thread. The placements are the same as on the carried path, and the fill time is about linear in players (measured, `docs/port-check.md`). The points above describe the carried path, which confined items keep.
-- **Setup can be parallel; placing is not.** Compiling worlds and resolving instances per player run on the worker count asked for (`config::FILL_SETUP_WORKERS` in the tools; a generation in the server asks for `config::GENERATION_WORKERS`, one, and compiles nothing: see "Prepared worlds") and are merged in player order; placing is one sequential walk with one random stream. Results are the same for any worker count (tested with 1, 2, 3, 7 and 16 workers). (History: since 2026-11-26 setup runs on one thread in every caller, and the worker count is gone.)
-- **Rounds**: as in the reference multiplayer fill, progression is placed in rounds of one item per player (the last of each player's own pile of the shuffled pool, piles in the order players first appear), and a round is placed against a state that holds none of its items, which favours earlier locations; confined items go one at a time. With one player a round is one item. A round whose state does not reach a free location for each of its items is divided in halves, down to single items. An item that still has nowhere to go takes the location of a placed item that is reached without it, and that item is placed again against the state that has neither (the assumed fill's own step, so the seed is beatable for the same reason); at most `config::FILL_DISPLACE_TRIES` placed items are tried, spread over the order they were placed in, one fresh solve each, and a fill's repair (the moves' solves, one solve's worth for the pass over the rounds after each move, and one solve's worth per divided round) spends at most `config::FILL_REPAIR_EVALS` rule evaluations over all its attempts (a budget of work, the same on every machine and path). A room that fills without either is placed exactly as before these repairs. Only when a repair fails does the fill start over, at most `config::FILL_MAX_ATTEMPTS` times, and a restart orders each player's pile deepest first (`depth.rs`): one forward solve of the world alone adds, step by step, every copy that would open something, and the step is the copy's depth. That keeps a room of worlds where one key hides everything behind it from falling back to its start regions (issue 212), at a cost: shorter item chains and seeds further from uniform (counted on the bench), which is why it is only the recovery. Setup reports a world whose early capacity ratio (`data_fill::capacity`) is under 1: such a world leaves fewer places early on than items to seat, and leans on these repairs.
-- **Choices where the reference multiplayer fill has options**: one shared pool and one shuffled location list over all players; an item with a placement group stays in its owner's world and group; no progression on an excluded location; every player's goal must be reachable, and a location may be unreachable (see #92; the opt-in fill modes of `docs/port-check.md` ask that every progression item can be collected unless their `goal_only` dial is set); local-item limits are open (#91).
+- **Memory is linear**: the world and its section are shared; each added player adds a plan and a state (`measure_room` measures it).
+- **Placing is sequential**: one walk with one random stream, on one thread.
 
-Counters that check the contract (`Stats`, printed by `measure` and in `port-check`'s report under `work`), seed 1 of the test world, both instances (clock shuffle off / on):
+- **Rounds**: as in the reference multiplayer fill, progression is placed in rounds of one item per player (the last of each player's own pile of the shuffled pool, piles in the order players first appear), and a round is placed against a state that holds none of its items, which favours earlier locations; confined items go one at a time. With one player a round is one item. A round whose state does not reach a free location for each of its items is divided in halves, down to single items. An item that still has nowhere to go takes the location of a placed item that is reached without it, and that item is placed again against the state that has neither (the assumed fill's own step, so the seed is beatable for the same reason); at most `config::FILL_DISPLACE_TRIES` placed items are tried, spread over the order they were placed in, one fresh solve each, and a fill's repair (the moves' solves, one solve's worth for the pass over the rounds after each move, and one solve's worth per divided round) spends at most `config::FILL_REPAIR_EVALS` rule evaluations over all its attempts (a budget of work, the same on every machine). A room that fills without either is placed exactly as before these repairs. Only when a repair fails does the fill start over, at most `config::FILL_MAX_ATTEMPTS` times, and a restart orders each player's pile deepest first (`depth.rs`): one forward solve of the world alone adds, step by step, every copy that would open something, and the step is the copy's depth. That keeps a room of worlds where one key hides everything behind it from falling back to its start regions (issue 212), at a cost: shorter item chains and seeds further from uniform (counted on the bench), which is why it is only the recovery. Setup reports a world whose early capacity ratio (`data_fill::capacity`) is under 1: such a world leaves fewer places early on than items to seat, and leans on these repairs.
+- **Choices where the reference multiplayer fill has options**: one shared pool and one shuffled location list over all players; an item with a placement group stays in its owner's world and group; no progression on an excluded location; every player's goal must be reachable, and a location may be unreachable (see #92); local-item limits are open (#91).
 
-These counters were measured before truth maintenance and are kept for the comparison between the first three engines only; they do not describe the current engine, whose totals `measure` prints under `work`.
+## Measured
 
-| Counter | Tree-walking engine | Compiled section, fresh solve per step | Derivation log (since replaced) |
-|---|---|---|---|
-| full solves per fill | 288 / 293 | 288 / 293 | 2 / 2 (one per placement phase) |
-| rule evaluations per fill (all steps) | 1 132 039 / 1 203 715 | 1 116 824 / 1 170 006 | 61 931 / 88 012 |
-| rule evaluations per full solve | 3 931 / 4 108 | 3 878 / 3 993 | |
-| worklist pushes per fill | 692 068 / 978 242 | 439 384 / 688 326 (about 2 350 per solve with clocks) | 61 298 / 84 264 |
-| dependency entries walked per collected item, mean / max | 4.1 / 600, 4.8 / 600 | 4.1 / 601, 5.1 / 601 | |
-| dependency entries walked for start items (before the first run) | 2 165 515 / 2 111 601 | 0 | 0 |
-
-The derivation log was an intermediate step between a fresh solve per step and truth maintenance: it recorded each firing, mask change and visit, replayed the sites that read a taken-back item and, on a failed replay, undid and rewalked the log suffix. It cut fill time from 98 to 101 ms to 26 to 28 ms (clock shuffle on: 174 to 197 ms to 46 to 52 ms), but most of what remained was log bookkeeping, and the log (24 bytes per entry, about 115 / 170 KB per solve state) raised engine peak heap to 1.0 / 1.5 MB. Truth maintenance retracts along the dependency indexes instead of walking the log suffix: one full solve per fill instead of two, fill 18 to 25 ms, engine peak heap 715 / 718 KB on the test world. The saturation pass adds about 1 ms to the plan.
-
-The max of 601 is the most-read item (one entry per site that reads it); it is walked once per copy collected, and sites already done are skipped at the push.
-
-## Measured on the test world
-
-`measure` (feature `memory-harness`), seed 1, both instances, release build, shared box under `systemd-run -p CPUQuota=200%` at load 6 to 9 (times vary about 20% run to run). "Before" is the tree-walking engine, "After" the compiled section with a fresh solve per step, "Now" the same with truth maintenance (only the rows it changes were re-measured).
-
-| Phase | Before | After | Now |
-|---|---|---|---|
-| once per world version: parse manifest JSON, compile | 31 ms, 13.2 MB peak | 45 to 58 ms, 14.9 MB peak (JSON only here) |  |
-| package on disk (rules + game stand-in, not deflated) | | 185 KB; rules section 68 021 bytes |  |
-| load the package (read, check, unpack hot indexes) | | 1.5 ms, 0.33 MB held |  |
-| parse the instance (typed, streamed, recorded oracle skipped) | 4 to 6 ms (text held: 2.9 MB) | 15 to 21 ms (nothing but the typed instance held) |  |
-| plan and per-seed fold | 0.5 ms | 3.5 ms, 83 KB held |  |
-| fill | 116 / 218 ms, 3 482 allocations | 108 / 184 ms, 40 allocations | 18 to 25 ms |
-| one solve | 0.51 / 0.71 ms | 0.39 / 0.43 ms |  |
-| **engine peak heap** | **17.9 / 17.8 MB** | **688 / 691 KB** | **715 / 718 KB** |
-
-The section is 68 KB against the 66 KB estimate; the peak is above the 160 KB estimate because the typed instance (0.27 MB, the first open question below) and the instance parser's buffers are live while the plan is built, and the game stand-in keeps every key. Fills are byte-identical to the tree-walking engine for seeds 1 to 20 on both instances (the `golden` example), and `port-check` (5 legacy seeds, 50 inventories, 200 sanity fills) passes every check.
+Current numbers on committed synthetic worlds come from the `bench-room` CI job (`docs/port-check.md`).
 
 ## Prepared worlds
 
@@ -227,6 +166,6 @@ A stored world is prepared again from the stored manifest, by the generation tha
 
 ## What is not decided here
 
-- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. Today's typed JSON instance is 0.27 MB held, which alone fits the budget but is most of it.
+- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. On a large world the typed JSON instance alone fits the budget but is most of it.
 - Whether the dependency index stays in the section. The converter computes it and the loader rebuilds it from the rules and refuses a section whose index differs (a missing reader would never be rechecked); the item group membership index is computed at load. `reach` is allowed in the goal only, by compiler and loader, so no index of region readers is needed.
 - Versioning: a change to any layout here bumps the header's format version; section 2 is listed as unstable in the v2 document until the first release.

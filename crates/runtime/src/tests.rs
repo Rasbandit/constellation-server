@@ -51,7 +51,7 @@ fn kv_add(slot: u32, key: &str, n: i64) -> Command {
     }))
 }
 
-/// Docs/protocol-plan.md section 0.5: what the edge attached to a command rides with that
+/// What the edge attached to a command rides with that
 /// command's events, in the same queue entry, with the command's reply; commands without a
 /// note add none.
 #[tokio::test]
@@ -93,7 +93,7 @@ async fn a_refused_noted_command_publishes_no_note() {
     assert_eq!(sub.live.try_recv().unwrap_err(), TryRecvError::Empty);
 }
 
-/// Docs/protocol-plan.md section 0.4: a read is answered from the room state after every
+/// A read is answered from the room state after every
 /// command sent before it, and writes nothing.
 #[tokio::test]
 async fn a_read_sees_every_earlier_command_and_writes_nothing() {

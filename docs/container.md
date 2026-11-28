@@ -1,4 +1,6 @@
-# Running the room server in a container
+# Deploy and operate: the container, CI and continuous deploy
+
+One doc for running the server in production: the image and compose file, the reverse proxy, CI and releases, and how a host follows `main`. It holds the method only, never a host's names, paths or secrets.
 
 The image holds the room server, the web UI and the upload and generation API. Rooms and the UI share the one public port, 38281: `/` is the UI, a WebSocket upgrade on `/<key>` is a room. Flags and environment variables are in the README; the compose file runs `constellation-server --host 0.0.0.0 --port 38281 --rooms /data/rooms --data-dir /data` (the admin API shares the port; the image's own default is the same without `--data-dir`; its default command already has `--web-dir`).
 
@@ -50,14 +52,14 @@ There is one public port (`38281`). `/api/*` is served on it, always on when the
 
 Behind a proxy every client has the proxy's address, so the sign-up and login counts are shared (an IPv6 address counts as its /64); start the server with `--trusted-proxy-header X-Forwarded-For` (or `X-Real-IP`) so it counts per real client. Only the last entry of the last line of that header is used (the one your proxy appended), and the proxy must overwrite or append it: never turn the flag on when clients can reach the port without the proxy, because they could then send any address.
 
-TLS comes from the reverse proxy; never expose the port over plain HTTP, since passwords, sessions and the uploads travel on it. For `const.ras.band` with nginx (plain pass-through, no auth of its own):
+TLS comes from the reverse proxy; never expose the port over plain HTTP, since passwords, sessions and the uploads travel on it. For a host `play.example` with nginx (plain pass-through, no auth of its own):
 
 ```
 map $http_upgrade $connection_upgrade { default upgrade; "" close; }
 
 server {
     listen 443 ssl;
-    server_name const.ras.band;
+    server_name play.example;
     # ssl_certificate / ssl_certificate_key as usual
 
     # Room uploads: at least apworld_max_bytes (64 MiB); the server enforces its own caps.
@@ -100,7 +102,7 @@ Uploaded code runs in bubblewrap (README, "Security model"). Two things differ i
   - `seccomp=./docker/seccomp-bwrap.json`: Docker's default profile plus an allow rule for `clone`, `unshare`, `setns`, `mount`, `umount`, `umount2` and `pivot_root`, without `CAP_SYS_ADMIN`. Re-sync it with Docker's default when you upgrade Docker.
   - `apparmor=unconfined`: the `docker-default` AppArmor profile denies `mount`. This drops AppArmor for this container (it only matters on hosts that use AppArmor).
   - `systempaths=unconfined`: Docker masks parts of `/proc` and `/sys`, and the kernel then refuses a new `/proc` mount inside a user namespace. This unmasks them for this container (for example `/proc/kcore` and `/proc/sys`; `/proc/sys` stays read-only to a process without capabilities).
-  The container is not privileged and has no added capabilities. The tradeoff: this container (the server as well as its jobs) has a weaker container boundary than a default one, so a job that escaped bubblewrap would face less. Do not run other services in it, and keep the admin token secret and the port behind a TLS proxy.
+  The container is not privileged and has no added capabilities. The tradeoff: this container (the server as well as its jobs) has a weaker container boundary than a default one, so a job that escaped bubblewrap would face less. Do not run other services in it, and keep the port behind a TLS proxy.
 
 ## Versions and releases
 One version covers the server, the web UI and the image: `version` under `[workspace.package]` in `Cargo.toml` (every crate inherits it). `web/package.json` must carry the same one; `tools/version-check/check.sh` checks that and the `version` workflow runs it on PRs that touch those files, so there is no per-PR bump. The server answers `GET /version` with `{"version":"<version>"}`; a build made with `CONSTELLATION_BUILD_SHA` set (the image's `BUILD_SHA` build arg, used for every non-release build) reads `<version>+<short sha>`. The web UI shows `server <v> / web <v>` in a corner badge and flags a difference.
@@ -111,3 +113,20 @@ Pushing a tag `v*` runs `.github/workflows/release.yml`, which pushes `linux/amd
 
 ## CI
 PRs never build the image. The `release` workflow lints the packaging first (hadolint, shellcheck, the entrypoint and db-roles tests, compose config check), then builds the image and runs it under compose on every push to main and, when that passes, publishes it to GHCR as `main` and `sha-<short sha>` (one publish at a time, never cancelled mid-push); a `v*` tag publishes the version tags and `latest`; it can also be started by hand on any branch (Actions, release, Run workflow), which builds and runs without pushing.
+
+## Continuous deploy to one host
+
+The release workflow publishes `main` and `sha-<short sha>` only after its smoke job passes, so a red smoke run deploys nothing. A host follows `main` with a small pull-based deployer (a scheduled script; any scheduler works) that:
+
+1. Polls the registry for a new `:main` digest.
+2. Pins the container to the matching `sha-<short sha>` tag, never to `:main`, so the previous tag is always a rollback target.
+3. Syncs `docker/seccomp-bwrap.json` from the repo at that revision (the sandbox profile must match the image).
+4. Recreates the container.
+5. Waits up to 60 seconds for `/healthz`; on failure it rolls back to the previous tag.
+
+So every merge to `main` that publishes an image reaches that host within minutes.
+
+- **Config before code.** A change that needs a new environment variable, secret file or database change must be in the host's container config before its image lands, or the container crash-loops and the deployer rolls back. Add the variable or secret first, then recreate within the health window.
+- **Database roles.** Run `docker/db-roles.sh` inside the Postgres container once per database, for example `docker exec -i -e PGHOST=/var/run/postgresql <postgres container> sh -s < docker/db-roles.sh`. Check that `pg_stat_activity` shows only `constellation_app` connected and that `pg_roles` has `rolsuper = f` for it.
+- **Secrets** are files on the host, mounted as above; never put a value in a template, an environment file in the repo, or a log.
+- **Before a destructive change** (a wipe, a schema reset), take a `pg_dump` in custom format and keep the old data and secret folders beside the live ones until the new state is checked.
