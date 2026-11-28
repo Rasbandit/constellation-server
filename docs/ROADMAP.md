@@ -57,7 +57,7 @@ Projects are goals that cut across the five lanes. Each has a label `project:<na
 3. Registry (#152), automated checks (#153), listing states (#154) and the takedown path (#155).
 4. Then the portal (#156), sandbox (#157), quick start (#158), maintainer dashboard (#159), games site (#160) and game health signal (#161).
 
-**World standard** (`project:world-standard`: #164 to #172, plus #27 to #31, #71, #91 to #94; lane games, M3). Goal: convert existing worlds into the data-only standard in a separate worlds repo, and write down best practice from what hurts.
+**World standard** (`project:world-standard`: #164 to #172, plus #28 to #31, #71, #91 to #94 and #226; #27, the validator, is done; lane games, M3). Goal: convert existing worlds into the data-only standard in a separate worlds repo, and write down best practice from what hurts.
 1. Setup: the worlds repo (#164), credit and copying rules (#165), the definition of a converted world (#166).
 2. Pick the first three worlds (#167), then the folder template (#168).
 3. Convert them (#29, #30), checked by the equivalence harness (#31).
@@ -68,7 +68,19 @@ Projects are goals that cut across the five lanes. Each has a label `project:<na
 2. Build owner tools (#177), metrics (#180), alerting (#181) and the retention policy (#184).
 3. Then the operator console (#178), audit log (#179), public status page (#183) and cost per room (#182).
 
-**Features and web app** (`project:features-web`: #42, #73, #82, #111; lane web). Goal: user-facing features and the web app flow. The website cleanup is parked until it has issues.
+**Features and web app** (`project:features-web`: #42, #73, #82, #111, and #225 as a stretch; lane web). Goal: user-facing features and the web app flow. The website cleanup is parked until it has issues.
+
+### Started since, with no label or board yet
+
+These four serve question 3 (lane games, M3). Each follows a decided design doc in the `constellation` repo and has merged work here; none has a `project:` label or a board yet, so the issues and pull requests below are the record.
+
+**The `.rando` authoring language** (doc 18, D-141). Goal: worlds written as `.rando` files and built by the `rando` tool in `crates/world-build` ([`world-build.md`](world-build.md)). Done: the tool core (#223), two grammar rounds (#228 and the trial worlds of #227), five genre example worlds (#229). Open: the lexer moving to its own crate (#232), the doc 18 features the tool still refuses (#226), and the three trial worlds that must pass before the grammar is frozen (doc 18 section 8, question 9).
+
+**World packaging** (doc 19, D-142). Goal: one package per world version for the developer portal. Done in the tool: `rando.toml`, `rando.lock` and `rando pack` (#230). Not built yet: the server side, which checks the package as untrusted input and rebuilds its source in the sandbox (D-142).
+
+**The settings language** (doc 20, D-143, D-144). Goal: player and room settings as a small `.rando` file type. Done: option scope and labels, and `settings.json` in the package (#231). Open: the shared lexer for settings files (#232), then the checker and tools of doc 20 sections 7 and 8.
+
+**Generic shuffles, entrance and room shuffle first** (doc 17, D-137). Goal: one system for randomization that is not item placement. Done: the first slice in `data_fill::shuffle`, with entrance shuffle (#207; [`data-only-world-experiment.md`](data-only-world-experiment.md) section 4). Open: the write edges in the run order (#210) and the rest of doc 17 (#211).
 
 ## Tech choices
 
