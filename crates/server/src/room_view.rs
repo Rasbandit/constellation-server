@@ -147,7 +147,7 @@ mod tests {
     /// The e2e fixture's room, in memory, with its handle to make events in it.
     async fn fixture_room() -> (Host, Arc<CompatRoom>, runtime::RoomHandle) {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../e2e/fixtures/two-slot.json");
+            .join("../seed-bundle/fixtures/two-slot.json");
         let (_, host) = app(&Source::Bundle(fixture), None, None, Limits::DESIGN).await.unwrap();
         let rooms = host.rooms();
         let room = crate::rooms::read(&rooms).iter().next().unwrap().1.room.clone().unwrap();

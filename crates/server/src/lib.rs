@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn a_bundle_over_the_cap_or_missing_is_refused() {
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         assert!(load_bundle(&fixture, &Limits::DESIGN).is_ok());
         let small = Limits {
             format: rando_limits::Limits { bundle_max_bytes: 10, ..rando_limits::Limits::DESIGN },
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn a_bundle_exactly_at_the_cap_loads_and_one_byte_over_does_not() {
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         let len = std::fs::metadata(&fixture).unwrap().len();
         let at = Limits {
             format: rando_limits::Limits { bundle_max_bytes: len, ..rando_limits::Limits::DESIGN },
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn a_v2_seed_file_is_not_imported_from_disk() {
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         let v1 = load_bundle(&fixture, &Limits::DESIGN).unwrap();
         assert_eq!(v1.packages.len(), 2, "the import hands its two package files to the host");
         let e = parse_bundle(v1.bundle.bytes(), &Limits::DESIGN).unwrap_err();
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn the_bundle_hash_is_sha256_of_the_canonical_input_json() {
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         let hex = hex(&load_bundle(&fixture, &Limits::DESIGN).unwrap().hash);
         assert_eq!(hex, "97cee53e7307b8ec357b4419cc1cfd89bfc52d72b57767297d22905ededb9275");
     }
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn the_bundle_hash_ignores_formatting_and_key_order_and_sees_content() {
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         let text = std::fs::read_to_string(&fixture).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let pretty = serde_json::to_string_pretty(&v).unwrap();
@@ -1544,7 +1544,7 @@ mod tests {
     async fn with_a_bundle_an_upgrade_on_any_path_joins_the_room_and_a_get_is_the_ui() {
         let (root, dist) = web_fixture("bundle");
         let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json");
         let addr = serve_ui(&Source::Bundle(fixture), &dist).await;
         for path in ["/", "/anything/at/all"] {
             let r = raw(addr, path, UPGRADE).await;

@@ -31,7 +31,7 @@ pub const GUARD: Duration = Duration::from_secs(20);
 /// The committed two-slot fixture bundle.
 #[must_use]
 pub fn fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/two-slot.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json")
 }
 
 /// The fixture, parsed with the schema crate (the expected values in tests come from it).

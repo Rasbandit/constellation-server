@@ -4,7 +4,7 @@ use crate::bundle_hash;
 use serde_json::{Value, json};
 
 fn fixture_text() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../e2e/fixtures/two-slot.json");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/two-slot.json");
     std::fs::read_to_string(path).unwrap()
 }
 
@@ -399,10 +399,10 @@ fn ordinals_and_indexes_round_trip_across_many_slots() {
 
 /// Review finding: no test crossed games. Games A and B with disjoint item ids and different
 /// item counts: slot 1 (A) finds an item of B for slot 2 (B), slot 2 one of A for slot 1, and
-/// slot 3 (A) places nothing (`crates/e2e/fixtures/cross-games.json`, shared with the edge
+/// slot 3 (A) places nothing (`crates/seed-bundle/fixtures/cross-games.json`, shared with the edge
 /// tests). Item indexes resolve against the receiver's game.
 fn cross_games() -> Value {
-    serde_json::from_str(include_str!("../../../e2e/fixtures/cross-games.json")).unwrap()
+    serde_json::from_str(include_str!("../../fixtures/cross-games.json")).unwrap()
 }
 
 #[test]

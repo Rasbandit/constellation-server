@@ -102,7 +102,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    const V1: &str = include_str!("../../../e2e/fixtures/cross-games.json");
+    const V1: &str = include_str!("../../fixtures/cross-games.json");
 
     /// A fresh folder for one test.
     fn scratch(name: &str) -> PathBuf {

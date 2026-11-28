@@ -22,7 +22,7 @@ trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$work"' EXIT
 pw=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '{"username":"check","password":"%s"}' "$pw" >"$work/signup.json"
 mkdir "$work/rooms"
-cp "$root/crates/e2e/fixtures/two-slot.json" "$work/rooms/fixture.json"
+cp "$root/crates/seed-bundle/fixtures/two-slot.json" "$work/rooms/fixture.json"
 CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHON=$python \
     CONSTELLATION_AP_GEN_SCRIPT=$root/tools/ap-gen/ap_gen.py CONSTELLATION_ROOMS_SCAN_MS=200 \
     "${CARGO_TARGET_DIR:-$root/target}/debug/constellation-server" --rooms "$work/rooms" \

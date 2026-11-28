@@ -722,13 +722,13 @@ async fn a_self_found_item_reads_found_their() {
     assert_eq!(texts, ["1", " found their ", "8", " (", "101", ")"]);
 }
 
-/// Two games with disjoint item ids (`crates/e2e/fixtures/cross-games.json`): P1 plays A and
+/// Two games with disjoint item ids (`crates/seed-bundle/fixtures/cross-games.json`): P1 plays A and
 /// finds B's item 202 for P2; P2 plays B and finds A's item 2 (a trap) for P1; P3 places
 /// nothing. Ids at the wire come from the receiver's game.
 #[tokio::test]
 async fn items_across_games_carry_the_receivers_ids_at_the_wire() {
     let v: Value =
-        serde_json::from_str(include_str!("../../e2e/fixtures/cross-games.json")).unwrap();
+        serde_json::from_str(include_str!("../../seed-bundle/fixtures/cross-games.json")).unwrap();
     let b = seed(&v);
     let store = Arc::new(MemLogStore::new());
     let epoch = store.claim(RoomId(1));

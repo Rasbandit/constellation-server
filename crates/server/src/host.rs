@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     fn fixture() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../seed-bundle/fixtures/two-slot.json")
     }
 
     async fn host(dir: &TempDir, limits: Limits) -> Host {

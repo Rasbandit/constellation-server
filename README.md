@@ -28,7 +28,7 @@ Next crates, in doc 05 section 20 order: `edge-native`.
 
 ## Run the server
 ```sh
-cargo run -p server --bin constellation-server -- --bundle crates/e2e/fixtures/two-slot.json --port 38281
+cargo run -p server --bin constellation-server -- --bundle crates/seed-bundle/fixtures/two-slot.json --port 38281
 ```
 Then point a client compatible with Archipelago at `ws://localhost:38281` with slot `Alice` or `Bob` and game `Archipela-Go 2: Electric Boogaloo`. Flags: `--host <ip>` (default 127.0.0.1).
 
@@ -84,7 +84,7 @@ ROOT=$PWD; AG=$(realpath ../Archipela-Go); PY=$AG/apworld/.venv/bin/python; OUT=
 cd $AG/.ap
 PYTHONPATH=. $PY -c 'import runpy,sys,ModuleUpdate; ModuleUpdate.update_ran=True; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' \
   Generate.py --player_files_path $ROOT/crates/e2e/fixtures/players --outputpath $OUT --seed 7
-PYTHONPATH=. $PY $ROOT/tools/ap-import/ap_import.py $OUT/AP_*.zip $ROOT/crates/e2e/fixtures/two-slot.json
+PYTHONPATH=. $PY $ROOT/tools/ap-import/ap_import.py $OUT/AP_*.zip $ROOT/crates/seed-bundle/fixtures/two-slot.json
 cd $ROOT
 ```
 Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-17; Bob has a starting inventory). Importer tests: `python -m unittest discover -s tools/ap-import` (no Archipelago needed). `seed-bundle` has a test that loads the fixture, so a schema drift fails there.

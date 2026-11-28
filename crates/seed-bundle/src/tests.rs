@@ -127,7 +127,7 @@ fn race_mode_defaults_to_zero_and_is_kept() {
 /// contract. Counts were read off the generator's spoiler log for the fixture seed.
 #[test]
 fn the_imported_fixture_bundle_is_valid() {
-    let b = SeedBundle::from_json(include_str!("../../e2e/fixtures/two-slot.json")).unwrap();
+    let b = SeedBundle::from_json(include_str!("../fixtures/two-slot.json")).unwrap();
     let names: Vec<_> =
         b.slots.iter().map(|s| (s.id, s.name.as_str(), s.locations.len())).collect();
     assert_eq!(names, [(1, "Alice", 15), (2, "Bob", 15)]);

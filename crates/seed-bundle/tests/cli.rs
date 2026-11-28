@@ -11,7 +11,7 @@ fn a_bad_command_prints_the_usage_and_fails() {
 #[test]
 fn a_good_command_prints_its_result_and_succeeds() {
     let dir = std::env::temp_dir().join(format!("bundle-exit-{}", std::process::id()));
-    let input = concat!(env!("CARGO_MANIFEST_DIR"), "/../e2e/fixtures/cross-games.json");
+    let input = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/cross-games.json");
     let out = Command::new(env!("CARGO_BIN_EXE_bundle"))
         .args(["v2-encode", input])
         .arg(&dir)
