@@ -1233,7 +1233,7 @@ impl P<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
