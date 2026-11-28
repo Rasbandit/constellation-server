@@ -18,7 +18,7 @@ use rando_syntax::{Diagnostic, Pos, Severity};
 pub mod ast;
 pub mod canon;
 pub mod check;
-// pub mod edit;
+pub mod edit;
 pub mod fmt;
 pub mod schema;
 #[cfg(test)]
