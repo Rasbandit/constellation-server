@@ -5,7 +5,9 @@ use items
 def rank(n) = has(veteran_rank, n)
 def party(n) = group_count(companions) >= n
 
-# Rourke picks locks, Ilse heals through poison and cold, Bram lifts what blocks a path.
+# Tamsin reads old script, Rourke picks locks, Ilse heals through poison and cold, Bram lifts
+# what blocks a path.
+def can_read_script = has(tamsin)
 def can_pick_locks = has(rourke)
 def can_endure = has(ilse)
 def can_clear_rubble = has(bram)

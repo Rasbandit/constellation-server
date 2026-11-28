@@ -1,36 +1,21 @@
-# Each chapter ends in a finale written by hand: bigger fights, their own objectives, and the
-# `chapter_won` event the goal counts. A finale past `chapters` is left out.
+# Each chapter ends in a finale: a bigger fight with an objective of its own (`feat`), a
+# no-losses objective, and the `chapter_won` event the goal counts.
 use army
 use campaign
 
-region halvar_breakout {
-  check halvar_breakout_victory: army(4)
-  check halvar_breakout_rearguard: army(4) and has(raider)
-  check halvar_breakout_no_losses: army(7)
-  event chapter_won: army(4)
-  exit war_room
+table finale(key: name, planet: name, chapter: int, after: rule, power: int, feat: name, feat_needs: rule) {
+  halvar_breakout halvar 1 halvar_relay_won 4 rearguard has(scout_buggy)
+  velkas_conductor velkas 2 velkas_pylons_won 9 ground_the_rods has_air
+  brannoc_crucible brannoc 3 (brannoc_railway_won and brannoc_furnace_won) 13 breach can_siege
+  ilvane_citadel ilvane 4 ilvane_descent_won 18 flagship has(command_barge)
 }
 
-region velkas_hive {
-  check velkas_hive_victory: army(9)
-  check velkas_hive_burn_nests: army(9) and has_air
-  check velkas_hive_queen: army(12) and has(armor_upgrade, 2)
-  event chapter_won: army(9)
-  exit war_room
-}
-
-region brannoc_crucible when in_campaign(3, false) {
-  check brannoc_crucible_victory: army(13)
-  check brannoc_crucible_breach: army(13) and can_siege
-  check brannoc_crucible_hold_the_line: army(16)
-  event chapter_won: army(13)
-  exit war_room
-}
-
-region ilvane_throne when in_campaign(4, false) {
-  check ilvane_throne_victory: army(18)
-  check ilvane_throne_flagship: army(18) and has(carrier)
-  check ilvane_throne_no_losses: army(21)
-  event chapter_won: army(18)
-  exit war_room
+for f in finale where in_campaign(f.chapter, false) {
+  region {f.key} {
+    check {f.key}_victory: army(f.power)
+    check {f.key}_{f.feat}: army(f.power) and f.feat_needs
+    check {f.key}_no_losses: army(f.power + 3)
+    event chapter_won: army(f.power)
+    exit war_room
+  }
 }

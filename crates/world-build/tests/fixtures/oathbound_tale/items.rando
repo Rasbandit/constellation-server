@@ -15,15 +15,15 @@ item ferry_pass progression
 item skiff progression
 item miners_lamp progression
 item thaw_rune progression
-item royal_seal progression
+item war_writ progression
 
 # Each rank stands for the levels a party would reach by fighting; an area asks for a rank.
 item veteran_rank progression x 6
 
-# Gear and consumables. Shops are full of them.
+# Gear and consumables, and filler for the checks left over.
 item iron_sword useful
 item chain_mail useful
-item phoenix_feather useful x 3
+item revival_tonic useful x 3
 item healing_herb filler
 item gold_pouch filler
 item ambush_scroll trap

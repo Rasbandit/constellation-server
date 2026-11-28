@@ -1,24 +1,17 @@
-# The hub island: a world door for each world, opened by a count of sun gems.
+# The hub island: a world door for each world, opened by a count of lucky marbles.
 use items
-
-# What each world's door asks for, in sun gems.
-table world_door(key: name, gems: int) {
-  reef_cove 0
-  mossy_canopy 3
-  cinder_caldera 8
-  frostcap_peaks 14
-  clockwork_isle 20
-}
+use worlds
 
 region hub_meadow {
   check meadow_stump
   check windmill_roof: can_reach_high
   check pond_bottom: has(swim_fins)
-  check hollow_log: has(roll_dash)
-  for d in world_door {
-    exit {d.key}: count(sun_gem) >= d.gems
+  check fallen_log: has(roll_dash)
+  # Each world's door asks for the lucky marbles in its row of `isle`.
+  for w in isle {
+    exit {w.key}: count(lucky_marble) >= w.marbles
   }
-  exit summit_path: count(sun_gem) >= opt.gems_for_summit
+  exit summit_path: count(lucky_marble) >= opt.marbles_for_summit
 }
 
 region summit_path {

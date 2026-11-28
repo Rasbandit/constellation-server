@@ -1,0 +1,27 @@
+# The aqueduct: pumps and pipes, climbed from the airlock's cable or from the pump station.
+use items
+use logic
+
+region pump_station {
+  check valve_wheel
+  check burst_pipe: can_break_walls
+  exit airlock: has(tether_hook)
+  exit intake_lift: can_climb_shaft
+}
+
+region intake_lift {
+  check lift_cage
+  check counterweight
+  # The same ledge as the foundry's catwalk, seen across the shaft: the hook pulls the player
+  # over. One location, two ways in.
+  check catwalk_ledge also: has(tether_hook)
+  exit pump_station
+  exit cistern_top: can_reach_high and can_cross_gap
+}
+
+region cistern_top {
+  check overflow_grate
+  check storm_drain: has(spring_boots) and has(magnet_gloves)
+  check filter_bank: can_swim
+  exit intake_lift
+}

@@ -1,4 +1,5 @@
-# The wilds between towns. Monsters here scale with the road, so each road asks for a rank.
+# The wilds between towns. Monsters get stronger away from the start, so the far roads and
+# their camps ask for a rank.
 use items
 use logic
 
@@ -33,5 +34,5 @@ region ashen_road {
   check burnt_wagon
   check wyvern_nest: rank(4)
   exit salt_coast
-  exit sunspire
+  exit highmarch
 }

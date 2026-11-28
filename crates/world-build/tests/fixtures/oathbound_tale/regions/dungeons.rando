@@ -1,4 +1,4 @@
-# The dungeons. Each ends in a boss that holds a story item.
+# The dungeons, each with a boss. The first boss always holds the ferry pass.
 use items
 use logic
 
@@ -10,7 +10,7 @@ region goblin_warren {
 }
 
 region lighthouse_steps {
-  check keeper_log
+  check keeper_log: can_read_script
   check lantern_room: rank(2)
   check drowned_captain: rank(2) and party(2)
   exit saltmere
@@ -31,12 +31,12 @@ region frost_crypt {
 
 region keep_gate {
   check gate_armory: can_pick_locks
-  exit sunspire
-  exit throne_room: rank(6)
+  exit highmarch
+  exit warlord_hall: rank(6)
 }
 
-region throne_room {
-  check usurper_hoard
-  event crown_reclaimed: rank(6) and party(opt.party_needed) and can_endure
+region warlord_hall {
+  check warlord_hoard
+  event oath_fulfilled: rank(6) and party(opt.party_needed) and can_endure
   exit keep_gate
 }

@@ -1,20 +1,16 @@
 # Bramble Isles: a collect-a-thon 3D platformer invented as a genre example. No game's names,
-# data or logic. A hub island opens five worlds as the player gathers sun gems; every world
-# hides gems behind moves, and is scattered with minor collectibles (seed pods) everywhere.
-# The hub and each world are their own file, as a world with this many places would be.
+# data or logic. A hub island opens five worlds as the player gathers lucky marbles; every world
+# hides marbles behind moves, and is scattered with minor collectibles (seed pods) everywhere.
+# The worlds share one shape, so `worlds.rando` writes it once over tables of worlds and marbles.
 world bramble_isles "Bramble Isles" version 1
 use items
 use hub
-use worlds/reef_cove
-use worlds/mossy_canopy
-use worlds/cinder_caldera
-use worlds/frostcap_peaks
-use worlds/clockwork_isle
+use worlds
 start hub_meadow
 
-# Sun gems the summit door wants.
-option gems_for_summit: range 15..30 = 25
-# Seed pods per world that are checks. Every world has eight; the rest stay vanilla clutter.
+# Lucky marbles the summit door wants.
+option marbles_for_summit: range 15..30 = 25
+# Seed pods per world that are checks. Every world has eight; the rest stay where they are.
 option pods_per_world: range 2..8 = 6
 
 goal summit_reached

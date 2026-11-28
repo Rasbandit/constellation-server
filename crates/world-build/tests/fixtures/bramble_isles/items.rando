@@ -1,5 +1,5 @@
-# Sun gems are the main collectible: they open the worlds and the summit.
-item sun_gem progression x 30
+# Lucky marbles are the main collectible: they open the worlds and the summit.
+item lucky_marble progression x 30
 
 # Moves the player learns. Each opens a kind of obstacle in every world.
 item ground_pound progression
@@ -8,7 +8,8 @@ item swim_fins progression
 item high_bounce progression
 item roll_dash progression
 
-# Minor rewards: extra lives, health and a hat. The seed pods hand most of these out.
+# Minor rewards: extra lives, health and a hat. Filler fills every check the marbles and moves
+# leave.
 item health_berry useful x 4
 item feather filler
 item extra_life filler

@@ -1,0 +1,22 @@
+# Movement gear is the progression: each piece opens a kind of obstacle across the map.
+item spring_boots progression
+item thruster progression
+item magnet_gloves progression
+item tether_hook progression
+item rebreather progression
+item breach_charge progression
+item flare_lamp progression
+# The reactor door's keycard.
+item reactor_keycard progression
+
+# Upgrades that make the run easier but never open a path.
+item vigor_cell useful x 8
+item battery_pack useful x 4
+item survey_chip useful x 5
+
+item scrap filler
+item static_burst trap
+pool fill { scrap 10, static_burst 1 }
+
+# The four pieces of gear that move the player through the air or along walls.
+group movement = { spring_boots, thruster, magnet_gloves, tether_hook }

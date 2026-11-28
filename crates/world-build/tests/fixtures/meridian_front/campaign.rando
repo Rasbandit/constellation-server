@@ -2,54 +2,38 @@
 use army
 
 # A planet's coordinates open its missions in the war room.
-table planet(key: name, chapter: int) {
-  halvar 1
-  velkas 2
-  brannoc 3
-  ilvane 4
+table planet(key: name) {
+  halvar
+  velkas
+  brannoc
+  ilvane
 }
 
 for p in planet {
   item {p.key}_coordinates progression
 }
 
+# Which missions are in this seed: chapters up to `chapters`, and side operations only with
+# `side_ops` on. It reads options only, so it can be a family's `where`.
+def in_campaign(chapter, side) = chapter <= opt.chapters and (not side or opt.side_ops)
+
 # Every mission but the chapter finales (those are in `finales.rando`). `after` is the mission
 # tree: what must be won before it opens. `power` is the army strength its victory needs, and
 # `bonus` is what its bonus objective asks for besides.
 table mission(key: name, planet: name, chapter: int, side: bool, after: rule, power: int, bonus: rule) {
   halvar_landfall halvar 1 false true 0 true
-  halvar_relay halvar 1 false halvar_landfall_won 0 has(raider)
-  halvar_convoy halvar 1 true halvar_landfall_won 3 has(raider)
-  velkas_canopy velkas 2 false (counter(chapter_won) >= 1) 4 has_air
-  velkas_harvest velkas 2 false velkas_canopy_won 6 has(raider)
-  velkas_spores velkas 2 true velkas_canopy_won 6 has(armor_upgrade)
+  halvar_relay halvar 1 false halvar_landfall_won 0 has(scout_buggy)
+  halvar_convoy halvar 1 true halvar_landfall_won 3 has(scout_buggy)
+  velkas_stormfront velkas 2 false (counter(chapter_won) >= 1) 4 has_air
+  velkas_pylons velkas 2 false velkas_stormfront_won 6 has(scout_buggy)
+  velkas_lightning velkas 2 true velkas_stormfront_won 6 has(hull_plating)
   brannoc_foundry brannoc 3 false (counter(chapter_won) >= 2) 8 can_siege
-  brannoc_railway brannoc 3 false brannoc_foundry_won 9 has(raider)
+  brannoc_railway brannoc 3 false brannoc_foundry_won 9 has(scout_buggy)
   brannoc_furnace brannoc 3 false brannoc_foundry_won 10 has_air
-  brannoc_smugglers brannoc 3 true brannoc_railway_won 8 has(gunship)
+  brannoc_smugglers brannoc 3 true brannoc_railway_won 8 has(skimmer)
   ilvane_blockade ilvane 4 false (counter(chapter_won) >= 3) 12 has_air
   ilvane_descent ilvane 4 false ilvane_blockade_won 14 can_siege
-  ilvane_archive ilvane 4 true ilvane_blockade_won 12 has(raider)
-}
-
-# Which missions are in this seed: chapters up to `chapters`, and side operations only with
-# `side_ops` on. It reads options only, so it can be a family's `where`.
-def in_campaign(chapter, side) = chapter <= opt.chapters and (not side or opt.side_ops)
-
-# The war room is where every mission is launched from. With `mission_order` at `open`, the
-# tree is ignored and the coordinates alone decide.
-region war_room {
-  for m in mission where in_campaign(m.chapter, m.side) {
-    exit {m.key}: has({m.planet}_coordinates) and (opt.mission_order == open or m.after)
-  }
-  exit halvar_breakout: opt.mission_order == open or halvar_relay_won
-  exit velkas_hive: has(velkas_coordinates) and (opt.mission_order == open or velkas_harvest_won)
-  exit brannoc_crucible: in_campaign(3, false)
-    and has(brannoc_coordinates)
-    and (opt.mission_order == open or (brannoc_railway_won and brannoc_furnace_won))
-  exit ilvane_throne: in_campaign(4, false)
-    and has(ilvane_coordinates)
-    and (opt.mission_order == open or ilvane_descent_won)
+  ilvane_archive ilvane 4 true ilvane_blockade_won 12 has(scout_buggy)
 }
 
 # A mission is a region with an objective check each. Missions not in the campaign are left

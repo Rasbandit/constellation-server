@@ -1,0 +1,38 @@
+# The surface: the landing pad and the colony's yards, the hub every zone loops back to.
+use items
+use logic
+
+region landing_pad {
+  check crash_debris
+  check cargo_pod
+  check radio_mast: can_reach_high
+  exit airlock
+  exit ridge: can_reach_high
+}
+
+region airlock {
+  check locker_row
+  check sealed_bulkhead: can_break_walls
+  exit landing_pad
+  exit scrapyard
+  exit mine_shaft
+  # A cable from the airlock roof runs straight to the aqueduct once the hook can ride it.
+  exit pump_station: has(tether_hook)
+}
+
+region scrapyard {
+  check crane_cab
+  check rusted_hauler
+  check stacked_containers: can_climb_shaft
+  exit airlock
+  exit smelter_floor: can_cross_gap
+}
+
+region ridge {
+  check survey_beacon
+  check wind_ledge: can_cross_gap
+  exit landing_pad
+  # A one-way drop: the ridge gives way into the mines, and there is no climbing back up
+  # here. The game's warp to the landing pad is what gets a player out (see the README).
+  exit collapsed_mine
+}

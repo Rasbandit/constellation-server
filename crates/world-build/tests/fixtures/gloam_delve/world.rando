@@ -1,0 +1,63 @@
+# Gloam Delve: a run-based roguelike invented as a genre example. No game's names, data or
+# logic. Each run goes down a cave, depth by depth, with one of five delvers. A run has no map
+# to speak of, so the locations are counted progress: reaching a depth, beating the warden
+# halfway down with a delver, winning with a delver, winning again under hardship marks.
+# Options set how many of them exist. The world is small enough to stay in one file.
+world gloam_delve "Gloam Delve" version 1
+start cave
+
+# How deep the cave goes: one check per depth reached.
+option depths: range 5..50 = 20
+# Hardship marks make a win harder; each mark is one more check per delver.
+option hardships: range 0..4 = 2
+# How many delvers must win a run.
+option wins_needed: range 1..5 = 2
+
+# The delvers. The first is playable from the start; the others are items to find.
+table delver(key: name) {
+  lamplighter
+  ropewright
+  alchemist
+  sentry
+  gambler
+}
+
+for d in delver {
+  item {d.key} progression
+}
+start_item lamplighter
+
+# Ember shards are the lasting upgrades that make every run stronger. One copy per five
+# depths, so a deeper cave has more of them, and each five depths asks for one more. Each
+# hardship mark asks for one more again, so there is a copy for it too.
+item ember_shard progression x opt.depths div 5 + opt.hardships
+
+# Everything else is filler, as in most runs: coins, tonics and trinkets, and a jinx.
+item coin_purse filler
+item tonic filler
+item trinket filler
+item jinx trap
+pool fill { coin_purse 6, tonic 3, trinket 3, jinx 1 }
+
+# Delver `d` wins a run: the delver, and a shard per five depths of the cave.
+def can_win(d) = has(d) and has(ember_shard, opt.depths div 5)
+
+region cave {
+  # Depth N needs a shard for each five depths above it, so depths 1 to 5 are open.
+  for i in 1..50 where i <= opt.depths {
+    check reach_depth_{i}: has(ember_shard, (i - 1) div 5)
+  }
+
+  for d in delver {
+    # The warden guards the halfway point: a shard per five depths down to it.
+    check {d.key}_beats_warden: has({d.key}) and has(ember_shard, opt.depths div 10)
+    check win_with_{d.key}: can_win({d.key})
+    # A win under k hardship marks needs k more shards than a plain win.
+    for k in 1..4 where k <= opt.hardships {
+      check {d.key}_hardship_{k}: can_win({d.key}) and has(ember_shard, opt.depths div 5 + k)
+    }
+    event run_won: can_win({d.key})
+  }
+}
+
+goal counter(run_won) >= opt.wins_needed
