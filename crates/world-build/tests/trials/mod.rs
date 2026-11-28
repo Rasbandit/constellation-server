@@ -17,7 +17,7 @@ fn root(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
-/// Every file of a fixture folder (`.rando`, `.csv`, `ledger.json`) by relative path.
+/// Every file of a fixture folder (`.rando`, `.csv`, `rando.lock`) by relative path.
 fn read_all(dir: &Path) -> BTreeMap<String, String> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for e in std::fs::read_dir(dir).unwrap() {
@@ -35,19 +35,15 @@ fn read_all(dir: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Fixtures with no committed `ledger.json`: Tidewell's ids are its declaration order, pinned
-/// by its own test against its model.
-const NO_LEDGER: &[&str] = &["tidewell"];
-
-/// Every folder in `tests/fixtures`, by name. Each must be a world (have a `world.rando`), so a
-/// misnamed entry file fails here instead of leaving its folder untested.
+/// Every folder in `tests/fixtures`, by name. Each must be a world (have a `rando.toml`), so a
+/// folder missing it fails here instead of leaving its folder untested.
 fn fixtures() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root(""))
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.is_dir())
         .map(|p| {
-            assert!(p.join("world.rando").is_file(), "{} has no world.rando", p.display());
+            assert!(p.join("rando.toml").is_file(), "{} has no rando.toml", p.display());
             p.file_name().unwrap().to_str().unwrap().to_owned()
         })
         .collect();
@@ -124,14 +120,11 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
     for name in names {
         let b = ok(&Dir(root(&name)));
         assert!(b.warnings.is_empty(), "{name}: {:?}", b.warnings);
+        assert_eq!(b.meta.as_ref().map(|m| m.name.as_str()), b.manifest["game"].as_str(), "{name}");
         // The committed ledger is what the build writes: no id moved.
-        let ledger = std::fs::read_to_string(root(&name).join("ledger.json"));
-        if NO_LEDGER.contains(&name.as_str()) {
-            assert!(ledger.is_err(), "{name} has a ledger.json; take it off NO_LEDGER");
-        } else {
-            let committed = ledger.unwrap_or_else(|e| panic!("{name}/ledger.json: {e}"));
-            assert_eq!(b.ledger.as_deref(), Some(committed.as_str()), "{name}");
-        }
+        let committed = std::fs::read_to_string(root(&name).join("rando.lock"))
+            .unwrap_or_else(|e| panic!("{name}/rando.lock: {e}"));
+        assert_eq!(b.ledger.as_deref(), Some(committed.as_str()), "{name}");
         canonical(&name);
         fills(&b, &HashMap::new(), 50);
     }
@@ -199,7 +192,9 @@ fn logic(b: &Built, options: &HashMap<String, i64>) -> (serde_json::Value, Vec<(
 /// changes only rules or the goal is caught doing nothing too.
 #[test]
 fn the_genre_examples_have_their_check_counts_and_fill_at_their_option_extremes() {
-    let cases: &[(&str, &[(&str, &str)], usize)] = &[
+    // A world, its option settings, and the checks the README states for them.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], usize);
+    let cases: &[Case<'_>] = &[
         ("meridian_front", &[], 51),
         ("meridian_front", &[("chapters", "2"), ("side_ops", "off")], 18),
         ("meridian_front", &[("chapters", "3"), ("campaign_order", "open")], 39),

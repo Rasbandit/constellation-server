@@ -629,8 +629,8 @@ impl P<'_> {
             return Err((pos, format!("expected {what}")));
         }
         self.k = end;
-        for i in start + 1..end {
-            self.layout.glue[i] = true;
+        for g in self.layout.glue.iter_mut().take(end).skip(start + 1) {
+            *g = true;
         }
         Ok(At::new(pieces, pos))
     }

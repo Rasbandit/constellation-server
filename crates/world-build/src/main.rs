@@ -7,12 +7,15 @@
 //!   layout; with `--check`, change nothing and fail when a file would change.
 //! - `rando build [dir] [-o manifest.json] [--instance instance.json] [--allow-edited]
 //!   [--publish]`: check, then write the canonical manifest (to standard output without `-o`)
-//!   and `ledger.json` back into `dir`; `--instance` also writes the per-seed instance at the
+//!   and `rando.lock` back into `dir` (warning loudly when it had none); `--instance` also writes the per-seed instance at the
 //!   options' defaults.
 //! - `rando generate [dir] [--seed N] [--players N] [--option name=value ...] [--options file]
 //!   [-o out/] [--format text|json] [--check-seeds K]`: build in memory with the checks of
 //!   `build`, fill a room of N copies with the engine's fill and write `<world>-<seed>.seed` and
 //!   a spoiler log into `out/`; `--check-seeds K` fills K seeds instead and reports how it went.
+//! - `rando pack [dir] [-o file] [--no-source]`: check and build with the rules of `build
+//!   --publish`, require `rando.toml`'s publish fields, and write `<name>-<version>.randopack`
+//!   (design doc 19), then `rando.lock` with its ids marked published.
 //! - `rando stamp FILE --tool "NAME VERSION" [--source PATH ...] [--expect TABLE>=N ...]`:
 //!   write or refresh the `generated` header of FILE (a generator's output in any language),
 //!   with the SHA-256 of each source (paths relative to the world's folder, the nearest folder
@@ -22,11 +25,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use world_build::front::{Dir, LEDGER, Options, format_text};
+use world_build::meta::FILE;
 use world_build::{Error, build};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: rando check|fmt|build|generate [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
+        "usage: rando check|fmt|build|generate|pack [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
     );
     ExitCode::from(2)
 }
@@ -136,14 +140,15 @@ fn stamp(args: &[String]) -> ExitCode {
         }
     }
     let (Some(file), Some(tool)) = (file, tool) else { return usage() };
-    // The world's folder: the nearest folder above the file with an entry file.
+    // The world's folder: the nearest folder above the file with a `rando.toml` (or, until
+    // every world has one, a `world.rando`).
     let Some(root) = file
         .ancestors()
         .skip(1)
-        .find(|d| d.join(world_build::front::ENTRY).is_file())
+        .find(|d| d.join(FILE).is_file() || d.join(world_build::front::ENTRY).is_file())
         .map(Path::to_path_buf)
     else {
-        eprintln!("error: no folder above {} has a `world.rando`", file.display());
+        eprintln!("error: no folder above {} has a `rando.toml`", file.display());
         return ExitCode::FAILURE;
     };
     let folder = Dir(root);
@@ -197,9 +202,9 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let mut dir = PathBuf::from(".");
+    let mut dir = None::<PathBuf>;
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
-    let (mut opts, mut check_only) = (Options::default(), false);
+    let (mut opts, mut check_only, mut no_source) = (Options::default(), false, false);
     #[cfg(feature = "engine")]
     let (mut g, mut gen_flags) = (Gen::default(), false);
     #[cfg(not(feature = "engine"))]
@@ -227,15 +232,31 @@ fn main() -> ExitCode {
             "--allow-edited" => opts.allow_edited = true,
             "--publish" => opts.publish = true,
             "--check" => check_only = true,
+            "--no-source" => no_source = true,
             s if s.starts_with('-') => return usage(),
-            s => dir = PathBuf::from(s),
+            s => dir = Some(PathBuf::from(s)),
         }
     }
+    // A folder given must be the world; with none, walk up to the nearest `rando.toml`, as
+    // Cargo finds `Cargo.toml`.
+    let dir = dir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|c| c.ancestors().find(|d| d.join(FILE).is_file()).map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
     // A flag of one command given to another is a mistake, not something to ignore.
+    let pack_only = no_source;
     if (gen_flags && verb != "generate")
         || (verb == "generate" && (instance.is_some() || check_only))
+        || (pack_only && verb != "pack")
+        || (verb == "pack"
+            && (instance.is_some() || check_only || opts.allow_edited || opts.publish))
     {
         return usage();
+    }
+    if verb == "pack" {
+        return pack(&dir, out.as_deref(), !no_source);
     }
     if verb == "fmt" {
         return fmt(&dir, check_only);
@@ -251,6 +272,16 @@ fn main() -> ExitCode {
         }
     };
     report(&built.warnings, "warning");
+    if built.meta.is_none() {
+        // shortcut: a folder with only `world.rando` is still a world; make this an error with
+        // the first portal release (design doc 19 section 8).
+        let world = built.manifest["game"].as_str().unwrap_or("my_world");
+        let version = built.manifest["version"].as_i64().unwrap_or(1);
+        eprintln!(
+            "warning: {} is missing; this folder is read as a world from `world.rando` for now. Add one, for example:\n[world]\nname = \"{world}\"\nversion = \"{version}.0.0\"",
+            dir.join(FILE).display()
+        );
+    }
     if opts.publish && !built.warnings.is_empty() {
         eprintln!("error: publishing refuses a world with warnings");
         return ExitCode::FAILURE;
@@ -282,11 +313,50 @@ fn main() -> ExitCode {
     if steps.iter().all(Result::is_ok)
         && let Some(l) = &built.ledger
     {
-        steps.push(write(&dir.join(LEDGER), l));
+        steps.push(write_lock(&dir, l));
     }
     let failed: Vec<String> = steps.into_iter().filter_map(Result::err).collect();
     failed.iter().for_each(|e| eprintln!("error: {e}"));
     if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Write `rando.lock` into `dir`, warning loudly when there was none: every id in it is new.
+fn write_lock(dir: &Path, text: &str) -> Result<(), String> {
+    let lock = dir.join(LEDGER);
+    let fresh = std::fs::symlink_metadata(&lock).is_err();
+    write_file(&lock, text.as_bytes())?;
+    if fresh {
+        eprintln!(
+            "warning: there was no {LEDGER}, so new ids were assigned to every item and check and written to {}: commit it, and never delete it. Seeds and clients carry these ids, so a published world must keep them.",
+            lock.display()
+        );
+    }
+    Ok(())
+}
+
+/// `rando pack`: the package first, then the lock with its ids marked published; nothing is
+/// written when the pack is refused.
+fn pack(dir: &Path, out: Option<&Path>, source: bool) -> ExitCode {
+    let packed =
+        match world_build::pack::pack(&Dir(dir.to_path_buf()), source, &config::Limits::DESIGN) {
+            Ok(p) => p,
+            Err(list) => {
+                list.iter().for_each(|e| eprintln!("{e}"));
+                return ExitCode::FAILURE;
+            }
+        };
+    // Beside `rando.toml` unless `-o` says otherwise, wherever `rando` was run from.
+    let path = out.map_or_else(|| dir.join(&packed.file_name), Path::to_path_buf);
+    match write_file(&path, &packed.bytes).and_then(|()| write_lock(dir, &packed.lock)) {
+        Ok(()) => {
+            println!("wrote {} ({} bytes)", path.display(), packed.bytes.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// What `rando generate` was asked for.

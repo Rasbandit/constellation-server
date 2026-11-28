@@ -26,6 +26,13 @@ serde_json = { workspace = true, features = ["std"] }
 # SHA-256 of generated files' content and sources (doc 18 section 2.9): the RustCrypto crate the
 # workspace already uses (MIT OR Apache-2.0).
 sha2 = { version = "0.11", default-features = false }
+# `rando.toml` (design doc 19 section 2): the parser, no writer; `serde` only for its `Table` type
+# (serde is already in the tree). MIT OR Apache-2.0.
+toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
+# `rando pack` writes a zip (design doc 19 section 4): no default features, deflate through the
+# flate2 and zlib-rs already in the tree, named here so the build without the engine has a
+# deflate backend and every build compresses with the same one. MIT.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [features]
 default = ["engine"]
@@ -33,6 +40,8 @@ engine = ["dep:data-fill", "dep:seed-bundle"]
 
 [dev-dependencies]
 data-fill = { path = "../data-fill" }
+# The pack test checks the stored bytes are deflate at level 9 (flate2 is already in the tree).
+flate2 = "1"
 
 [[bin]]
 name = "rando"

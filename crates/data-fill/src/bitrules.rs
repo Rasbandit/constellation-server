@@ -85,12 +85,15 @@ pub(crate) struct Bits {
     pub atoms: Vec<Atom>,
     /// Per kind of value a solve changes: where each index's atoms start in the list of
     /// (threshold, bit).
-    by: [(Vec<u32>, Vec<(u16, u16)>); 4],
+    by: [AtomIndex; 4],
     /// The option atoms: bit, and the offset of the option-only rule that decides it.
     pub statics: Vec<(u16, u32)>,
     /// Rule sites per class ([`CLASSES`]).
     pub classes: [u32; 5],
 }
+
+/// For one kind of value: where each index's atoms start, and the (threshold, bit) list.
+type AtomIndex = (Vec<u32>, Vec<(u16, u16)>);
 
 /// Heap bytes a vector holds.
 pub(crate) fn vec_bytes<T>(x: &Vec<T>) -> usize {

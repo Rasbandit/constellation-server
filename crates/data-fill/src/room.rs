@@ -339,6 +339,9 @@ pub fn fill_room_fresh(
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
+/// One player's placements by location slot, filled as items are placed.
+type Placed = Vec<Option<Given>>;
+
 /// Tests only: [`fill_room_spheres`] with what a test holds the fill against: a budget of
 /// repair work of its own (`config::FILL_REPAIR_EVALS` in the product), how every attempt
 /// forms its rounds ([`Rule::of`] in the product; a test's baseline otherwise), and with
@@ -939,7 +942,7 @@ impl Steps<'_, '_> {
         &mut self,
         groups: &[&[Given]],
         also_held: &[Given],
-        (locs, placed): (&mut Live<(u16, u32)>, &mut [Vec<Option<Given>>]),
+        (locs, placed): (&mut Live<(u16, u32)>, &mut [Placed]),
         prev: &mut Vec<((u16, u32), Given)>,
     ) -> Result<(), FillError> {
         #[cfg(any(test, feature = "cross-check"))]

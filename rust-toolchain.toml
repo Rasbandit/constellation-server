@@ -1,3 +1,4 @@
 [toolchain]
-channel = "stable"
+# Pinned, so CI and local runs lint with the same clippy; a Rust upgrade is a deliberate PR.
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]

@@ -63,12 +63,9 @@ fn the_example_world_in_rando_builds_to_the_same_manifest_as_its_model() {
     let from_files = build(&example(), &Options::default()).unwrap();
     let from_model = build_model(&super::support::tidewell(), "w").unwrap();
     assert_eq!(from_files.json(), from_model.json());
+    // Its ids: the model numbers in declaration order, so this also proves the committed
+    // `rando.lock` holds declaration order; the fixture test holds the lock itself.
     assert!(from_files.warnings.is_empty(), "{:?}", from_files.warnings);
-    // Its ledger: ids in the order the files declare them, nothing retired.
-    let ledger: serde_json::Value =
-        serde_json::from_str(from_files.ledger.as_ref().unwrap()).unwrap();
-    assert_eq!(ledger["items"]["oar"], serde_json::json!({"id": 1, "retired": false}));
-    assert_eq!(ledger["checks"]["lantern_room"]["id"], 17);
 }
 
 /// `fmt` (and the generated-file hash, which runs the same layout) is linear in a rule's
@@ -406,7 +403,7 @@ fn the_ledger_keeps_ids_across_reordering_renames_and_removals() {
     };
     // Reordered, `two` renamed with `was`, `one` removed, a new check added: every old id kept.
     let mut v2 = world("region a {\n  check three\n  check second was two\n  check four\n}");
-    v2.0.insert("ledger.json".into(), ledger);
+    v2.0.insert("rando.lock".into(), ledger);
     let b2 = ok(&v2);
     assert_eq!((id(&b2, "three"), id(&b2, "second")), (id(&b1, "three"), id(&b1, "two")));
     assert_eq!(id(&b2, "four"), Some(4));
@@ -415,13 +412,13 @@ fn the_ledger_keeps_ids_across_reordering_renames_and_removals() {
     assert!(l2["checks"].get("two").is_none());
     // Bringing `one` back gives its old id; a new name never takes a retired one.
     let mut v3 = world("region a {\n  check fresh\n  check one\n}");
-    v3.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
+    v3.0.insert("rando.lock".into(), b2.ledger.clone().unwrap());
     let b3 = ok(&v3);
     assert_eq!((id(&b3, "one"), id(&b3, "fresh")), (Some(1), Some(5)));
     // A written key keeps an id when a generator renames a row.
     let mut v4 = world("region a {\n  check renamed key \"row-7\"\n}");
     v4.0.insert(
-        "ledger.json".into(),
+        "rando.lock".into(),
         "{\"checks\":{\"row-7\":{\"id\":40,\"retired\":false}},\"items\":{},\"world\":\"t\"}"
             .into(),
     );
@@ -429,7 +426,7 @@ fn the_ledger_keeps_ids_across_reordering_renames_and_removals() {
     // The ledger is checked, not trusted.
     let mut bad = world("region a {\n  check one\n}");
     bad.0.insert(
-        "ledger.json".into(),
+        "rando.lock".into(),
         "{\"checks\":{\"a\":{\"id\":3},\"b\":{\"id\":3}},\"world\":\"other\"}".into(),
     );
     let all = errors(&bad).join("\n");
@@ -656,7 +653,7 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
         "world.rando",
         "world t\nstart a\nitem junk filler\npool fill { junk 1 }\nregion a {\n  check one\n  check two\n}\ngoal reach(a)\n",
     )]);
-    no_item.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    no_item.0.insert("rando.lock".into(), b1.ledger.clone().unwrap());
     let all = errors(&no_item).join("\n");
     assert!(all.contains("published item `k` (id 1) is no longer declared"), "{all}");
     let mut removed = mem(&[
@@ -666,7 +663,7 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
         ),
         ("tweaks.rando", "remove check a.two\n"),
     ]);
-    removed.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    removed.0.insert("rando.lock".into(), b1.ledger.clone().unwrap());
     let all = errors(&removed).join("\n");
     assert!(all.contains("published check `two` (id 2) is no longer declared"), "{all}");
     // Without `--publish` nothing is marked.
@@ -674,7 +671,7 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
     assert!(plain["checks"]["one"].get("published").is_none(), "{plain}");
     // A rename keeps the id and the mark; a new check is not published by a plain build.
     let mut v2 = world("region a {\n  check one\n  check second was two\n  check three\n}");
-    v2.0.insert("ledger.json".into(), b1.ledger.clone().unwrap());
+    v2.0.insert("rando.lock".into(), b1.ledger.clone().unwrap());
     let b2 = ok(&v2);
     let l2: serde_json::Value = serde_json::from_str(b2.ledger.as_ref().unwrap()).unwrap();
     assert_eq!(
@@ -684,22 +681,154 @@ fn publishing_marks_ids_and_a_published_entry_cannot_be_removed() {
     assert_eq!(l2["checks"]["three"], serde_json::json!({"id": 3, "retired": false}));
     // Dropping a published check is an error naming it; dropping the unpublished one is fine.
     let mut v3 = world("region a {\n  check second\n}");
-    v3.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
+    v3.0.insert("rando.lock".into(), b2.ledger.clone().unwrap());
     let all = errors(&v3).join("\n");
     assert!(all.contains("published check `one` (id 1) is no longer declared"), "{all}");
     assert!(!all.contains("`three`"), "{all}");
     let mut v4 = world("region a {\n  check one\n  check second\n}");
-    v4.0.insert("ledger.json".into(), b2.ledger.clone().unwrap());
+    v4.0.insert("rando.lock".into(), b2.ledger.clone().unwrap());
     let l4: serde_json::Value = serde_json::from_str(ok(&v4).ledger.as_ref().unwrap()).unwrap();
     assert_eq!(l4["checks"]["three"], serde_json::json!({"id": 3, "retired": true}));
     // A `published` that is not true or false is an error, not a missing guard.
     let mut v5 = world("region a {\n  check second\n}");
     v5.0.insert(
-        "ledger.json".into(),
+        "rando.lock".into(),
         b2.ledger.clone().unwrap().replace("\"published\":true", "\"published\":\"yes\""),
     );
     let all = errors(&v5).join("\n");
     assert!(all.contains("has `published` \"yes\", not true or false"), "{all}");
+}
+
+/// `rando.lock` carries its format and a note saying what it is; an unknown format is refused,
+/// a lock written before the format field is read as format 1, and an old `ledger.json` left
+/// in the folder is an error that says how to upgrade, never a silent renumbering.
+#[test]
+fn the_lock_has_a_format_and_a_note_and_old_files_get_an_upgrade_path() {
+    let v1 = world("region a {\n  check one\n}");
+    let lock = ok(&v1).ledger.unwrap();
+    let l: serde_json::Value = serde_json::from_str(&lock).unwrap();
+    assert_eq!(l["format"], 1, "{l}");
+    let note = l["note"].as_str().unwrap();
+    assert!(note.contains("permanent ids") && note.contains("never delete"), "{note}");
+    // An unknown format is refused, naming the format this tool reads.
+    let mut future = world("region a {\n  check one\n}");
+    future.0.insert("rando.lock".into(), lock.replace("\"format\":1", "\"format\":2"));
+    let all = errors(&future).join("\n");
+    assert!(all.contains("rando.lock: has format 2; this rando reads format 1"), "{all}");
+    // A lock without `format` (a renamed `ledger.json`) keeps its ids and is upgraded.
+    let mut renamed = world("region a {\n  check two\n  check one\n}");
+    renamed.0.insert(
+        "rando.lock".into(),
+        "{\"checks\":{\"one\":{\"id\":7,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into(),
+    );
+    let up: serde_json::Value = serde_json::from_str(&ok(&renamed).ledger.unwrap()).unwrap();
+    assert_eq!((up["format"].clone(), up["checks"]["one"]["id"].clone()), (1.into(), 7.into()));
+    // An old `ledger.json` with no `rando.lock` is an error with the fix, not a new numbering.
+    let mut old = world("region a {\n  check one\n}");
+    old.0.insert("ledger.json".into(), lock);
+    let all = errors(&old).join("\n");
+    assert!(all.contains("ledger.json: is the old name of rando.lock"), "{all}");
+    assert!(all.contains("git mv ledger.json rando.lock"), "{all}");
+}
+
+/// A lock that is there but malformed is an error, never an empty lock: only a missing file
+/// starts the numbering afresh. Each case once renumbered `one` and `two` to 1 and 2.
+#[test]
+fn a_malformed_lock_is_an_error_never_a_fresh_numbering() {
+    let good = "{\"checks\":{\"one\":{\"id\":8,\"retired\":false},\"two\":{\"id\":9,\"retired\":false}},\"format\":1,\"items\":{\"k\":{\"id\":1,\"retired\":false},\"junk\":{\"id\":2,\"retired\":false}},\"world\":\"t\"}";
+    let with = |lock: &str| {
+        let mut w = world("region a {\n  check one\n  check two\n}");
+        w.0.insert("rando.lock".into(), lock.to_owned());
+        w
+    };
+    let l: serde_json::Value = serde_json::from_str(&ok(&with(good)).ledger.unwrap()).unwrap();
+    assert_eq!(l["checks"]["two"]["id"], 9);
+    for bad in [
+        "null".to_owned(),
+        "[]".to_owned(),
+        "7".to_owned(),
+        "{}".to_owned(),
+        good.replace("\"checks\":{\"one\":{\"id\":8,\"retired\":false},\"two\":{\"id\":9,\"retired\":false}}", "\"checks\":[]"),
+        good.replace(",\"world\":\"t\"", ""),
+        good.replace("\"items\":{", "\"items\":null,\"x\":{"),
+        // Only an unknown top-level key; everything else is a good lock.
+        good.replace(",\"world\":\"t\"", ",\"world\":\"t\",\"x\":1"),
+        good.replace("{\"id\":8,\"retired\":false}", "8"),
+    ] {
+        let all = errors(&with(&bad)).join("\n");
+        assert!(all.contains("rando.lock: "), "{bad}: {all}");
+        assert!(all.contains("restore it from version control"), "{bad}: {all}");
+    }
+    // A lock beside a leftover `ledger.json` is read, with a warning so the two cannot drift.
+    let mut both = with(good);
+    both.0.insert("ledger.json".into(), good.into());
+    let b = ok(&both);
+    let w = b.warnings.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    assert!(w.contains("ledger.json: is the old name of rando.lock"), "{w}");
+}
+
+/// The order the files are read in does not move an id: with a lock, swapping the `use` lines
+/// (so the modules apply in the other order) gives every item and check the same id.
+#[test]
+fn file_read_order_does_not_change_the_ids() {
+    let w = |uses: &str| {
+        mem(&[
+            (
+                "world.rando",
+                &format!(
+                    "world t\n{uses}start a\nitem junk filler\npool fill {{ junk 1 }}\nregion a {{\n  check c0\n  exit n\n  exit s\n}}\ngoal reach(a)\n"
+                ),
+            ),
+            ("north.rando", "item n1 progression\nregion n {\n  check n2\n}\n"),
+            ("south.rando", "item s1 progression\nregion s {\n  check s2\n}\n"),
+        ])
+    };
+    let first = ok(&w("use north\nuse south\n"));
+    let ids = |b: &Built| -> Vec<(String, i64)> {
+        let m = &b.manifest;
+        let mut v: Vec<(String, i64)> = ["items", "locations"]
+            .iter()
+            .flat_map(|t| m[*t].as_array().unwrap())
+            .map(|x| (x["key"].as_str().unwrap().to_owned(), x["id"].as_i64().unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    let mut swapped = w("use south\nuse north\n");
+    swapped.0.insert("rando.lock".into(), first.ledger.clone().unwrap());
+    let second = ok(&swapped);
+    assert_eq!(ids(&first), ids(&second));
+    assert_eq!(first.ledger, second.ledger);
+}
+
+/// A build with no `rando.lock` still writes one, and warns loudly that new ids were given and
+/// which file to commit; a build over an existing lock does not.
+#[test]
+fn a_build_without_a_lock_warns_and_names_the_file_to_commit() {
+    let root = std::env::temp_dir().join(format!("rando-nolock-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&root));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("world.rando"),
+        "world t\nstart a\nitem k progression\nregion a {\n  check c\n}\ngoal reach(a)\n",
+    )
+    .unwrap();
+    let run = || {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_rando"))
+            .args(["build", root.to_str().unwrap(), "-o", root.join("m.json").to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    let first = run();
+    assert!(root.join("rando.lock").is_file());
+    assert!(first.contains("new ids were assigned"), "{first}");
+    assert!(first.contains(&root.join("rando.lock").display().to_string()), "{first}");
+    assert!(first.contains("commit it"), "{first}");
+    let second = run();
+    assert!(!second.contains("new ids were assigned"), "{second}");
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// A build whose manifest cannot be written writes no ledger, so `--publish` never records
@@ -722,11 +851,11 @@ fn a_failed_build_writes_no_ledger() {
     };
     let bad = run(root.join("missing/m.json").to_str().unwrap());
     assert!(!bad.status.success());
-    assert!(!root.join("ledger.json").exists(), "the ledger was written by a failed build");
+    assert!(!root.join("rando.lock").exists(), "the ledger was written by a failed build");
     let good = run(root.join("m.json").to_str().unwrap());
     assert!(good.status.success(), "{}", String::from_utf8_lossy(&good.stderr));
     assert!(
-        std::fs::read_to_string(root.join("ledger.json")).unwrap().contains("\"published\":true")
+        std::fs::read_to_string(root.join("rando.lock")).unwrap().contains("\"published\":true")
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -734,11 +863,11 @@ fn a_failed_build_writes_no_ledger() {
 #[test]
 fn the_ledger_refuses_renames_and_keys_that_would_move_an_id() {
     let mut w = world("region a {\n  check c3 was c1\n  check c1\n}");
-    w.0.insert("ledger.json".into(), "{\"checks\":{\"c1\":{\"id\":1,\"retired\":false},\"c2\":{\"id\":2,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into());
+    w.0.insert("rando.lock".into(), "{\"checks\":{\"c1\":{\"id\":1,\"retired\":false},\"c2\":{\"id\":2,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into());
     fails(&w, &format!("world.rando:{}:9", line(2)), "`was c1` names a key that is still declared");
     let mut twice = world("region a {\n  check n1 was gone\n  check n2 was gone\n}");
     twice.0.insert(
-        "ledger.json".into(),
+        "rando.lock".into(),
         "{\"checks\":{\"gone\":{\"id\":1,\"retired\":false}},\"items\":{},\"world\":\"t\"}".into(),
     );
     assert!(
@@ -840,7 +969,7 @@ fn a_link_out_of_the_world_folder_is_refused() {
     assert!(e.iter().any(|x| x.msg.contains("leads nowhere")), "{e:?}");
     std::fs::remove_file(root.join("w/data/t.csv")).unwrap();
     std::fs::write(root.join("w/data/t.csv"), "key\nx\n").unwrap();
-    std::os::unix::fs::symlink(root.join("outside.json"), root.join("w/ledger.json")).unwrap();
+    std::os::unix::fs::symlink(root.join("outside.json"), root.join("w/rando.lock")).unwrap();
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_rando"))
         .args([
             "build",
@@ -912,4 +1041,26 @@ fn a_weighted_sum_is_written_in_the_engine_form() {
     let rule = &region(&b, "a")["checks"][0]["rule"];
     assert_eq!(rule["ge"][1], 5, "{rule}");
     assert!(rule.to_string().contains(r#"["*",{"count":"k"},3]"#), "{rule}");
+}
+
+/// A name must contain a letter: `_`, `__` and `_9` are refused as the game key on the `world`
+/// line (and as every other name, by the shared `name_shape`; `rando.toml` is tested in `pack`).
+#[test]
+fn a_name_without_a_letter_is_refused() {
+    for name in ["_", "__", "_9"] {
+        let w = mem(&[(
+            "world.rando",
+            &format!(
+                "world {name}\nstart a\nitem k progression\nregion a {{\n  check c\n}}\ngoal reach(a)\n"
+            ),
+        )]);
+        let all = errors(&w).join("\n");
+        // `_` alone is the wildcard token, refused by the parser; the rest by the name rule.
+        let want = if name == "_" {
+            "found `_`".to_owned()
+        } else {
+            format!("`{name}` is not a game key")
+        };
+        assert!(all.contains(&want), "{name}: {all}");
+    }
 }

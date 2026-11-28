@@ -3,6 +3,7 @@
 
 mod grammar;
 mod lang;
+mod pack;
 mod seeds;
 mod support;
 mod trials;

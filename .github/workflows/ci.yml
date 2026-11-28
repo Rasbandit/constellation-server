@@ -51,6 +51,9 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - if: steps.scope.outputs.code != 'false'
         run: cargo fmt --all --check
+      # Lints on the fill engine, the build tool and config, every target (tests included).
+      - if: steps.scope.outputs.code != 'false'
+        run: cargo clippy -p world-build -p data-fill -p config --all-targets --locked -- -D warnings
       # Every library's unit tests but the fill engine's and the build tool's: the next steps
       # run those.
       - if: steps.scope.outputs.code != 'false'

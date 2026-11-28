@@ -60,6 +60,13 @@ impl Errs {
         self.push(None, msg, help);
     }
 
+    /// An error or warning about the whole of `file`, a file that is not a `.rando` module.
+    pub(crate) fn in_file(&mut self, file: &str, msg: impl Into<String>, help: &str, warn: bool) {
+        let help = (!help.is_empty()).then(|| help.to_owned());
+        let e = Error { file: file.to_owned(), pos: None, msg: msg.into(), help };
+        if warn { self.warnings.push(e) } else { self.errors.push(e) }
+    }
+
     fn push(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
         let msg = msg.into();
         if !self.seen.insert((pos, msg.clone())) {
@@ -176,18 +183,33 @@ pub(crate) struct Model {
     pub defs: BTreeMap<String, Value>,
 }
 
-/// A name the rule language can read: `[a-z_][a-z0-9_]*`, not reserved, not too long.
+/// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*` with at least one
+/// letter, at most [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for `.rando` identifiers.
+pub(crate) fn name_shape(s: &str) -> bool {
+    s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.bytes().any(|b| b.is_ascii_lowercase())
+        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A game key: lowercase letters, digits, `_` and `-`, with at least one letter, at most
+/// [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for the `world` line and `rando.toml`'s
+/// `name`; looser than [`name_shape`] on purpose, since a game key is never read in a rule.
+pub(crate) fn game_key_ok(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_lowercase())
+        && s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// A name the rule language can read: [`name_shape`], not reserved.
 fn name_ok(errs: &mut Errs, n: &At<String>, what: &str) -> bool {
     let s = n.v.as_str();
     let most = config::MANIFEST_NAME_MAX_BYTES;
-    let shape = s.len() <= most
-        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    if !shape {
+    if !name_shape(s) {
         errs.err(
             n.pos,
             format!("`{s}` is not a valid {what} name"),
-            &format!("a name is lowercase letters, digits and `_`, starts with a letter or `_`, at most {most} bytes"),
+            &format!("a name is lowercase letters, digits and `_`, starts with a letter or `_`, holds at least one letter, at most {most} bytes"),
         );
         return false;
     }
@@ -341,6 +363,7 @@ fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
                     text,
                     model,
                     ledger: None,
+                    meta: None,
                 });
             }
             Ok(_) => {}
@@ -364,16 +387,11 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
     let game = match &w.game {
         Some(g) => {
-            let ok = !g.v.is_empty()
-                && g.v.len() <= config::MANIFEST_NAME_MAX_BYTES
-                && g.v.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
-                });
-            if !ok {
+            if !game_key_ok(&g.v) {
                 errs.err(
                     g.pos,
                     format!("`{}` is not a game key", g.v),
-                    "a game key is lowercase letters, digits, `_` and `-`",
+                    "a game key is lowercase letters, digits, `_` and `-`, with at least one letter",
                 );
             }
             g.v.clone()

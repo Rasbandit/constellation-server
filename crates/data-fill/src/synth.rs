@@ -265,12 +265,9 @@ fn wide(shape: &Shape, pick: &mut dyn FnMut(usize) -> usize) -> (Value, Instance
     let copies_total = ((checks as f64 * shape.progression).round() as usize).clamp(3, checks);
     let (kinds, copies) = (copies_total / 3, 3);
     let p = |k: usize| format!("p{k}");
-    fn tree(
-        depth: usize,
-        any: bool,
-        leaf: &dyn Fn(&mut dyn FnMut(usize) -> usize) -> Value,
-        pick: &mut dyn FnMut(usize) -> usize,
-    ) -> Value {
+    /// A leaf maker: given the pick, one rule leaf.
+    type Leaf<'a> = dyn Fn(&mut dyn FnMut(usize) -> usize) -> Value + 'a;
+    fn tree(depth: usize, any: bool, leaf: &Leaf, pick: &mut dyn FnMut(usize) -> usize) -> Value {
         if depth == 0 {
             return leaf(pick);
         }
