@@ -1267,6 +1267,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rando-settings"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "rando-syntax",
+ "semver",
+ "serde_json",
+ "sha2 0.11.1",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "rando-syntax"
 version = "0.1.0"
 dependencies = [
@@ -1503,6 +1515,12 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
