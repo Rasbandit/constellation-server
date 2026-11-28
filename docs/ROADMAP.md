@@ -10,12 +10,16 @@ Every pitfall we hit on the way is a result, not a failure. Write it down (see "
 
 Design references point at the `constellation` repo: `docs/design/NN-*.md`, decisions as `D-NN` in `docs/design/DECISIONS.md`.
 
-## Where we are (2026-11-16)
+## Where we are (2026-11-28)
 
-- One process hosts one room from a seed bundle. The Archipelago-compatible edge (`crates/edge-compat`) handles connect, checks, items, sync, scouts, chat, bounce, goal. The full table, with the test behind each line, is [`compat-status.md`](compat-status.md).
+- One server hosts many rooms, each reached by its room key in the path (#55, #105). The Archipelago-compatible edge (`crates/edge-compat`) handles connect, checks, items, sync, scouts, chat, bounce, goal. The full table, with the test behind each line, is [`compat-status.md`](compat-status.md).
 - With a database URL set, the room log is in Postgres and survives `kill -9`; without one it is in memory.
 - A seed made by Archipelago's own generator converts to our bundle (`tools/ap-import`).
-- Not started: the native edge (`edge-native`), the client SDK, the manifest validator, the rule evaluator, the fill.
+- The fill: `crates/data-fill` makes a seed from a data-only world manifest (#81), for several players in one room (#95), with one fill method on one path (#222). Rules are compiled into a bytecode rules section and evaluated inside `data-fill` (#81, #205); the separate evaluator crate with shared test vectors (#28) is not built.
+- The language and CLI: the `.rando` authoring language and the `rando` tool with `check`, `fmt`, `build` and `generate` (#223, which closed the validator issue #27), then a second grammar round (#228).
+- Packaging: `rando.toml`, `rando.lock` and `rando pack` (#230).
+- The settings schema: option scope and labels, and `settings.json` in the package (#231).
+- Not started: the native edge (`edge-native`) and the client SDK (no such crates on main).
 
 ## Milestones
 
