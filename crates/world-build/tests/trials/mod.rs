@@ -192,7 +192,9 @@ fn logic(b: &Built, options: &HashMap<String, i64>) -> (serde_json::Value, Vec<(
 /// changes only rules or the goal is caught doing nothing too.
 #[test]
 fn the_genre_examples_have_their_check_counts_and_fill_at_their_option_extremes() {
-    let cases: &[(&str, &[(&str, &str)], usize)] = &[
+    // A world, its option settings, and the checks the README states for them.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], usize);
+    let cases: &[Case<'_>] = &[
         ("meridian_front", &[], 51),
         ("meridian_front", &[("chapters", "2"), ("side_ops", "off")], 18),
         ("meridian_front", &[("chapters", "3"), ("campaign_order", "open")], 39),

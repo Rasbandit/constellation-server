@@ -2,6 +2,7 @@
 //! entry file and holds what is not game logic (name, version, authors, license, links,
 //! assets). The engine never reads it; `rando pack` writes it, normalised, as `meta.json`.
 
+use config::Limits;
 use toml::{Table, Value};
 
 /// The file that marks a world folder.
@@ -98,9 +99,9 @@ impl P {
 ///
 /// # Errors
 /// Every problem found, one message each.
-pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
-    if text.len() > config::WORLD_TOML_MAX_BYTES {
-        return Err(vec![format!("is over {} bytes", config::WORLD_TOML_MAX_BYTES)]);
+pub fn parse(text: &str, l: &Limits) -> Result<Meta, Vec<String>> {
+    if text.len() > l.world_toml_max_bytes {
+        return Err(vec![format!("is over {} bytes", l.world_toml_max_bytes)]);
     }
     let t: Table = text.parse().map_err(|e: toml::de::Error| vec![e.to_string()])?;
     let mut p = P(Vec::new());
@@ -123,13 +124,20 @@ pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
         p.0.push(format!("unknown key `world.{k}`"));
     }
     let name = p.string(w, "name");
-    p.check(name.as_ref().is_some_and(|n| name_ok(n)), || {
-        "`world.name` is required: 1 to 64 bytes of lowercase letters, digits and `_`, with at least one letter".into()
-    });
+    let most = l.world_name_max_bytes;
+    p.check(
+        name.as_ref().is_some_and(|n| {
+            !n.is_empty() && n.len() <= most && crate::world::name_shape(n)
+        }),
+        || format!("`world.name` is required: a `.rando` name (lowercase letters, digits and `_`, not starting with a digit) of at most {most} bytes"),
+    );
     let version = p.string(w, "version");
     if let Some(v) = &version {
         p.check(!v.contains('+'), || {
             format!("`world.version` {v:?} has build metadata (`+...`): two contents would share one version; leave it out")
+        });
+        p.check(v.len() <= l.world_version_max_bytes, || {
+            format!("`world.version` is over {} bytes", l.world_version_max_bytes)
         });
         p.check(v.contains('+') || semver(v), || {
             format!("`world.version` {v:?} is not Semantic Versioning: MAJOR.MINOR.PATCH, with an optional pre-release (`1.2.0-beta.1`)")
@@ -145,26 +153,36 @@ pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
     });
     let authors = p.strings(w, "world", "authors");
     if w.contains_key("authors") {
-        p.check((1..=16).contains(&authors.len()), || "`world.authors` takes 1 to 16 names".into());
-    }
-    for a in &authors {
-        p.check(text_ok(a, 128, false), || {
-            format!("author {a:?} must be 1 to 128 characters of plain text")
+        let most = l.world_authors_max;
+        p.check((1..=most).contains(&authors.len()), || {
+            format!("`world.authors` takes 1 to {most} names")
         });
     }
+    // shortcut: no warning yet that an email written here is public (doc 19 section 2.3); a
+    // warning would refuse `pack`, so it needs its own channel first. Add it with the portal.
+    for a in &authors {
+        let most = l.world_author_max_chars;
+        p.check(text_ok(a, most, false), || {
+            format!("author {a:?} must be 1 to {most} characters of plain text")
+        });
+    }
+    let lim = l;
     let license = p.string(w, "license");
     if let Some(l) = &license {
-        p.check(license_ok(l), || {
+        p.check(license_ok(l, lim.world_license_max_bytes), || {
             format!("`world.license` {l:?} is not an SPDX license expression (`MIT`, `MIT OR Apache-2.0`)")
         });
     }
     let description = p.string(w, "description");
     if let Some(d) = &description {
-        p.check(text_ok(d, 1000, true), || {
-            "`world.description` must be 1 to 1,000 characters of plain text".into()
+        let most = lim.world_description_max_chars;
+        p.check(text_ok(d, most, true), || {
+            format!("`world.description` must be 1 to {most} characters of plain text")
         });
     }
     let icon = p.string(w, "icon");
+    // shortcut: the icon's pixel size (square, 64 to 512) is not read from its header yet;
+    // the server checks it (doc 19 section 5.1, step 4). Add it before the portal opens.
     if let Some(i) = &icon {
         p.check(crate::front::safe(i), || {
             format!("`world.icon` {i:?} must be a relative path inside the folder")
@@ -173,8 +191,9 @@ pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
     let (homepage, repository) = (p.string(w, "homepage"), p.string(w, "repository"));
     for (k, u) in [("homepage", &homepage), ("repository", &repository)] {
         if let Some(u) = u {
-            p.check(url_ok(u), || {
-                format!("`world.{k}` must be an `https://` URL of at most 2,048 bytes")
+            let most = lim.world_url_max_bytes;
+            p.check(url_ok(u, most), || {
+                format!("`world.{k}` must be an `https://` URL of at most {most} bytes")
             });
         }
     }
@@ -186,9 +205,14 @@ pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
                 p.0.push(format!("unknown key `assets.{k}`"));
             }
             assets = p.strings(a, "assets", "files");
-            p.check(assets.len() <= config::WORLD_ASSETS_MAX, || {
-                format!("`assets.files` lists more than {} files", config::WORLD_ASSETS_MAX)
+            let most = lim.world_assets_max;
+            p.check(assets.len() <= most, || {
+                format!("`assets.files` lists more than {most} files")
             });
+            let mut seen = std::collections::HashSet::new();
+            for f in assets.iter().filter(|f| !seen.insert(*f)) {
+                p.0.push(format!("asset {f:?} is listed twice"));
+            }
             for f in &assets {
                 p.check(crate::front::safe(f), || {
                     format!("asset {f:?} must be a relative path inside the folder (no globs)")
@@ -214,14 +238,7 @@ pub fn parse(text: &str) -> Result<Meta, Vec<String>> {
     })
 }
 
-/// A `.rando` name of at most 64 bytes.
-fn name_ok(n: &str) -> bool {
-    (1..=64).contains(&n.len())
-        && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        && n.bytes().any(|b| b.is_ascii_lowercase())
-}
-
-/// Semantic Versioning 2.0.0 without build metadata, at most 64 bytes, numbers in 64 bits.
+/// Semantic Versioning 2.0.0 without build metadata, numbers in 64 bits.
 fn semver(v: &str) -> bool {
     let num = |n: &str| {
         !n.is_empty()
@@ -234,8 +251,7 @@ fn semver(v: &str) -> bool {
         None => (v, None),
     };
     let parts: Vec<&str> = core.split('.').collect();
-    v.len() <= 64
-        && parts.len() == 3
+    parts.len() == 3
         && parts.iter().all(|n| num(n))
         && pre.is_none_or(|p| {
             p.split('.').all(|id| {
@@ -253,17 +269,17 @@ fn text_ok(s: &str, max: usize, lines: bool) -> bool {
         && s.chars().all(|c| !c.is_control() || (lines && matches!(c, '\n' | '\t')))
 }
 
-/// The shape of an SPDX expression, at most 256 bytes. shortcut: the identifiers are not
+/// The shape of an SPDX expression, at most `max` bytes. shortcut: the identifiers are not
 /// checked against the SPDX license list; add the list when the portal opens (doc 19 2.3).
-fn license_ok(l: &str) -> bool {
-    (1..=256).contains(&l.len())
+fn license_ok(l: &str, max: usize) -> bool {
+    (1..=max).contains(&l.len())
         && l.bytes().all(|b| b.is_ascii_alphanumeric() || b" .-+():".contains(&b))
         && l.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
-/// An `https://` URL of at most 2,048 bytes with no spaces or control characters.
-fn url_ok(u: &str) -> bool {
-    u.len() <= 2048
+/// An `https://` URL of at most `max` bytes with no spaces or control characters.
+fn url_ok(u: &str, max: usize) -> bool {
+    u.len() <= max
         && u.len() > "https://".len()
         && u.starts_with("https://")
         && u.chars().all(|c| !c.is_whitespace() && !c.is_control())

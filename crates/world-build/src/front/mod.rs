@@ -174,7 +174,7 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let (meta, meta_errs) = match files.read(crate::meta::FILE) {
         None => (None, Vec::new()),
         Some(Err(e)) => (None, vec![e]),
-        Some(Ok(t)) => match crate::meta::parse(&t) {
+        Some(Ok(t)) => match crate::meta::parse(&t, &config::Limits::DESIGN) {
             Ok(m) => (Some(m), Vec::new()),
             Err(e) => (None, e),
         },

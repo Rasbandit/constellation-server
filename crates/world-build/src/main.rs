@@ -337,14 +337,16 @@ fn write_lock(dir: &Path, text: &str) -> Result<(), String> {
 /// `rando pack`: the package first, then the lock with its ids marked published; nothing is
 /// written when the pack is refused.
 fn pack(dir: &Path, out: Option<&Path>, source: bool) -> ExitCode {
-    let packed = match world_build::pack::pack(&Dir(dir.to_path_buf()), source) {
-        Ok(p) => p,
-        Err(list) => {
-            list.iter().for_each(|e| eprintln!("{e}"));
-            return ExitCode::FAILURE;
-        }
-    };
-    let path = out.map_or_else(|| PathBuf::from(&packed.file_name), Path::to_path_buf);
+    let packed =
+        match world_build::pack::pack(&Dir(dir.to_path_buf()), source, &config::Limits::DESIGN) {
+            Ok(p) => p,
+            Err(list) => {
+                list.iter().for_each(|e| eprintln!("{e}"));
+                return ExitCode::FAILURE;
+            }
+        };
+    // Beside `rando.toml` unless `-o` says otherwise, wherever `rando` was run from.
+    let path = out.map_or_else(|| dir.join(&packed.file_name), Path::to_path_buf);
     match write_file(&path, &packed.bytes).and_then(|()| write_lock(dir, &packed.lock)) {
         Ok(()) => {
             println!("wrote {} ({} bytes)", path.display(), packed.bytes.len());

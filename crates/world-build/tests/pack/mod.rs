@@ -172,8 +172,9 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
     use sha2::Digest;
     let root = packable("pack");
     let dir = world_build::front::Dir(root.clone());
-    let a = world_build::pack::pack(&dir, true).unwrap_or_else(|e| panic!("{e:#?}"));
-    let b = world_build::pack::pack(&dir, true).unwrap();
+    let a = world_build::pack::pack(&dir, true, &config::Limits::DESIGN)
+        .unwrap_or_else(|e| panic!("{e:#?}"));
+    let b = world_build::pack::pack(&dir, true, &config::Limits::DESIGN).unwrap();
     assert_eq!(a.bytes, b.bytes, "two packs of one folder differ");
     assert_eq!(a.file_name, "tide-1.2.0.randopack");
     let e = entries(&a.bytes);
@@ -223,7 +224,8 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
     );
     assert_eq!(v["tool"], format!("rando {}", env!("CARGO_PKG_VERSION")));
     // Without the source, `source/` is left out.
-    let bare = entries(&world_build::pack::pack(&dir, false).unwrap().bytes);
+    let bare =
+        entries(&world_build::pack::pack(&dir, false, &config::Limits::DESIGN).unwrap().bytes);
     assert!(bare.keys().all(|k| !k.starts_with("source/")), "{:?}", bare.keys());
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -236,7 +238,10 @@ fn pack_refuses_missing_fields_bad_assets_and_oversized_files() {
     let root = packable("refuse");
     let dir = world_build::front::Dir(root.clone());
     let refused = |needle: &str| {
-        let e = world_build::pack::pack(&dir, true).err().unwrap_or_default().join("\n");
+        let e = world_build::pack::pack(&dir, true, &config::Limits::DESIGN)
+            .err()
+            .unwrap_or_default()
+            .join("\n");
         assert!(e.contains(needle), "want {needle:?} in {e}");
     };
     let toml = std::fs::read_to_string(root.join("rando.toml")).unwrap();
@@ -246,7 +251,7 @@ fn pack_refuses_missing_fields_bad_assets_and_oversized_files() {
         .unwrap();
     refused("needs a LICENSE file");
     std::fs::write(root.join("LICENSE"), "All mine.\n").unwrap();
-    let e = entries(&world_build::pack::pack(&dir, true).unwrap().bytes);
+    let e = entries(&world_build::pack::pack(&dir, true, &config::Limits::DESIGN).unwrap().bytes);
     assert!(e.contains_key("assets/LICENSE"), "{:?}", e.keys());
     std::fs::write(root.join("rando.toml"), &toml).unwrap();
     std::fs::write(root.join("art/map.png"), b"GIF89a\x00\x01").unwrap();
@@ -284,4 +289,118 @@ fn rando_pack_writes_the_package_and_the_published_lock() {
     assert!(String::from_utf8_lossy(&run.stderr).contains("rando pack requires a rando.toml"));
     assert!(!old.join("rando.lock").exists(), "a refused pack wrote the lock");
     std::fs::remove_dir_all(&old).unwrap();
+}
+
+/// The zip settings doc 19 section 3 promises, read back from the entries: the zip epoch as
+/// every time, mode 0644, deflate at level 9 (the compressed bytes are exactly what deflate at
+/// level 9 makes), and a generated file's non-table source left out of `source/`.
+#[test]
+fn pack_pins_time_mode_compression_and_the_source_filter() {
+    let root = packable("pin");
+    // A generated module stamped from a script's input: the build reads `gen/input.json`
+    // to check the header, and the package must still leave it out.
+    std::fs::create_dir_all(root.join("gen")).unwrap();
+    std::fs::write(root.join("gen/input.json"), "{\"rows\": 1}\n").unwrap();
+    let dir = world_build::front::Dir(root.clone());
+    let made = world_build::front::write_generated(
+        "gen 1",
+        &[("gen/input.json", "{\"rows\": 1}\n")],
+        &[],
+        "item extra filler\n",
+        &dir,
+    )
+    .unwrap();
+    std::fs::write(root.join("made.rando"), made).unwrap();
+    let toml = std::fs::read_to_string(root.join("src/tide.rando")).unwrap();
+    std::fs::write(root.join("src/tide.rando"), toml.replace("use more\n", "use more\nuse made\n"))
+        .unwrap();
+    let limits = config::Limits::DESIGN;
+    let a = world_build::pack::pack(&dir, true, &limits).unwrap_or_else(|e| panic!("{e:#?}"));
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&a.bytes)).unwrap();
+    let mut names = Vec::new();
+    for i in 0..z.len() {
+        let f = z.by_index_raw(i).unwrap();
+        let name = f.name().unwrap().into_owned();
+        let t = f.last_modified().unwrap();
+        assert_eq!(
+            (t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second()),
+            (1980, 1, 1, 0, 0, 0),
+            "{name}"
+        );
+        assert_eq!(f.unix_mode(), Some(0o100_644), "{name}");
+        assert_eq!(f.compression(), zip::CompressionMethod::Deflated, "{name}");
+        names.push(name);
+    }
+    assert!(names.contains(&"source/made.rando".to_owned()), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("input.json")), "{names:?}");
+    // Level 9: the stored bytes of the manifest are raw deflate at level 9 of its text.
+    let manifest = entries(&a.bytes)["manifest.json"].clone();
+    let mut d = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
+    std::io::Write::write_all(&mut d, &manifest).unwrap();
+    let want = d.finish().unwrap();
+    let idx = names.iter().position(|n| n == "manifest.json").unwrap();
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_index_raw(idx).unwrap(), &mut raw).unwrap();
+    assert_eq!(raw, want, "manifest.json is not deflate at level 9");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The package caps refuse a pack that passes everything else: too many entries, a path too
+/// long, too much source, and a package too large. Each cap is `config::Limits`, set low here.
+#[test]
+fn pack_refuses_past_the_package_caps() {
+    let root = packable("caps");
+    let dir = world_build::front::Dir(root.clone());
+    let d = config::Limits::DESIGN;
+    let refused = |l: config::Limits, needle: &str| {
+        let e = world_build::pack::pack(&dir, true, &l).err().unwrap_or_default().join("\n");
+        assert!(e.contains(needle), "want {needle:?} in {e}");
+    };
+    assert!(world_build::pack::pack(&dir, true, &d).is_ok());
+    refused(config::Limits { package_max_entries: 10, ..d }, "more than 10 entries");
+    refused(
+        config::Limits { package_max_path_bytes: 20, ..d },
+        "source/src/tide.rando is a path over 20 bytes",
+    );
+    refused(config::Limits { package_max_source_bytes: 100, ..d }, "the source is over 100 bytes");
+    refused(config::Limits { package_max_bytes: 1000, ..d }, "the package is over 1000 bytes");
+    refused(
+        config::Limits { world_assets_max_bytes: 20, ..d },
+        "the assets are over 20 bytes in all",
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `rando.toml`'s caps come from `config::Limits` too, and an asset listed twice is refused.
+#[test]
+fn rando_toml_caps_are_limits_and_a_repeated_asset_is_refused() {
+    let d = config::Limits::DESIGN;
+    let has = |toml: &str, l: &config::Limits, needle: &str| {
+        let e = world_build::meta::parse(toml, l).unwrap_err().join("\n");
+        assert!(e.contains(needle), "want {needle:?} in {e}");
+    };
+    assert!(world_build::meta::parse(TOML, &d).is_ok());
+    has(TOML, &config::Limits { world_name_max_bytes: 3, ..d }, "`world.name`");
+    has(TOML, &config::Limits { world_version_max_bytes: 3, ..d }, "`world.version`");
+    has(TOML, &config::Limits { world_authors_max: 0, ..d }, "`world.authors` takes 1 to 0");
+    has(TOML, &config::Limits { world_author_max_chars: 3, ..d }, "1 to 3 characters");
+    has(TOML, &config::Limits { world_description_max_chars: 3, ..d }, "1 to 3 characters");
+    has(TOML, &config::Limits { world_license_max_bytes: 2, ..d }, "`world.license`");
+    has(TOML, &config::Limits { world_toml_max_bytes: 10, ..d }, "is over 10 bytes");
+    let url = format!("{TOML}homepage = \"https://example.com/a\"\n");
+    has(&url, &config::Limits { world_url_max_bytes: 10, ..d }, "at most 10 bytes");
+    let twice = format!("{TOML}\n[assets]\nfiles = [\"a.png\", \"a.png\"]\n");
+    has(&twice, &d, "asset \"a.png\" is listed twice");
+    has(&twice, &config::Limits { world_assets_max: 1, ..d }, "more than 1 files");
+}
+
+/// With no `-o`, the package is written beside `rando.toml`, wherever `rando` was run from.
+#[test]
+fn the_package_lands_beside_rando_toml() {
+    let root = packable("where");
+    let run = rando(&root.join("src"), &["pack"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(root.join("tide-1.2.0.randopack").is_file());
+    assert!(!root.join("src/tide-1.2.0.randopack").exists());
+    std::fs::remove_dir_all(&root).unwrap();
 }

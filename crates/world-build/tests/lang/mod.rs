@@ -714,7 +714,7 @@ fn the_lock_has_a_format_and_a_note_and_old_files_get_an_upgrade_path() {
     let mut future = world("region a {\n  check one\n}");
     future.0.insert("rando.lock".into(), lock.replace("\"format\":1", "\"format\":2"));
     let all = errors(&future).join("\n");
-    assert!(all.contains("rando.lock has format 2; this rando reads format 1"), "{all}");
+    assert!(all.contains("rando.lock: has format 2; this rando reads format 1"), "{all}");
     // A lock without `format` (a renamed `ledger.json`) keeps its ids and is upgraded.
     let mut renamed = world("region a {\n  check two\n  check one\n}");
     renamed.0.insert(
@@ -727,8 +727,42 @@ fn the_lock_has_a_format_and_a_note_and_old_files_get_an_upgrade_path() {
     let mut old = world("region a {\n  check one\n}");
     old.0.insert("ledger.json".into(), lock);
     let all = errors(&old).join("\n");
-    assert!(all.contains("ledger.json is the old name of rando.lock"), "{all}");
+    assert!(all.contains("ledger.json: is the old name of rando.lock"), "{all}");
     assert!(all.contains("git mv ledger.json rando.lock"), "{all}");
+}
+
+/// A lock that is there but malformed is an error, never an empty lock: only a missing file
+/// starts the numbering afresh. Each case once renumbered `one` and `two` to 1 and 2.
+#[test]
+fn a_malformed_lock_is_an_error_never_a_fresh_numbering() {
+    let good = "{\"checks\":{\"one\":{\"id\":8,\"retired\":false},\"two\":{\"id\":9,\"retired\":false}},\"format\":1,\"items\":{\"k\":{\"id\":1,\"retired\":false},\"junk\":{\"id\":2,\"retired\":false}},\"world\":\"t\"}";
+    let with = |lock: &str| {
+        let mut w = world("region a {\n  check one\n  check two\n}");
+        w.0.insert("rando.lock".into(), lock.to_owned());
+        w
+    };
+    let l: serde_json::Value = serde_json::from_str(&ok(&with(good)).ledger.unwrap()).unwrap();
+    assert_eq!(l["checks"]["two"]["id"], 9);
+    for bad in [
+        "null".to_owned(),
+        "[]".to_owned(),
+        "7".to_owned(),
+        "{}".to_owned(),
+        good.replace("\"checks\":{\"one\":{\"id\":8,\"retired\":false},\"two\":{\"id\":9,\"retired\":false}}", "\"checks\":[]"),
+        good.replace(",\"world\":\"t\"", ""),
+        good.replace("\"items\":{", "\"items\":null,\"x\":{"),
+        good.replace("{\"id\":8,\"retired\":false}", "8"),
+    ] {
+        let all = errors(&with(&bad)).join("\n");
+        assert!(all.contains("rando.lock: "), "{bad}: {all}");
+        assert!(all.contains("restore it from version control"), "{bad}: {all}");
+    }
+    // A lock beside a leftover `ledger.json` is read, with a warning so the two cannot drift.
+    let mut both = with(good);
+    both.0.insert("ledger.json".into(), good.into());
+    let b = ok(&both);
+    let w = b.warnings.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    assert!(w.contains("ledger.json: is the old name of rando.lock"), "{w}");
 }
 
 /// The order the files are read in does not move an id: with a lock, swapping the `use` lines

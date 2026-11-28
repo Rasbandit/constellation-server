@@ -183,14 +183,19 @@ pub(crate) struct Model {
     pub defs: BTreeMap<String, Value>,
 }
 
-/// A name the rule language can read: `[a-z_][a-z0-9_]*`, not reserved, not too long.
+/// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*`, at most
+/// [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule, shared with `rando.toml`'s `name`.
+pub(crate) fn name_shape(s: &str) -> bool {
+    s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A name the rule language can read: [`name_shape`], not reserved.
 fn name_ok(errs: &mut Errs, n: &At<String>, what: &str) -> bool {
     let s = n.v.as_str();
     let most = config::MANIFEST_NAME_MAX_BYTES;
-    let shape = s.len() <= most
-        && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    if !shape {
+    if !name_shape(s) {
         errs.err(
             n.pos,
             format!("`{s}` is not a valid {what} name"),

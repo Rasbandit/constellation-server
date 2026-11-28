@@ -63,7 +63,7 @@ fn text(b: &[u8]) -> bool {
 ///
 /// # Errors
 /// Every reason it was refused, one line each, printed as `rando check` prints them.
-pub fn pack(dir: &Dir, source: bool) -> Result<Packed, Vec<String>> {
+pub fn pack(dir: &Dir, source: bool, l: &config::Limits) -> Result<Packed, Vec<String>> {
     if dir.read(FILE).is_none() {
         return Err(vec![format!(
             "rando pack requires a {FILE} in {}; see design doc 19 section 2",
@@ -84,12 +84,12 @@ pub fn pack(dir: &Dir, source: bool) -> Result<Packed, Vec<String>> {
     };
     let mut errs = Vec::new();
     let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let manifest_max = config::Limits::DESIGN.manifest_max_bytes;
+    let manifest_max = l.manifest_max_bytes;
     if built.json().len() > manifest_max {
         errs.push(format!("the manifest is over {manifest_max} bytes"));
     }
     entries.insert("manifest.json".into(), built.json().as_bytes().to_vec());
-    let license_file = assets(dir, &meta, &mut entries, &mut errs);
+    let license_file = assets(dir, &meta, l, &mut entries, &mut errs);
     let meta_json = crate::canon::to_string(&meta_json(&meta, license_file))
         .map_err(|e| vec![format!("meta.json: {e}")])?;
     entries.insert("meta.json".into(), meta_json.into_bytes());
@@ -106,8 +106,8 @@ pub fn pack(dir: &Dir, source: bool) -> Result<Packed, Vec<String>> {
         }
         total += lock.len();
         entries.insert(format!("source/{LEDGER}"), lock.clone().into_bytes());
-        if total > config::PACKAGE_MAX_SOURCE_BYTES {
-            errs.push(format!("the source is over {} bytes", config::PACKAGE_MAX_SOURCE_BYTES));
+        if total > l.package_max_source_bytes {
+            errs.push(format!("the source is over {} bytes", l.package_max_source_bytes));
         }
     }
     let sums: String = entries
@@ -115,21 +115,18 @@ pub fn pack(dir: &Dir, source: bool) -> Result<Packed, Vec<String>> {
         .map(|(p, b)| format!("{}  {p}\n", crate::front::hex(&Sha256::digest(b))))
         .collect();
     entries.insert("sha256.txt".into(), sums.into_bytes());
-    if entries.len() > config::PACKAGE_MAX_ENTRIES {
-        errs.push(format!("more than {} entries", config::PACKAGE_MAX_ENTRIES));
+    if entries.len() > l.package_max_entries {
+        errs.push(format!("more than {} entries", l.package_max_entries));
     }
-    for p in entries.keys().filter(|p| p.len() > config::PACKAGE_MAX_PATH_BYTES) {
-        errs.push(format!("{p} is a path over {} bytes", config::PACKAGE_MAX_PATH_BYTES));
+    for p in entries.keys().filter(|p| p.len() > l.package_max_path_bytes) {
+        errs.push(format!("{p} is a path over {} bytes", l.package_max_path_bytes));
     }
     if !errs.is_empty() {
         return Err(errs.into_iter().map(|e| format!("error: {e}")).collect());
     }
     let bytes = zip(&entries).map_err(|e| vec![format!("error: writing the package: {e}")])?;
-    if bytes.len() > config::PACKAGE_MAX_BYTES {
-        return Err(vec![format!(
-            "error: the package is over {} bytes",
-            config::PACKAGE_MAX_BYTES
-        )]);
+    if bytes.len() > l.package_max_bytes {
+        return Err(vec![format!("error: the package is over {} bytes", l.package_max_bytes)]);
     }
     Ok(Packed { file_name: format!("{}-{}.{EXT}", meta.name, meta.version), bytes, lock })
 }
@@ -139,15 +136,16 @@ pub fn pack(dir: &Dir, source: bool) -> Result<Packed, Vec<String>> {
 fn assets(
     dir: &Dir,
     meta: &Meta,
+    l: &config::Limits,
     entries: &mut BTreeMap<String, Vec<u8>>,
     errs: &mut Vec<String>,
 ) -> Option<String> {
     let license_ref = meta.license.as_ref().is_some_and(|l| l.contains("LicenseRef-"));
     let mut want: Vec<(&str, usize)> = Vec::new();
-    want.extend(meta.icon.iter().map(|i| (i.as_str(), config::WORLD_ICON_MAX_BYTES)));
-    want.extend(meta.assets.iter().map(|a| (a.as_str(), config::WORLD_ASSET_MAX_BYTES)));
+    want.extend(meta.icon.iter().map(|i| (i.as_str(), l.world_icon_max_bytes)));
+    want.extend(meta.assets.iter().map(|a| (a.as_str(), l.world_asset_max_bytes)));
     if license_ref {
-        want.push(("LICENSE", config::WORLD_ASSET_MAX_BYTES));
+        want.push(("LICENSE", l.world_asset_max_bytes));
     }
     let mut total = 0;
     for (path, max) in want {
@@ -170,8 +168,8 @@ fn assets(
             }
         }
     }
-    if total > config::WORLD_ASSETS_MAX_BYTES {
-        errs.push(format!("the assets are over {} bytes in all", config::WORLD_ASSETS_MAX_BYTES));
+    if total > l.world_assets_max_bytes {
+        errs.push(format!("the assets are over {} bytes in all", l.world_assets_max_bytes));
     }
     license_ref.then(|| "assets/LICENSE".to_owned())
 }

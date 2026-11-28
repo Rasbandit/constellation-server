@@ -40,6 +40,8 @@ engine = ["dep:data-fill", "dep:seed-bundle"]
 
 [dev-dependencies]
 data-fill = { path = "../data-fill" }
+# The pack test checks the stored bytes are deflate at level 9 (flate2 is already in the tree).
+flate2 = "1"
 
 [[bin]]
 name = "rando"

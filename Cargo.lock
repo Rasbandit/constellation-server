@@ -2455,6 +2455,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "data-fill",
+ "flate2",
  "rule-ops",
  "seed-bundle",
  "serde_json",

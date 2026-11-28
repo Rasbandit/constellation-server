@@ -194,6 +194,43 @@ pub struct Limits {
     pub yaml_max_bytes: usize,
     /// Largest world manifest upload, bytes (design value: the large test world is 830 KB).
     pub manifest_max_bytes: usize,
+    /// Largest `rando.toml`, bytes (design doc 19 section 2.2, design value: a full one is
+    /// under 1 KiB).
+    pub world_toml_max_bytes: usize,
+    /// Longest `rando.toml` `name`, bytes (doc 19 section 2.3, design value).
+    pub world_name_max_bytes: usize,
+    /// Longest `rando.toml` `version`, bytes (doc 19 section 2.3, design value).
+    pub world_version_max_bytes: usize,
+    /// Most `authors` in `rando.toml` (doc 19 section 2.3, design value).
+    pub world_authors_max: usize,
+    /// Longest author, characters (doc 19 section 2.3, design value).
+    pub world_author_max_chars: usize,
+    /// Longest `description`, characters (doc 19 section 2.3, design value).
+    pub world_description_max_chars: usize,
+    /// Longest `license` expression, bytes (doc 19 section 2.3, design value).
+    pub world_license_max_bytes: usize,
+    /// Longest `homepage` or `repository` URL, bytes (doc 19 section 2.3, design value).
+    pub world_url_max_bytes: usize,
+    /// Most files `[assets] files` may list (doc 19 section 2.3, design value).
+    pub world_assets_max: usize,
+    /// Largest asset file, bytes (doc 19 section 2.3, design value).
+    pub world_asset_max_bytes: usize,
+    /// Largest sum of a world's assets, bytes (doc 19 section 2.3, design value).
+    pub world_assets_max_bytes: usize,
+    /// Largest icon, bytes (doc 19 section 2.3, design value).
+    pub world_icon_max_bytes: usize,
+    /// Largest `source/` of a world package, all files together, bytes (doc 19 section 5.2,
+    /// design value: 256 files at the per-file cap would be 2 GiB). `rando pack` holds to the
+    /// package caps too, so it never writes a package the server refuses for size.
+    pub package_max_source_bytes: usize,
+    /// Largest world package, bytes (doc 19 section 5.2, design value: 8 MiB manifest, 16 MiB
+    /// source and 16 MiB assets).
+    pub package_max_bytes: usize,
+    /// Most entries in a world package (doc 19 section 5.2, design value: 256 modules, 64
+    /// assets and the fixed entries).
+    pub package_max_entries: usize,
+    /// Longest entry path in a world package, bytes (doc 19 section 5.2, design value).
+    pub package_max_path_bytes: usize,
     /// Bytes of manifests the server keeps in memory for generation (least recently used go
     /// first); the database holds every one (design value).
     pub manifest_cache_bytes: usize,
@@ -478,39 +515,6 @@ pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Most files (modules and table files) one world may read (a design value).
 pub const WORLD_MODULES_MAX: usize = 256;
 
-/// Largest `rando.toml`, bytes (design doc 19 section 2.2, a design value: a full one is under
-/// 1 KiB).
-pub const WORLD_TOML_MAX_BYTES: usize = 64 * 1024;
-
-/// Most files `rando.toml`'s `[assets] files` may list (design doc 19 section 2.3, a design
-/// value).
-pub const WORLD_ASSETS_MAX: usize = 64;
-
-/// Largest asset file `rando pack` takes, bytes (design doc 19 section 2.3, a design value).
-pub const WORLD_ASSET_MAX_BYTES: usize = 2 * 1024 * 1024;
-
-/// Largest sum of a world's asset files, bytes (design doc 19 section 2.3, a design value).
-pub const WORLD_ASSETS_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-/// Largest icon, bytes (design doc 19 section 2.3, a design value).
-pub const WORLD_ICON_MAX_BYTES: usize = 256 * 1024;
-
-/// Largest `source/` of a package, all files together, bytes (design doc 19 section 5.2, a
-/// design value: 256 files at the per-file cap would be 2 GiB). `rando pack` holds to it so a
-/// package it writes is never one the server refuses for size.
-pub const PACKAGE_MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
-
-/// Largest package file, bytes (design doc 19 section 5.2: 8 MiB manifest, 16 MiB source and
-/// 16 MiB assets, a design value).
-pub const PACKAGE_MAX_BYTES: usize = 40 * 1024 * 1024;
-
-/// Most entries in a package (design doc 19 section 5.2: 256 modules, 64 assets and the fixed
-/// entries, a design value).
-pub const PACKAGE_MAX_ENTRIES: usize = 512;
-
-/// Longest entry path in a package, bytes (design doc 19 section 5.2, a design value).
-pub const PACKAGE_MAX_PATH_BYTES: usize = 255;
-
 /// Most declarations the families of one world may expand to, so a product of a few long
 /// lists cannot run away (a design value: the survey's largest family is a few thousand).
 pub const WORLD_FAMILY_MAX: usize = 100_000;
@@ -633,6 +637,22 @@ impl Limits {
         apworld_max_entries: 20_000,
         yaml_max_bytes: 1024 * 1024,
         manifest_max_bytes: 8 * 1024 * 1024,
+        world_toml_max_bytes: 64 * 1024,
+        world_name_max_bytes: 64,
+        world_version_max_bytes: 64,
+        world_authors_max: 16,
+        world_author_max_chars: 128,
+        world_description_max_chars: 1000,
+        world_license_max_bytes: 256,
+        world_url_max_bytes: 2048,
+        world_assets_max: 64,
+        world_asset_max_bytes: 2 * 1024 * 1024,
+        world_assets_max_bytes: 16 * 1024 * 1024,
+        world_icon_max_bytes: 256 * 1024,
+        package_max_source_bytes: 16 * 1024 * 1024,
+        package_max_bytes: 40 * 1024 * 1024,
+        package_max_entries: 512,
+        package_max_path_bytes: 255,
         manifest_cache_bytes: 64 * 1024 * 1024,
         list_page_max: 200,
         catalogue_name_max_bytes: 100,
@@ -1303,6 +1323,25 @@ mod tests {
         let l = Limits::DESIGN;
         assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
         assert_eq!(l.manifest_max_bytes, 8 << 20);
+        assert_eq!(
+            (l.world_toml_max_bytes, l.world_name_max_bytes, l.world_version_max_bytes),
+            (64 << 10, 64, 64)
+        );
+        assert_eq!(
+            (l.world_authors_max, l.world_author_max_chars, l.world_description_max_chars),
+            (16, 128, 1000)
+        );
+        assert_eq!((l.world_license_max_bytes, l.world_url_max_bytes), (256, 2048));
+        assert_eq!(
+            (l.world_assets_max, l.world_asset_max_bytes, l.world_assets_max_bytes),
+            (64, 2 << 20, 16 << 20)
+        );
+        assert_eq!(l.world_icon_max_bytes, 256 << 10);
+        assert_eq!(
+            (l.package_max_source_bytes, l.package_max_bytes, l.package_max_entries),
+            (16 << 20, 40 << 20, 512)
+        );
+        assert_eq!(l.package_max_path_bytes, 255);
         assert_eq!((l.gen_concurrency, l.gen_queue_max), (1, 64));
         assert_eq!(
             (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),
