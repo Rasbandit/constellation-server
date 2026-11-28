@@ -15,8 +15,8 @@ Design references point at the `constellation` repo: `docs/design/NN-*.md`, deci
 - One server hosts many rooms, each reached by its room key in the path (#55, #105). The Archipelago-compatible edge (`crates/edge-compat`) handles connect, checks, items, sync, scouts, chat, bounce, goal. The full table, with the test behind each line, is [`compat-status.md`](compat-status.md).
 - With a database URL set, the room log is in Postgres and survives `kill -9`; without one it is in memory.
 - A seed made by Archipelago's own generator converts to our bundle (`tools/ap-import`).
-- The fill: `crates/data-fill` makes a seed from a data-only world manifest (#81), for several players in one room (#95), with one fill method on one path (#222). Rules are compiled into a bytecode rules section and evaluated inside `data-fill` (#81, #205); the separate evaluator crate with shared test vectors (#28) is not built.
-- The language and CLI: the `.rando` authoring language and the `rando` tool with `check`, `fmt`, `build` and `generate` (#223, which closed the validator issue #27), then a second grammar round (#228).
+- The fill: `crates/data-fill` makes a seed from a data-only world manifest (#81), for several players in one room (#95), with one fill method on one path (#222). Rules are compiled into a bytecode rules section and evaluated inside `data-fill` (#81, #205); the separate evaluator crate with shared test vectors (#28) is not built. `crates/rule-ops` holds only the comparison operators that `data-fill` and `world-build` share.
+- The language and CLI: the `.rando` authoring language and the `rando` tool with `check`, `fmt`, `build` and `generate` (#223), then a second grammar round (#228); the lexer is its own crate, `crates/rando-syntax` (#232). The validator issue #27 is closed, by hand, with a comment that #223 did the work.
 - Packaging: `rando.toml`, `rando.lock` and `rando pack` (#230).
 - The settings schema: option scope and labels, and `settings.json` in the package (#231).
 - Not started: the native edge (`edge-native`) and the client SDK (no such crates on main).
@@ -41,7 +41,7 @@ Five lanes, one owner each. A lane owns its crates, so two people rarely edit th
 
 - **Lane A: compatibility with existing clients (M1).** Owns `crates/edge-compat`, `crates/seed-bundle`, `tools/ap-import`, `docs/compat-status.md`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:compat)
 - **Lane B: the native standard (M2).** Owns `crates/proto`, the new `crates/edge-native`, the new `crates/sdk-core`, `crates/runtime`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:native)
-- **Lane C: games on the standard (M3).** Owns the new `crates/cgm` (manifest types and validator), `crates/rules`, later `crates/fill`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:games)
+- **Lane C: games on the standard (M3).** Owns `crates/world-build` (the `rando` tool), `crates/rando-syntax`, `crates/data-fill` (the fill) and `crates/rule-ops`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:games)
 - **Lane D: reliability and hosting (M1 playtests, M4).** Owns `crates/sim`, `.github/workflows`, deploy files, `docs/TESTING.md`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:reliability)
 - **Lane E: web UI (M1, M2 stretch).** Owns the `web/` app (Vite and React) and the web routes in `crates/server`. [Issues](https://github.com/Rasbandit/constellation-server/issues?q=is:open+label:lane:web)
 
@@ -61,7 +61,7 @@ Projects are goals that cut across the five lanes. Each has a label `project:<na
 3. Registry (#152), automated checks (#153), listing states (#154) and the takedown path (#155).
 4. Then the portal (#156), sandbox (#157), quick start (#158), maintainer dashboard (#159), games site (#160) and game health signal (#161).
 
-**World standard** (`project:world-standard`: #164 to #172, plus #28 to #31, #71, #91 to #94 and #226; #27, the validator, is done; lane games, M3). Goal: convert existing worlds into the data-only standard in a separate worlds repo, and write down best practice from what hurts.
+**World standard** (`project:world-standard`: #164 to #172, plus #28 to #31, #71, #91 to #94 and #226; #27, the validator, is closed; lane games, M3). Goal: convert existing worlds into the data-only standard in a separate worlds repo, and write down best practice from what hurts.
 1. Setup: the worlds repo (#164), credit and copying rules (#165), the definition of a converted world (#166).
 2. Pick the first three worlds (#167), then the folder template (#168).
 3. Convert them (#29, #30), checked by the equivalence harness (#31).
@@ -78,11 +78,11 @@ Projects are goals that cut across the five lanes. Each has a label `project:<na
 
 These four serve question 3 (lane games, M3). Each follows a decided design doc in the `constellation` repo and has merged work here; none has a `project:` label or a board yet, so the issues and pull requests below are the record.
 
-**The `.rando` authoring language** (doc 18, D-141). Goal: worlds written as `.rando` files and built by the `rando` tool in `crates/world-build` ([`world-build.md`](world-build.md)). Done: the tool core (#223), two grammar rounds (#228 and the trial worlds of #227), five genre example worlds (#229). Open: the lexer moving to its own crate (#232), the doc 18 features the tool still refuses (#226), and the three trial worlds that must pass before the grammar is frozen (doc 18 section 8, question 9).
+**The `.rando` authoring language** (doc 18, D-141). Goal: worlds written as `.rando` files and built by the `rando` tool in `crates/world-build` ([`world-build.md`](world-build.md)). Done: the tool core (#223), two grammar rounds (#228 and the trial worlds of #227), five genre example worlds (#229), the lexer in its own crate, `crates/rando-syntax` (#232). The trial worlds ran on 2026-11-27 and led to nine grammar and tool changes (doc 18 section 2.13, built in #228); the grammar is still provisional (doc 18). Open: the doc 18 features the tool still refuses (#226).
 
 **World packaging** (doc 19, D-142). Goal: one package per world version for the developer portal. Done in the tool: `rando.toml`, `rando.lock` and `rando pack` (#230). Not built yet: the server side, which checks the package as untrusted input and rebuilds its source in the sandbox (D-142).
 
-**The settings language** (doc 20, D-143, D-144). Goal: player and room settings as a small `.rando` file type. Done: option scope and labels, and `settings.json` in the package (#231). Open: the shared lexer for settings files (#232), then the checker and tools of doc 20 sections 7 and 8.
+**The settings language** (doc 20, D-143, D-144). Goal: player and room settings as a small `.rando` file type. Done: option scope and labels, and `settings.json` in the package (#231), and the shared lexer with a settings file kind (#232). Open: the checker and tools of doc 20 sections 7 and 8.
 
 **Generic shuffles, entrance and room shuffle first** (doc 17, D-137). Goal: one system for randomization that is not item placement. Done: the first slice in `data_fill::shuffle`, with entrance shuffle (#207; [`data-only-world-experiment.md`](data-only-world-experiment.md) section 4). Open: the write edges in the run order (#210) and the rest of doc 17 (#211).
 
@@ -97,7 +97,7 @@ Each person can start on day one without waiting for anyone:
 1. Lane A: #19 client matrix, then #21 (#20 is done).
 2. Lane B: #13 cursors (#12 schema is done), then #14 and #15.
 3. Lane C: #28 rule evaluator, then #29 (#27 validator is done).
-4. Lane D: #35 chaos run and #37 simulator, then #33 once approved, then #22, #23 or #31 wherever is behind.
+4. Lane D: #35 chaos run and #37 simulator, then #33 once approved, then #22 or #23 wherever is behind.
 5. Lane E (if a fifth person joins): pick from the open `lane:web` issues.
 
 Cross-lane handoff to watch: #17 needs lane A's test helpers (`crates/e2e`).
