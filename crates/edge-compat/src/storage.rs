@@ -1,5 +1,5 @@
 //! Data storage on the wire (protocol doc, sections "Get", "Set", "`SetNotify`", "`SetReply`";
-//! docs/protocol-plan.md section 1): parsing a `Set` into a room-core key write, building
+//! the archived protocol plan section 1): parsing a `Set` into a room-core key write, building
 //! `SetReply`, and the read-only `_read_` keys. The room owns the stored values; this module only
 //! translates.
 #![allow(

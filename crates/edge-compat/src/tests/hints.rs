@@ -1,4 +1,4 @@
-// Hint scenarios (docs/protocol-plan.md section 2.7) over a real room task. Who finds and who
+// Hint scenarios (the archived protocol plan section 2.7) over a real room task. Who finds and who
 // receives each item is read off the test bundle in `tests.rs` by eye: A's location 100 holds
 // B's item 7 (progression), A's 101 holds A's own item 8, B's 100 holds A's item 7 (a trap).
 // A hint costs each slot 1 point (10 percent of a world of 1 or 2, at least 1); a check earns 2.

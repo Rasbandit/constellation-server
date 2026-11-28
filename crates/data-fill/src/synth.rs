@@ -10,7 +10,8 @@
 //!
 //! Two profiles: [`Shape::default`] (light: few sites, two time slices, short rules) and
 //! [`Shape::heavy`], whose counts per check follow the experiment's test world as counted in
-//! `docs/data-only-world-experiment.md` (1516 checks, 318 regions, 3685 rule sites, 107 defs,
+//! the data-only world experiment, archived in the design repo (1516 checks, 318 regions, 3685
+//! rule sites, 107 defs,
 //! 45 time slices, clocks as items).
 //!
 //! A third, [`Shape::wide`], is another kind of world: one region that holds every check, each
@@ -1178,8 +1179,8 @@ mod tests {
     }
 
     /// The heavy profile against the test world's counts per check
-    /// (`docs/data-only-world-experiment.md`: 1516 checks, 318 regions, 3685 rule sites, 107
-    /// defs, 45 slices), within a fifth; about 2.6 nodes per rule site.
+    /// (the data-only world experiment, archived in the design repo: 1516 checks, 318 regions,
+    /// 3685 rule sites, 107 defs, 45 slices), within a fifth; about 2.6 nodes per rule site.
     #[test]
     fn the_heavy_profile_has_the_test_worlds_counts_per_check() {
         let shape = Shape::heavy();

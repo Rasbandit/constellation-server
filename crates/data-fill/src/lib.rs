@@ -1,5 +1,6 @@
 //! Experiment: fill and reachability for a data-only world (doc 07), no world code at
-//! generation time. See `docs/data-only-world-experiment.md` for the format extensions it reads.
+//! generation time. The format extensions it reads are described in the data-only world
+//! experiment, archived in the design repo.
 
 mod bitrules;
 pub mod capacity;

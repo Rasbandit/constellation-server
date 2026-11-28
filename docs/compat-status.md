@@ -56,7 +56,7 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 
 ## Not implemented yet
 
-Release, collect and remaining (and their `!` commands); `CreateHints`; every `!` command but `!hint` and `!hint_location`; group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; `TagsChanged` prints; TLS (put a terminator in front). The plan and build order: `docs/protocol-plan.md`.
+Release, collect and remaining (and their `!` commands); `CreateHints`; every `!` command but `!hint` and `!hint_location`; group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; `TagsChanged` prints; TLS (put a terminator in front). The plan and build order: the protocol plan (archived in the design repo).
 
 ## Hints
 

@@ -9,7 +9,7 @@ Both are generic. The only world-specific code is a small Python adapter you wri
 
 ## What you need
 
-1. The manifest of your port (doc 07 shape plus the `x.` extensions in `data-only-world-experiment.md`, see #71). Location and item keys in the manifest are the keys every exchange below uses.
+1. The manifest of your port (doc 07 shape plus the `x.` extensions of the data-only world experiment, archived in the design repo, see #71). Location and item keys in the manifest are the keys every exchange below uses.
 2. A Python environment where the legacy world runs.
 3. An adapter file (next section). Keep it next to your world, not in this repository, if the legacy world's license does not allow redistribution.
 

@@ -1,4 +1,4 @@
-//! Hints on the wire (docs/protocol-plan.md section 2): the `Hint` record and its print, the
+//! Hints on the wire (the archived protocol plan section 2): the `Hint` record and its print, the
 //! `!hint` and `!hint_location` name lookup, and the command result texts. The room owns the
 //! hints and the points; this module only translates.
 //!

@@ -15,11 +15,11 @@
 //! Applied cursors (`Ack`) are not log events (D-02): `fold` does not restore them, the caller
 //! reads them from the store and calls [`RoomState::restore_applied`].
 //!
-//! The room also holds a key-value store written by `KvSet` (data storage, docs/protocol-plan.md
+//! The room also holds a key-value store written by `KvSet` (data storage, the archived protocol plan
 //! section 1). `apply` evaluates the operations (the `kv` module); the event carries the resulting value,
 //! so `fold` never evaluates them again.
 //!
-//! Hints and hint points live in the `hint` module (docs/protocol-plan.md section 2).
+//! Hints and hint points live in the `hint` module (the archived protocol plan section 2).
 #![no_std]
 
 extern crate alloc;

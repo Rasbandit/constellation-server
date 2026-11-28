@@ -1,4 +1,4 @@
-//! Client status presence (docs/protocol-plan.md section 5): a slot reads as connected (5) while
+//! Client status presence (the archived protocol plan section 5): a slot reads as connected (5) while
 //! any connection is on it and as unknown (0) once the last one leaves; `StatusUpdate` sets it
 //! in between. A reached goal (30) is durable in the room and always wins. Presence itself is
 //! not durable: a restart disconnects everyone, so 0 is right afterwards (reference
