@@ -110,8 +110,8 @@ pub(crate) struct Worlds {
     /// Makes temporary folder names and world ids unique within the process.
     seq: AtomicU64,
     /// With `--rooms`: the host's rooms folder, where a finished world is listed as a room (its
-    /// seed is in the host's store, never a file), and the public `host:port` its join address
-    /// is under.
+    /// seed is in the host's store, never a file), and the public `host:port` (or `ws(s)://host:port`
+    /// URL) its join address is under.
     rooms: Option<(RoomsFolder, String)>,
     /// The host's store, where every finished world's seed and packages go.
     importer: Option<Waker>,

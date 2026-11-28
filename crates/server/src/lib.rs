@@ -85,8 +85,10 @@ pub struct Args {
     /// Header a trusted reverse proxy sets to the client address (for example `X-Forwarded-For`);
     /// sign-up and login limits count per that address. None (default): the peer address.
     pub trusted_proxy_header: Option<axum::http::HeaderName>,
-    /// The host name clients reach this server by; a room's join address is
-    /// `{public_host}:{port}/{room_key}` (default `localhost`).
+    /// How clients reach this server: a host name (a room's join address is then
+    /// `{public_host}:{port}/{room_key}`) or a full `ws://` or `wss://` URL with no path, used
+    /// as given (`wss://play.example:443`; the port is spelled out because Archipelago clients
+    /// use 38281 when none is typed). Default `localhost`.
     pub public_host: String,
     /// The built web UI, served on the room port (`--web-dir`); none: no UI.
     pub web_dir: Option<PathBuf>,
@@ -94,13 +96,58 @@ pub struct Args {
 
 /// How to run the binary.
 pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms <folder>) \
-     --port <port> [--host <ip>] [--public-host <name>] \
+     --port <port> [--host <ip>] [--public-host <name | ws(s)://host:port>] \
      [--web-dir <path>] [--data-dir <path> [--trusted-proxy-header <name>]] \
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
      needs CONSTELLATION_AP_DIR, \
      CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; \
      CONSTELLATION_SIGNUP=closed stops new sign-ups)";
+
+/// Check a `--public-host` value: a bare host (a name or a bracketed IPv6 address, no port), or
+/// a `ws://` / `wss://` URL that is only `host:port` (a port is required: Archipelago clients
+/// use 38281 when none is typed; an optional trailing `/` is allowed; no user info, path,
+/// query, spaces or control characters).
+fn public_host_value(v: String) -> Result<String, String> {
+    let host_ok = |h: &str| {
+        !h.is_empty()
+            && !h.contains(['/', '?', '#', '@'])
+            && !h.contains(|c: char| c.is_whitespace() || c.is_control())
+            && match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                Some(ip) => ip.parse::<std::net::Ipv6Addr>().is_ok(),
+                None => !h.contains([':', '[', ']']),
+            }
+    };
+    match v.split_once("://") {
+        None if host_ok(&v) => Ok(v),
+        None => Err("--public-host needs a host name with no port (bracket an IPv6 address); \
+                     for a port use a URL like wss://host:port"
+            .to_owned()),
+        Some(("ws" | "wss", rest)) => {
+            let authority = rest.strip_suffix('/').unwrap_or(rest);
+            let port_ok = |p: &str| {
+                !p.is_empty()
+                    && p.bytes().all(|b| b.is_ascii_digit())
+                    && p.parse::<u16>().is_ok_and(|n| n > 0)
+            };
+            match authority.rsplit_once(':') {
+                Some((host, port)) if host_ok(host) && port_ok(port) => Ok(v),
+                _ => Err("--public-host needs a URL like wss://host:443".to_owned()),
+            }
+        }
+        _ => Err("--public-host needs a host name or a URL like wss://host:443".to_owned()),
+    }
+}
+
+/// The base of a room's join address: a `ws(s)://` URL as given (no trailing `/`), else
+/// `{public_host}:{port}`.
+fn join_base(public_host: &str, port: u16) -> String {
+    if public_host.contains("://") {
+        public_host.trim_end_matches('/').to_owned()
+    } else {
+        format!("{public_host}:{port}")
+    }
+}
 
 impl Args {
     /// Parse the arguments after the program name.
@@ -127,7 +174,7 @@ impl Args {
                 "--port" => port = Some(value()?.parse().map_err(|_| "--port needs a number")?),
                 "--host" => host = Some(value()?.parse().map_err(|_| "--host needs an IP")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
-                "--public-host" => public_host = Some(value()?),
+                "--public-host" => public_host = Some(public_host_value(value()?)?),
                 "--web-dir" => web_dir = Some(PathBuf::from(value()?)),
                 "--trusted-proxy-header" => {
                     trusted_proxy_header = Some(
@@ -820,7 +867,7 @@ pub async fn run(
             router,
             api,
             &host,
-            format!("{}:{}", args.public_host, addr.port()),
+            join_base(&args.public_host, addr.port()),
             args.trusted_proxy_header,
         )
         .await;
@@ -906,6 +953,8 @@ mod tests {
             parse("--bundle x --port 1 --public-host play.example").unwrap().public_host,
             "play.example"
         );
+        let a = parse("--bundle x --port 1 --public-host wss://play.example:443/").unwrap();
+        assert_eq!(a.public_host, "wss://play.example:443/");
         let a = parse("--bundle x --port 1 --trusted-proxy-header X-Forwarded-For").unwrap();
         assert_eq!(a.trusted_proxy_header.unwrap().as_str(), "x-forwarded-for");
         let a = parse("--rooms seeds --port 1").unwrap();
@@ -1561,5 +1610,53 @@ mod tests {
         assert_eq!(version_string("0.1.0", Some("")), "0.1.0");
         assert_eq!(version_string("0.1.0", Some("abcdef1234567")), "0.1.0+abcdef1");
         assert_eq!(version_string("0.1.0", Some("abc")), "0.1.0+abc");
+    }
+
+    #[test]
+    fn a_join_address_base_is_host_and_port_or_a_full_ws_url() {
+        assert_eq!(join_base("play.example", 38281), "play.example:38281");
+        assert_eq!(join_base("wss://play.example:443", 38281), "wss://play.example:443");
+        assert_eq!(join_base("wss://play.example:443/", 38281), "wss://play.example:443");
+        assert_eq!(join_base("wss://[::1]:443", 1), "wss://[::1]:443");
+    }
+
+    #[test]
+    fn a_public_host_url_must_be_ws_or_wss_with_a_port_and_nothing_else() {
+        for bad in [
+            "https://x:443",
+            "wss://x:443/room",
+            "wss://",
+            "ws://x?a=1",
+            "wss://x",
+            "ws://x:",
+            "ws://x:0",
+            "ws://x:99999",
+            "ws://x:+443",
+            "wss://u:p@x:443",
+            "wss://x :443",
+            "WSS://x:443",
+            "wss:/x:443",
+            "play example",
+            "x/y",
+            "wss://[::1]",
+            "wss://:443",
+            "wss://::1:443",
+            "wss://a:b:443",
+            "play.example:443",
+            "wss:x",
+            "::1",
+            "[::1",
+            "x\u{1b}[31m",
+            "wss://x\u{7f}:443",
+        ] {
+            assert!(parse(&format!("--bundle x --port 1 --public-host {bad}")).is_err(), "{bad}");
+        }
+        for ok in
+            ["ws://x:80", "wss://play.example:443/", "wss://[::1]:443", "play.example", "[::1]"]
+        {
+            assert!(parse(&format!("--bundle x --port 1 --public-host {ok}")).is_ok(), "{ok}");
+        }
+        let err = parse("--bundle x --port 1 --public-host play.example:443").unwrap_err();
+        assert!(err.contains("wss://host:port"), "{err}");
     }
 }

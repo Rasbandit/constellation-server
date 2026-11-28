@@ -23,7 +23,7 @@ docker compose up -d   # sign-up is open, see "The world API on the same port"
 
 ## DNS
 
-A client reaches a room at `<host>:<port>/<key>` (the path is the room key). One host name and one ordinary TLS certificate serve every room: no wildcard DNS or wildcard certificate is needed. A proxy must pass the path through unchanged.
+A client reaches a room at `<host>:<port>/<key>` (the path is the room key). Behind a proxy on 443, set `CONSTELLATION_PUBLIC_HOST=wss://<host>:443` (a `ws://` or `wss://` URL with no path is shown as given); the port stays in the address on purpose, because Archipelago's client connects to 38281 whenever no port is typed, even for `wss://`. One host name and one ordinary TLS certificate serve every room: no wildcard DNS or wildcard certificate is needed. A proxy must pass the path through unchanged.
 
 ## Building
 Generation needs the generator's source, which is not in this repo and whose URL is not committed. Pass it as build args `GEN_REPO_URL` and `GEN_REPO_REF` (a pinned commit SHA); the build fails with a message when either is empty. Compose reads them from `.env`; the release workflow reads `GEN_REPO_REF` from a repository variable (a SHA is harmless) and `GEN_REPO_URL` from a repository secret, so the URL is masked in public logs; the push job also turns off the build attestation, which would embed it. The image also holds python with the generator's dependencies, bubblewrap and `prlimit`.
