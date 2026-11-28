@@ -439,8 +439,8 @@ fn rando_toml_name_follows_the_game_key_rule() {
 
 /// `settings.json` (doc 20 section 5): every option with its kind, values or bounds, default,
 /// scope (`seed` when none is written) and label (a string key into `strings`, which holds the
-/// text), then the items with their copies, and the place and door names, in canonical JSON. Each part after an option's type is optional, in the order default, label,
-/// scope.
+/// text), then the items with their copies, and the place and door names, in canonical JSON.
+/// Each part after an option's type is optional, in the order default, label, scope.
 #[test]
 fn the_settings_schema_keeps_option_scope_and_label() {
     let body = "option lamp_color: choice(teal, amber) = teal \"Lamp color\" cosmetic\n\
