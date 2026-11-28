@@ -53,7 +53,9 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
     }
     // `and` and `or` nodes, by first token, outer first; and the tokens to break before, with
     // their indent, once one is found too long for its line.
-    let mut wraps: std::collections::HashMap<usize, Vec<(usize, &Vec<usize>, usize)>> =
+    // Per node: one past its last token, the tokens to break before, its nesting.
+    type Node<'a> = (usize, &'a Vec<usize>, usize);
+    let mut wraps: std::collections::HashMap<usize, Vec<Node<'_>>> =
         std::collections::HashMap::new();
     if with_comments {
         for (a, b, at, level) in &ast.layout.wraps {

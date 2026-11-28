@@ -97,6 +97,10 @@ pub(crate) fn check(
     let mut memo = HashMap::new();
     let site_reads: Vec<Reads> = m.sites.iter().map(|s| reads(&s.3, defs, &mut memo)).collect();
     let pos_of: HashMap<&str, Pos> = m.regions.iter().map(|r| (r.0, r.1)).collect();
+    let mut next: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (from, to) in &m.exits {
+        next.entry(from).or_default().push(to);
+    }
     let mut told: HashSet<(Pos, String)> = HashSet::new();
     for given in &all {
         let o = values(options, given);
@@ -109,7 +113,7 @@ pub(crate) fn check(
         let mut seen = HashSet::from([m.start]);
         let mut todo = vec![m.start];
         while let Some(r) = todo.pop() {
-            for (_, to) in m.exits.iter().filter(|x| x.0 == r && on.contains(x.1)) {
+            for to in next.get(r).into_iter().flatten().filter(|t| on.contains(*t)) {
                 if seen.insert(to) {
                     todo.push(to);
                 }
@@ -124,33 +128,103 @@ pub(crate) fn check(
                 );
             }
         }
-        for ((pos, region, when, _), r) in m.sites.iter().zip(&site_reads) {
+        let gone_events: HashSet<&str> = m
+            .fired
+            .iter()
+            .filter(|(_, rs)| !rs.iter().any(|q| on.contains(q)))
+            .map(|(e, _)| *e)
+            .collect();
+        let gone = Gone { events: &gone_events, on: &on, regions: &pos_of, defs };
+        let mut memo: HashMap<&str, bool> = HashMap::new();
+        for ((pos, region, when, rule), r) in m.sites.iter().zip(&site_reads) {
             if region.is_some_and(|q| !on.contains(q)) || !ev.rule(when).unwrap_or(true) {
                 continue;
             }
-            for e in &r.events {
-                let Some(firing) = m.fired.get(e.as_str()) else { continue };
-                if firing.iter().any(|q| on.contains(q)) || !told.insert((*pos, e.clone())) {
+            let dead_events: Vec<&String> =
+                r.events.iter().filter(|e| gone_events.contains(e.as_str())).collect();
+            let dead_regions: Vec<&String> = r
+                .regions
+                .iter()
+                .filter(|q| pos_of.contains_key(q.as_str()) && !on.contains(q.as_str()))
+                .collect();
+            // Only a read the rule cannot do without dangles: one alternative of an `or` may be
+            // gone while another still holds.
+            if (dead_events.is_empty() && dead_regions.is_empty()) || gone.possible(rule, &mut memo)
+            {
+                continue;
+            }
+            for e in dead_events {
+                if !told.insert((*pos, e.clone())) {
                     continue;
                 }
+                let firing = &m.fired[e.as_str()];
                 errs.err(
                     *pos,
                     format!(
-                        "`{e}` is fired only in regions that do not exist with {set} ({}), and this rule reads it",
+                        "`{e}` is fired only in regions that do not exist with {set} ({}), and this rule cannot hold without it",
                         firing.iter().map(|q| format!("`{q}`")).collect::<Vec<_>>().join(", ")
                     ),
-                    "give this the same `when`, or fire the event in a region that exists then",
+                    "give this the same `when`, add another way with `or`, or fire the event in a region that exists then",
                 );
             }
-            for q in r.regions.iter().filter(|q| pos_of.contains_key(q.as_str())) {
-                if !on.contains(q.as_str()) && told.insert((*pos, q.clone())) {
+            for q in dead_regions {
+                if told.insert((*pos, q.clone())) {
                     errs.err(
                         *pos,
-                        format!("this rule reaches region `{q}`, which does not exist with {set}"),
-                        "read an event its rooms fire, or drop the region's `when`",
+                        format!("this rule reaches region `{q}`, which does not exist with {set}, and cannot hold without it"),
+                        "read an event its rooms fire, add another way with `or`, or drop the region's `when`",
                     );
                 }
             }
+        }
+    }
+}
+
+/// What is gone for one option setting: events no existing region fires, and regions that do
+/// not exist.
+struct Gone<'g> {
+    events: &'g HashSet<&'g str>,
+    on: &'g HashSet<&'g str>,
+    regions: &'g HashMap<&'g str, Pos>,
+    defs: &'g BTreeMap<String, Value>,
+}
+
+impl<'g> Gone<'g> {
+    /// Whether a lowered rule can still hold with what is gone false and everything else
+    /// granted: an `or` needs one part that can, an `and` every part.
+    fn possible(&self, v: &'g Value, memo: &mut HashMap<&'g str, bool>) -> bool {
+        let Some((k, a)) = v.as_object().and_then(|o| o.iter().next()) else { return true };
+        match k.as_str() {
+            "all" => a.as_array().into_iter().flatten().all(|x| self.possible(x, memo)),
+            "any" => a.as_array().into_iter().flatten().any(|x| self.possible(x, memo)),
+            "ref" => {
+                let Some(d) = a.as_str() else { return true };
+                if let Some(b) = memo.get(d) {
+                    return *b;
+                }
+                // A cycle is the lowering's error; it counts as possible here.
+                memo.insert(d, true);
+                let b = self.defs.get(d).is_none_or(|body| self.possible(body, memo));
+                memo.insert(d, b);
+                b
+            }
+            "reach" => a
+                .as_str()
+                .map(|r| r.strip_prefix("region:").unwrap_or(r))
+                .is_none_or(|r| !self.regions.contains_key(r) || self.on.contains(r)),
+            // An event's counter of 0 fails `counter(e) >= n` for any n of at least 1.
+            "ge" | "gt" => match a.as_array().map(Vec::as_slice) {
+                Some([Value::Object(c), n]) if c.len() == 1 => {
+                    let gone = c
+                        .get("counter")
+                        .and_then(Value::as_str)
+                        .is_some_and(|e| self.events.contains(e));
+                    let need = n.as_i64().unwrap_or(0) + i64::from(k == "gt");
+                    !(gone && need >= 1)
+                }
+                _ => true,
+            },
+            _ => true,
         }
     }
 }

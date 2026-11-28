@@ -5,7 +5,7 @@
 //! publish marks every declared key published; a published key may be renamed with `was` but
 //! never dropped, since seeds and clients already carry its id.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -105,10 +105,12 @@ pub(crate) fn assign(
         } else {
             w.items.iter().map(|i| i.key.v.as_str()).collect()
         };
-        let mine: Vec<&Ident> = idents
-            .iter()
-            .filter(|i| i.check == check && present.contains(i.name.as_str()))
-            .collect();
+        let mine = one_per_check(
+            idents.iter().filter(|i| i.check == check && present.contains(i.name.as_str())),
+            check,
+            errs,
+        );
+        let mine: Vec<&Ident> = mine.iter().collect();
         let key_of = |i: &Ident| i.key.clone().unwrap_or_else(|| i.name.clone());
         let declared: HashSet<String> = mine.iter().map(|i| key_of(i)).collect();
         let mut used: HashSet<String> = HashSet::new();
@@ -199,6 +201,37 @@ pub(crate) fn assign(
         errs.whole(format!("the ledger is not canonical: {e}"), "");
         String::new()
     })
+}
+
+/// The idents of one table, a check declared in several regions joined into one: its `key` and
+/// `was` come from the one declaration that gives each (a second is an error), so the check
+/// keeps one id.
+fn one_per_check<'i>(
+    idents: impl Iterator<Item = &'i Ident>,
+    check: bool,
+    errs: &mut Errs,
+) -> Vec<Ident> {
+    let mut out: Vec<Ident> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for i in idents {
+        let Some(o) = at.get(&i.name).filter(|_| check).map(|k| &mut out[*k]) else {
+            at.insert(i.name.clone(), out.len());
+            out.push(i.clone());
+            continue;
+        };
+        for (field, mine, theirs) in [("key", &mut o.key, &i.key), ("was", &mut o.was, &i.was)] {
+            match (mine.is_some(), theirs) {
+                (true, Some(_)) => errs.err(
+                    i.pos,
+                    format!("`{field}` of check `{}` is also given in another declaration", i.name),
+                    "a check in several regions gives each modifier in one declaration only",
+                ),
+                (false, Some(t)) => *mine = Some(t.clone()),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Whether some declaration of this table writes `key` as its `key "..."`.

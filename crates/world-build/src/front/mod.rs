@@ -280,7 +280,14 @@ pub fn stamp(
                 .comments
                 .iter()
                 .map(|c| c.pos.line)
-                .filter(|l| *l > ast.generated.as_ref().map_or(0, |g| g.pos.line))
+                // After the header's closing `}`: a comment inside the header is not body.
+                .filter(|l| {
+                    *l > ast
+                        .generated
+                        .as_ref()
+                        .and_then(|g| ast.toks.get(g.end.saturating_sub(1)))
+                        .map_or(0, |t| t.pos.line)
+                })
                 .chain([first.pos.line])
                 .min()
                 .unwrap_or(first.pos.line);

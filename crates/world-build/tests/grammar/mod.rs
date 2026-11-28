@@ -192,8 +192,8 @@ fn a_check_in_several_regions_gives_each_modifier_once() {
     );
 }
 
-/// Two exits between the same two rooms are two ways in, each with its rule; in a world with
-/// a shuffle each has its own door, and its key names the door (`region:to:door`).
+/// Two exits between the same two rooms are two ways in, each with its rule; with a door each,
+/// the key names the door (`region:to:door`), and two may not share one.
 #[test]
 fn several_exits_to_one_region_each_keep_their_rule_and_door() {
     let b = ok(&world(
@@ -208,9 +208,9 @@ fn several_exits_to_one_region_each_keep_their_rule_and_door() {
     assert_eq!(keys.len(), 2);
     assert!(keys.contains(&"a:b:front") && keys.contains(&"a:b:back"), "{keys:?}");
     fails(
-        &world(&doors.replace("  exit b: has(k) door back group g", "  exit b: has(k) group g")),
-        &format!("world.rando:{}:8", line(8)),
-        "each needs its own `door`",
+        &world(&doors.replace("  exit b: has(k) door back group g", "  exit b: has(k) door front")),
+        &format!("world.rando:{}:23", line(8)),
+        "two exits to `b` through door `front`",
     );
 }
 
@@ -464,4 +464,99 @@ fn stamp_writes_and_refreshes_a_generated_header() {
         newer.contains("tool \"export 2\"") && !newer.contains("export 1") && newer.ends_with(body),
         "{newer}"
     );
+}
+
+/// Review findings on PR 228, each failing before its fix.
+mod review {
+    use super::*;
+
+    /// A check in an always-present region and in an optional one: at the value that removes
+    /// the optional region, its site there gives nothing (it carries the region's condition).
+    #[test]
+    fn a_check_site_in_a_removed_region_gives_nothing() {
+        let b = ok(&world(
+            "option vault: toggle = off\nregion a {\n  check drop: has(k)\n  check a1\n  exit b\n}\nregion b when opt.vault {\n  check drop\n  exit a\n}",
+        ));
+        let site = &region(&b, "b")["checks"][0];
+        assert_eq!(site["rule"], serde_json::json!({"ne": [{"opt": "vault"}, 0]}), "{site}");
+        // Before the fix this site read `true`, and the start's exit into the removed room
+        // let the fill place `k` at `drop` behind its own lock.
+        fills(&b, &HashMap::new(), 10);
+    }
+
+    /// `key` and `was` of a check in several regions are given once and keep one id.
+    #[test]
+    fn key_and_was_of_a_check_in_several_regions() {
+        let two = "region a {\n  check drop KEY_A\n  exit b\n}\nregion b {\n  check drop KEY_B\n  exit a\n}";
+        let ledger = |b: &world_build::Built| -> serde_json::Value {
+            serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap()
+        };
+        let b = ok(&world(&two.replace("KEY_A", "key \"dk\"").replace(" KEY_B", "")));
+        let l = ledger(&b);
+        assert_eq!(l["checks"].as_object().unwrap().keys().collect::<Vec<_>>(), ["dk"], "{l}");
+        assert_eq!(b.manifest["locations"][0]["id"], l["checks"]["dk"]["id"]);
+        fails(
+            &world(&two.replace("KEY_A", "key \"dk\"").replace("KEY_B", "key \"dk\"")),
+            &format!("world.rando:{}:9", line(6)),
+            "`key` of check `drop` is also given in another declaration",
+        );
+        let old = super::super::lang::mem(&[(
+            "world.rando",
+            &world(&two.replace(" KEY_A", "").replace(" KEY_B", "")).0["world.rando"]
+                .replace("drop", "old"),
+        )]);
+        let first = ok(&old);
+        let mut files = world(&two.replace(" KEY_A", "").replace("KEY_B", "was old"));
+        files.0.insert("ledger.json".into(), first.ledger.clone().unwrap());
+        let l = ledger(&ok(&files));
+        assert_eq!(l["checks"]["drop"]["id"], ledger(&first)["checks"]["old"]["id"], "{l}");
+    }
+
+    /// A read of a removed region's event in one alternative of an `or` is fine.
+    #[test]
+    fn an_optional_event_in_one_alternative_is_not_an_error() {
+        ok(&world(
+            &format!("{OPTIONAL}\nregion d {{\n  check d1: has(k) or lever\n  exit a\n}}")
+                .replace("  exit b\n}\nregion b", "  exit b\n  exit d\n}\nregion b")
+                .replace("  check c1\n", "  check c1\n  event lever: true\n"),
+        ));
+    }
+
+    /// A shuffle may not move an exit into a removed region, whatever names it (a group here),
+    /// though the exit itself may have a group.
+    #[test]
+    fn a_shuffle_cannot_move_an_exit_of_a_removed_region() {
+        let files = world(
+            "option vault: toggle = off\nshuffle s {\n  slots exits(g)\n}\nregion a {\n  check a1\n  exit b group g\n}\nregion b when opt.vault {\n  exit a\n}",
+        );
+        let all = errors(&files);
+        assert!(
+            all.iter().any(|e| e
+                .contains("moves exit `a:b`, which leads into or out of a region with a `when`")),
+            "{all:#?}"
+        );
+    }
+
+    /// Parallel exits in a world with a shuffle need no door: unmoved, each is keyed by its
+    /// place among them.
+    #[test]
+    fn parallel_exits_need_no_door_when_no_shuffle_moves_them() {
+        let b = ok(&world(
+            "shuffle s {\n  slots p, q\n  thing x\n  thing y\n}\nregion a {\n  check c\n  exit b: has(k)\n  exit b\n}\nregion b {\n  exit a\n}",
+        ));
+        let a = region(&b, "a");
+        let keys: Vec<&str> =
+            a["exits"].as_array().unwrap().iter().map(|e| e["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["a:b:1", "a:b:2"]);
+    }
+
+    /// `stamp` reads a comment inside an old header as part of the header.
+    #[test]
+    fn stamp_keeps_a_header_with_a_comment_inside() {
+        let folder = super::super::lang::mem(&[("world.rando", "world t\n")]);
+        let body = "region a {\n  check c\n}\n";
+        let one = world_build::front::stamp(body, "x 1", &[], &[], &folder).unwrap();
+        let noted = one.replacen("  tool", "  # a note\n  tool", 1);
+        assert_eq!(world_build::front::stamp(&noted, "x 1", &[], &[], &folder).unwrap(), one);
+    }
 }
