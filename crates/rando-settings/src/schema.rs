@@ -325,7 +325,8 @@ fn usize_of(o: &Map<String, Value>, k: &str, key: &str) -> Result<usize, String>
 /// A world option's kind and canonical default.
 fn option_kind(o: &Map<String, Value>, key: &str) -> Result<(Kind, Value), String> {
     let kind = o.get("kind").and_then(Value::as_str).unwrap_or("");
-    let default = o.get("default").cloned().unwrap_or(Value::Null);
+    let default =
+        o.get("default").cloned().ok_or_else(|| format!("option `{key}` has no `default`"))?;
     let of = |o: &Map<String, Value>| -> Result<Of, String> {
         match o.get("of") {
             Some(Value::String(s)) if s == "items" => Ok(Of::Items),

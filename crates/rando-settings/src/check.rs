@@ -471,6 +471,18 @@ impl C<'_> {
                 for l in body {
                     if let Stmt::Setting { key, value, .. } = &l.stmt {
                         match legacy(&value.v) {
+                            Some(_) if layer.legacy.contains_key(&key.v) => {
+                                let msg = format!(
+                                    "The legacy key '{}' is set twice in this file.",
+                                    key.v
+                                );
+                                self.err(
+                                    "settings.set_twice",
+                                    key.pos,
+                                    msg,
+                                    Some("keep one".into()),
+                                );
+                            }
                             Some(v) => {
                                 layer.legacy.insert(key.v.clone(), v);
                             }
@@ -604,6 +616,11 @@ impl C<'_> {
             (Kind::Counts { of, .. }, V::Record(fields)) => {
                 let mut out = Map::new();
                 for (k, n) in fields {
+                    if out.contains_key(&k.v) {
+                        let msg = format!("'{}' is written twice.", k.v);
+                        self.err("settings.bad_value", k.pos, msg, Some("keep one".into()));
+                        return None;
+                    }
                     if !of.contains(&k.v) {
                         self.unknown_word(opt, of, &k.v, k.pos);
                         return None;
@@ -771,7 +788,13 @@ impl C<'_> {
             }
             (Kind::Record(kinds), V::Record(fields)) => {
                 let mut out = opt.default.as_object().cloned().unwrap_or_default();
+                let mut seen = BTreeSet::new();
                 for (k, fv) in fields {
+                    if !seen.insert(k.v.as_str()) {
+                        let msg = format!("'{label}' has its field '{}' twice.", k.v);
+                        self.err("settings.bad_value", k.pos, msg, Some("keep one".into()));
+                        return None;
+                    }
                     let Some((_, kind)) = kinds.iter().find(|(n, _)| *n == k.v) else {
                         let names: Vec<&str> = kinds.iter().map(|(n, _)| n.as_str()).collect();
                         let msg = format!("'{label}' has no field '{}'.", k.v);
@@ -855,15 +878,19 @@ impl C<'_> {
     /// per-seed groups are allowed (a `place` position).
     fn expand(&mut self, of: &Of, name: &str, pos: Pos, place: bool) -> Option<Vec<String>> {
         let s = self.s;
-        let one = |n: &str| Some(Vec::from([n.to_owned()]));
-        let found: Option<Vec<String>> = match of {
-            Of::Links => one(name),
-            Of::Words(w) => w.iter().any(|x| x == name).then(|| Vec::from([name.to_owned()])),
-            Of::Items if s.items.contains_key(name) => one(name),
-            Of::Items if name == EVERY_ITEM => Some(s.items.keys().cloned().collect()),
-            Of::Items => s.item_groups.get(name).cloned(),
-            Of::Places if s.places.contains(name) => one(name),
-            Of::Places if name == EVERY_PLACE => Some(s.places.iter().cloned().collect()),
+        if self.expanded > self.l.settings_max_expanded_names {
+            // The cap is passed: nothing more is expanded in this file.
+            return None;
+        }
+        // The size first, so a group past the cap is refused before it is copied.
+        let size = match of {
+            Of::Links => Some(1),
+            Of::Words(w) => w.iter().any(|x| x == name).then_some(1),
+            Of::Items if s.items.contains_key(name) => Some(1),
+            Of::Items if name == EVERY_ITEM => Some(s.items.len()),
+            Of::Items => s.item_groups.get(name).map(Vec::len),
+            Of::Places if s.places.contains(name) => Some(1),
+            Of::Places if name == EVERY_PLACE => Some(s.places.len()),
             Of::Places if name == EARLY_PLACES || name == LATER_PLACES => {
                 if !place {
                     let msg = format!(
@@ -872,12 +899,22 @@ impl C<'_> {
                     self.err("settings.bad_value", pos, msg, None);
                     return None;
                 }
-                Some(Vec::new())
+                Some(0)
             }
-            Of::Places => s.place_groups.get(name).cloned(),
+            Of::Places => s.place_groups.get(name).map(Vec::len),
         };
-        if let Some(v) = found {
-            return self.count_expanded(v.len(), pos).then_some(v);
+        if let Some(n) = size {
+            if !self.count_expanded(n, pos) {
+                return None;
+            }
+            return Some(match of {
+                Of::Items if name == EVERY_ITEM => s.items.keys().cloned().collect(),
+                Of::Items if !s.items.contains_key(name) => s.item_groups[name].clone(),
+                Of::Places if name == EVERY_PLACE => s.places.iter().cloned().collect(),
+                Of::Places if name == EARLY_PLACES || name == LATER_PLACES => Vec::new(),
+                Of::Places if !s.places.contains(name) => s.place_groups[name].clone(),
+                _ => Vec::from([name.to_owned()]),
+            });
         }
         let (what, pool): (&str, Vec<&str>) = match of {
             Of::Items => (
@@ -1022,75 +1059,75 @@ impl C<'_> {
                 self.err("settings.surprise_shape", v.pos, msg, help);
                 None
             }
-            V::OneOf(entries) => {
-                let mut out: Vec<Value> = Vec::new();
-                for e in entries {
-                    let x = self.choice(opt, e)?;
-                    if out.contains(&x) {
-                        self.err(
-                            "settings.surprise_shape",
-                            e.pos,
-                            "This value is written twice.".into(),
-                            Some("keep one".into()),
-                        );
-                        return None;
-                    }
-                    out.push(x);
-                }
-                if out.len() < 2 {
-                    self.err(
-                        "settings.surprise_shape",
-                        v.pos,
-                        "one_of needs at least 2 different values.".into(),
-                        None,
-                    );
-                    return None;
-                }
-                out.sort_by_key(spec_key);
-                Some(json!({"one_of": out}))
-            }
-            V::Chance(entries) => {
-                let mut out: Vec<Value> = Vec::new();
-                let mut total = 0i64;
-                for (e, p) in entries {
-                    let x = self.choice(opt, e)?;
-                    if out.iter().any(|o| o[0] == x) {
-                        self.err(
-                            "settings.surprise_shape",
-                            e.pos,
-                            "This value is written twice.".into(),
-                            Some("keep one".into()),
-                        );
-                        return None;
-                    }
-                    if !(1..=100).contains(&p.v) {
-                        self.err(
-                            "settings.chances_total",
-                            p.pos,
-                            format!("A chance is 1% to 100%, not {}%.", p.v),
-                            None,
-                        );
-                        return None;
-                    }
-                    total += p.v;
-                    out.push(json!([x, p.v]));
-                }
-                if total != 100 {
-                    let more = if total < 100 {
-                        format!("{} more", 100 - total)
-                    } else {
-                        format!("{} less", total - 100)
-                    };
-                    let msg = format!(
-                        "The chances for '{label}' add up to {total}. They need to add up to 100 ({more})."
-                    );
-                    self.err("settings.chances_total", v.pos, msg, None);
-                    return None;
-                }
-                Some(json!({"chance": out}))
+            V::OneOf(_) | V::Chance(_) => {
+                self.draw(&label, v, &mut |c: &mut Self, e: &Node<V>| c.choice(opt, e))
             }
             _ => None,
         }
+    }
+
+    /// A `one_of` or `chance`, each entry checked by `entry`: shared by option values and
+    /// `place`, so both refuse a value written twice, a chance outside 1% to 100% and a total
+    /// other than 100. `one_of` is sorted (equal odds); `chance` keeps its written order, which
+    /// the draw follows (2.10).
+    fn draw(
+        &mut self,
+        label: &str,
+        v: &Node<V>,
+        entry: &mut dyn FnMut(&mut Self, &Node<V>) -> Option<Value>,
+    ) -> Option<Value> {
+        let entries: Vec<(&Node<V>, Option<&Node<i64>>)> = match &v.v {
+            V::OneOf(list) => list.iter().map(|e| (e, None)).collect(),
+            V::Chance(list) => list.iter().map(|(e, p)| (e, Some(p))).collect(),
+            _ => return None,
+        };
+        let mut out: Vec<(Value, Option<i64>)> = Vec::new();
+        let mut total = 0i64;
+        for (e, p) in entries {
+            let x = entry(self, e)?;
+            if out.iter().any(|o| o.0 == x) {
+                let help = Some("keep one".into());
+                self.err(
+                    "settings.surprise_shape",
+                    e.pos,
+                    "This value is written twice.".into(),
+                    help,
+                );
+                return None;
+            }
+            if let Some(p) = p {
+                if !(1..=100).contains(&p.v) {
+                    let msg = format!("A chance is 1% to 100%, not {}%.", p.v);
+                    self.err("settings.chances_total", p.pos, msg, None);
+                    return None;
+                }
+                total += p.v;
+            }
+            out.push((x, p.map(|p| p.v)));
+        }
+        if matches!(v.v, V::OneOf(_)) {
+            if out.len() < 2 {
+                let msg = "one_of needs at least 2 different values.".into();
+                self.err("settings.surprise_shape", v.pos, msg, None);
+                return None;
+            }
+            let mut vals: Vec<Value> = out.into_iter().map(|o| o.0).collect();
+            vals.sort_by_key(spec_key);
+            return Some(json!({"one_of": vals}));
+        }
+        if total != 100 {
+            let more = if total < 100 {
+                format!("{} more", 100 - total)
+            } else {
+                format!("{} less", total - 100)
+            };
+            let msg = format!(
+                "The chances for '{label}' add up to {total}. They need to add up to 100 ({more})."
+            );
+            self.err("settings.chances_total", v.pos, msg, None);
+            return None;
+        }
+        Some(json!({"chance": out.into_iter().map(|(x, p)| json!([x, p])).collect::<Vec<_>>()}))
     }
 
     /// One entry of `one_of` or `chance`: a plain value, `any` or `between`, one level deep.
@@ -1326,60 +1363,18 @@ impl C<'_> {
                 let size = if matches!(size.v, Size::Any) { json!("any") } else { json!([a, b]) };
                 (json!({"some_of": {"size": size, "names": sorted(&names)}}), b)
             }
-            Items::Pick(V::OneOf(list)) => {
-                let mut out = Vec::new();
-                for e in list {
+            Items::Pick(pick @ (V::OneOf(_) | V::Chance(_))) => {
+                let node = Node { v: pick.clone(), pos: items.pos, span: items.span };
+                let mut item = |c: &mut Self, e: &Node<V>| -> Option<Value> {
                     let V::Name(n) = &e.v else {
-                        self.err(
-                            "settings.surprise_shape",
-                            e.pos,
-                            "`place` draws among items.".into(),
-                            None,
-                        );
+                        let msg = "`place` draws among items.".into();
+                        c.err("settings.surprise_shape", e.pos, msg, None);
                         return None;
                     };
-                    self.expand(&Of::Items, n, e.pos, false)?;
-                    out.push(n.clone());
-                }
-                if out.len() < 2 {
-                    self.err(
-                        "settings.surprise_shape",
-                        items.pos,
-                        "one_of needs at least 2 different items.".into(),
-                        None,
-                    );
-                    return None;
-                }
-                out.sort();
-                (json!({"one_of": out}), 1)
-            }
-            Items::Pick(V::Chance(list)) => {
-                let mut out = Vec::new();
-                let mut total = 0;
-                for (e, p) in list {
-                    let V::Name(n) = &e.v else {
-                        self.err(
-                            "settings.surprise_shape",
-                            e.pos,
-                            "`place` draws among items.".into(),
-                            None,
-                        );
-                        return None;
-                    };
-                    self.expand(&Of::Items, n, e.pos, false)?;
-                    total += p.v;
-                    out.push(json!([n, p.v]));
-                }
-                if total != 100 {
-                    self.err(
-                        "settings.chances_total",
-                        items.pos,
-                        format!("The chances add up to {total}. They need to add up to 100."),
-                        None,
-                    );
-                    return None;
-                }
-                (json!({"chance": out}), 1)
+                    c.expand(&Of::Items, n, e.pos, false)?;
+                    Some(json!(n))
+                };
+                (self.draw("This placement", &node, &mut item)?, 1)
             }
             Items::Pick(_) => return None,
         };
@@ -1388,7 +1383,14 @@ impl C<'_> {
         let mut known: Option<BTreeSet<String>> = Some(BTreeSet::new());
         let list: Vec<(String, Pos)> = match &places.v {
             V::Name(n) => Vec::from([(n.clone(), places.pos)]),
-            V::List(es) => es.iter().map(|e| (e.v.name.v.clone(), e.v.name.pos)).collect(),
+            V::List(es) => {
+                if let Some(e) = es.iter().find(|e| e.v.count.is_some()) {
+                    let msg = "A place takes one item at a time: places have no counts.".into();
+                    self.err("settings.bad_value", e.pos, msg, None);
+                    return None;
+                }
+                es.iter().map(|e| (e.v.name.v.clone(), e.v.name.pos)).collect()
+            }
             _ => Vec::new(),
         };
         for (n, at) in list {
@@ -1731,10 +1733,8 @@ pub(crate) mod tests {
         assert_eq!(keys("shops = some_of(any, bakery)\n"), Vec::<String>::new());
         assert_eq!(keys("greeting = any\n"), ["settings.surprise_shape"]);
         assert_eq!(keys("trap_mix = any\n"), ["settings.surprise_shape"]);
-        assert_eq!(
-            keys("traps = one_of(none, one_of(a_few, lots))\n"),
-            ["settings.surprise_shape"]
-        );
+        // Deeper than 2.2 allows is refused by the parser's depth cap, before it recurses.
+        assert_eq!(keys("traps = one_of(none, one_of(a_few, lots))\n"), ["settings.limit"]);
         assert_eq!(keys("traps = chance(none 0%, a_few 100%)\n"), ["settings.chances_total"]);
         assert_eq!(keys("traps = chance(none 50%, none 50%)\n"), ["settings.surprise_shape"]);
     }
@@ -1881,6 +1881,66 @@ pub(crate) mod tests {
         assert_eq!(k("start_with = { items = [arrow x 5] }\n"), Vec::<String>::new());
         assert_eq!(k("start_with = { items = [arrow x 6] }\n"), ["settings.limit"]);
         let _ = vec![0];
+    }
+
+    /// Review of PR 233, high 2: expansion stops at the cap, before a group is copied, and
+    /// stays stopped for the rest of the file.
+    #[test]
+    fn expansion_stops_at_the_cap_within_a_time_budget() {
+        let items: Vec<String> =
+            (0..50_000).map(|i| format!("{{\"name\":\"i{i}\",\"copies\":1}}")).collect();
+        let schema = format!(
+            "{{\"format\":\"schema/1\",\"world\":\"big\",\"version\":\"1.0.0\",\"items\":[{}]}}",
+            items.join(",")
+        );
+        let s = Schema::parse(&schema, &L).unwrap();
+        let src = format!("settings for big\n{}", "reveal_items = [every_item]\n".repeat(2000));
+        assert!(src.len() > 56_000);
+        let (f, _) = parse(&src, "f", &L);
+        let start = std::time::Instant::now();
+        let (_, e) = check(&f, &s, "f", &L);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_millis(500), "took {took:?}");
+        assert_eq!(e.iter().filter(|d| d.key.as_deref() == Some("settings.limit")).count(), 1);
+    }
+
+    /// Review of PR 233, medium 6 and mutation survivor M13: each `place chance` entry is 1 to
+    /// 100%, an item is drawn once, and the chances add to 100.
+    #[test]
+    fn place_chance_checks_each_entry_and_the_total() {
+        assert_eq!(
+            keys("place chance(rope 150%, boots -50%) at mine_cart\n"),
+            ["settings.chances_total"]
+        );
+        assert_eq!(
+            keys("place chance(rope 50%, rope 50%) at mine_cart\n"),
+            ["settings.surprise_shape"]
+        );
+        assert_eq!(
+            keys("place chance(rope 50%, boots 40%) at mine_cart\n"),
+            ["settings.chances_total"]
+        );
+        assert_eq!(keys("place one_of(rope, rope) at mine_cart\n"), ["settings.surprise_shape"]);
+        assert_eq!(keys("place chance(rope 50%, boots 50%) at mine_cart\n"), Vec::<String>::new());
+    }
+
+    /// Review of PR 233, medium 8: nothing written is dropped silently (D-121).
+    #[test]
+    fn repeats_and_stray_counts_are_errors() {
+        assert_eq!(
+            keys("start_with = { items = [rope], items = [boots] }\n"),
+            ["settings.bad_value"]
+        );
+        assert_eq!(keys("place rope at [mine_cart x 5]\n"), ["settings.bad_value"]);
+        assert_eq!(keys("place rope at mine_cart x 5\n"), ["settings.syntax"]);
+        assert_eq!(keys("legacy {\n  a = 1\n  a = 2\n}\n"), ["settings.set_twice"]);
+        assert_eq!(keys("legacy {\n  a = 1\n}\nlegacy {\n  a = 2\n}\n"), ["settings.set_twice"]);
+        assert_eq!(
+            keys("when goal = light_every_lamp {\n  trap_mix += { slow = 1, slow = 2 }\n}\n"),
+            ["settings.bad_value"]
+        );
+        let no_default = r#"{"format":"schema/1","world":"w","version":"1","options":[{"key":"a","kind":"toggle"}]}"#;
+        assert!(Schema::parse(no_default, &L).unwrap_err().contains("default"));
     }
 
     #[test]

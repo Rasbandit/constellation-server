@@ -15,7 +15,7 @@ use rando_syntax::lex::{Kind, Tok, lex};
 
 use crate::ast::{Count, Entry, File, Node, Op, Span, Stmt, Value, parse, parse_value};
 use crate::diag;
-use crate::fmt::value_text;
+use crate::fmt::{newline, value_text};
 use crate::schema::Schema;
 
 fn bad(msg: &str) -> Box<Diagnostic> {
@@ -63,11 +63,6 @@ fn splice(src: &str, edits: &mut [(usize, usize, String)]) -> String {
     out
 }
 
-/// The file's line ending.
-fn newline(src: &str) -> &'static str {
-    if src.contains("\r\n") { "\r\n" } else { "\n" }
-}
-
 /// The byte where the line holding byte `at` ends (before its line break), or the end.
 fn line_end(src: &str, at: usize) -> usize {
     src[at..].find(['\r', '\n']).map_or(src.len(), |k| at + k)
@@ -91,6 +86,22 @@ fn entry_text(e: &Entry) -> String {
 /// value (`settings.bad_value`, `settings.limit`), or a key a block of this file changes
 /// (`settings.in_block`).
 pub fn set(
+    src: &str,
+    key: &str,
+    value: &str,
+    schema: Option<&Schema>,
+    l: &Limits,
+) -> Result<String, Box<Diagnostic>> {
+    let out = set_unchecked(src, key, value, schema, l)?;
+    // A belt over the value's own checks: an edit never leaves a file the next edit refuses.
+    let (_, errs) = parse(&out, "edit", l);
+    match errs.into_iter().find(|d| d.key.as_deref() != Some("settings.header")) {
+        Some(e) => Err(e.into()),
+        None => Ok(out),
+    }
+}
+
+fn set_unchecked(
     src: &str,
     key: &str,
     value: &str,
@@ -146,7 +157,9 @@ pub fn set(
 }
 
 /// The edits that turn list `old` into `new` entry by entry, or `None` when every old entry
-/// goes (the whole value is replaced then).
+/// goes (the whole value is replaced then). A removed entry standing alone on its line goes
+/// with its whole line, its comment included; one sharing a line goes with its comma. Kept
+/// entries keep their comments.
 fn list_edits(
     src: &str,
     old: &[Node<Entry>],
@@ -157,37 +170,73 @@ fn list_edits(
     let kept: Vec<bool> = old_texts.iter().map(|t| new_texts.contains(t)).collect();
     let last_kept = kept.iter().rposition(|k| *k)?;
     let added: Vec<&String> = new_texts.iter().filter(|t| !old_texts.contains(t)).collect();
-    let mut edits = Vec::new();
     let bytes = src.as_bytes();
-    for (i, e) in old.iter().enumerate().take(last_kept) {
+    let nl = newline(src);
+    let skip_spaces = |mut k: usize| {
+        while k < src.len() && matches!(bytes[k], b' ' | b'\t') {
+            k += 1;
+        }
+        k
+    };
+    // One past the comma after byte `end` (spaces between allowed), when there is one.
+    let comma_after = |end: usize| {
+        let k = skip_spaces(end);
+        (bytes.get(k) == Some(&b',')).then_some(k + 1)
+    };
+    let line_start = |at: usize| src[..at].rfind('\n').map_or(0, |k| k + 1);
+    let alone_before = |at: usize| src[line_start(at)..at].trim_matches([' ', '\t']).is_empty();
+    // Only spaces and a comment from `k` to the line's end.
+    let rest_is_comment = |k: usize| {
+        let k = skip_spaces(k);
+        k >= src.len() || matches!(bytes[k], b'#' | b'\r' | b'\n')
+    };
+    let next_line = |k: usize| src[k..].find('\n').map_or(src.len(), |n| k + n + 1);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut drop_anchor_comma = false;
+    for (i, e) in old.iter().enumerate() {
         if kept[i] {
             continue;
         }
-        // The entry, its comma and the spaces after it on the same line.
-        let mut end = e.span.end;
-        while end < src.len() && bytes[end] != b',' {
-            end += 1;
+        let comma = comma_after(e.span.end);
+        let after = comma.unwrap_or(e.span.end);
+        if alone_before(e.span.start) && rest_is_comment(after) {
+            let start = line_start(e.span.start);
+            edits.push((start, next_line(after), String::new()));
+        } else if let Some(c) = comma {
+            edits.push((e.span.start, skip_spaces(c), String::new()));
+        } else {
+            // The last entry, sharing its line: the comma before it goes too.
+            edits.push((e.span.start, e.span.end, String::new()));
+            drop_anchor_comma = i > last_kept;
         }
-        end += 1;
-        while end < src.len() && matches!(bytes[end], b' ' | b'\t') {
-            end += 1;
-        }
-        edits.push((e.span.start, end, String::new()));
     }
-    let tail = old.last().map_or(old[last_kept].span, |e| e.span);
     let anchor: Span = old[last_kept].span;
-    // The separator the list already uses: a line break and the last entry's indent when its
-    // entries stand on lines of their own.
+    let anchor_comma = comma_after(anchor.end);
     let multi = old.len() > 1 && old[old.len() - 2].pos.line != old[old.len() - 1].pos.line;
-    let sep = if multi {
-        let start = src[..anchor.start].rfind('\n').map_or(0, |k| k + 1);
-        format!(",{}{}", newline(src), &src[start..anchor.start])
+    let indent = &src[line_start(anchor.start)..anchor.start];
+    let (at, text) = if multi
+        && alone_before(anchor.start)
+        && rest_is_comment(anchor_comma.unwrap_or(anchor.end))
+    {
+        // New entries on lines of their own, after the anchor's line and its comment.
+        let lines: String = added.iter().map(|t| format!("{indent}{t},{nl}")).collect();
+        if anchor_comma.is_none() && !added.is_empty() {
+            edits.push((anchor.end, anchor.end, ",".into()));
+        }
+        (next_line(anchor_comma.unwrap_or(anchor.end)), lines)
     } else {
-        ", ".to_owned()
+        (anchor.end, added.iter().map(|t| format!(", {t}")).collect())
     };
-    let insert: String = added.iter().map(|t| format!("{sep}{t}")).collect();
-    // Entries after the last kept one go from its end to the list's last entry.
-    edits.push((anchor.end, tail.end.max(anchor.end), insert));
+    if drop_anchor_comma && let Some(c) = anchor_comma {
+        edits.push((anchor.end, skip_spaces(c), String::new()));
+    }
+    if !text.is_empty() {
+        // An insertion where a deletion starts joins it, so the two never race.
+        match edits.iter_mut().find(|e| e.0 == at) {
+            Some(e) => e.2.insert_str(0, &text),
+            None => edits.push((at, at, text)),
+        }
+    }
     Some(edits)
 }
 
@@ -279,6 +328,41 @@ mod tests {
         assert_eq!(diff(HAND, &out), ("shared_deaths = true      # my opt-in\r\n", ""));
         assert!(out.contains("# Playing with others\r\nkeep_home"));
         assert_eq!(reset(HAND, "bombs", &L).unwrap(), HAND);
+    }
+
+    /// Review of PR 233, medium 5: removing or adding entries keeps the comments of the
+    /// entries that stay on their own lines.
+    #[test]
+    fn a_splice_keeps_the_comments_of_kept_entries() {
+        let src = "settings for w\nk = [\n  lantern,   # keep\n  rope,   # remove me\n  boots,   # remove\n]\n";
+        assert_eq!(
+            set(src, "k", "[lantern]", None, &L).unwrap(),
+            "settings for w\nk = [\n  lantern,   # keep\n]\n"
+        );
+        let src = "settings for w\nk = [\n  lantern,   # keep\n  rope,   # r\n]\n";
+        assert_eq!(
+            set(src, "k", "[lantern, rope, boots]", None, &L).unwrap(),
+            "settings for w\nk = [\n  lantern,   # keep\n  rope,   # r\n  boots,\n]\n"
+        );
+        assert_eq!(
+            set(src, "k", "[rope]", None, &L).unwrap(),
+            "settings for w\nk = [\n  rope,   # r\n]\n"
+        );
+    }
+
+    /// Review of PR 233, high 3: a value past a cap is refused at `set`, so the file stays
+    /// editable.
+    #[test]
+    fn a_value_past_a_cap_is_refused_and_the_file_stays_editable() {
+        let src = "settings for lanternfall\nkeep_home = [lantern]\n";
+        for v in ["[rope x 70000]", "[rope x 0]"] {
+            assert_eq!(
+                set(src, "keep_home", v, None, &L).unwrap_err().key.as_deref(),
+                Some("settings.limit"),
+                "{v}"
+            );
+        }
+        assert!(reset(src, "keep_home", &L).is_ok());
     }
 
     #[test]

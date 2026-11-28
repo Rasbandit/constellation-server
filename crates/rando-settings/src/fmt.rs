@@ -9,12 +9,11 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt::Write;
 use core::ops::Range;
 
 use config::Limits;
-use rando_syntax::Diagnostic;
 use rando_syntax::lex::{Tok, Token};
+use rando_syntax::{Diagnostic, hex};
 use sha2::{Digest, Sha256};
 
 use crate::ast::{File, Line, Mod, Node, Stmt, Value, parse};
@@ -50,13 +49,9 @@ pub fn token_hash(f: &File) -> String {
     hex(&Sha256::digest(layout(f, false).as_bytes()))
 }
 
-/// Lowercase hex.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+/// The file's line ending: CRLF when it has one, else LF.
+pub(crate) fn newline(src: &str) -> &'static str {
+    if src.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
 /// The tokens of one value, `src` their source, printed in canonical form (8.3).
@@ -178,7 +173,8 @@ fn join(toks: &[Token], src: &str, order: &[usize], flip: Option<usize>) -> Stri
 }
 
 fn layout(f: &File, with_comments: bool) -> String {
-    let nl = if f.src.contains("\r\n") { "\r\n" } else { "\n" };
+    // The hash never depends on line endings (a CRLF checkout keeps its pin).
+    let nl = if with_comments { newline(&f.src) } else { "\n" };
     let out = lines(f);
     let ntok = f.toks.len();
     // Per output line: the comments above it and its trailing comment.
@@ -320,6 +316,13 @@ mod tests {
         assert_ne!(a, h("preset fast for w\ngoal = b\nk = [x, y]\n"));
         assert_eq!(a.len(), 64);
         let _ = vec![0];
+    }
+
+    /// Review of PR 233, medium 4: a preset's pin does not depend on its line endings.
+    #[test]
+    fn the_token_hash_ignores_line_endings() {
+        let h = |s: &str| token_hash(&parse(s, "f", &L).0);
+        assert_eq!(h("preset fast for w\ngoal = a\n"), h("preset fast for w\r\ngoal = a\r\n"));
     }
 
     #[test]

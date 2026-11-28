@@ -331,7 +331,7 @@ pub fn parse(src: &str, file: &str, l: &Limits) -> (File, Vec<Diagnostic>) {
             return (out, Vec::from([diag(file, "settings.syntax", Some(pos), msg, None)]));
         }
     };
-    let mut p = P { toks: &toks, i: 0, file, l, errs: Vec::new(), stmts: 0 };
+    let mut p = P { toks: &toks, i: 0, file, l, errs: Vec::new(), stmts: 0, depth: 0 };
     if comments.len() > l.settings_max_comments {
         let msg = format!(
             "This file has {} comments. A settings file may hold at most {} \
@@ -430,12 +430,15 @@ pub fn parse_value(text: &str, l: &Limits) -> Result<(Value, Vec<Token>), Box<Di
     if toks.is_empty() {
         return Err(bad("A value is missing."));
     }
-    let mut p = P { toks: &toks, i: 0, file: "value", l, errs: Vec::new(), stmts: 0 };
+    let mut p = P { toks: &toks, i: 0, file: "value", l, errs: Vec::new(), stmts: 0, depth: 0 };
     p.check_tokens();
     if let Some(e) = p.errs.pop() {
         return Err(e.into());
     }
     let v = p.value()?;
+    if let Some(e) = p.errs.pop() {
+        return Err(e.into());
+    }
     if p.i < toks.len() {
         return Err(bad("A value is one value, with nothing after it."));
     }
@@ -449,6 +452,8 @@ struct P<'a> {
     l: &'a Limits,
     errs: Vec<Diagnostic>,
     stmts: usize,
+    /// How many values the current one is inside, counting itself.
+    depth: usize,
 }
 
 type R<T> = Result<T, Box<Diagnostic>>;
@@ -1129,8 +1134,22 @@ impl P<'_> {
         }
     }
 
-    /// 2.2's `value`.
+    /// 2.2's `value`, refused past `settings_max_depth` before it recurses.
     fn value(&mut self) -> R<Node<Value>> {
+        if self.depth >= self.l.settings_max_depth {
+            let msg = format!(
+                "Values nest at most {} deep: a surprise holds `any` or `between`, and a record a list (settings_max_depth).",
+                self.l.settings_max_depth
+            );
+            return Err(diag(self.file, "settings.limit", Some(self.here()), msg, None).into());
+        }
+        self.depth += 1;
+        let v = self.value_inner();
+        self.depth -= 1;
+        v
+    }
+
+    fn value_inner(&mut self) -> R<Node<Value>> {
         let start = self.i;
         let call = self.peek_at(1) == Some(&Tok::Open);
         let v = match self.peek().cloned() {
@@ -1492,6 +1511,58 @@ connect cave_mouth to mill_door one_way
         }
         let big = "a".repeat(L.settings_max_value_bytes + 1);
         assert_eq!(parse_value(&big, &L).unwrap_err().key.as_deref(), Some("settings.limit"));
+    }
+
+    /// Review of PR 233, high 1: nesting is capped before the parser recurses, so a deep file
+    /// is refused, never a stack overflow.
+    #[test]
+    fn deep_nesting_is_refused_without_recursing() {
+        let deep = |open: &str, close: &str| {
+            format!("settings for w\ngoal = {}a{}\n", open.repeat(1000), close.repeat(1000))
+        };
+        assert_eq!(keys(&deep("one_of(", ", b)")), ["settings.limit"]);
+        assert_eq!(keys(&deep("{a = ", "}")), ["settings.limit"]);
+        assert_eq!(keys(&deep("chance(", " 50%, b 50%)")), ["settings.limit"]);
+        // One level of surprise nesting, and a list in a record, are inside the cap.
+        assert_eq!(
+            keys(
+                "settings for w\nk = chance(5 60%, between(1, 3, low) 40%)\nr = { items = [a] }\n"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            keys("settings for w\nk = one_of(a, one_of(b, chance(c 100%)))\n"),
+            ["settings.limit"]
+        );
+        assert!(
+            parse_value(&format!("{}a{}", "one_of(".repeat(1000), ", b)".repeat(1000)), &L)
+                .is_err()
+        );
+    }
+
+    /// Review of PR 233, high 3: a limit hit inside a value reaches the caller.
+    #[test]
+    fn a_value_past_a_cap_is_refused() {
+        for v in ["[rope x 70000]", "[rope x 0]", "one_of(a, one_of(b, one_of(c, d)))"] {
+            assert_eq!(
+                parse_value(v, &L).unwrap_err().key.as_deref(),
+                Some("settings.limit"),
+                "{v}"
+            );
+        }
+    }
+
+    /// Mutation survivor M1: `+` and `=` with a space between are not `+=`.
+    #[test]
+    fn plus_equals_must_be_glued() {
+        assert_eq!(
+            keys("settings for w\nwhen a = b {\n  k + = [x]\n  k - = [x]\n}\n"),
+            ["settings.syntax", "settings.syntax"]
+        );
+        assert_eq!(
+            keys("settings for w\nwhen a = b {\n  k += [x]\n  k -= [x]\n}\n"),
+            Vec::<String>::new()
+        );
     }
 
     fn limit_keys(src: &str, l: &Limits) -> Vec<String> {

@@ -286,6 +286,10 @@ pub struct Limits {
     /// Most presets taking part in one settings file's layering, counted across lines and
     /// chains (doc 20 section 2.6, doc 15 section 2.6's design value).
     pub settings_max_presets: usize,
+    /// Deepest nesting of values in a settings file, checked by the parser before it recurses
+    /// (doc 20 section 2.2: a surprise holds `any` or `between` one level down, and a record's
+    /// field holds a list; nothing deeper), so a deep file is refused, never a stack overflow.
+    pub settings_max_depth: usize,
     /// Longest player name, Unicode scalar values (doc 20 7.1, design value).
     pub settings_player_max_chars: usize,
     /// Longest player name, bytes (doc 20 7.1, design value).
@@ -735,6 +739,7 @@ impl Limits {
         settings_writes_burst: 20,
         settings_cosmetic_persist_secs: 5,
         settings_max_presets: 2,
+        settings_max_depth: 2,
         settings_player_max_chars: 64,
         settings_player_max_bytes: 256,
         manifest_cache_bytes: 64 * 1024 * 1024,
@@ -1418,6 +1423,7 @@ mod tests {
         assert_eq!((l.settings_writes_per_sec, l.settings_writes_burst), (10, 20));
         assert_eq!(l.settings_cosmetic_persist_secs, 5);
         assert_eq!(l.settings_max_presets, 2);
+        assert_eq!(l.settings_max_depth, 2);
         assert_eq!((l.settings_player_max_chars, l.settings_player_max_bytes), (64, 256));
     }
 

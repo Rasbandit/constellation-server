@@ -13,14 +13,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use config::Limits;
-use rando_syntax::{Diagnostic, Pos, suggest};
+use rando_syntax::{Diagnostic, Pos, hex, suggest};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::ast::{Header, Node, Op, PresetRef, parse};
 use crate::check::{Block, Change, Layer, Val, check};
 use crate::diag;
-use crate::fmt::{hex, token_hash};
+use crate::fmt::token_hash;
 use crate::schema::{Kind, Schema, Scope};
 
 /// Canonical JSON's `format`.
@@ -357,8 +357,10 @@ fn settle_layers(
                 looks_rules.push(rule(b, &changes));
                 continue;
             }
+            // A written 100% draws nothing: section 6 writes `chance` 100 for no chance, so the
+            // two fold alike and hash alike.
             let draws = b.with
-                || b.chance.is_some()
+                || b.chance.is_some_and(|c| c != 100)
                 || b.when.iter().any(|(k, _)| matches!(eff.get(k), Some(Val::Surprise(_))));
             if folding && !draws {
                 if b.when.iter().all(|(k, v)| eff.get(k) == Some(&Val::Plain(v.clone()))) {
@@ -450,10 +452,12 @@ fn places(
             Some("keep it in one of them".into()),
         ));
     }
-    let mut taken: BTreeMap<String, i64> = BTreeMap::new();
+    // `x all` takes what `from_shuffle` leaves (2.11), so the two are counted apart.
+    let mut from_shuffle: BTreeMap<String, i64> = BTreeMap::new();
+    let mut placed: BTreeMap<String, i64> = BTreeMap::new();
     if let Some(Val::Plain(sw)) = eff.get("start_with") {
         for pair in sw["from_shuffle"].as_array().into_iter().flatten() {
-            *taken.entry(pair[0].as_str().unwrap_or("").to_owned()).or_default() +=
+            *from_shuffle.entry(pair[0].as_str().unwrap_or("").to_owned()).or_default() +=
                 pair[1].as_i64().unwrap_or(0);
         }
     }
@@ -480,7 +484,7 @@ fn places(
                     continue;
                 }
                 let have = s.items.get(item).and_then(|i| i.copies).map(|c| c as i64);
-                let used = taken.entry(item.clone()).or_default();
+                let used = placed.entry(item.clone()).or_default();
                 match n {
                     None => {
                         if *used > 0 || !all.insert(item) {
@@ -494,6 +498,7 @@ fn places(
                     }
                     Some(n) => {
                         *used += n;
+                        let used = *used + from_shuffle.get(item).copied().unwrap_or(0);
                         if all.contains(item.as_str()) {
                             err(
                                 p.pos,
@@ -502,7 +507,7 @@ fn places(
                                 ),
                             );
                         } else if let Some(have) = have
-                            && *used > have
+                            && used > have
                         {
                             err(
                                 p.pos,
@@ -807,6 +812,36 @@ mod tests {
         assert_eq!(s.json["rules"], json!([]));
         let plain = settle_ok("settings for lanternfall\n", &presets());
         assert_eq!(s.hash, plain.hash);
+    }
+
+    /// Review of PR 233, medium 7: `x all` takes what is left after `from_shuffle` (2.11).
+    #[test]
+    fn x_all_after_from_shuffle_is_allowed() {
+        let k = |body: &str| keys(&alloc::format!("settings for lanternfall\n{body}"));
+        assert_eq!(
+            k("start_with = { from_shuffle = [arrow x 2] }\nplace arrow x all at every_place\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            k("place arrow x all at every_place\nplace arrow at p1\n"),
+            ["settings.placement"]
+        );
+    }
+
+    /// Review of PR 233, low 10: a written `100%` is no draw, so the block folds as one with
+    /// no chance would, and both give the same hash (section 6 writes `chance` 100 for both).
+    #[test]
+    fn a_hundred_percent_chance_folds_like_none() {
+        let a = settle_ok(
+            "settings for lanternfall\nwhen goal = find_the_crown 100% {\n  hint_count = 9\n}\n",
+            &presets(),
+        );
+        let b = settle_ok(
+            "settings for lanternfall\nwhen goal = find_the_crown {\n  hint_count = 9\n}\n",
+            &presets(),
+        );
+        assert_eq!(a.json["options"]["hint_count"], json!(9));
+        assert_eq!(a.hash, b.hash);
     }
 
     #[test]

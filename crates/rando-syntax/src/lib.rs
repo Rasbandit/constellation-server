@@ -15,6 +15,18 @@ pub mod canon;
 pub mod lex;
 pub mod suggest;
 
+/// `bytes` in lowercase hex, as SHA-256 sums are written (generated-file headers, package
+/// sums, preset pins and the settings hash).
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// A place in the source: the file (an index into the caller's list of files), line and
 /// column, both from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
