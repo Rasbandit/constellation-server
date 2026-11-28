@@ -1,0 +1,64 @@
+# Ember Spire: a run-based roguelike invented as a genre example. No game's names, data or
+# logic. Each run climbs a tower floor by floor with one of four heroes. A run has no map to
+# speak of, so the locations are counted progress: clearing floor N, beating an act's boss
+# with a hero, winning with a hero. Options set how many of them exist. The world is small
+# enough to stay in one file.
+world ember_spire "Ember Spire" version 1
+start spire
+
+# How tall the tower is: one check per floor cleared.
+option floors: range 5..50 = 20
+# Ascensions are harder repeat wins with one hero; each level is one more check per hero.
+option ascensions: range 0..5 = 2
+# How many heroes must win a run.
+option wins_needed: range 1..4 = 2
+
+# The heroes. The first is playable from the start; the others are items to find.
+table hero(key: name) {
+  ashwalker
+  duelist
+  hexer
+  warden
+}
+
+for h in hero {
+  item {h.key} progression
+}
+start_item ashwalker
+
+# Ember relics make every run stronger. One copy per five floors, so a taller tower has more
+# of them, and each five floors climbed asks for one more. Each ascension level asks for one
+# more again, so there is a copy for it too.
+item ember_relic progression x opt.floors div 5 + opt.ascensions
+
+# Everything else is filler, as in most runs: gold, potions and card packs, and a curse.
+item gold_pile filler
+item potion filler
+item card_pack filler
+item curse trap
+pool fill { gold_pile 6, potion 3, card_pack 3, curse 1 }
+
+# A run strong enough to reach the top: one relic per five floors of the tower.
+def can_reach_top = has(ember_relic, opt.floors div 5)
+
+region spire {
+  # Floor N needs a relic for each five floors below it, so floors 1 to 5 are open.
+  for i in 1..50 where i <= opt.floors {
+    check clear_floor_{i}: has(ember_relic, (i - 1) div 5)
+  }
+
+  for h in hero {
+    # Three acts, each ending in a boss a third of the way up.
+    for a in 1..3 {
+      check {h.key}_act_{a}_boss: has({h.key}) and has(ember_relic, opt.floors * a div 15)
+    }
+    check win_with_{h.key}: has({h.key}) and can_reach_top
+    # Ascension k is a win at a harder setting: k more relics than a plain win.
+    for k in 1..5 where k <= opt.ascensions {
+      check {h.key}_ascension_{k}: has({h.key}) and has(ember_relic, opt.floors div 5 + k)
+    }
+    event run_won: has({h.key}) and can_reach_top
+  }
+}
+
+goal counter(run_won) >= opt.wins_needed

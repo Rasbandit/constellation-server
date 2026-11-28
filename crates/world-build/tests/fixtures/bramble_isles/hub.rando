@@ -1,0 +1,28 @@
+# The hub island: a world door for each world, opened by a count of sun gems.
+use items
+
+# What each world's door asks for, in sun gems.
+table world_door(key: name, gems: int) {
+  reef_cove 0
+  mossy_canopy 3
+  cinder_caldera 8
+  frostcap_peaks 14
+  clockwork_isle 20
+}
+
+region hub_meadow {
+  check meadow_stump
+  check windmill_roof: can_reach_high
+  check pond_bottom: has(swim_fins)
+  check hollow_log: has(roll_dash)
+  for d in world_door {
+    exit {d.key}: count(sun_gem) >= d.gems
+  }
+  exit summit_path: count(sun_gem) >= opt.gems_for_summit
+}
+
+region summit_path {
+  check summit_lookout
+  event summit_reached: has(high_bounce) and has(glide_cape)
+  exit hub_meadow
+}

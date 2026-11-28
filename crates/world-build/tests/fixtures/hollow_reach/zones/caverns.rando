@@ -1,0 +1,45 @@
+# The caverns: the first zone, under the surface. The moss guardian lives at the bottom.
+use items
+use logic
+
+region cavern_mouth {
+  check mouth_chest
+  check bat_roost
+  exit ruined_gate
+  exit dripstone_hall
+}
+
+region dripstone_hall {
+  check dripstone_cache
+  check stalactite_perch: can_reach_high
+  check hidden_burrow: can_break_walls
+  exit cavern_mouth
+  exit crystal_pit: can_see_dark
+  exit flooded_tunnel
+}
+
+region crystal_pit {
+  check crystal_cluster
+  check pit_floor
+  check echo_chamber: can_see_dark
+  # Back up to the hall needs a way up the pit's wall.
+  exit dripstone_hall: can_climb_shaft
+  exit moss_lair: can_see_dark
+  # The sealed door at the pit's floor, into the core.
+  exit core_gate: can_break_walls
+}
+
+region flooded_tunnel {
+  check tunnel_mouth
+  check sunken_crate: can_swim
+  check air_pocket: can_swim and can_see_dark
+  exit dripstone_hall
+  # Swimming under the archive's foundations comes up in its stacks.
+  exit archive_stacks: can_swim
+}
+
+region moss_lair {
+  check moss_guardian: can_fight_guardian
+  event guardian_down: can_fight_guardian
+  exit crystal_pit
+}

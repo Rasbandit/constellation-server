@@ -1,0 +1,21 @@
+# Crownless Saga: a turn-based party RPG invented as a genre example. No game's names, data or
+# logic. A hero gathers companions and key items across four towns and the wilds between
+# them, then storms the keep at the end. Shop shelves are locations. Areas that a party would
+# have to grind levels for are gated by a progression item, `veteran_rank`, that stands for
+# those levels.
+world crownless_saga "Crownless Saga" version 1
+use items
+use logic
+use regions/towns
+use regions/wilds
+use regions/dungeons
+start millbrook
+
+# Shelves per town shop that hold a randomized item.
+option shop_slots: range 1..5 = 3
+# On, shops never hold progression, so a player never has to buy the key to the next area.
+option safe_shops: toggle = on
+# Companions that must have joined before the keep opens.
+option party_needed: range 1..4 = 3
+
+goal crown_reclaimed

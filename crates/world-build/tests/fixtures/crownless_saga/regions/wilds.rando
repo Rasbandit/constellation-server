@@ -1,0 +1,37 @@
+# The wilds between towns. Monsters here scale with the road, so each road asks for a rank.
+use items
+use logic
+
+region west_fields {
+  check scarecrow_cache
+  check bandit_camp: rank(1)
+  check old_well
+  exit millbrook
+  exit saltmere
+  exit goblin_warren
+  exit frost_pass: rank(2)
+}
+
+region salt_coast {
+  check tide_cave
+  check wrecked_hull: has(skiff)
+  exit saltmere
+  # The ferry crosses to the capital's side of the bay.
+  exit ashen_road: has(ferry_pass)
+}
+
+region frost_pass {
+  check frozen_traveler
+  check ice_shrine: has(thaw_rune)
+  check avalanche_ledge: can_clear_rubble
+  exit west_fields
+  exit cragholm
+  exit frost_crypt: has(thaw_rune) and rank(3)
+}
+
+region ashen_road {
+  check burnt_wagon
+  check wyvern_nest: rank(4)
+  exit salt_coast
+  exit sunspire
+}

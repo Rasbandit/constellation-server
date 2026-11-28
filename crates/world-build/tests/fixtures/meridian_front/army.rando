@@ -1,0 +1,28 @@
+# What the fleet fields. Each unit item unlocks one unit type for every mission after it
+# arrives; each upgrade copy is one more research tier for the whole army.
+item trooper progression
+item raider progression
+item gunship progression
+item siege_walker progression
+item carrier progression
+item weapons_upgrade progression x 3
+item armor_upgrade progression x 3
+
+# Commanders join the war room and help in their own way.
+item field_medic useful
+item salvage_crew useful
+
+# Resources the game hands out as filler, and an ambush as the trap.
+item supply_crate filler
+item mineral_cache filler
+item ambush trap
+pool fill { supply_crate 8, mineral_cache 4, ambush 1 }
+
+# Army strength is a weighted sum: a unit type is worth more the heavier it is, and each
+# upgrade tier adds one. Missions ask for `army(n)`.
+def army(n) = count(trooper) + 2 * count(raider) + 3 * count(gunship) + 4 * count(siege_walker) + 6 * count(carrier) + count(weapons_upgrade) + count(armor_upgrade) >= n
+
+# Air cover counts gunships or the carrier's wings.
+def has_air = has_any(gunship, carrier)
+# Breaking a fortified line wants heavy armor.
+def can_siege = has(siege_walker) or (has(gunship) and has(weapons_upgrade, 2))

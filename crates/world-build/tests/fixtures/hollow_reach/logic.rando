@@ -1,0 +1,28 @@
+# Named movement checks every zone reads. Each says what opens it with no tricks, and what the
+# `tricks` option adds.
+use items
+
+# A dash off a wall, kicked at the right frame: a trick only `advanced` counts.
+def can_wall_dash = opt.tricks == advanced and has(rush_core)
+
+# A high ledge: a second jump or the claws, or the wall dash.
+def can_reach_high = has_any(vault_boots, grip_claws) or can_wall_dash
+
+# A tall shaft wants the claws. Tricks let a player climb it with jumps alone.
+def can_climb_shaft = has(grip_claws) or match opt.tricks {
+  none => false
+  basic => has(vault_boots) and has(rush_core)
+  advanced => has(vault_boots)
+}
+
+# A wide gap: the dash or the hook. On `advanced`, a well-timed double jump clears it.
+def can_cross_gap = has_any(rush_core, hook_line) or (opt.tricks == advanced and has(vault_boots))
+
+def can_break_walls = has(shatter_charge)
+def can_swim = has(tide_lung)
+
+# Dark rooms: the moth lights them. Any trick setting assumes the player knows them blind.
+def can_see_dark = has(lumen_moth) or opt.tricks != none
+
+# A guardian fight wants a way to dodge in the air.
+def can_fight_guardian = group_count(movement) >= 2

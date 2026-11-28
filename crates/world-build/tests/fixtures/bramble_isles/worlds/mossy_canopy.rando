@@ -1,0 +1,25 @@
+# A forest of huge trees, climbed branch by branch.
+use items
+
+region mossy_canopy {
+  check stump_gem
+  check beehive_gem: has(ground_pound)
+  check mushroom_gem: has(high_bounce)
+  # Seed pods lie all over: four down here, four further in. `pods_per_world` of the eight
+  # are checks.
+  for i in 1..4 where i <= opt.pods_per_world {
+    check mossy_canopy_pod_{i}
+  }
+  exit canopy_crown: can_reach_high
+  exit hub_meadow
+}
+
+region canopy_crown {
+  check treetop_gem
+  check owl_nest_gem: has(glide_cape)
+  check vine_race_gem: has(roll_dash)
+  for i in 5..8 where i <= opt.pods_per_world {
+    check mossy_canopy_pod_{i}
+  }
+  exit mossy_canopy
+}

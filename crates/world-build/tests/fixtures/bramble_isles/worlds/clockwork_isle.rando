@@ -1,0 +1,25 @@
+# A wind-up island of gears and moving platforms, the last world.
+use items
+
+region clockwork_isle {
+  check cog_gem
+  check piston_gem: has(ground_pound)
+  check pendulum_gem: can_reach_high and has(roll_dash)
+  # Seed pods lie all over: four down here, four further in. `pods_per_world` of the eight
+  # are checks.
+  for i in 1..4 where i <= opt.pods_per_world {
+    check clockwork_isle_pod_{i}
+  }
+  exit clock_tower: has(ground_pound)
+  exit hub_meadow
+}
+
+region clock_tower {
+  check gear_maze_gem: has(roll_dash)
+  check belltower_gem: has(high_bounce) and has(glide_cape)
+  check mainspring_gem: has(swim_fins)
+  for i in 5..8 where i <= opt.pods_per_world {
+    check clockwork_isle_pod_{i}
+  }
+  exit clockwork_isle
+}

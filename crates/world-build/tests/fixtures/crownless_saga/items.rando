@@ -1,0 +1,32 @@
+# Companions join the party as items. Each one also opens what only they can do.
+table companion(key: name) {
+  tamsin
+  rourke
+  ilse
+  bram
+}
+
+for c in companion {
+  item {c.key} progression
+}
+
+# Key items: travel and story items that open new parts of the map.
+item ferry_pass progression
+item skiff progression
+item miners_lamp progression
+item thaw_rune progression
+item royal_seal progression
+
+# Each rank stands for the levels a party would reach by fighting; an area asks for a rank.
+item veteran_rank progression x 6
+
+# Gear and consumables. Shops are full of them.
+item iron_sword useful
+item chain_mail useful
+item phoenix_feather useful x 3
+item healing_herb filler
+item gold_pouch filler
+item ambush_scroll trap
+pool fill { healing_herb 6, gold_pouch 6, ambush_scroll 1 }
+
+group companions = { tamsin, rourke, ilse, bram }

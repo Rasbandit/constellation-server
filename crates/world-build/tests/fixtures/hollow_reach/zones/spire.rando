@@ -1,0 +1,33 @@
+# The spire: a tower climbed from the gate's arch or from the archive's roof.
+use items
+use logic
+
+region spire_base {
+  check base_alcove
+  check broken_lift: can_break_walls
+  exit ruined_gate: has(hook_line)
+  exit spire_lift: can_climb_shaft
+}
+
+region spire_lift {
+  check lift_cage
+  check counterweight
+  # The same ledge as the archive's stacks, seen from the lift shaft: the hook pulls the
+  # player across. One location, two ways in.
+  check gallery_ledge also: has(hook_line)
+  exit spire_base
+  exit spire_crown: can_reach_high and can_cross_gap
+}
+
+region spire_crown {
+  check crown_bell
+  check storm_perch: has(vault_boots) and has(grip_claws)
+  exit spire_lift
+  exit storm_roost: can_fight_guardian
+}
+
+region storm_roost {
+  check storm_guardian: has(hook_line)
+  event guardian_down: has(hook_line)
+  exit spire_crown
+}

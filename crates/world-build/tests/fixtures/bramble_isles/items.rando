@@ -1,0 +1,21 @@
+# Sun gems are the main collectible: they open the worlds and the summit.
+item sun_gem progression x 30
+
+# Moves the player learns. Each opens a kind of obstacle in every world.
+item ground_pound progression
+item glide_cape progression
+item swim_fins progression
+item high_bounce progression
+item roll_dash progression
+
+# Minor rewards: extra lives, health and a hat. The seed pods hand most of these out.
+item health_berry useful x 4
+item feather filler
+item extra_life filler
+item fancy_hat filler
+item bee_swarm trap
+pool fill { feather 10, extra_life 4, fancy_hat 1, bee_swarm 1 }
+
+# Two moves reach high places: either one gets up a tall ledge.
+group lift_moves = { glide_cape, high_bounce }
+def can_reach_high = group_count(lift_moves) >= 1

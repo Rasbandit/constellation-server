@@ -1,0 +1,25 @@
+# A sandy cove: open water and tide pools, the first world.
+use items
+
+region reef_cove {
+  check sandcastle_gem
+  check lighthouse_gem: has(high_bounce)
+  check shipwreck_gem: has(swim_fins)
+  # Seed pods lie all over: four down here, four further in. `pods_per_world` of the eight
+  # are checks.
+  for i in 1..4 where i <= opt.pods_per_world {
+    check reef_cove_pod_{i}
+  }
+  exit reef_lagoon: has(swim_fins)
+  exit hub_meadow
+}
+
+region reef_lagoon {
+  check clam_gem
+  check coral_arch_gem: has(roll_dash)
+  check crab_king_gem: has(ground_pound)
+  for i in 5..8 where i <= opt.pods_per_world {
+    check reef_cove_pod_{i}
+  }
+  exit reef_cove
+}

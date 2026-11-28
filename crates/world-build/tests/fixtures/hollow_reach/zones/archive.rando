@@ -1,0 +1,36 @@
+# The sunken archive: shelves stacked high, reached from the terrace or under water.
+use items
+use logic
+
+region archive_atrium {
+  check reading_desk
+  check atrium_mosaic
+  check skylight: can_reach_high and can_cross_gap
+  exit overgrown_terrace
+  exit archive_stacks
+}
+
+region archive_stacks {
+  for i in 1..4 {
+    check stack_shelf_{i}
+  }
+  check top_shelf: can_climb_shaft
+  # The ledge above the stacks: reached here by climbing.
+  check gallery_ledge: can_climb_shaft and can_cross_gap
+  exit archive_atrium
+  exit flooded_tunnel: can_swim
+  exit archive_vault: can_break_walls
+}
+
+region archive_vault {
+  check vault_lectern
+  check sealed_case: can_see_dark
+  exit archive_stacks
+  exit archivist_hall: can_cross_gap
+}
+
+region archivist_hall {
+  check archivist_guardian: can_fight_guardian and can_see_dark
+  event guardian_down: can_fight_guardian and can_see_dark
+  exit archive_vault
+}
