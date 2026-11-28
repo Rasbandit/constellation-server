@@ -704,6 +704,9 @@ impl P<'_> {
             self.skip_line(start);
         }
         out.header = Some(self.node(start, header));
+        if let Err(e) = self.one_line(start..self.i) {
+            self.errs.push(*e);
+        }
         out.head.push(start..self.i);
         // Header lines, until the first body line.
         loop {
@@ -730,7 +733,7 @@ impl P<'_> {
                 }
                 _ => break,
             };
-            if let Err(e) = r {
+            if let Err(e) = r.and_then(|()| self.one_line(start..self.i)) {
                 self.errs.push(*e);
                 self.skip_line(start);
             }
@@ -764,6 +767,33 @@ impl P<'_> {
         Ok(self.node(start, p))
     }
 
+    /// The first token of `r` past the first that starts a new line outside any bracket: a
+    /// statement is one line (2.1), and only `( )`, `[ ]` and a record's `{ }` may span lines.
+    fn split(&self, r: Range<usize>) -> Option<Pos> {
+        let mut depth = 0i64;
+        for (k, t) in self.toks[r.clone()].iter().enumerate() {
+            if k > 0 && depth == 0 && t.nl {
+                return Some(t.pos);
+            }
+            depth += match t.t {
+                Tok::Open | Tok::LBrack | Tok::LBrace => 1,
+                Tok::Close | Tok::RBrack | Tok::RBrace => -1,
+                _ => 0,
+            };
+        }
+        None
+    }
+
+    fn one_line(&mut self, r: Range<usize>) -> R<()> {
+        match self.split(r) {
+            Some(at) => {
+                Err(self
+                    .err(Some(at), "a statement is one line; this one goes on to the next".into()))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// One statement from the start of a line. `in_block`: a change line inside a block.
     fn statement(&mut self, in_block: bool) -> R<Line> {
         let start = self.i;
@@ -782,6 +812,7 @@ impl P<'_> {
                 .map_or(toks_end, |k| start + k + 1),
             None => toks_end,
         };
+        self.one_line(start..head_end)?;
         Ok(Line { stmt, pos, span: self.span_from(start), toks: start..head_end })
     }
 
@@ -1550,6 +1581,36 @@ connect cave_mouth to mill_door one_way
                 "{v}"
             );
         }
+    }
+
+    /// Review of PR 233, low 9: a statement is one line outside its brackets (2.1).
+    #[test]
+    fn a_statement_does_not_run_onto_the_next_line() {
+        for src in [
+            "settings for w\nplace pickaxe\nat mine_cart\n",
+            "settings for w\ngoal\n= find_the_crown\n",
+            "settings for w\nwhen a = b and\nc = d {\n}\n",
+            "settings for w\nconnect a\nto b\n",
+            "settings\nfor w\n",
+        ] {
+            let k = keys(src);
+            assert!(
+                !k.is_empty() && k.iter().all(|k| k == "settings.syntax" || k == "settings.header"),
+                "{src:?}: {k:?}"
+            );
+        }
+        assert_eq!(
+            keys("settings for w\nk = [a,\n  b]\nr = {\n  a = 1\n}\nc = one_of(a,\n  b)\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Review of PR 233, low 11: names in a settings file are lowercase, with no dots.
+    #[test]
+    fn names_are_lowercase_without_dots() {
+        assert_eq!(keys("settings for w\nGoal = a\n"), ["settings.syntax"]);
+        assert_eq!(keys("settings for w\ngoal.x = a\n"), ["settings.syntax"]);
+        assert!(parse_value("one_of(one_of(a, b), c)", &L).is_err());
     }
 
     /// Mutation survivor M1: `+` and `=` with a space between are not `+=`.

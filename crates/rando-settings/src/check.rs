@@ -380,29 +380,28 @@ impl C<'_> {
             Stmt::Connect { from, to, dir, chance } => {
                 let mut doors = Vec::from([from.v.clone()]);
                 let target = match &to.v {
-                    V::OneOf(list) => {
-                        let mut names = Vec::new();
-                        for e in list {
-                            match &e.v {
-                                V::Name(n) => names.push(n.clone()),
-                                v => {
-                                    let msg =
-                                        format!("`connect` draws among doors, not {}.", shape(v));
-                                    self.err("settings.surprise_shape", e.pos, msg, None);
-                                }
-                            }
-                        }
-                        if names.len() < 2 {
-                            self.err(
-                                "settings.surprise_shape",
-                                to.pos,
-                                "one_of needs at least 2 doors.".into(),
-                                None,
-                            );
-                        }
-                        doors.extend(names.iter().cloned());
-                        names.sort();
-                        json!({"one_of": names})
+                    V::OneOf(_) => {
+                        // The same checks as any one_of: distinct doors, at least 2.
+                        let mut door = |c: &mut Self, e: &Node<V>| -> Option<Value> {
+                            let V::Name(n) = &e.v else {
+                                let msg =
+                                    format!("`connect` draws among doors, not {}.", shape(&e.v));
+                                c.err("settings.surprise_shape", e.pos, msg, None);
+                                return None;
+                            };
+                            Some(json!(n))
+                        };
+                        let Some(spec) = self.draw("This connection", to, &mut door) else {
+                            return;
+                        };
+                        doors.extend(
+                            spec["one_of"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|d| d.as_str().map(ToOwned::to_owned)),
+                        );
+                        spec
                     }
                     V::Name(n) => {
                         doors.push(n.clone());
@@ -531,7 +530,14 @@ impl C<'_> {
         }
         let mut scopes = BTreeSet::new();
         let mut ok = true;
+        let mut seen = BTreeSet::new();
         for (key, value) in when {
+            if !seen.insert(key.v.as_str()) {
+                let msg = format!("This block tests '{}' twice.", key.v);
+                self.err("settings.block", key.pos, msg, Some("test each option once".into()));
+                ok = false;
+                continue;
+            }
             let Some(opt) = self.option(key).cloned() else {
                 ok = false;
                 continue;
@@ -1279,6 +1285,12 @@ impl C<'_> {
             }
             pool.extend(self.expand(of, &n.v, n.pos, false)?);
         }
+        if pool.is_empty() {
+            let at = names.first().map_or(Pos::default(), |n| n.pos);
+            let msg = "some_of draws from these names, and they hold none.".into();
+            self.err("settings.surprise_shape", at, msg, None);
+            return None;
+        }
         Some(pool)
     }
 
@@ -1922,6 +1934,31 @@ pub(crate) mod tests {
         );
         assert_eq!(keys("place one_of(rope, rope) at mine_cart\n"), ["settings.surprise_shape"]);
         assert_eq!(keys("place chance(rope 50%, boots 50%) at mine_cart\n"), Vec::<String>::new());
+    }
+
+    /// Review of PR 233, low 11: a block tests an option once, draws are among distinct
+    /// doors, and a `some_of` pool holds at least one name.
+    #[test]
+    fn smaller_gaps_are_errors() {
+        assert_eq!(
+            keys("when goal = find_the_crown and goal = light_every_lamp {\n  hint_count = 1\n}\n"),
+            ["settings.block"]
+        );
+        assert_eq!(
+            keys("connect cave_mouth to one_of(mill_door, mill_door)\n"),
+            ["settings.surprise_shape"]
+        );
+        let empty = r#"{"format":"schema/1","world":"w","version":"1.0.0","options":[{"key":"t","kind":"set","of":"items","default":[]}],"items":[{"name":"a","copies":1}],"item_groups":[{"name":"none","members":[]}]}"#;
+        let s = Schema::parse(empty, &L).unwrap();
+        let k = |body: &str| -> Vec<String> {
+            let (f, _) = parse(&format!("settings for w\n{body}"), "f", &L);
+            check(&f, &s, "f", &L).1.into_iter().filter_map(|d| d.key).collect()
+        };
+        assert_eq!(k("t = some_of(any, none)\n"), ["settings.surprise_shape"]);
+        assert_eq!(
+            k("place some_of(any, none) at x\n").first().map(String::as_str),
+            Some("settings.surprise_shape")
+        );
     }
 
     /// Review of PR 233, medium 8: nothing written is dropped silently (D-121).
