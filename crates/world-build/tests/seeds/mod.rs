@@ -238,6 +238,8 @@ fn check_seeds_50_passes_on_the_example_world() {
 fn a_world_that_cannot_fill_fails_check_seeds_clearly() {
     let t = Temp::new("stuck");
     std::fs::write(t.0.join("world.rando"), STUCK).unwrap();
+    // A world folder, so stderr holds only the fill's error, not the missing-file warning.
+    std::fs::write(t.0.join("rando.toml"), "[world]\nname = \"stuck\"\nversion = \"1.0.0\"\nauthors = [\"T\"]\nlicense = \"MIT\"\ndescription = \"Stuck.\"\n").unwrap();
     let r = rando(&["check", &t.s("")]);
     assert!(r.status.success(), "check accepts it: {}", text(&r.stderr));
     let r = rando(&["generate", &t.s(""), "--check-seeds", "4"]);
