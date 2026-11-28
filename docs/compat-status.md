@@ -58,19 +58,6 @@ Test names: `e2e::` is `crates/server/tests/compat.rs` (real binary, yawc client
 
 Release, collect and remaining (and their `!` commands); `CreateHints`; every `!` command but `!hint` and `!hint_location`; group slots (item links): the importer and the bundle loader refuse such seeds with a clear message; `TagsChanged` prints; TLS (put a terminator in front). The plan and build order: `docs/protocol-plan.md`.
 
-## Where the protocol document and the reference server differ, and what we do
-
-Read at the 0.6.8 checkout (reference behavior read from code, not run). We follow what real clients need, usually the server.
-
-| Topic | Document | Reference server | Ours |
-|---|---|---|---|
-| Reserved prefix | a key "can never start with `_read`" | refuses only `_read_` (`MultiServer.py:2286`), so `_readme` is a key | as the server |
-| `default`, `floor`, `ceil` without `value` | `value` is ignored | reads `value` for every operation; a missing one ends the connection (`MultiServer.py:2297`) | accepted without `value` |
-| `Set` without `default` | silent | starts from 0 (`MultiServer.py:2292`) | as the server |
-| `SetReply.slot` on read-only keys | listed without exception | left out (`MultiServer.py:966, 972`) | as the server |
-| `class` on `NetworkItem`, `NetworkPlayer`, `NetworkSlot` | not mentioned | always sent (`NetUtils.py:98-107`); its client needs it | as the server |
-| Bad `Set`, `Get` arguments (unknown operation, non-string key, a refused operation) | silent | an exception ends the connection (`MultiServer.py:994-1005`) | `InvalidPacket` `arguments`, the connection stays open |
-
 ## Hints
 
 Read at the 0.6.8 checkout, from code, not run. Ours: `crates/room-core/src/hint.rs` (the table, the points, the events), `crates/edge-compat/src/hints.rs` (wire, names, texts).
@@ -86,8 +73,8 @@ Deviations from the reference server:
 - **Names.** An exact name, else the one name equal ignoring case; several equal ignoring case, or none, is answered "no such name". The reference ranks every name by Damerau-Levenshtein ratio and takes a close enough match, or answers with a "did you mean" suggestion that its text client turns into an autocompletion (`Utils.py:676-742`); we have neither the fuzzy match nor the suggestion. `unit::hints::bang_hint_with_an_unknown_name_says_so_and_costs_nothing`.
 - **Two names, one id.** The room keeps one name per id (the first in name order), so `!hint` finds an item or location only under that name; the reference matches every name in its table.
 - **Ties.** Candidates of the same sphere and locality go in (slot, location) order; the reference shuffles them with the room's random seeded by the seed name (`MultiServer.py:1858`), so which of several equal hints comes first can differ.
-- **One record per location.** The reference keeps hints in a set of records whose equality includes the status and `found` (`NetUtils.py:393-419`), so in some sequences it can hold two records for one location (inferred from reading; not reproduced). Ours never does.
-- **`UpdateHint` with a missing or `null` status** changes nothing without checking who asks; the reference checks the asker first and refuses a non-receiver even then (`MultiServer.py:2172-2180`). The reference also ends the connection on a missing `status`; ours does not.
+- **One record per location.** Ours keeps exactly one hint record per (finding slot, location).
+- **`UpdateHint` with a missing or `null` status** changes nothing without checking who asks; the reference checks the asker first and refuses a non-receiver even then (`MultiServer.py:2172-2180`). Ours keeps the connection open on a missing `status`.
 - **`create_as_hint`** takes integers and booleans; the reference's `int()` also takes floats and numeric strings (`MultiServer.py:2088`).
 - **Texts.** The `Hint` print keeps the reference's part types and fields (`NetUtils.py:421-442`) in our own wording; every `CommandResult` text is our own wording.
 - **Prints are not durable.** Like chat, `Hint` prints are fanned out once; a connection whose queue is full misses them (its `_read_hints_` key still converges).
@@ -99,7 +86,7 @@ Accepted risk (see #47): `UpdateHint` can toggle a status forever, and each chan
 ## Data storage: deviations from the reference server
 
 - Numbers are `i64` and `f64`. A result outside `i64` (Python integers are unbounded), a float that is not finite, or a non-real power is refused; an integer above `i64::MAX` in a request is refused too. Risk: a client relying on integers above 2^63 gets `InvalidPacket` (real magnitudes not verified).
-- A write is all or nothing; the reference can leave a list half changed when a later operation fails (in-place helpers, `MultiServer.py:127-155`).
+- A write is all or nothing: a refused operation stores nothing.
 - `mod` with a string is refused (Python formats the string).
 - `update` accepts lists that hold lists or objects (Python refuses unhashable elements); `update` of an object takes an object or a list of `[key, value]` pairs with string keys (Python also takes other key types and two-character strings).
 - Objects keep their keys sorted, not in insertion order (no client depending on key order found; not verified broadly).
@@ -113,7 +100,3 @@ Every data storage write is logged with its whole value, and subscribe and resta
 ## Known deviation: applied cursors are not persisted
 
 Doc 02 D3 asks for each slot's applied cursor (`applied_seq`, what the client confirmed) to be persisted at most once a second. Today the runtime does not write acks to the store (`crates/runtime/src/lib.rs`, module docs), so `slot_cursors` stays empty and a restart starts every slot's applied cursor at 0. Nothing a client sees depends on it yet: the compatible edge resends the whole inventory from index 0 on every connect, which is what the protocol document asks for. Follow-up: batch acks into the room's next append (`AppendBatch::cursors`, already stored and restored on start) or a once-a-second flush, before any feature reads the applied cursor (resume from a cursor, delivery metrics).
-
-## Known interop finding (not a defect of our server)
-
-`archipelago_rs` 3.0.1 as vendored uses `soketto` 0.8.1, which inflates each compressed message by finishing a deflate stream that has no final block. `flate2` 1.1.11 rejects that ("incomplete deflate stream"), so with `flate2` 1.1.11 every compressed frame fails, against any compressing server. `crates/e2e-ap` pins `flate2 = "=1.1.10"`, the version the Archipela-Go app locks. Inferred from `flate2` 1.1.11's own tests and reproduced here; not checked against Archipelago's server.

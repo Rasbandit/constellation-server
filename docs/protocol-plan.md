@@ -365,26 +365,6 @@ Checked against the reference server and the reference client's connect path (`C
 
 ---
 
-## 6. Where the protocol doc and the reference server disagree
-
-All "server" sides are read from code at `MultiServer.py` / `NetUtils.py` 0.6.8, not run. When the server raises inside command handling, the exception escapes to the per-connection loop and the connection is closed (`MultiServer.py:994-1005`).
-
-1. **Reserved prefix.** Doc "Set": key "can never start with `_read`". Server refuses only `_read_` (with the trailing underscore, `MultiServer.py:2286`), so a key like `_readme` is accepted.
-2. **Operations that ignore `value`.** Doc "DataStorageOperation": `default`, `floor`, `ceil` ignore `value`. Server reads `value` for every operation (`MultiServer.py:2297`); an operation object without `value` closes the connection. We accept a missing `value` for those three.
-3. **`Set` without `default`.** Doc says nothing; server starts from 0 (`MultiServer.py:2292`). Gap, not a conflict; we match 0.
-4. **CreateHints, own unknown location.** Doc: "non-existing locations will silently be skipped". Server looks it up directly and the missing key closes the connection (`MultiServer.py:2138`; both lookup paths raise, `NetUtils.py` pure store and `_speedups.pyx:361-365`). We skip silently, as the doc says.
-5. **CreateHints with status FOUND.** Doc: "Cannot set HINT_FOUND". Server accepts 40 (it only checks the value is a known status, `MultiServer.py:2117-2124`) and stores a hint with status FOUND while `found` is false. We refuse with InvalidPacket.
-6. **UpdateHint `status` optional.** Doc marks it optional. Server reads it as required (`MultiServer.py:2162`); a missing field closes the connection (an explicit `null` is ignored). We treat missing like `null`.
-7. **"Broadcast" hints from scouts.** Doc "LocationScouts": hints are "broadcasted". Server sends them only to the finder and receivers (`MultiServer.py:923-930`). We follow the server.
-8. **Trap hints default to AVOID.** Doc "HintStatus" states it generally. Server applies it only to item hints (`!hint`); location hints (scouts, `!hint_location`, CreateHints) pass UNSPECIFIED explicitly, so a trap stays UNSPECIFIED (`MultiServer.py:1289-1296, 1306, 1316, 2100`). We follow the server.
-9. **Release `auto`.** Doc "release": auto distributes on goal, says nothing about manual use. Server also allows manual `!release` after the goal in auto mode (`MultiServer.py:1605-1613`); `Permission` value 6 includes the goal bit. Same for collect.
-10. **Permission `auto` scope.** Doc "Permission": auto works for release and collect. `NetUtils.py:59` comment says release only. Server code auto-collects (`MultiServer.py:949-950`), agreeing with the doc.
-11. **`SetReply.slot`.** Doc lists `slot` without exception (only `original_value` is marked absent for `_read` keys). Server omits `slot` too for `_read_` notifications (`MultiServer.py:966, 972`).
-12. **Unknown scout location.** Doc silent; server closes the connection (`MultiServer.py:2098`). Ours answers InvalidPacket (keep).
-13. **`!` commands echoed as chat.** Not in the doc; server echoes every `!` text except `!admin` to all players (`MultiServer.py:1510-1514`).
-
----
-
 ## 7. Recommended build order
 
 1. **Starting inventory + importer fields** (section 4.1, plus name groups, Archipelago package, start hints, entrances, spheres, blacklist into the bundle). Smallest change, no room-core events, unblocks most real seeds (start inventory is a common player option, **not verified** as a share).

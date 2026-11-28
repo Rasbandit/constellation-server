@@ -50,14 +50,14 @@ There is one public port (`38281`). `/api/*` is served on it, always on when the
 
 Behind a proxy every client has the proxy's address, so the sign-up and login counts are shared (an IPv6 address counts as its /64); start the server with `--trusted-proxy-header X-Forwarded-For` (or `X-Real-IP`) so it counts per real client. Only the last entry of the last line of that header is used (the one your proxy appended), and the proxy must overwrite or append it: never turn the flag on when clients can reach the port without the proxy, because they could then send any address.
 
-TLS comes from the reverse proxy; never expose the port over plain HTTP, since passwords, sessions and the uploads travel on it. For `const.ras.band` with nginx (plain pass-through, no auth of its own):
+TLS comes from the reverse proxy; never expose the port over plain HTTP, since passwords, sessions and the uploads travel on it. For a host `play.example` with nginx (plain pass-through, no auth of its own):
 
 ```
 map $http_upgrade $connection_upgrade { default upgrade; "" close; }
 
 server {
     listen 443 ssl;
-    server_name const.ras.band;
+    server_name play.example;
     # ssl_certificate / ssl_certificate_key as usual
 
     # Room uploads: at least apworld_max_bytes (64 MiB); the server enforces its own caps.
