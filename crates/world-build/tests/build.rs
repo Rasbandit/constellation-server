@@ -1,6 +1,7 @@
 //! The build tool end to end: the example world builds to a manifest the engine prepares and
 //! fills beatable, the canonical bytes are pinned, and every check names its place.
 
+mod grammar;
 mod lang;
 mod seeds;
 mod support;
@@ -180,8 +181,10 @@ fn unknown_names_say_what_the_name_is() {
 
 #[test]
 fn a_name_declared_twice_is_an_error_at_the_second() {
+    // A check may share a name with an item now (checks have their own namespace); a def
+    // still may not.
     let mut w = tidewell();
-    w.regions[0].checks[0].key = At::new("oar".into(), P);
+    w.defs[0].name = At::new("oar".into(), P);
     fails(&w, "`oar` is already an item", P);
     let mut w = tidewell();
     w.regions[1].key = At::new("dock".into(), P);
@@ -658,6 +661,7 @@ fn many_generated_checks_build_quickly_and_keep_their_source_place() {
     let family = Pos::new(500, 3);
     let n = 20_000;
     w.regions[0].checks.extend((0..n).map(|k| world_build::model::Check {
+        also: false,
         key: At::new(format!("shelf_{k}"), family),
         id: None,
         rule: At::new(

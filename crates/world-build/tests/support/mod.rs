@@ -45,12 +45,14 @@ impl F {
             id: None,
             class: Some(self.s(class)),
             count: count.map(|c| self.at(c)),
+            count_rule: None,
             later: vec![],
         }
     }
 
     pub fn check(&self, key: &str, rule: &str) -> Check {
         Check {
+            also: false,
             key: self.s(key),
             id: None,
             rule: self.r(rule),

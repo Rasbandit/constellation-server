@@ -171,6 +171,8 @@ pub struct Item {
     pub class: Option<At<String>>,
     /// Copies in the pool (default 1, or 0 for an item in `fill_with`).
     pub count: Option<At<i64>>,
+    /// Copies as an options-only number expression, settled per seed (instead of `count`).
+    pub count_rule: Option<RuleAt>,
     /// Fields not carried (a class table, an option-read count).
     pub later: Vec<At<String>>,
 }
@@ -227,6 +229,9 @@ pub struct Check {
     pub no_progression: Option<RuleAt>,
     /// Its placement set.
     pub placement: Option<At<String>>,
+    /// A repeat of a check declared in another region (`also`): the same location, reachable
+    /// from this region too.
+    pub also: bool,
     /// Fields not carried.
     pub later: Vec<At<String>>,
 }

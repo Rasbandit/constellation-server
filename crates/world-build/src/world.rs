@@ -104,6 +104,17 @@ impl Errs {
         self.warnings
     }
 
+    /// The errors ([`Errs::finish`]) and the warnings ([`Errs::warnings_list`]).
+    pub(crate) fn split(mut self) -> (Vec<Error>, Vec<Error>) {
+        let w = Errs {
+            files: self.files.clone(),
+            warnings: std::mem::take(&mut self.warnings),
+            dropped_warnings: self.dropped_warnings,
+            ..Errs::default()
+        };
+        (self.finish(), w.warnings_list())
+    }
+
     /// The errors in file order, and one more line for what the cap dropped.
     pub(crate) fn finish(mut self) -> Vec<Error> {
         self.errors.sort_by_key(|e| e.pos);
@@ -152,6 +163,8 @@ pub(crate) struct Model {
     pub options: Vec<OptM>,
     /// Key, class, count; in key order.
     pub items: Vec<(String, String, i64)>,
+    /// Copies an options-only number sets, by item, in place of the count in `items`.
+    pub copies: BTreeMap<String, Value>,
     /// The fill and its weights, in key order.
     pub fill_with: Vec<(String, i64)>,
     pub checks: Vec<CheckM>,
@@ -239,7 +252,7 @@ impl Space {
                 errs.err(
                     n.pos,
                     format!("`{}` is already {} ({file}:{}:{})", n.v, was.word(), at.line, at.col),
-                    "items, checks, defs, events, regions, item groups, placement sets and shuffles share one namespace",
+                    "items, defs, events, regions, item groups, placement sets and shuffles share one namespace (checks have their own)",
                 );
                 false
             }
@@ -251,9 +264,15 @@ impl Space {
     }
 }
 
-/// `{"all": [a, b]}`, or just `b` when `a` is true.
+/// `{"all": [a, b]}`, or just one of them when the other is true.
 fn both(a: &Value, b: Value) -> Value {
-    if *a == truth() { b } else { json!({"all": [a, b]}) }
+    if *a == truth() {
+        b
+    } else if b == truth() {
+        a.clone()
+    } else {
+        json!({"all": [a, b]})
+    }
 }
 
 /// Build `w`, read from `file`.
@@ -515,6 +534,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
                 continue;
             }
+            None if it.count_rule.is_some() => 0,
             None => i64::from(!fill.contains(it.key.v.as_str())),
         };
         items.push((it.key.v.clone(), class, count));
@@ -597,12 +617,31 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
 
     // Regions, checks, events, defs, shuffles: declared before any rule is read.
+    let mut checks_seen: HashSet<&str> = HashSet::new();
     for r in &w.regions {
         space.declare(errs, &r.key, Sort::Region);
         later(errs, &r.later, "region field");
+        let mut here: HashMap<&str, Pos> = HashMap::new();
         for c in &r.checks {
-            space.declare(errs, &c.key, Sort::Check);
             later(errs, &c.later, "check field");
+            if let Some(at) = here.get(c.key.v.as_str()) {
+                let file = errs.files.get(at.file as usize).cloned().unwrap_or_default();
+                errs.err(
+                    c.key.pos,
+                    format!(
+                        "`{}` is already a check in region `{}` ({file}:{}:{})",
+                        c.key.v, r.key.v, at.line, at.col
+                    ),
+                    "a check is declared once in each region it can be reached from",
+                );
+            } else {
+                here.insert(c.key.v.as_str(), c.key.pos);
+                // Declared again in another region: the same check, reachable from both.
+                // Checks have their own namespace: rules never read them.
+                if checks_seen.insert(c.key.v.as_str()) {
+                    name_ok(errs, &c.key, "check");
+                }
+            }
         }
         for (e, _) in &r.events {
             space.declare(errs, e, Sort::Event);
@@ -661,11 +700,21 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
         names.shuffles.insert(n.v.clone(), readable);
     }
     names.sorts = space.first.iter().map(|(k, (s, _))| (k.clone(), *s)).collect();
+    names.checks = checks_seen.iter().map(|c| (*c).to_owned()).collect();
     let region_of: HashSet<&str> = w.regions.iter().map(|r| r.key.v.as_str()).collect();
     let shuffled = !w.shuffles.is_empty();
 
     let mut lw = Lower::new(&names, errs);
     lw.all_defs();
+    // Copies that read options, settled per seed.
+    let mut copies: BTreeMap<String, Value> = BTreeMap::new();
+    for it in &w.items {
+        if let Some(r) = &it.count_rule
+            && let Some(v) = lw.number(r, "a number of copies")
+        {
+            copies.insert(it.key.v.clone(), v);
+        }
+    }
 
     // Regions to the manifest.
     let mut regions = Vec::new();
@@ -674,17 +723,41 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let mut held_by: HashMap<String, Vec<Pos>> = HashMap::new();
     let mut exit_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut exit_keys: BTreeSet<String> = BTreeSet::new();
-    let check_ids = ids(
-        lw.errs(),
-        &w.regions.iter().flat_map(|r| &r.checks).map(|c| c.id.as_ref()).collect::<Vec<_>>(),
-        "check",
-    );
-    let mut check_ids = check_ids.into_iter();
+    let merged = merge_checks(lw.errs(), w);
+    let firsts: Vec<&crate::model::Check> = w
+        .regions
+        .iter()
+        .flat_map(|r| &r.checks)
+        .filter(|c| merged.get(c.key.v.as_str()).is_some_and(|m| std::ptr::eq(m.first, *c)))
+        .collect();
+    let check_ids =
+        ids(lw.errs(), &firsts.iter().map(|c| c.id.as_ref()).collect::<Vec<_>>(), "check");
+    let check_id: HashMap<&str, i64> =
+        firsts.iter().map(|c| c.key.v.as_str()).zip(check_ids).collect();
+    // Each region's condition first: an exit into a region carries the region's condition
+    // too, so a region that does not exist this seed has no way in.
+    let mut present: HashMap<&str, Value> = HashMap::new();
     for r in &w.regions {
         let when = match &r.when {
             Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
             None => truth(),
         };
+        if when != truth() && w.start.as_ref().is_some_and(|s| s.v == r.key.v) {
+            lw.errs().err(
+                r.key.pos,
+                format!("the start region always exists; `{}` cannot have a `when`", r.key.v),
+                "move the `when` onto its checks",
+            );
+        }
+        present.entry(r.key.v.as_str()).or_insert(when);
+    }
+    let when_of = |k: &str| present.get(k).cloned().unwrap_or_else(truth);
+    let mut sites: Vec<(Pos, Option<&str>, Value, Value)> = Vec::new();
+    // Exit keys that lead into or out of a region with a `when`: no shuffle may move them.
+    let mut optional_exits: BTreeSet<String> = BTreeSet::new();
+    let mut fired: HashMap<&str, Vec<&str>> = HashMap::new();
+    for r in &w.regions {
+        let when = when_of(&r.key.v);
         let set_ok = |lw: &mut Lower<'_>, s: &Option<At<String>>| match s {
             Some(s) if !sets.contains(&s.v) => {
                 lw.errs().err(
@@ -696,21 +769,28 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             }
             s => s.as_ref().map(|s| s.v.clone()),
         };
-        let region_set = set_ok(&mut lw, &r.placement);
         let mut checks = Vec::new();
         for c in &r.checks {
-            let check_id = check_ids.next().unwrap_or(0);
             let rule = lw.rule(&c.rule, Mode::Rule).map_or_else(truth, |v| v.0);
-            let cwhen = match &c.when {
+            // The site carries its region's condition: a removed region is still reached
+            // (by the exit from the start), and its sites must give nothing then.
+            checks.push(json!({"loc": c.key.v, "rule": both(&when, rule.clone())}));
+            let Some(m) = merged.get(c.key.v.as_str()) else { continue };
+            let cwhen = match m.when {
                 Some(x) => lw.rule(x, Mode::Static("when")).map_or_else(truth, |v| v.0),
                 None => truth(),
             };
-            let no_progression = match &c.no_progression {
+            sites.push((c.rule.pos, Some(r.key.v.as_str()), cwhen.clone(), rule));
+            if !std::ptr::eq(m.first, c) {
+                continue;
+            }
+            let no_progression = match m.no_progression {
                 Some(x) => lw.rule(x, Mode::Static("no_progression")).map_or_else(truth, |v| v.0),
                 None => json!({"false": {}}),
             };
-            let mut loc = json!({"id": check_id, "key": c.key.v});
-            for (field, it) in [("vanilla", &c.vanilla), ("holds", &c.holds)] {
+            let mut loc =
+                json!({"id": check_id.get(c.key.v.as_str()).copied().unwrap_or(0), "key": c.key.v});
+            for (field, it) in [("vanilla", m.vanilla), ("holds", m.holds)] {
                 let Some(it) = it else { continue };
                 if !is_item(&it.v) {
                     lw.errs().err(it.pos, format!("`{field}: {}` is not an item", it.v), "");
@@ -720,37 +800,102 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                     held_by.entry(it.v.clone()).or_default().push(it.pos);
                 }
             }
-            let set = set_ok(&mut lw, &c.placement).or_else(|| region_set.clone());
+            // The check exists where at least one of its regions does.
+            let mut wheres: Vec<Value> = Vec::new();
+            for q in &m.regions {
+                let v = when_of(&q.key.v);
+                if !wheres.contains(&v) {
+                    wheres.push(v);
+                }
+            }
+            let exists = if wheres.contains(&truth()) || wheres.is_empty() {
+                truth()
+            } else if wheres.len() == 1 {
+                wheres.remove(0)
+            } else {
+                json!({"any": wheres})
+            };
+            let mut region_sets: Vec<Option<String>> =
+                m.regions.iter().map(|q| set_ok(&mut lw, &q.placement)).collect();
+            region_sets.dedup();
+            if region_sets.len() > 1 && m.placement.is_none() {
+                lw.errs().err(
+                    c.key.pos,
+                    format!("check `{}` is in regions of different placement sets", c.key.v),
+                    "give the check its own `placement`",
+                );
+            }
+            let set = set_ok(&mut lw, &m.placement.cloned()).or_else(|| region_sets.remove(0));
             locations.push(loc);
-            checks.push(json!({"loc": c.key.v, "rule": rule}));
             checks_m.push(CheckM {
                 key: c.key.v.clone(),
-                when: both(&when, cwhen),
+                when: both(&exists, cwhen),
                 no_progression,
-                holds: c.holds.as_ref().map(|h| h.v.clone()),
+                holds: m.holds.map(|h| h.v.clone()),
                 set,
             });
         }
         let mut events = Vec::new();
         for (e, rule) in &r.events {
             let rule = lw.rule(rule, Mode::Rule).map_or_else(truth, |v| v.0);
+            sites.push((e.pos, Some(r.key.v.as_str()), truth(), rule.clone()));
+            fired.entry(e.v.as_str()).or_default().push(r.key.v.as_str());
             events.push(json!({"event": e.v, "rule": both(&when, rule)}));
         }
         let mut exits = Vec::new();
-        let mut to_seen = HashSet::new();
+        // Several exits to one region are several ways in. A shuffle keys each exit: each of
+        // them is keyed by its door when it has one, by its place among them otherwise.
+        let mut ways: HashMap<&str, usize> = HashMap::new();
+        r.exits.iter().for_each(|x| *ways.entry(x.to.v.as_str()).or_default() += 1);
+        let mut doors_seen: HashSet<(&str, &str)> = HashSet::new();
+        let mut nth: HashMap<&str, usize> = HashMap::new();
         for x in &r.exits {
+            let parallel = ways.get(x.to.v.as_str()).copied().unwrap_or(0) > 1;
+            let place = {
+                let k = nth.entry(x.to.v.as_str()).or_default();
+                *k += 1;
+                *k
+            };
             if !region_of.contains(x.to.v.as_str()) {
-                lw.errs().err(x.to.pos, format!("exit to `{}`, which is not a region", x.to.v), "");
-            } else if !to_seen.insert(x.to.v.clone()) {
+                let help = crate::suggest::help(&x.to.v, region_of.iter().copied(), "");
                 lw.errs().err(
                     x.to.pos,
-                    format!("region `{}` has two exits to `{}`", r.key.v, x.to.v),
-                    "join their rules with `or`",
+                    format!("exit to `{}`, which is not a region", x.to.v),
+                    &help,
+                );
+            } else if let Some(d) = x.door.as_ref().filter(|_| parallel)
+                && !doors_seen.insert((x.to.v.as_str(), d.v.as_str()))
+            {
+                lw.errs().err(
+                    d.pos,
+                    format!(
+                        "region `{}` has two exits to `{}` through door `{}`",
+                        r.key.v, x.to.v, d.v
+                    ),
+                    "each exit to one region names its own door",
                 );
             }
             let rule = lw.rule(&x.rule, Mode::Rule).map_or_else(truth, |v| v.0);
-            let mut e = json!({"rule": both(&when, rule), "to": x.to.v});
-            let key = format!("{}:{}", r.key.v, x.to.v);
+            let to_when = when_of(&x.to.v);
+            // The exit exists where its target does too: gone with a removed target.
+            sites.push((x.rule.pos, Some(r.key.v.as_str()), to_when.clone(), rule.clone()));
+            let mut e = json!({"rule": both(&when, both(&to_when, rule)), "to": x.to.v});
+            let key = match (&x.door, parallel) {
+                (Some(d), true) => format!("{}:{}:{}", r.key.v, x.to.v, d.v),
+                (None, true) => format!("{}:{}:{place}", r.key.v, x.to.v),
+                _ => format!("{}:{}", r.key.v, x.to.v),
+            };
+            if when != truth() || to_when != truth() {
+                optional_exits.insert(key.clone());
+                // A door pairs exits for the engine whether a shuffle moves them or not.
+                if let Some(d) = &x.door {
+                    lw.errs().err(
+                        d.pos,
+                        "an exit into or out of a region with a `when` cannot have a `door` yet",
+                        "a shuffle that changes with the options is not in the engine's first slice; keep the region, and put the `when` on its checks",
+                    );
+                }
+            }
             for (field, v) in [("door", &x.door), ("group", &x.group)] {
                 if let Some(v) = v {
                     name_ok(lw.errs(), v, field);
@@ -779,8 +924,23 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             "key": r.key.v, "stays": [],
         }));
     }
+    // The engine reaches every region of the manifest in a world with a shuffle (it has no
+    // way to say a region does not exist this seed): a region that is gone is reached from the
+    // start by an exit that opens only then. Nothing in it exists, and its own exits are shut.
+    if let Some(s) = &w.start
+        && let Some(start) = regions.iter_mut().find(|x| x["key"] == s.v.as_str())
+        && let Some(list) = start["exits"].as_array_mut()
+    {
+        for r in w.regions.iter().filter(|r| r.key.v != s.v) {
+            let when = when_of(&r.key.v);
+            if when != truth() {
+                list.push(json!({"rule": {"not": when}, "to": r.key.v}));
+            }
+        }
+        list.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
+    }
     let counts: HashMap<&str, i64> = items.iter().map(|i| (i.0.as_str(), i.2)).collect();
-    for (item, places) in &held_by {
+    for (item, places) in held_by.iter().filter(|(i, _)| !copies.contains_key(*i)) {
         let count = counts.get(item.as_str()).copied().unwrap_or(0);
         if let Some(p) = places.get(usize::try_from(count).unwrap_or(0)) {
             lw.errs().err(
@@ -795,7 +955,8 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let start = match &w.start {
         Some(s) if region_of.contains(s.v.as_str()) => Some(s.v.clone()),
         Some(s) => {
-            lw.errs().err(s.pos, format!("start `{}` is not a region", s.v), "");
+            let help = crate::suggest::help(&s.v, region_of.iter().copied(), "");
+            lw.errs().err(s.pos, format!("start `{}` is not a region", s.v), &help);
             None
         }
         None => {
@@ -845,13 +1006,42 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     // Shuffles.
     let mut shuffles = Map::new();
     for sh in &w.shuffles {
-        if let Some(v) = shuffle(&mut lw, sh, &exit_groups, &exit_keys) {
+        if let Some(v) = shuffle(&mut lw, sh, &exit_groups, &exit_keys, &optional_exits) {
             shuffles.insert(sh.name.v.clone(), v);
         }
     }
     reads_cycle(&mut lw, w, &shuffles);
     let defs = std::mem::take(&mut lw.defs);
     drop(lw);
+    if let (Some(start), Some(g)) = (&start, &goal) {
+        sites.push((w.goal.as_ref().map_or(Pos::default(), |g| g.pos), None, truth(), g.clone()));
+        // A shuffle thing's rule is read wherever its slot is: in no region in particular.
+        for sh in &w.shuffles {
+            for t in
+                shuffles.get(&sh.name.v).and_then(|v| v["things"].as_object()).into_iter().flatten()
+            {
+                if let Some(r) = t.1.get("rule") {
+                    sites.push((sh.name.pos, None, truth(), r.clone()));
+                }
+            }
+        }
+        let map = crate::presence::Map {
+            start,
+            regions: w
+                .regions
+                .iter()
+                .map(|r| (r.key.v.as_str(), r.key.pos, when_of(&r.key.v)))
+                .collect(),
+            exits: w
+                .regions
+                .iter()
+                .flat_map(|r| r.exits.iter().map(|x| (r.key.v.as_str(), x.to.v.as_str())))
+                .collect(),
+            fired,
+            sites,
+        };
+        crate::presence::check(&map, &options, &defs, errs);
+    }
 
     // Every region can be reached from the start by some exits (rules aside).
     if let Some(start) = &start {
@@ -915,6 +1105,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     let model = Model {
         options,
         items: ordered,
+        copies,
         fill_with,
         checks: checks_m,
         start_items,
@@ -925,6 +1116,73 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     Some((m, model))
 }
 
+/// One check, from every region that declares it: the first declaration, the regions, and
+/// each modifier from the one declaration that gives it.
+struct Merged<'w> {
+    first: &'w crate::model::Check,
+    regions: Vec<&'w crate::model::Region>,
+    when: Option<&'w crate::model::RuleAt>,
+    vanilla: Option<&'w At<String>>,
+    holds: Option<&'w At<String>>,
+    no_progression: Option<&'w crate::model::RuleAt>,
+    placement: Option<&'w At<String>>,
+}
+
+/// Every check by name, its declarations in several regions joined: a check reachable from
+/// several regions is declared in each, with that region's rule, and every other modifier in
+/// one declaration only (a second is an error naming the first's region).
+fn merge_checks<'w>(errs: &mut Errs, w: &'w World) -> HashMap<&'w str, Merged<'w>> {
+    let mut out: HashMap<&str, Merged<'w>> = HashMap::new();
+    let mut given: HashMap<(&str, &str), &str> = HashMap::new();
+    for r in &w.regions {
+        for c in &r.checks {
+            let m = out.entry(c.key.v.as_str()).or_insert(Merged {
+                first: c,
+                regions: Vec::new(),
+                when: None,
+                vanilla: None,
+                holds: None,
+                no_progression: None,
+                placement: None,
+            });
+            if m.regions.iter().any(|q| q.key.v == r.key.v) {
+                continue;
+            }
+            m.regions.push(r);
+            let fields: [(&str, Option<Pos>); 5] = [
+                ("when", c.when.as_ref().map(|x| x.pos)),
+                ("vanilla", c.vanilla.as_ref().map(|x| x.pos)),
+                ("holds", c.holds.as_ref().map(|x| x.pos)),
+                ("no_progression", c.no_progression.as_ref().map(|x| x.pos)),
+                ("placement", c.placement.as_ref().map(|x| x.pos)),
+            ];
+            for (field, pos) in fields {
+                let Some(pos) = pos else { continue };
+                if let Some(other) = given.get(&(c.key.v.as_str(), field)) {
+                    errs.err(
+                        pos,
+                        format!(
+                            "`{field}` of check `{}` is also given in region `{other}`",
+                            c.key.v
+                        ),
+                        "a check in several regions gives each modifier in one declaration only",
+                    );
+                    continue;
+                }
+                given.insert((c.key.v.as_str(), field), r.key.v.as_str());
+                match field {
+                    "when" => m.when = c.when.as_ref(),
+                    "vanilla" => m.vanilla = c.vanilla.as_ref(),
+                    "holds" => m.holds = c.holds.as_ref(),
+                    "no_progression" => m.no_progression = c.no_progression.as_ref(),
+                    _ => m.placement = c.placement.as_ref(),
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One shuffle as the engine's first slice reads it (`data_fill::shuffle`): exit slots
 /// (`layout`), or free-name slots whose things may carry rules (`none`).
 fn shuffle(
@@ -932,6 +1190,7 @@ fn shuffle(
     sh: &crate::model::Shuffle,
     exit_groups: &BTreeMap<String, Vec<String>>,
     exit_keys: &BTreeSet<String>,
+    optional: &BTreeSet<String>,
 ) -> Option<Value> {
     let name = &sh.name.v;
     later(lw.errs(), &sh.later, "shuffle field");
@@ -986,6 +1245,14 @@ fn shuffle(
                     .collect()
             };
             let slots = expand(&pick(lw, list)?);
+            if let Some(k) = slots.iter().find(|k| optional.contains(*k)) {
+                lw.errs().err(
+                    sh.slots.pos,
+                    format!("shuffle `{name}` moves exit `{k}`, which leads into or out of a region with a `when`"),
+                    "a shuffle that changes with the options is not in the engine's first slice; keep the region, and put the `when` on its checks",
+                );
+                return None;
+            }
             if slots.is_empty() {
                 lw.errs().err(sh.slots.pos, "the shuffle has no slots", "");
                 return None;

@@ -1,33 +1,31 @@
-# The sunken vault, below the wreck: an optional dungeon whose checks exist only with
-# `sunken_vault` on. Its rooms stay in the map either way: with a shuffle in the world the
-# engine needs every region reachable, so a region `when` here would make every seed fail
-# at the default (`off`). Each check carries the `when` instead.
+# The sunken vault, below the wreck: an optional dungeon that exists only with `sunken_vault`
+# on. Each room's `when` removes it, with its checks and exits, at `off`.
 use items
 use logic
 
-region sunken_gate {
-  check barnacled_door when opt.sunken_vault
+region sunken_gate when opt.sunken_vault {
+  check barnacled_door
   exit coast_wreck
   exit sunken_atrium
 }
 
-region sunken_atrium {
-  check atrium_left when opt.sunken_vault
-  check atrium_right: can_burn when opt.sunken_vault
+region sunken_atrium when opt.sunken_vault {
+  check atrium_left
+  check atrium_right: can_burn
   exit sunken_gate
   exit sunken_archive: can_cross_gap
 }
 
-region sunken_archive {
+region sunken_archive when opt.sunken_vault {
   for i in 1..4 {
-    check archive_shelf_{i}: can_see_dark when opt.sunken_vault
+    check archive_shelf_{i}: can_see_dark
   }
   exit sunken_atrium
   exit sunken_core: can_fight(3)
 }
 
-region sunken_core {
-  check core_chest when opt.sunken_vault
-  check core_reward no_progression when opt.sunken_vault
+region sunken_core when opt.sunken_vault {
+  check core_chest
+  check core_reward no_progression
   exit sunken_archive
 }

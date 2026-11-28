@@ -20,16 +20,16 @@ pool fill { coin 20, spark_trap 1 }
 group fire_tools = { lantern, cinder_wand }
 group mobility = { grapple, glider, kelp_charm }
 
-# Dungeon keys stay inside their own dungeon.
-item mire_key progression x 2
-item mire_great_key progression
-placement mire_keys { mire_key, mire_great_key }
-item ember_key progression x 3
-item ember_great_key progression
-placement ember_keys { ember_key, ember_great_key }
-item frost_key progression x 2
-item frost_great_key progression
-placement frost_keys { frost_key, frost_great_key }
-item tide_key progression x 2
-item tide_great_key progression
-placement tide_keys { tide_key, tide_great_key }
+# Dungeon keys stay inside their own dungeon: each dungeon file wraps its rooms in a
+# placement block for its set.
+table dungeon(key: name, keys: int) {
+  mire 2
+  ember 3
+  frost 2
+  tide 2
+}
+
+for d in dungeon {
+  item {d.key}_key progression x d.keys
+  item {d.key}_great_key progression
+}

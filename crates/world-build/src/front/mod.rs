@@ -119,8 +119,48 @@ pub struct Read {
 /// # Errors
 /// Every syntax, module, family, overlay, ledger and header error found.
 pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
+    let p = read_partly(files, opts);
+    if !p.errors.is_empty() {
+        return Err(p.errors);
+    }
+    Ok(Read { world: p.world, ledger: p.ledger, warnings: p.warnings })
+}
+
+/// What [`read_partly`] gives: the world as far as it was read, even with errors.
+#[derive(Debug, Clone)]
+pub struct Partial {
+    /// The world model, with whatever parsed.
+    pub world: World,
+    /// The ledger after this build (empty when a file did not parse).
+    pub ledger: String,
+    /// Every error found, in file order.
+    pub errors: Vec<Error>,
+    /// Things worth a look.
+    pub warnings: Vec<Error>,
+    /// Every name written in a file with a syntax error, when one has one: a declaration of
+    /// any of them may be in the part that did not parse, so the checks' errors about them
+    /// are left out as likely cascades.
+    pub broken: Option<HashSet<String>>,
+    /// Every name a family wrote from a template ([`merge_repeats`]).
+    pub templates: Templates,
+}
+
+/// [`read`], keeping the world when there are errors, so the checks can still report the
+/// mistakes in the files that parsed.
+#[must_use]
+pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let mut x = X::default();
     x.load(files);
+    let mut broken: Option<HashSet<String>> = None;
+    for ast in x.asts.iter().filter(|a| !a.errors.is_empty()) {
+        let names = broken.get_or_insert_with(HashSet::new);
+        for t in &ast.toks {
+            if let crate::lex::Tok::Name(n) = &t.t {
+                names.extend(n.split('.').map(str::to_owned));
+            }
+        }
+    }
+    x.broken = broken.clone().unwrap_or_default();
     x.tables(files);
     let order = x.order.clone();
     for f in &order {
@@ -130,17 +170,25 @@ pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
         }
         x.asts[*f as usize].decls = decls;
     }
+    // `also` is checked on the files as written, then again for what overlays add: an
+    // overlay that removes the plain declaration leaves the repeats as the check.
+    let authored = x.check_also(None);
     x.apply_overlays();
+    x.check_also(Some(&authored));
     x.visibility();
     x.generated(files, opts);
-    let ledger = ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs);
+    // A failed parse would retire or move the ids of what it lost: no ledger then.
+    let ledger = if broken.is_none() {
+        ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs)
+    } else {
+        String::new()
+    };
     x.world.files.clone_from(&x.paths);
-    let (world, errs) = (x.world, x.errs);
-    if !errs.errors.is_empty() {
-        return Err(errs.finish());
-    }
-    let warnings = errs.warnings_list();
-    Ok(Read { world, ledger, warnings })
+    let (errors, warnings) = x.errs.split();
+    let world = x.world;
+    let templates = x.templates.into_inner();
+    let errors = merge_repeats(errors, &templates);
+    Partial { world, ledger, errors, warnings, broken, templates }
 }
 
 /// Parse and format one file's text.
@@ -215,6 +263,46 @@ pub fn write_generated(
     Ok(draft.replacen(&placeholder, &hash, 1))
 }
 
+/// `text` with a generated header for the tool, sources and table promises given: a header
+/// it already has is replaced, the body after it kept as written. What `rando stamp` writes,
+/// so a generator in any language can emit plain text.
+///
+/// # Errors
+/// The body's syntax errors.
+pub fn stamp(
+    text: &str,
+    tool: &str,
+    sources: &[(&str, &str)],
+    expect: &[(&str, i64)],
+    files: &dyn Files,
+) -> Result<String, Vec<Error>> {
+    let ast = parse::parse(text, 0);
+    let body = match ast.generated.as_ref().and_then(|g| ast.toks.get(g.end)) {
+        // The body starts on the line after the header's `}`, comments before it included.
+        Some(first) => {
+            let line = ast
+                .comments
+                .iter()
+                .map(|c| c.pos.line)
+                // After the header's closing `}`: a comment inside the header is not body.
+                .filter(|l| {
+                    *l > ast
+                        .generated
+                        .as_ref()
+                        .and_then(|g| ast.toks.get(g.end.saturating_sub(1)))
+                        .map_or(0, |t| t.pos.line)
+                })
+                .chain([first.pos.line])
+                .min()
+                .unwrap_or(first.pos.line);
+            text.split_inclusive('\n').skip(line - 1).collect::<String>()
+        }
+        None if ast.generated.is_some() => String::new(),
+        None => text.to_owned(),
+    };
+    write_generated(tool, sources, expect, &body, files)
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -269,6 +357,71 @@ struct X {
     grown: usize,
     /// The family limit was passed: expansion stops.
     over: bool,
+    /// Names written in files that did not parse ([`Partial::broken`]).
+    broken: HashSet<String>,
+    /// The placement set whose block is being read: its regions join it.
+    set: Option<At<String>>,
+    /// Every name a family wrote from a template, by the template's place.
+    templates: std::cell::RefCell<Templates>,
+}
+
+/// A family template's expansions: the template as written, and each name it gave with the
+/// binder values that gave it (`s = amber`).
+#[derive(Debug, Clone, Default)]
+pub struct Template {
+    /// The template, `{s.pack}_pak`.
+    pub text: String,
+    /// Each expansion: the name and its binder values.
+    pub names: Vec<(String, String)>,
+}
+
+/// Templates by their place.
+pub type Templates = BTreeMap<Pos, Template>;
+
+/// `errors` with each mistake a family template repeats written once: the template in place
+/// of the expanded name, the first expansion's name and binder values, and how many more. A
+/// mistake one expansion makes keeps its name, with the template and binder values after it.
+#[must_use]
+pub fn merge_repeats(errors: Vec<Error>, templates: &Templates) -> Vec<Error> {
+    // Each error, and for a templated one: its message with the template, the first name and
+    // binder values, the template, and how many expansions gave it.
+    type Seen = Option<(String, String, String, usize)>;
+    let mut out: Vec<(Error, Seen)> = Vec::new();
+    for e in errors {
+        let found = e.pos.and_then(|p| templates.get(&p)).and_then(|t| {
+            let (name, binders) =
+                t.names.iter().find(|(n, _)| e.msg.contains(&format!("`{n}`")))?;
+            let msg = e.msg.replace(&format!("`{name}`"), &format!("`{}`", t.text));
+            Some((msg, name.clone(), binders.clone(), t.text.clone()))
+        });
+        let Some((msg, name, binders, text)) = found else {
+            out.push((e, None));
+            continue;
+        };
+        let same = out.iter_mut().find(|(x, m)| {
+            // The help may differ by expansion (a suggestion): the first one's is kept.
+            x.pos == e.pos && m.as_ref().is_some_and(|m| m.0 == msg)
+        });
+        match same {
+            Some((_, Some(m))) => m.3 += 1,
+            _ => out.push((e, Some((msg, format!("`{name}` for `{binders}`"), text, 1)))),
+        }
+    }
+    out.into_iter()
+        .map(|(mut e, m)| {
+            match m {
+                Some((msg, first, _, n)) if n > 1 => {
+                    e.msg = format!("{msg} (as {first}, and {} more)", n - 1);
+                }
+                Some((_, first, text, _)) => {
+                    let first = first.split_once(" for ").map_or(first.clone(), |x| x.1.to_owned());
+                    e.msg = format!("{} (from `{text}` for {first})", e.msg);
+                }
+                None => {}
+            }
+            e
+        })
+        .collect()
 }
 
 impl X {
@@ -517,8 +670,13 @@ impl X {
             }
             let values: Vec<Val> = match &b.over {
                 Over::Range(lo, hi) => {
+                    let (Some(lo), Some(hi)) = (self.constant(lo, env), self.constant(hi, env))
+                    else {
+                        return Vec::new();
+                    };
+                    let (lo, hi) = (lo.v, hi.v);
                     if hi
-                        .checked_sub(*lo)
+                        .checked_sub(lo)
                         .is_none_or(|d| d < 0 || d >= config::WORLD_FAMILY_MAX as i64)
                     {
                         self.errs.err(
@@ -528,7 +686,7 @@ impl X {
                         );
                         return Vec::new();
                     }
-                    (*lo..=*hi).map(Val::Int).collect()
+                    (lo..=hi).map(Val::Int).collect()
                 }
                 Over::List(names) => names.iter().map(|n| Val::Name(n.v.clone())).collect(),
                 Over::Table(t) => match self.tables.get(&t.v) {
@@ -636,7 +794,42 @@ impl X {
                 },
             }
         }
+        if !env.is_empty() {
+            self.note_template(n.pos, &n.v, &s, env);
+        }
         Some(At::new(s, n.pos))
+    }
+
+    /// Note that the template `pieces` at `at` gave `name` with the family values `env`.
+    fn note_template(&self, at: Pos, pieces: &[Piece], name: &str, env: &Env) {
+        let vars: Vec<&str> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Var(v) => v.split('.').next(),
+                Piece::Text(_) => None,
+            })
+            .collect();
+        let binders: Vec<String> = env
+            .iter()
+            .filter(|(v, _)| vars.contains(&v.as_str()))
+            .map(|(v, val)| {
+                let shown = match val {
+                    Val::Int(n) => n.to_string(),
+                    Val::Name(n) => n.clone(),
+                    Val::Row(t, r) => match self.tables.get(t).and_then(|x| x.rows[*r].first()) {
+                        Some(Cell::Name(n)) => n.clone(),
+                        _ => format!("row {}", r + 1),
+                    },
+                };
+                format!("{v} = {shown}")
+            })
+            .collect();
+        let mut all = self.templates.borrow_mut();
+        let t = all.entry(at).or_default();
+        if t.text.is_empty() {
+            t.text = parse::pieces_text(pieces);
+        }
+        t.names.push((name.to_owned(), binders.join(", ")));
     }
 
     /// `e` with the family's variables put in.
@@ -677,6 +870,7 @@ impl X {
                             Piece::Var(v) => s.push_str(&self.piece(v, env, x.at)?),
                         }
                     }
+                    self.note_template(x.at, ps, &s, env);
                     Some(E::Name(s))
                 }
                 _ => None,
@@ -696,6 +890,40 @@ impl X {
             todo.extend(x.children_mut());
         }
         Ok(out)
+    }
+
+    /// A number expression with the family put in: its value when it folds, or the
+    /// expression (which may read options) for the checks; `None` after an error.
+    fn number(&mut self, f: u32, e: &Expr, env: &Env) -> Option<Result<At<i64>, RuleAt>> {
+        match self.subst(e, env) {
+            Ok(x) => Some(match fold(&x) {
+                Some(n) => Ok(At::new(n, e.at)),
+                None => {
+                    self.note_refs(f, &x);
+                    Err(At::new(Rule::Parsed(x), e.at))
+                }
+            }),
+            Err((p, m)) => {
+                self.errs.err(p, m, "");
+                None
+            }
+        }
+    }
+
+    /// A number that must be known when the world is built: written numbers, family fields and
+    /// arithmetic over them.
+    fn constant(&mut self, e: &Expr, env: &Env) -> Option<At<i64>> {
+        match self.number(0, e, env)? {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.errs.err(
+                    e.at,
+                    "this number must be known when the world is built",
+                    "use written numbers, family fields and `+ - * div mod`; options are read only by item copies and rules",
+                );
+                None
+            }
+        }
     }
 
     /// A rule with the family put in, as the model holds it; the names it reads noted.
@@ -848,24 +1076,45 @@ impl X {
                 if !self.grow(env, name.pos) {
                     return;
                 }
+                // Copies fold to a number here, or stay an options-only expression the
+                // checks lower and each seed settles.
+                let (mut count, mut count_rule) = (None, None);
+                if let Some(c) = &i.count {
+                    match self.number(f, c, env) {
+                        Some(Ok(n)) => count = Some(n),
+                        Some(Err(r)) => count_rule = Some(r),
+                        None => return,
+                    }
+                }
                 self.ident(false, &name, i.key.as_ref(), i.was.as_ref(), env);
                 let class = (i.class.v != "match").then(|| i.class.clone());
                 self.world.items.push(Item {
                     key: name,
                     id: None,
                     class,
-                    count: i.count.clone(),
+                    count,
+                    count_rule,
                     later,
                 });
             }
-            Decl::Pool(fill) => self.world.fill_with.extend(fill.iter().cloned()),
+            Decl::Pool(fill) => {
+                for (item, w) in fill {
+                    if let Some(w) = self.constant(w, env) {
+                        self.world.fill_with.push((item.clone(), w));
+                    }
+                }
+            }
             Decl::Grant { assumed, item, n, when } => {
                 let Some(item) = self.tn(item, env) else { return };
                 if !self.grow(env, item.pos) {
                     return;
                 }
+                let n = n.as_ref().map(|n| self.constant(n, env));
+                if n.as_ref().is_some_and(Option::is_none) {
+                    return;
+                }
                 let when = self.opt_rule(f, when.as_ref(), env, cond);
-                let g = Grant { item, n: n.clone(), when };
+                let g = Grant { item, n: n.flatten(), when };
                 if *assumed { self.world.assumed.push(g) } else { self.world.start_items.push(g) }
             }
             Decl::Def { name, params, rule } => {
@@ -878,8 +1127,24 @@ impl X {
                     });
                 }
             }
-            Decl::Group(n, m) => self.world.item_groups.push((n.clone(), m.clone())),
-            Decl::Placement(n, m) => self.world.placement.push((n.clone(), m.clone())),
+            Decl::Group(n, m) => {
+                let Some(n) = self.tn(n, env) else { return };
+                let Some(m) = m.iter().map(|x| self.tn(x, env)).collect() else { return };
+                no_cond(self, "an item group", n.pos);
+                self.world.item_groups.push((n, m));
+            }
+            Decl::Placement(n, m, body) => {
+                let Some(n) = self.tn(n, env) else { return };
+                let Some(m) = m.iter().map(|x| self.tn(x, env)).collect() else { return };
+                no_cond(self, "a placement set", n.pos);
+                self.world.placement.push((n.clone(), m));
+                // Every region of its block joins the set, unless it names its own.
+                let outer = self.set.replace(n);
+                for d in body {
+                    self.decl(f, d, env, cond);
+                }
+                self.set = outer;
+            }
             Decl::Region(r) => {
                 let Some(key) = self.tn(&r.name, env) else { return };
                 let when = self.opt_rule(f, r.when.as_ref(), env, cond);
@@ -889,7 +1154,7 @@ impl X {
                     exits: Vec::new(),
                     events: Vec::new(),
                     when,
-                    placement: r.placement.clone(),
+                    placement: r.placement.clone().or_else(|| self.set.clone()),
                     can_stay: r.can_stay,
                     later: Vec::new(),
                 };
@@ -1013,6 +1278,7 @@ impl X {
             holds,
             no_progression,
             placement: c.placement.clone(),
+            also: c.also,
             later: Vec::new(),
         })
     }
@@ -1104,6 +1370,65 @@ impl X {
         self.world.shuffles.push(sh);
     }
 
+    /// Whether `name` is written in a file that did not parse, so its declaration may be in the
+    /// part that was lost: what the checks here would say about it may be a cascade. The one
+    /// filter every front-end check of a possibly lost name goes through.
+    fn lost(&self, name: &str) -> bool {
+        self.broken.contains(name)
+    }
+
+    /// A check in several regions has exactly one plain declaration, and every repeat says
+    /// `also`, so a name copied by mistake is never merged. The rule is for the files as
+    /// written; overlays may reshape them freely after (remove the plain declaration, or every
+    /// declaration, and re-add repeats), so with `authored` (the names declared before
+    /// overlays applied) only what an overlay added is checked: a second plain one, or `also`
+    /// on a name nothing declared. Names written in a file that did not parse are skipped
+    /// ([`X::lost`]). Returns the names declared.
+    fn check_also(&mut self, authored: Option<&HashSet<String>>) -> HashSet<String> {
+        // Per name, one declaration per region in file order; a name a region declares twice
+        // has its own error, and is left out here.
+        let mut decls: BTreeMap<String, Vec<(String, Pos, bool)>> = BTreeMap::new();
+        let mut twice: HashSet<String> = HashSet::new();
+        for r in &self.world.regions {
+            let mut here = HashSet::new();
+            for c in &r.checks {
+                if !here.insert(c.key.v.as_str()) {
+                    twice.insert(c.key.v.clone());
+                    continue;
+                }
+                decls.entry(c.key.v.clone()).or_default().push((
+                    r.key.v.clone(),
+                    c.key.pos,
+                    c.also,
+                ));
+            }
+        }
+        let skip: HashSet<&String> =
+            decls.keys().filter(|n| twice.contains(*n) || self.lost(n)).collect();
+        for (name, list) in decls.iter().filter(|(n, _)| !skip.contains(n)) {
+            let plain: Vec<&(String, Pos, bool)> = list.iter().filter(|d| !d.2).collect();
+            if let [(region, at, _), rest @ ..] = plain.as_slice() {
+                let file = self.paths.get(at.file as usize).cloned().unwrap_or_default();
+                for (_, p, _) in rest {
+                    self.errs.err(
+                        *p,
+                        format!("check `{name}` is already declared in region `{region}` ({file}:{}:{})", at.line, at.col),
+                        "to reach the same check from this region too, write `check NAME also`; otherwise rename one",
+                    );
+                }
+            } else if let Some((_, p, _)) = list.first()
+                && authored.is_none_or(|a| !a.contains(name))
+            {
+                self.errs.err(
+                    *p,
+                    format!("check `{name}` is marked `also`, and no other declaration of it lacks `also`"),
+                    "`also` marks a repeat of a check another region declares; drop it here",
+                );
+            }
+        }
+        decls.into_keys().collect()
+    }
+
     /// Overlays, in the order their files apply (doc 18 section 2.8): every target named,
     /// a target that is gone an error, two replacements of one target an error unless one
     /// file uses the other.
@@ -1141,7 +1466,11 @@ impl X {
                 _ => HashSet::new(),
             };
             let found = self.overlay(&o);
-            if !found {
+            let lost = match target {
+                Target::Region(n) | Target::Def(n) | Target::Item(n) => self.lost(&n.v),
+                Target::Check(r, c) | Target::Exit(r, c) => self.lost(&r.v) || self.lost(&c.v),
+            };
+            if !found && !lost {
                 self.errs.err(
                     pos,
                     format!(
@@ -1205,13 +1534,16 @@ impl X {
                         ch.rule = new;
                     }
                     Target::Exit(r, c) => {
+                        // Every exit to that region: several are several ways in.
                         let Some(i) = region(&mut self.world, &r.v) else { return false };
-                        let Some(x) =
-                            self.world.regions[i].exits.iter_mut().find(|x| x.to.v == c.v)
-                        else {
+                        let mut found = false;
+                        for x in self.world.regions[i].exits.iter_mut().filter(|x| x.to.v == c.v) {
+                            x.rule = new.clone();
+                            found = true;
+                        }
+                        if !found {
                             return false;
-                        };
-                        x.rule = new;
+                        }
                     }
                     Target::Def(d) => {
                         let Some(def) = self.world.defs.iter_mut().find(|x| x.name.v == d.v) else {
@@ -1256,9 +1588,10 @@ impl X {
         }
     }
 
-    /// A file reads a name declared in another file only if it uses that file, directly or
-    /// through modules it uses, or the name is in the entry file (doc 18 section 2.5). An
-    /// exit's target is not a read: regions in different files lead to each other, and a `use`
+    /// A file reads a def, item, item group, placement set, shuffle or option declared in
+    /// another file only if it uses that file, directly or through modules it uses, or the name
+    /// is in the entry file (doc 18 section 2.5). Regions, events and checks are visible
+    /// world-wide: region files lead to each other and read each other's events, and a `use`
     /// each way would be a cycle for no gain.
     fn visibility(&mut self) {
         let w = &self.world;
@@ -1272,11 +1605,8 @@ impl X {
         w.item_groups.iter().for_each(|g| put(g.0.v.clone(), g.0.pos));
         w.placement.iter().for_each(|g| put(g.0.v.clone(), g.0.pos));
         w.shuffles.iter().for_each(|s| put(s.name.v.clone(), s.name.pos));
-        for r in &w.regions {
-            put(r.key.v.clone(), r.key.pos);
-            r.checks.iter().for_each(|c| put(c.key.v.clone(), c.key.pos));
-            r.events.iter().for_each(|e| put(e.0.v.clone(), e.0.pos));
-        }
+        // Regions, events and checks are visible world-wide: only defs, items, item groups,
+        // placement sets, shuffles and options need a `use`.
         let mut closures: HashMap<u32, BTreeSet<u32>> = HashMap::new();
         let mut seen = HashSet::new();
         // A call reads a def with parameters (as lowering reads it); any other call is a

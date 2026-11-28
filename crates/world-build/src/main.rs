@@ -13,6 +13,10 @@
 //!   [-o out/] [--format text|json] [--check-seeds K]`: build in memory with the checks of
 //!   `build`, fill a room of N copies with the engine's fill and write `<world>-<seed>.seed` and
 //!   a spoiler log into `out/`; `--check-seeds K` fills K seeds instead and reports how it went.
+//! - `rando stamp FILE --tool "NAME VERSION" [--source PATH ...] [--expect TABLE>=N ...]`:
+//!   write or refresh the `generated` header of FILE (a generator's output in any language),
+//!   with the SHA-256 of each source (paths relative to the world's folder, the nearest folder
+//!   above FILE with a `world.rando`) and of the content.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,7 +25,9 @@ use world_build::front::{Dir, LEDGER, Options, format_text};
 use world_build::{Error, build};
 
 fn usage() -> ExitCode {
-    eprintln!("usage: rando check|fmt|build|generate [dir] [options]; see docs/world-build.md");
+    eprintln!(
+        "usage: rando check|fmt|build|generate [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
+    );
     ExitCode::from(2)
 }
 
@@ -101,9 +107,90 @@ fn fmt(dir: &Path, check_only: bool) -> ExitCode {
     if bad { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
+/// `rando stamp`: write or refresh a generated file's header.
+fn stamp(args: &[String]) -> ExitCode {
+    let (mut file, mut tool) = (None::<PathBuf>, None::<String>);
+    let (mut sources, mut expect) = (Vec::<String>::new(), Vec::<(String, i64)>::new());
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--tool" | "--source" | "--expect" => {
+                let Some(v) = rest.next() else { return usage() };
+                match a.as_str() {
+                    "--tool" => tool = Some(v.clone()),
+                    "--source" => sources.push(v.clone()),
+                    _ => {
+                        let parsed = v
+                            .split_once(">=")
+                            .and_then(|(t, n)| Some((t.trim().to_owned(), n.trim().parse().ok()?)));
+                        let Some(e) = parsed else {
+                            eprintln!("error: --expect takes TABLE>=N, not `{v}`");
+                            return ExitCode::from(2);
+                        };
+                        expect.push(e);
+                    }
+                }
+            }
+            s if s.starts_with('-') => return usage(),
+            s => file = Some(PathBuf::from(s)),
+        }
+    }
+    let (Some(file), Some(tool)) = (file, tool) else { return usage() };
+    // The world's folder: the nearest folder above the file with an entry file.
+    let Some(root) = file
+        .ancestors()
+        .skip(1)
+        .find(|d| d.join(world_build::front::ENTRY).is_file())
+        .map(Path::to_path_buf)
+    else {
+        eprintln!("error: no folder above {} has a `world.rando`", file.display());
+        return ExitCode::FAILURE;
+    };
+    let folder = Dir(root);
+    let mut texts = Vec::new();
+    for p in &sources {
+        match world_build::front::Files::read(&folder, p) {
+            Some(Ok(t)) => texts.push((p.as_str(), t)),
+            Some(Err(e)) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            None => {
+                eprintln!("error: source `{p}` does not exist in the world's folder");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}: {e}", file.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let srcs: Vec<(&str, &str)> = texts.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let exp: Vec<(&str, i64)> = expect.iter().map(|(t, n)| (t.as_str(), *n)).collect();
+    match world_build::front::stamp(&text, &tool, &srcs, &exp, &folder) {
+        Ok(out) => match write_file(&file, out.as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(list) => {
+            report(&list, "error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(verb) = args.first() else { return usage() };
+    if verb == "stamp" {
+        return stamp(&args[1..]);
+    }
     if verb == "generate" && !cfg!(feature = "engine") {
         eprintln!(
             "error: this rando was built without the engine (feature `engine`), so it cannot generate seeds; build it with default features"

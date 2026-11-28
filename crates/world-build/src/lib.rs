@@ -21,7 +21,9 @@ mod instance;
 pub mod lex;
 mod lower;
 pub mod model;
+mod presence;
 pub mod rule;
+mod suggest;
 mod world;
 
 pub use model::Pos;
@@ -140,13 +142,38 @@ impl Built {
 /// # Errors
 /// Every error the front end and the checks find.
 pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, Vec<Error>> {
-    let read = front::read(files, opts)?;
-    let mut built = build_model(&read.world, front::ENTRY)?;
+    let read = front::read_partly(files, opts);
+    if let Some(broken) = &read.broken {
+        // A file did not parse: the checks still run on what did, so a mistake elsewhere is
+        // not hidden behind the syntax error; what may be a cascade of it is left out.
+        let mut all = read.errors;
+        if let Err(more) = build_model(&read.world, front::ENTRY) {
+            let more = front::merge_repeats(more, &read.templates);
+            all.extend(more.into_iter().filter(|e| !cascade(e, broken)));
+        }
+        all.sort_by_key(|e| (e.pos.is_none(), e.pos));
+        all.dedup();
+        return Err(all);
+    }
+    if !read.errors.is_empty() {
+        return Err(read.errors);
+    }
+    let mut built = build_model(&read.world, front::ENTRY)
+        .map_err(|e| front::merge_repeats(e, &read.templates))?;
     let mut warnings = read.warnings;
     warnings.append(&mut built.warnings);
     built.warnings = warnings;
     built.ledger = Some(read.ledger);
     Ok(built)
+}
+
+/// Whether a check's error may only follow from a file that did not parse: it is about the
+/// whole world, about reaching a region (an exit may be in the lost part), or it names, in
+/// backticks, a name written in a broken file (its declaration may be in the lost part).
+fn cascade(e: &Error, broken: &std::collections::HashSet<String>) -> bool {
+    e.pos.is_none()
+        || e.msg.contains("cannot be reached")
+        || e.msg.split('`').skip(1).step_by(2).any(|n| broken.contains(n))
 }
 
 /// Check `w`, a world read from `file`, and build its manifest.

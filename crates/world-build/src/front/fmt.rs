@@ -1,11 +1,17 @@
 //! The formatter (design doc 18 section 5.1, `fmt`): one canonical layout, comments kept.
 //! It writes the file's own tokens again, breaking lines where the parser marked a
 //! declaration, a member, a row or an arm, two spaces per level, one space between tokens
-//! except around punctuation, and parentheses around `and` inside `or`. Formatting a formatted
-//! file gives it back unchanged.
+//! except around punctuation, and parentheses around `and` inside `or`. A rule too long for a
+//! line of [`WIDTH`] characters is broken before each top-level `or` (or `and`), indented one
+//! level under its line; a generated file's hash does not count these breaks. Formatting a
+//! formatted file gives it back unchanged.
 
 use super::parse::FileAst;
 use crate::lex::{RESERVED, RULE_WORDS, Tok, Token};
+
+/// The longest line `fmt` writes a rule on before breaking it (a line with one long name can
+/// still be longer).
+pub const WIDTH: usize = 100;
 
 /// The file in its canonical layout.
 #[must_use]
@@ -45,7 +51,56 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
             *n += 1;
         }
     }
+    // `and` and `or` nodes, by first token, outer first; and the tokens to break before, with
+    // their indent, once one is found too long for its line.
+    // Per node: one past its last token, the tokens to break before, its nesting.
+    type Node<'a> = (usize, &'a Vec<usize>, usize);
+    let mut wraps: std::collections::HashMap<usize, Vec<Node<'_>>> =
+        std::collections::HashMap::new();
+    if with_comments {
+        for (a, b, at, level) in &ast.layout.wraps {
+            wraps.entry(*a).or_default().push((*b, at, *level));
+        }
+        wraps.values_mut().for_each(|v| v.sort_by_key(|w| w.2));
+    }
+    let mut wrap_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // Per token, the ends of the parentheses `fmt` adds that open at it.
+    let mut opens_at: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &(a, b) in &ast.layout.parens {
+        opens_at.entry(a).or_default().push(b);
+    }
     for i in from..=toks.len() {
+        for (end, at, level) in wraps.get(&i).into_iter().flatten() {
+            // The space written before the node: none after `(` (a fixed 1 here measured a line
+            // one longer on the second pass, when a `(` `fmt` had added was a token before the
+            // node). A node starts after its rule's `:` or `=`, or after an operator, never at
+            // a line break, so the line it starts on is the one being written.
+            let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
+            let glue = ast.layout.glue.get(i).copied().unwrap_or(false);
+            let sep =
+                usize::from(i > from && toks.get(i).is_some_and(|t| space(&toks[i - 1], t, glue)));
+            let mut len = 0;
+            for k in i..(*end).min(toks.len()) {
+                let glue = ast.layout.glue.get(k).copied().unwrap_or(false);
+                len += text(&toks[k].t).chars().count();
+                len += usize::from(k > i && space(&toks[k - 1], &toks[k], glue));
+            }
+            // Only the parentheses `fmt` adds inside the node: one it closes after the node
+            // is a token outside it once written, so counting it would break the node on
+            // the first pass and not the second.
+            let end = (*end).min(toks.len());
+            len += 2
+                * (i..end)
+                    .flat_map(|k| opens_at.get(&k).into_iter().flatten())
+                    .filter(|b| **b <= end)
+                    .count();
+            if line + sep + len > WIDTH {
+                for k in at.iter() {
+                    wrap_at.insert(*k, depth + 1 + level);
+                }
+            }
+        }
         // Comments that come before this token.
         while let Some(c) = comments.get(ci).filter(|c| c.before == i) {
             if c.own_line {
@@ -76,7 +131,10 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
         if let Some(d) = brk {
             depth = d;
         }
-        if brk.is_some() || need_break {
+        if let Some(d) = wrap_at.get(&i).copied().filter(|_| brk.is_none() && !need_break) {
+            out.push('\n');
+            out.push_str(&"  ".repeat(d));
+        } else if brk.is_some() || need_break {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }

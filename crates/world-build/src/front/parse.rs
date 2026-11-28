@@ -50,8 +50,9 @@ pub struct Table {
 pub enum Over {
     /// Every row of a table.
     Table(At<String>),
-    /// Whole numbers from and to, both included.
-    Range(i64, i64),
+    /// Whole numbers from and to, both included (number expressions, folded when the family
+    /// expands).
+    Range(Expr, Expr),
     /// Names.
     List(Vec<At<String>>),
 }
@@ -76,6 +77,8 @@ pub struct CheckD {
     pub placement: Option<At<String>>,
     pub key: Option<At<String>>,
     pub was: Option<At<String>>,
+    /// `also`: a repeat of a check another region declares.
+    pub also: bool,
 }
 
 /// An exit, as written.
@@ -111,7 +114,7 @@ pub struct RegionD {
 pub struct ItemD {
     pub name: Tn,
     pub class: At<String>,
-    pub count: Option<At<i64>>,
+    pub count: Option<Expr>,
     pub when: Option<Expr>,
     pub key: Option<At<String>>,
     pub was: Option<At<String>>,
@@ -167,11 +170,11 @@ pub enum Decl {
         default: Option<At<Lit>>,
     },
     Item(ItemD),
-    Pool(Vec<(At<String>, At<i64>)>),
+    Pool(Vec<(At<String>, Expr)>),
     Grant {
         assumed: bool,
         item: Tn,
-        n: Option<At<i64>>,
+        n: Option<Expr>,
         when: Option<Expr>,
     },
     Def {
@@ -179,8 +182,10 @@ pub enum Decl {
         params: Vec<At<String>>,
         rule: Expr,
     },
-    Group(At<String>, Vec<At<String>>),
-    Placement(At<String>, Vec<At<String>>),
+    Group(Tn, Vec<Tn>),
+    /// A placement set, and the declarations of its block when it has one: every region in
+    /// the block joins the set.
+    Placement(Tn, Vec<Tn>, Vec<Decl>),
     Region(RegionD),
     Table(Table),
     For(Vec<Binder>, Vec<Decl>),
@@ -212,6 +217,10 @@ pub struct Layout {
     pub glue: Vec<bool>,
     /// Token ranges `fmt` wraps in parentheses (`and` inside `or`).
     pub parens: Vec<(usize, usize)>,
+    /// `and` and `or` nodes `fmt` may break over lines: first token, one past the last, the
+    /// tokens to break before when the node is too long for its line (its operators), and how
+    /// many such nodes hold it.
+    pub wraps: Vec<(usize, usize, Vec<usize>, usize)>,
 }
 
 /// A parsed file.
@@ -267,7 +276,12 @@ pub fn parse(src: &str, file: u32) -> FileAst {
         toks: &toks,
         k: 0,
         errors: Vec::new(),
-        layout: Layout { brk: vec![None; n], glue: vec![false; n], parens: Vec::new() },
+        layout: Layout {
+            brk: vec![None; n],
+            glue: vec![false; n],
+            parens: Vec::new(),
+            wraps: Vec::new(),
+        },
     };
     let generated = p.generated();
     let mut uses = Vec::new();
@@ -392,6 +406,28 @@ impl P<'_> {
         }
     }
 
+    /// A number: a whole number with its sign, or a number expression (`d.keys - 1`,
+    /// `opt.k + 1`, `2 * n`), folded where it is used. A rule here is an error.
+    fn num(&mut self, depth: usize, what: &str) -> R<Expr> {
+        let from = self.k;
+        if matches!(self.peek(), Some(Tok::Minus)) {
+            let n = self.int(what)?;
+            return Ok(Expr { e: E::Int(n.v), at: n.pos, paren: false, span: (from, self.k) });
+        }
+        let pos = self.here();
+        if !matches!(self.peek(), Some(Tok::Int(_) | Tok::Name(_) | Tok::Open)) {
+            return Err((pos, format!("expected {what}, found {}", self.got())));
+        }
+        let e = self.rule(depth)?;
+        if matches!(
+            e.e,
+            E::Bool(_) | E::Not(_) | E::And(_) | E::Or(_) | E::Cmp(..) | E::In(..) | E::Match(..)
+        ) {
+            return Err((pos, format!("expected {what}, found a rule")));
+        }
+        Ok(e)
+    }
+
     fn string(&mut self, what: &str) -> R<At<String>> {
         match self.peek().cloned() {
             Some(Tok::Str(s)) => {
@@ -413,20 +449,40 @@ impl P<'_> {
         Ok(out)
     }
 
-    /// `{ a, b }`.
-    fn name_set(&mut self, what: &str) -> R<Vec<At<String>>> {
-        self.expect(&Tok::LBrace, "`{`")?;
-        let out = self.names(what)?;
-        self.expect(&Tok::RBrace, "`}`")?;
-        Ok(out)
-    }
-
     /// A rule here: parsed, its `and` inside `or` noted for `fmt`, its `match` arms laid out.
     fn rule(&mut self, depth: usize) -> R<Expr> {
         let (e, end) = parse_in(self.toks, self.k, self.toks.len())?;
         self.k = end;
         self.lay_rule(&e, depth);
+        self.lay_wrap(&e);
         Ok(e)
+    }
+
+    /// Where `fmt` may break `e` when it is too long for one line: before the `or`s of each
+    /// `or`, and the `and`s of each `and`, outer ones first, each with how many `and`/`or`
+    /// nodes hold it. A rule with a `match` (laid out over lines already) is left alone.
+    fn lay_wrap(&mut self, e: &Expr) {
+        let mut todo = vec![e];
+        while let Some(x) = todo.pop() {
+            if matches!(x.e, E::Match(..)) {
+                return;
+            }
+            todo.extend(x.children());
+        }
+        let mut todo = vec![(e, 0usize)];
+        while let Some((x, level)) = todo.pop() {
+            let inner = match &x.e {
+                E::Or(parts) | E::And(parts) => {
+                    // A part in parentheses starts at its `(`; the operator is just before.
+                    let at: Vec<usize> = parts.iter().skip(1).map(|p| p.span.0 - 1).collect();
+                    let first = if x.paren { x.span.0 + 1 } else { x.span.0 };
+                    self.layout.wraps.push((first, x.span.1, at, level));
+                    level + 1
+                }
+                _ => level,
+            };
+            todo.extend(x.children().into_iter().map(|c| (c, inner)));
+        }
     }
 
     /// A rule that must end on this line (a table cell).
@@ -625,7 +681,7 @@ impl P<'_> {
                 let mut fill = Vec::new();
                 loop {
                     let n = self.name("an item")?;
-                    fill.push((n, self.int("its weight")?));
+                    fill.push((n, self.num(depth, "its weight")?));
                     if self.peek() != Some(&Tok::Comma) {
                         break;
                     }
@@ -638,7 +694,7 @@ impl P<'_> {
                 let item = self.tname("an item")?;
                 let n = if self.ctx("x") {
                     self.k += 1;
-                    Some(self.int("a number of copies")?)
+                    Some(self.num(depth, "a number of copies")?)
                 } else {
                     None
                 };
@@ -662,43 +718,27 @@ impl P<'_> {
                 Decl::Def { name, params, rule: self.rule(depth)? }
             }
             "group" => {
-                let name = self.name("the group's name")?;
+                let name = self.tname("the group's name")?;
                 self.expect(&Tok::Eq, "`=`")?;
-                Decl::Group(name, self.name_set("an item")?)
+                Decl::Group(name, self.tname_set("an item")?)
             }
             "placement" => {
-                let name = self.name("the placement set's name")?;
-                Decl::Placement(name, self.name_set("an item")?)
+                let name = self.tname("the placement set's name")?;
+                let items = self.tname_set("an item")?;
+                let body = if self.peek() == Some(&Tok::LBrace) {
+                    self.k += 1;
+                    self.block(depth)?
+                } else {
+                    Vec::new()
+                };
+                Decl::Placement(name, items, body)
             }
             "region" => Decl::Region(self.region(depth)?),
             "table" => Decl::Table(self.table(depth)?),
             "for" => {
                 let binders = self.binders(depth)?;
                 self.expect(&Tok::LBrace, "`{`")?;
-                let mut body = Vec::new();
-                while !matches!(self.peek(), Some(Tok::RBrace) | None) {
-                    let start = self.k;
-                    self.brk(start, depth + 1);
-                    let inside = matches!(
-                        self.peek(),
-                        Some(Tok::Kw("item" | "region" | "start_item" | "assumed" | "for"))
-                    );
-                    if !inside {
-                        self.errors.push((self.here(), format!("{} cannot be inside a family; a family repeats items, regions, start items and families", self.got())));
-                        self.skip_to_member(start);
-                        continue;
-                    }
-                    match self.decl(depth + 1) {
-                        Ok(d) => body.push(d),
-                        Err(e) => {
-                            self.errors.push(e);
-                            self.skip_to_member(start);
-                        }
-                    }
-                }
-                self.brk(self.k, depth);
-                self.expect(&Tok::RBrace, "`}`")?;
-                Decl::For(binders, body)
+                Decl::For(binders, self.block(depth)?)
             }
             "shuffle" => self.shuffle(depth)?,
             "goal" => Decl::Goal(self.rule(depth)?),
@@ -717,6 +757,50 @@ impl P<'_> {
             }
             other => return Err((pos, format!("`{other}` cannot start a declaration here"))),
         })
+    }
+
+    /// The declarations of a family's or a placement set's block, after its `{`, up to and
+    /// including its `}`: items, regions, start and assumed items, groups, placement sets and
+    /// families.
+    fn block(&mut self, depth: usize) -> R<Vec<Decl>> {
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RBrace) | None) {
+            let start = self.k;
+            self.brk(start, depth + 1);
+            let inside = matches!(
+                self.peek(),
+                Some(Tok::Kw(
+                    "item" | "region" | "start_item" | "assumed" | "for" | "group" | "placement"
+                ))
+            );
+            if !inside {
+                self.errors.push((self.here(), format!("{} cannot be inside a family or a placement block; they hold items, regions, start items, groups, placement sets and families", self.got())));
+                self.skip_to_member(start);
+                continue;
+            }
+            match self.decl(depth + 1) {
+                Ok(d) => body.push(d),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.skip_to_member(start);
+                }
+            }
+        }
+        self.brk(self.k, depth);
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(body)
+    }
+
+    /// `{ a, b }` of names that may hold `{var}` pieces.
+    fn tname_set(&mut self, what: &str) -> R<Vec<Tn>> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut out = vec![self.tname(what)?];
+        while self.peek() == Some(&Tok::Comma) {
+            self.k += 1;
+            out.push(self.tname(what)?);
+        }
+        self.expect(&Tok::RBrace, "`}`")?;
+        Ok(out)
     }
 
     fn option(&mut self) -> R<Decl> {
@@ -795,7 +879,7 @@ impl P<'_> {
         loop {
             if self.ctx("x") {
                 self.k += 1;
-                d.count = Some(self.int("a number of copies")?);
+                d.count = Some(self.num(depth, "a number of copies")?);
             } else if self.word("when") {
                 self.k += 1;
                 d.when = Some(self.rule(depth)?);
@@ -832,22 +916,27 @@ impl P<'_> {
                 break;
             }
         }
-        self.expect(&Tok::LBrace, "`{` and the region's checks and exits")?;
-        r.members = self.members(depth + 1)?;
+        let open = self.expect(&Tok::LBrace, "`{` and the region's checks and exits")?;
+        r.members = self.members(depth + 1, &format!("region `{}`", show_tn(&r.name)), open)?;
         Ok(r)
     }
 
-    /// Members up to the closing `}`, which this consumes.
-    fn members(&mut self, depth: usize) -> R<Vec<Member>> {
+    /// Members up to the closing `}`, which this consumes. `what` names the block, opened at
+    /// `open`, for the error when it is left open.
+    fn members(&mut self, depth: usize, what: &str, open: Pos) -> R<Vec<Member>> {
         let mut out = Vec::new();
         while !matches!(self.peek(), Some(Tok::RBrace) | None) {
             if matches!(self.peek(), Some(Tok::Kw(k)) if DECLS.contains(k) && *k != "for") {
-                // A declaration where a member was expected: the block was left open. Stop at
-                // it, so the declarations after it are read.
-                return Err((
+                // A declaration where a member was expected: the block was left open. The
+                // members read so far are kept, and reading goes on at this declaration.
+                self.errors.push((
                     self.here(),
-                    "a region's `{` is not closed before this declaration".into(),
+                    format!(
+                        "{what}, opened at line {}, is not closed before this declaration",
+                        open.line
+                    ),
                 ));
+                return Ok(out);
             }
             let start = self.k;
             self.brk(start, depth);
@@ -877,6 +966,10 @@ impl P<'_> {
         match kw {
             "check" => {
                 let name = self.tname("the check's name")?;
+                let also = self.ctx("also");
+                if also {
+                    self.k += 1;
+                }
                 let rule = if self.peek() == Some(&Tok::Colon) {
                     self.k += 1;
                     Some(self.rule(depth)?)
@@ -893,6 +986,7 @@ impl P<'_> {
                     placement: None,
                     key: None,
                     was: None,
+                    also,
                 };
                 // Each modifier once: a second would silently replace the first.
                 let mut seen: Vec<&str> = Vec::new();
@@ -901,6 +995,13 @@ impl P<'_> {
                         .into_iter()
                         .find(|w| self.word(w))
                         .or_else(|| CHECK_MODIFIERS.into_iter().find(|w| self.ctx(w)));
+                    if self.ctx("also") {
+                        return Err((
+                            self.here(),
+                            "`also` goes right after the check's name: `check NAME also: rule`"
+                                .into(),
+                        ));
+                    }
                     let Some(w) = word else { return Ok(Member::Check(Box::new(c))) };
                     if seen.contains(&w) {
                         return Err((self.here(), format!("`{w}` is given twice")));
@@ -963,8 +1064,8 @@ impl P<'_> {
             }
             "for" => {
                 let binders = self.binders(depth)?;
-                self.expect(&Tok::LBrace, "`{`")?;
-                Ok(Member::For(binders, self.members(depth + 1)?))
+                let open = self.expect(&Tok::LBrace, "`{`")?;
+                Ok(Member::For(binders, self.members(depth + 1, "a family's block", open)?))
             }
             "stay" => {
                 Err((pos, "`stay` needs a time context, which this version does not build".into()))
@@ -986,11 +1087,17 @@ impl P<'_> {
                 return Err((self.here(), format!("expected `in`, found {}", self.got())));
             }
             self.k += 1;
+            // A table is one name alone; anything else before `..` is a range's first number.
+            let table = matches!(self.peek(), Some(Tok::Name(_)))
+                && !matches!(
+                    self.toks.get(self.k + 1).map(|t| &t.t),
+                    Some(Tok::DotDot | Tok::Plus | Tok::Minus | Tok::Star | Tok::Kw("div" | "mod"))
+                );
             let over = match self.peek().cloned() {
-                Some(Tok::Int(lo)) => {
-                    self.k += 1;
+                Some(_) if !table && !matches!(self.peek(), Some(Tok::LBrack)) => {
+                    let lo = self.num(depth, "the first number")?;
                     self.expect(&Tok::DotDot, "`..`")?;
-                    Over::Range(lo, self.int("the last number")?.v)
+                    Over::Range(lo, self.num(depth, "the last number")?)
                 }
                 Some(Tok::LBrack) => {
                     self.k += 1;
@@ -1285,8 +1392,8 @@ impl P<'_> {
                         "`extend` adds to a region: `extend region NAME { ... }`".into(),
                     ));
                 }
-                self.expect(&Tok::LBrace, "`{`")?;
-                Overlay::Extend(pos, target, self.members(depth + 1)?)
+                let open = self.expect(&Tok::LBrace, "`{`")?;
+                Overlay::Extend(pos, target, self.members(depth + 1, "this `extend`", open)?)
             }
             "replace" => {
                 if !matches!(target, Target::Check(..) | Target::Exit(..) | Target::Def(_)) {
@@ -1301,6 +1408,22 @@ impl P<'_> {
             _ => Overlay::Remove(pos, target),
         })
     }
+}
+
+/// A name as written, its `{var}` pieces included.
+fn show_tn(n: &Tn) -> String {
+    pieces_text(&n.v)
+}
+
+/// Name pieces as written: `{s.pack}_pak`.
+pub(crate) fn pieces_text(pieces: &[Piece]) -> String {
+    pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Text(t) => t.clone(),
+            Piece::Var(v) => format!("{{{v}}}"),
+        })
+        .collect()
 }
 
 fn col_word(c: Col) -> &'static str {

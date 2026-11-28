@@ -12,11 +12,10 @@ use crate::model::{Pos, Rule, RuleAt};
 use crate::rule::{Arith, Arm, Cmp, E, Expr, parse};
 use crate::world::Errs;
 
-/// What a name in the world's one namespace is.
+/// What a name in the world's one namespace is (checks have their own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sort {
     Item,
-    Check,
     Def,
     Event,
     Region,
@@ -29,7 +28,6 @@ impl Sort {
     pub(crate) fn word(self) -> &'static str {
         match self {
             Sort::Item => "an item",
-            Sort::Check => "a check",
             Sort::Def => "a def",
             Sort::Event => "an event",
             Sort::Region => "a region",
@@ -61,6 +59,8 @@ pub(crate) enum Readable {
 #[derive(Debug, Default)]
 pub(crate) struct Names {
     pub sorts: HashMap<String, Sort>,
+    /// Every check's name: not readable, named in the error when a rule tries.
+    pub checks: std::collections::HashSet<String>,
     pub options: HashMap<String, OptTy>,
     pub item_groups: HashMap<String, Vec<String>>,
     pub shuffles: HashMap<String, Readable>,
@@ -151,6 +151,22 @@ impl<'a> Lower<'a> {
             },
             Rule::Parsed(e) => self.b(e, mode),
         }
+    }
+
+    /// A number settled before the fill (`what`, such as a number of copies): options and
+    /// numbers only.
+    pub(crate) fn number(&mut self, n: &RuleAt, what: &str) -> Option<Value> {
+        let e = self.tree(n)?;
+        let (v, state) = self.i(&e)?;
+        if state {
+            self.err(
+                n.pos,
+                format!("{what} reads options and numbers only"),
+                "it is settled before the fill; what the player holds is not known then",
+            );
+            return None;
+        }
+        Some(v)
     }
 
     /// A rule as a tree: parsed from its text when it has one.
@@ -303,6 +319,16 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Every declared name of the given sorts, for "did you mean".
+    fn of_sort(&self, sorts: &[Sort]) -> Vec<&'a str> {
+        self.names
+            .sorts
+            .iter()
+            .filter(|(_, s)| sorts.contains(s))
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+
     fn sort_of(&self, n: &str) -> Option<Sort> {
         self.names.sorts.get(n).copied()
     }
@@ -317,11 +343,14 @@ impl<'a> Lower<'a> {
             E::Name(n) => {
                 match self.sort_of(n) {
                     Some(s) => self.err(e.at, format!("`{n}` is {}, not an item", s.word()), ""),
-                    None => self.err(
-                        e.at,
-                        format!("unknown item `{n}`"),
-                        "declare it with `item NAME CLASS`",
-                    ),
+                    None => {
+                        let help = crate::suggest::help(
+                            n,
+                            self.of_sort(&[Sort::Item]),
+                            "declare it with `item NAME CLASS`",
+                        );
+                        self.err(e.at, format!("unknown item `{n}`"), &help)
+                    }
                 };
                 None
             }
@@ -350,11 +379,14 @@ impl<'a> Lower<'a> {
             return match self.names.options.get(k) {
                 Some(ty) => Some(Dotted::Opt(k, ty.clone())),
                 None => {
-                    self.err(
-                        at,
-                        format!("unknown option `{k}`"),
+                    let opts: Vec<String> =
+                        self.names.options.keys().map(|o| format!("opt.{o}")).collect();
+                    let help = crate::suggest::help(
+                        n,
+                        opts.iter().map(String::as_str),
                         "declare it with `option NAME: TYPE`",
                     );
+                    self.err(at, format!("unknown option `{k}`"), &help);
                     None
                 }
             };
@@ -449,11 +481,21 @@ impl<'a> Lower<'a> {
                         ),
                         "",
                     ),
-                    None => self.err(
+                    None if self.names.checks.contains(n) => self.err(
                         e.at,
-                        format!("unknown name `{n}`"),
-                        "declare it as an item, def or event, or check the spelling",
+                        format!(
+                            "`{n}` is a check; a rule reads items, defs and events, not checks"
+                        ),
+                        "fire an event next to the check and read the event",
                     ),
+                    None => {
+                        let help = crate::suggest::help(
+                            n,
+                            self.of_sort(&[Sort::Def, Sort::Event]),
+                            "declare it as an item, def or event, or check the spelling",
+                        );
+                        self.err(e.at, format!("unknown name `{n}`"), &help)
+                    }
                 },
             },
             E::Not(x) => {
@@ -562,6 +604,9 @@ impl<'a> Lower<'a> {
                     _ => return self.err(at, "`has` takes an item and an optional count", "`has(x)` or `has(x, 3)`"),
                 };
                 let item = self.item(x)?;
+                // A count that folds (a def's parameter, a family field, arithmetic) is a number.
+                let folded = n.and_then(fold).map(|k| Expr { e: E::Int(k), ..n.cloned().unwrap_or_else(|| x.clone()) });
+                let n = folded.as_ref().or(n);
                 match n.map(|n| &n.e) {
                     None | Some(E::Int(1)) => Some((json!({"has": item}), true)),
                     Some(E::Int(k)) if usize::try_from(*k).is_ok_and(|k| k <= config::RULE_MAX_PARTS) => Some((json!({"has": item, "n": k}), true)),
@@ -570,11 +615,15 @@ impl<'a> Lower<'a> {
                         format!("`has` counts 0 to {} copies, not {k} (the engine's limit)", config::RULE_MAX_PARTS),
                         "for more, write `count(x) >= n`",
                     ),
-                    Some(_) => self.err(
-                        n.map_or(at, |n| n.at),
-                        "the count in `has` is a number as written",
-                        "for a count set by an option, write `count(x) >= opt.k`",
-                    ),
+                    // A count that reads options: the engine compares the item's count with it.
+                    Some(_) => {
+                        let n = n?;
+                        let (v, state) = self.i(n)?;
+                        if state {
+                            return self.err(n.at, "the count in `has` reads options and numbers only", &format!("to compare two counts, write `count({item}) >= ...`"));
+                        }
+                        Some((json!({"ge": [{"count": item}, v]}), true))
+                    }
                 }
             }
             "has_all" | "has_any" => {
