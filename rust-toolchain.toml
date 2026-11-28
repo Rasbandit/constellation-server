@@ -2,5 +2,6 @@
 # Pinned, so CI and local runs lint with the same clippy; a Rust upgrade is a deliberate PR.
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]
-# `rando-syntax` must build for WebAssembly (design doc 20 section 8.1); CI checks it.
-targets = ["wasm32-unknown-unknown"]
+# `rando-syntax` must build for WebAssembly (design doc 20 section 8.1); CI checks it, and
+# `wasm32v1-none` has no std at all, so the check fails if std gets back in.
+targets = ["wasm32-unknown-unknown", "wasm32v1-none"]
