@@ -928,12 +928,9 @@ pub(crate) fn failed_status(status: &str, error: &str) -> String {
     v.to_string()
 }
 
-/// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes.
-#[must_use]
-pub fn blob_key(bytes: &[u8]) -> BlobKey {
-    use sha2::Digest;
-    sha2::Sha256::digest(bytes).into()
-}
+/// The SHA-256 of `bytes`: the key [`BlobStore::put`] takes. Defined by the seed format, so a
+/// package file's key and its blob key are one function.
+pub use seed_bundle::package::key_of as blob_key;
 
 #[cfg(test)]
 mod contract;

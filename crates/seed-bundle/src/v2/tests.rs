@@ -271,14 +271,27 @@ fn a_stored_seed_reads_back_on_its_packages_and_decodes_to_its_v1() {
     assert_eq!(canonical_of(&back), package::canonical(input));
 }
 
+/// The reads a room makes through `room_core::World`, by slot position.
+struct World<'a>(&'a Seed);
+
+impl World<'_> {
+    fn placed(&self, pos: usize) -> usize {
+        self.0.slot_at(pos).map_or(0, |s| s.placed())
+    }
+
+    fn target(&self, pos: usize, index: usize) -> Option<(usize, i64)> {
+        self.0.slot_at(pos)?.target(index)
+    }
+}
+
 #[test]
 fn the_world_view_matches_the_placements() {
     let (seed, _) = opened(&small().to_string());
-    let w: &dyn World = &seed;
-    assert_eq!(w.slots(), [SlotNo(1), SlotNo(2)]);
+    let w = World(&seed);
+    assert_eq!(seed.slot_ids(), [SlotNo(1), SlotNo(2)]);
     assert_eq!((w.placed(0), w.placed(1), w.placed(2)), (1, 2, 0));
     // Slot 2 (position 1): location 101 is index 1 and sends item 7 to slot 1 (position 0).
-    assert_eq!(w.find(1, 101), Some(1));
+    assert_eq!(seed.slot_at(1).unwrap().find(101), Some(1));
     assert_eq!(w.target(1, 1), Some((0, 7)));
     assert_eq!(w.target(1, 2), None);
     let start: Vec<i64> = seed.slot(2).unwrap().start_inventory().collect();
@@ -397,7 +410,7 @@ fn a_placement_across_games_resolves_against_the_receivers_game() {
     let text = cross_games().to_string();
     let (seed, data) = opened(&text);
     assert_eq!(seed.to_v1(&data).unwrap(), SeedBundle::from_json(&text).unwrap());
-    let w: &dyn World = &seed;
+    let w = World(&seed);
     // Slot 1's location 11 (index 0) sends B's item 202 (index 2 in B, beyond A's 2 items).
     assert_eq!(w.target(0, 0), Some((1, 202)));
     assert_eq!(w.target(1, 0), Some((0, 2)));

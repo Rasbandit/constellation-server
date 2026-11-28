@@ -22,32 +22,7 @@ use alloc::{boxed::Box, collections::BTreeSet, vec::Vec};
 use proto::{Event, EventKind, HintAsk, HintRequest, Seq, SlotNo};
 use serde::{Deserialize, Serialize};
 
-/// Status values (protocol doc, "`HintStatus`").
-pub mod status {
-    /// No status chosen.
-    pub const UNSPECIFIED: u8 = 0;
-    /// The receiver does not need it soon.
-    pub const NO_PRIORITY: u8 = 10;
-    /// The receiver would rather not get it (traps).
-    pub const AVOID: u8 = 20;
-    /// The receiver wants it.
-    pub const PRIORITY: u8 = 30;
-    /// The location is checked. Never set by a request; it follows from the checks.
-    pub const FOUND: u8 = 40;
-}
-
-/// Whether `s` is a status a hint may be stored with.
-#[must_use]
-pub const fn valid(s: u8) -> bool {
-    matches!(
-        s,
-        status::UNSPECIFIED
-            | status::NO_PRIORITY
-            | status::AVOID
-            | status::PRIORITY
-            | status::FOUND
-    )
-}
+use proto::hint_status::{self as status, valid};
 
 /// Whether a status update may set `s`: a stored status, but never found (only a check finds).
 const fn settable(s: u8) -> bool {

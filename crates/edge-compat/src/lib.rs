@@ -88,7 +88,7 @@ impl CompatRoom {
         limits: Limits,
     ) -> Result<Self, String> {
         let password = password.or_else(|| bundle.password().map(str::to_owned));
-        let hint_rules = bundle.hint_rules();
+        let hint_rules = room_core::HintRules::of(&bundle);
         let l = limits;
         let keys = l.rate_table_max_keys;
         Ok(Self {

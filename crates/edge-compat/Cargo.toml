@@ -16,7 +16,7 @@ bits = { path = "../bits" }
 config = { path = "../config" }
 futures-util = { workspace = true }
 proto = { path = "../proto" }
-room-core = { path = "../room-core" }
+room-core = { path = "../room-core", features = ["seed"] }
 runtime = { path = "../runtime" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }

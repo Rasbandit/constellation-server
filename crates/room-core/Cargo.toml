@@ -11,10 +11,16 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# A room built from a v2 seed file (`seed` module). Off by default so the room stays no_std;
+# the server and the edge turn it on.
+seed = ["dep:seed-bundle"]
+
 [dependencies]
 bits = { path = "../bits" }
 config = { path = "../config", default-features = false }
 proto = { path = "../proto" }
+seed-bundle = { path = "../seed-bundle", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 
