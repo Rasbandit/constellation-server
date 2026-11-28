@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use world_build::front::{Dir, Mem, Options, format_text, write_generated};
-use world_build::{Built, build, build_model};
+use world_build::{Built, Severity, build, build_model};
 
 pub(crate) fn example() -> Dir {
     Dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tidewell"))
@@ -126,13 +126,20 @@ fn a_reserved_word_is_a_name_in_backticks() {
     fails(&world("item group progression"), &format!("world.rando:{}:6", line(1)), "reserved word");
 }
 
-/// `%` is a token for settings files (doc 20 section 2.1); a world file has no place for it,
-/// so the parser refuses it where it stands.
+/// `%` is a token only in settings files (doc 20 section 2.1): a world file refuses it in the
+/// lexer, with the same message and place as before it was a token, wherever it stands.
 #[test]
-fn a_percent_sign_in_a_world_is_a_syntax_error_at_its_place() {
-    let files = world("region a {\n  check x: count(k) >= 50%\n}");
-    fails(&files, &format!("world.rando:{}:26", line(2)), "`%`");
-    fails(&world("option o: range 0..9 = 5%"), &format!("world.rando:{}:25", line(1)), "`%`");
+fn a_percent_sign_in_a_world_is_the_same_lex_error_as_before() {
+    for (body, at) in [
+        ("region a {\n  check x: count(k) >= 50%\n}", (2, 26)),
+        ("option o: range 0..9 = 5%", (1, 25)),
+        ("item k2% progression", (1, 8)),
+    ] {
+        let all = build(&world(body), &Options::default()).unwrap_err();
+        let want = format!("world.rando:{}:{}: unexpected character `%`", line(at.0), at.1);
+        assert_eq!(all.iter().map(ToString::to_string).collect::<Vec<_>>(), [want], "{body}");
+        assert!(all.iter().all(|e| e.severity == Severity::Error));
+    }
 }
 
 /// A `-` before a number where a number is expected is part of it (a range's ends, a table

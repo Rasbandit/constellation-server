@@ -37,7 +37,7 @@ pub fn help<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>, help:
 }
 
 /// Levenshtein distance over characters.
-fn distance(a: &str, b: &str) -> usize {
+pub fn distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {

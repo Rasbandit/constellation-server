@@ -63,13 +63,8 @@ impl Errs {
     /// An error or warning about the whole of `file`, a file that is not a `.rando` module.
     pub(crate) fn in_file(&mut self, file: &str, msg: impl Into<String>, help: &str, warn: bool) {
         let help = (!help.is_empty()).then(|| help.to_owned());
-        let mut e = Error::new(file.to_owned(), None, msg.into(), help);
-        if warn {
-            e.severity = Severity::Warning;
-            self.warnings.push(e);
-        } else {
-            self.errors.push(e);
-        }
+        let e = Error::new(file.to_owned(), None, msg.into(), help);
+        if warn { self.warnings.push(e) } else { self.errors.push(e) }
     }
 
     fn push(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
@@ -99,8 +94,7 @@ impl Errs {
             return;
         }
         if self.warnings.len() < config::WORLD_BUILD_MAX_ERRORS {
-            let mut e = self.make(pos, msg, help);
-            e.severity = Severity::Warning;
+            let e = self.make(pos, msg, help);
             self.warnings.push(e);
         } else {
             self.dropped_warnings += 1;
@@ -110,10 +104,13 @@ impl Errs {
     /// The warnings, and one more line for what the cap dropped.
     pub(crate) fn warnings_list(mut self) -> Vec<Error> {
         if self.dropped_warnings > 0 {
-            let mut e =
+            let e =
                 self.make(None, format!("{} more warnings not shown", self.dropped_warnings), "");
-            e.severity = Severity::Warning;
             self.warnings.push(e);
+        }
+        // Every warning leaves through here, so this is the one place they are marked.
+        for e in &mut self.warnings {
+            e.severity = Severity::Warning;
         }
         self.warnings
     }

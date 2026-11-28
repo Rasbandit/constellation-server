@@ -70,8 +70,8 @@ pub enum Tok {
     Plus,
     Minus,
     Star,
-    /// `%`, after a chance in a settings file (design doc 20 section 2.1). A world file has no
-    /// place for it, so its parser refuses it.
+    /// `%`, after a chance in a settings file (design doc 20 section 2.1). In a world file it
+    /// is not a token: the lexer refuses it.
     Percent,
 }
 
@@ -173,7 +173,11 @@ pub fn lex(src: &str, base: Pos, kind: Kind) -> Result<(Vec<Token>, Vec<Comment>
             continue;
         }
         if c == '#' {
-            let end = chars[i..].iter().position(|x| *x == '\n').map_or(chars.len(), |p| i + p);
+            let mut end = chars[i..].iter().position(|x| *x == '\n').map_or(chars.len(), |p| i + p);
+            // A CRLF line's `\r` belongs to the line end, not the comment.
+            if end > i && chars[end - 1] == '\r' {
+                end -= 1;
+            }
             let text: String = chars[i..end].iter().collect();
             let (off, size) = span(i, end);
             comments.push(Comment { text, pos: at, before: toks.len(), own_line: nl, off, size });
@@ -181,11 +185,13 @@ pub fn lex(src: &str, base: Pos, kind: Kind) -> Result<(Vec<Token>, Vec<Comment>
             (i, glued) = (end, false);
             continue;
         }
-        let operand_before = match toks.last().map(|t| &t.t) {
-            Some(Tok::Kw(k)) => matches!(*k, "true" | "false"),
-            Some(Tok::Name(_) | Tok::Int(_) | Tok::Close | Tok::RBrack | Tok::RBrace) => true,
-            _ => false,
-        };
+        // A settings file has no subtraction: `-` before a digit is always a negative number.
+        let operand_before = kind == Kind::World
+            && match toks.last().map(|t| &t.t) {
+                Some(Tok::Kw(k)) => matches!(*k, "true" | "false"),
+                Some(Tok::Name(_) | Tok::Int(_) | Tok::Close | Tok::RBrack | Tok::RBrace) => true,
+                _ => false,
+            };
         let next = chars.get(i + 1).copied();
         let (t, len) = match c {
             '(' => (Tok::Open, 1),
@@ -199,7 +205,7 @@ pub fn lex(src: &str, base: Pos, kind: Kind) -> Result<(Vec<Token>, Vec<Comment>
             '/' => (Tok::Slash, 1),
             '+' => (Tok::Plus, 1),
             '*' => (Tok::Star, 1),
-            '%' => (Tok::Percent, 1),
+            '%' if kind == Kind::Settings => (Tok::Percent, 1),
             '.' if next == Some('.') => (Tok::DotDot, 2),
             '=' if next == Some('>') => (Tok::Arrow, 2),
             '=' if next == Some('=') => (Tok::Cmp(Cmp::Eq), 2),
@@ -370,9 +376,33 @@ mod tests {
         for c in &comments {
             assert_eq!(&src[c.off..c.off + c.size], c.text, "{c:?}");
         }
-        assert!(comments[0].text.starts_with("# caf\u{e9}"));
+        assert_eq!(comments[0].text, "# caf\u{e9}");
+        assert_eq!(comments[1].text, "# end");
+        let (_, c) = lex("#c\r\n", Pos::new(1, 1), Kind::World).unwrap();
+        assert_eq!((c[0].text.as_str(), c[0].size), ("#c", 2));
         assert_eq!(comments[1].pos, Pos::new(3, 1));
         assert_eq!(toks[3].pos, Pos::new(2, 3));
+    }
+
+    /// A settings file has no subtraction, so `-` before a digit is always a negative number
+    /// (doc 20 section 2.2: `INT = [ "-" ] DIGITS`), even after a name such as `to`.
+    #[test]
+    fn a_settings_minus_before_a_digit_is_a_negative_number() {
+        assert_eq!(
+            settings("some_of(1 to -3) x -2"),
+            [
+                Tok::Name("some_of".into()),
+                Tok::Open,
+                Tok::Int(1),
+                Tok::Name("to".into()),
+                Tok::Int(-3),
+                Tok::Close,
+                Tok::Name("x".into()),
+                Tok::Int(-2)
+            ]
+        );
+        assert_eq!(settings("k -= 3"), [Tok::Name("k".into()), Tok::Minus, Tok::Eq, Tok::Int(3)]);
+        assert_eq!(kinds("x -2")[1], Tok::Minus);
     }
 
     #[test]
@@ -388,7 +418,9 @@ mod tests {
                 Tok::Close
             ]
         );
-        assert_eq!(kinds("50%"), [Tok::Int(50), Tok::Percent]);
+        // A world file keeps the error it had before `%` was a token.
+        let e = lex("a\n k2% b", Pos::new(1, 1), Kind::World).unwrap_err();
+        assert_eq!(e, (Pos::new(2, 4), "unexpected character `%`".into()));
         assert_eq!(show(&Tok::Percent), "`%`");
         let (t, _) = lex("k += [a]\nk -= [b]", Pos::new(1, 1), Kind::Settings).unwrap();
         assert_eq!((&t[1].t, &t[2].t, t[2].glued), (&Tok::Plus, &Tok::Eq, true));
