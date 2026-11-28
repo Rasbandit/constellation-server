@@ -10,7 +10,7 @@ Conventions it shows:
 - **Objectives are the checks.** Each mission has a victory, a bonus and a mastery objective, written once in a family over the mission table. Finales have a victory, a feat named in their row, and a no-losses objective.
 - **Three kinds of items.** Coordinates open a planet's missions, unit items unlock a unit type, upgrade copies add research tiers (2 targeting tiers, 4 plating tiers).
 - **Army strength as a weighted sum.** `def army(n)` adds the units with weights 1 to 6 plus one per upgrade tier, and a mission's victory asks for `army(m.power)`. The first two missions ask for 0, which folds to `true`; the rest ask for 3 to 18.
-- **Campaign subsets.** `chapters` cuts the campaign short and `side_ops` drops the optional missions. Both reach the missions through one def, `in_campaign(chapter, side)`, that reads options only, used as each family's `where`.
+- **Campaign subsets.** `chapters` cuts the campaign short and `side_ops` drops the optional missions. Both reach the missions through one def, `in_campaign(chapter, side)`, that reads options only, used as the mission and finale families' `where`. The war room's exits into a mission left out go with it, so they need no filter of their own.
 - **Campaign order.** `campaign_order` is `tree` or `open` (any mission of a reached planet), through `opt.campaign_order == open or ...` on each exit.
 - **A goal counted over chapters**: each finale fires `chapter_won`, and the goal is `counter(chapter_won) >= opt.chapters`.
 
@@ -21,5 +21,3 @@ What the language cannot express yet (listed on server issue 226):
 - **A shuffled mission order that an option turns on.** Dealing missions to the tree's slots each seed is an exit shuffle, but a shuffle cannot have a `when`, so it could not be an option. `campaign_order` offers the tree or an open order instead.
 - **A campaign subset drawn per seed** (`pick n from mission`). Subsets here are fixed by options.
 - **A weighted sum as a named number** (`score`). `army(n)` works as a def with arithmetic, but a def is always a rule, so the sum cannot be named once and compared in different ways, and `fmt` writes the sum on one long line: it breaks rules at `and` and `or` only.
-
-One friction worth knowing: an exit into a mission that an option removes still has its rule checked against the events of other removed missions, so the war room's exit families repeat the region families' `where` (`in_campaign`). Without it, `check` reports each such exit. This is under review as a possible checker bug.

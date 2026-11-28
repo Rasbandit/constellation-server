@@ -5,11 +5,11 @@ use campaign
 use finales
 
 region war_room {
-  # Each family repeats its regions' `where`: see the README.
-  for m in mission where in_campaign(m.chapter, m.side) {
+  # An exit into a mission an option leaves out goes with it.
+  for m in mission {
     exit {m.key}: has({m.planet}_coordinates) and (opt.campaign_order == open or m.after)
   }
-  for f in finale where in_campaign(f.chapter, false) {
+  for f in finale {
     exit {f.key}: has({f.planet}_coordinates) and (opt.campaign_order == open or f.after)
   }
 }
