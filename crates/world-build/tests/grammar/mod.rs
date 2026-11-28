@@ -522,6 +522,19 @@ mod review {
         ));
     }
 
+    /// A rule that the setting's options close anyway is the author's logic, not a dangling
+    /// read (delta check on 922acd2).
+    #[test]
+    fn an_optional_event_behind_its_own_option_is_not_an_error() {
+        ok(&world(
+            &format!(
+                "{OPTIONAL}\nregion d {{\n  check d1\n  exit a\n  exit c: opt.vault and lever\n}}"
+            )
+            .replace("  exit b\n}\nregion b", "  exit b\n  exit d\n}\nregion b")
+            .replace("  check c1\n", "  check c1\n  event lever: true\n"),
+        ));
+    }
+
     /// A shuffle may not move an exit into a removed region, whatever names it (a group here),
     /// though the exit itself may have a group.
     #[test]

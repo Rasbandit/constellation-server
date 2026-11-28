@@ -134,8 +134,11 @@ pub(crate) fn check(
             .filter(|(_, rs)| !rs.iter().any(|q| on.contains(q)))
             .map(|(e, _)| *e)
             .collect();
+        let none = HashSet::new();
+        let all_on: HashSet<&str> = m.regions.iter().map(|r| r.0).collect();
         let gone = Gone { events: &gone_events, on: &on, regions: &pos_of, defs };
-        let mut memo: HashMap<&str, bool> = HashMap::new();
+        let whole = Gone { events: &none, on: &all_on, regions: &pos_of, defs };
+        let (mut memo, mut whole_memo) = (HashMap::new(), HashMap::new());
         for ((pos, region, when, rule), r) in m.sites.iter().zip(&site_reads) {
             if region.is_some_and(|q| !on.contains(q)) || !ev.rule(when).unwrap_or(true) {
                 continue;
@@ -149,7 +152,11 @@ pub(crate) fn check(
                 .collect();
             // Only a read the rule cannot do without dangles: one alternative of an `or` may be
             // gone while another still holds.
-            if (dead_events.is_empty() && dead_regions.is_empty()) || gone.possible(rule, &mut memo)
+            // What the options of this setting close anyway is the author's logic, not a
+            // dangling read: only a rule that could hold but for what is gone is reported.
+            if (dead_events.is_empty() && dead_regions.is_empty())
+                || gone.possible(rule, &mut ev, &mut memo)
+                || !whole.possible(rule, &mut ev, &mut whole_memo)
             {
                 continue;
             }
@@ -190,13 +197,18 @@ struct Gone<'g> {
 }
 
 impl<'g> Gone<'g> {
-    /// Whether a lowered rule can still hold with what is gone false and everything else
-    /// granted: an `or` needs one part that can, an `and` every part.
-    fn possible(&self, v: &'g Value, memo: &mut HashMap<&'g str, bool>) -> bool {
+    /// Whether a lowered rule can still hold with what is gone false, what reads options only
+    /// as this setting has it (`ev`), and everything else granted: an `or` needs one part that
+    /// can, an `and` every part.
+    fn possible(&self, v: &'g Value, ev: &mut Ev<'g>, memo: &mut HashMap<&'g str, bool>) -> bool {
+        // Options only: its value this setting (`None` when it reads more than options).
+        if let Some(b) = ev.rule(v) {
+            return b;
+        }
         let Some((k, a)) = v.as_object().and_then(|o| o.iter().next()) else { return true };
         match k.as_str() {
-            "all" => a.as_array().into_iter().flatten().all(|x| self.possible(x, memo)),
-            "any" => a.as_array().into_iter().flatten().any(|x| self.possible(x, memo)),
+            "all" => a.as_array().into_iter().flatten().all(|x| self.possible(x, ev, memo)),
+            "any" => a.as_array().into_iter().flatten().any(|x| self.possible(x, ev, memo)),
             "ref" => {
                 let Some(d) = a.as_str() else { return true };
                 if let Some(b) = memo.get(d) {
@@ -204,7 +216,7 @@ impl<'g> Gone<'g> {
                 }
                 // A cycle is the lowering's error; it counts as possible here.
                 memo.insert(d, true);
-                let b = self.defs.get(d).is_none_or(|body| self.possible(body, memo));
+                let b = self.defs.get(d).is_none_or(|body| self.possible(body, ev, memo));
                 memo.insert(d, b);
                 b
             }

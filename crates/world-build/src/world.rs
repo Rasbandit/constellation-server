@@ -886,6 +886,14 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             };
             if when != truth() || to_when != truth() {
                 optional_exits.insert(key.clone());
+                // A door pairs exits for the engine whether a shuffle moves them or not.
+                if let Some(d) = &x.door {
+                    lw.errs().err(
+                        d.pos,
+                        "an exit into or out of a region with a `when` cannot have a `door` yet",
+                        "a shuffle that changes with the options is not in the engine's first slice; keep the region, and put the `when` on its checks",
+                    );
+                }
             }
             for (field, v) in [("door", &x.door), ("group", &x.group)] {
                 if let Some(v) = v {
