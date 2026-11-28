@@ -5,6 +5,7 @@ mod grammar;
 mod lang;
 mod pack;
 mod seeds;
+mod settings;
 mod support;
 mod trials;
 

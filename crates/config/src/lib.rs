@@ -234,6 +234,66 @@ pub struct Limits {
     /// Largest `settings.json` in a world package, bytes (doc 20 section 5, a design value,
     /// not derived: it repeats the manifest's names and adds labels).
     pub package_max_settings_bytes: usize,
+    /// Largest settings file (`.randoset`), bytes (doc 20 section 7.1, design value), checked
+    /// before it is lexed.
+    pub settings_max_bytes: usize,
+    /// Most statements in one settings file, block lines included (doc 20 7.1, design value).
+    pub settings_max_statements: usize,
+    /// Most entries in one list, and in one argument list of `one_of`, `chance` and `some_of`
+    /// (doc 20 7.1, design value).
+    pub settings_max_list_entries: usize,
+    /// Most item copies one settings file names, summed over every `x` count (doc 20 7.1,
+    /// design value).
+    pub settings_max_total_copies: u64,
+    /// Most names one settings file reaches after expanding groups, counted while expanding
+    /// (doc 20 7.1, design value).
+    pub settings_max_expanded_names: usize,
+    /// Most `place`, `connect` and `pin` lines in one settings file (doc 20 7.1, design value).
+    pub settings_max_placements: usize,
+    /// Most `when` and `with` blocks in one settings file (doc 20 7.1, design value).
+    pub settings_max_blocks: usize,
+    /// Most conditions on one `when` (doc 20 7.1, design value).
+    pub settings_max_conditions: usize,
+    /// Most value combinations the `requires` walk over surprises tries before leaving it to
+    /// generation (doc 20 sections 2.10 and 7.1, design value).
+    pub settings_max_combinations: u64,
+    /// Most comments in one settings file (doc 20 7.1, design value).
+    pub settings_max_comments: usize,
+    /// Longest name in a settings file, bytes (doc 20 7.1, design value).
+    pub settings_max_name_bytes: usize,
+    /// Longest string in a settings file, bytes; a `text` option may set less (doc 20 7.1).
+    pub settings_max_string_bytes: usize,
+    /// Smallest integer a settings file may write (doc 20 7.1: a 32-bit integer).
+    pub settings_int_min: i64,
+    /// Largest integer a settings file may write (doc 20 7.1: a 32-bit integer).
+    pub settings_int_max: i64,
+    /// Largest `x` count (doc 20 7.1, design value); the smallest is 1.
+    pub settings_max_copies: i64,
+    /// Most edits in one `set_options` frame (doc 20 7.1, design value).
+    pub settings_max_edits_per_frame: usize,
+    /// Longest value text of one edit, bytes (doc 20 7.1, design value).
+    pub settings_max_value_bytes: usize,
+    /// Longest `rules` field of `set_options`, and one rule given to `add_rule` or `set_rule`,
+    /// bytes (doc 20 7.1, design value).
+    pub settings_max_rules_bytes: usize,
+    /// `set_options` frames one seat may send a second, steady (doc 20 7.1, design value).
+    pub settings_writes_per_sec: u32,
+    /// `set_options` frames one seat may send in a burst (doc 20 7.1, design value).
+    pub settings_writes_burst: u32,
+    /// Cosmetic writes during play are stored at most once per this many seconds per seat,
+    /// coalesced (doc 20 7.1, design value).
+    pub settings_cosmetic_persist_secs: u64,
+    /// Most presets taking part in one settings file's layering, counted across lines and
+    /// chains (doc 20 section 2.6, doc 15 section 2.6's design value).
+    pub settings_max_presets: usize,
+    /// Deepest nesting of values in a settings file, checked by the parser before it recurses
+    /// (doc 20 section 2.2: a surprise holds `any` or `between` one level down, and a record's
+    /// field holds a list; nothing deeper), so a deep file is refused, never a stack overflow.
+    pub settings_max_depth: usize,
+    /// Longest player name, Unicode scalar values (doc 20 7.1, design value).
+    pub settings_player_max_chars: usize,
+    /// Longest player name, bytes (doc 20 7.1, design value).
+    pub settings_player_max_bytes: usize,
     /// Bytes of manifests the server keeps in memory for generation (least recently used go
     /// first); the database holds every one (design value).
     pub manifest_cache_bytes: usize,
@@ -657,6 +717,31 @@ impl Limits {
         package_max_entries: 512,
         package_max_path_bytes: 255,
         package_max_settings_bytes: 4 * 1024 * 1024,
+        settings_max_bytes: 64 * 1024,
+        settings_max_statements: 2000,
+        settings_max_list_entries: 1000,
+        settings_max_total_copies: 20_000,
+        settings_max_expanded_names: 50_000,
+        settings_max_placements: 256,
+        settings_max_blocks: 64,
+        settings_max_conditions: 8,
+        settings_max_combinations: 4096,
+        settings_max_comments: 1000,
+        settings_max_name_bytes: 64,
+        settings_max_string_bytes: 1024,
+        settings_int_min: -(1 << 31),
+        settings_int_max: (1 << 31) - 1,
+        settings_max_copies: 65_535,
+        settings_max_edits_per_frame: 64,
+        settings_max_value_bytes: 4 * 1024,
+        settings_max_rules_bytes: 32 * 1024,
+        settings_writes_per_sec: 10,
+        settings_writes_burst: 20,
+        settings_cosmetic_persist_secs: 5,
+        settings_max_presets: 2,
+        settings_max_depth: 2,
+        settings_player_max_chars: 64,
+        settings_player_max_bytes: 256,
         manifest_cache_bytes: 64 * 1024 * 1024,
         list_page_max: 200,
         catalogue_name_max_bytes: 100,
@@ -1320,6 +1405,26 @@ mod tests {
             let e = Limits { fill_worker_recycle_percent: percent, ..l }.check().unwrap_err();
             assert!(e.contains("fill_worker_recycle_percent"), "{e}");
         }
+    }
+
+    #[test]
+    fn settings_language_caps_are_doc_20_design_values() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.settings_max_bytes, l.settings_max_statements), (64 << 10, 2000));
+        assert_eq!((l.settings_max_list_entries, l.settings_max_total_copies), (1000, 20_000));
+        assert_eq!((l.settings_max_expanded_names, l.settings_max_placements), (50_000, 256));
+        assert_eq!((l.settings_max_blocks, l.settings_max_conditions), (64, 8));
+        assert_eq!((l.settings_max_combinations, l.settings_max_comments), (4096, 1000));
+        assert_eq!((l.settings_max_name_bytes, l.settings_max_string_bytes), (64, 1024));
+        assert_eq!((l.settings_int_min, l.settings_int_max), (-(1 << 31), (1 << 31) - 1));
+        assert_eq!(l.settings_max_copies, 65_535);
+        assert_eq!((l.settings_max_edits_per_frame, l.settings_max_value_bytes), (64, 4096));
+        assert_eq!(l.settings_max_rules_bytes, 32 << 10);
+        assert_eq!((l.settings_writes_per_sec, l.settings_writes_burst), (10, 20));
+        assert_eq!(l.settings_cosmetic_persist_secs, 5);
+        assert_eq!(l.settings_max_presets, 2);
+        assert_eq!(l.settings_max_depth, 2);
+        assert_eq!((l.settings_player_max_chars, l.settings_player_max_bytes), (64, 256));
     }
 
     #[test]

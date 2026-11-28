@@ -166,6 +166,22 @@ An option takes, after its type and each optional, in this order (doc 18 section
 
 `Built::settings_schema()` writes the settings schema (design doc 20 section 5) as canonical JSON, and `rando pack` puts it in the package as `settings.json`: `format` (`schema/1`), `world` and `version` (from `rando.toml`, which it needs), `options` in declaration order (each with `key`, `kind`, a choice's `values` or a range's `min` and `max`, `default` as a toggle's `true`/`false`, a choice's value name or a range's number, `scope`, and `label` when written: a string key, `opt.<key>.label`), `strings` (each string key's text by language, `en` for now), the sorted `items` as `{name, copies}` objects (without the engine's own `nothing`; `filler: true` for an item in `pool fill`; no `copies` when they read options or when the item is only in the fill, whose weights decide its count), `places` (the check names) and `doors` (the door names of shuffled exits), each as `{name}` objects, so every list entry can grow. A reader of `schema/1` ignores keys it does not know, so a key added later stays `schema/1`; a key whose meaning changes makes `schema/2`. The settings checker reads this file instead of the world, so the web screen never runs the world compiler. Cinderfall's schema is pinned in `crates/world-build/tests/golden/cinderfall.settings.json`. Option renames (`was`) are not part of it: a world changes options by releasing a new version.
 
+## Settings files (`.randoset`, `crates/rando-settings`)
+
+The settings language of design doc 20, in its own `no_std` crate (builds for `wasm32v1-none`, no IO, no unsafe), so the web screen and the client SDK can embed it without the world compiler:
+
+```sh
+cargo run -p world-build --bin rando -- check mira.randoset [--world <dir or .randopack>]
+cargo run -p world-build --bin rando -- settings json mira.randoset [--world <dir or .randopack>]
+cargo run -p world-build --bin rando -- fmt <dir> [--check]
+```
+
+- `check` parses the file, finds its world (doc 20 section 5: `--world`, then the header's `from "path"` relative to the file, then the nearest folder above with a `rando.toml`; the cache and registry are not built), reads the schema (a folder is built in memory; a package gives its `settings.json`), layers the file with its presets (`presets/NAME.randoset` in the world's folder, or `source/presets/` in a package) and prints every error as `file:line:col: message` with `help:`, each with its doc 20 section 7.1 key in the library.
+- `settings json` prints the canonical JSON (doc 20 section 6) on one line and the settings hash on the next.
+- `fmt` formats `.randoset` files beside `.rando` files (doc 20 section 2.9).
+- The modules: `ast` (parser, a tree with byte spans; one value from untrusted text), `schema` (`settings.json` plus the common vocabulary of doc 15 section 4), `check` (one file against the schema, values into canonical form), `canon` (layering, the checks across layers, canonical JSON, the hash), `fmt` (formatter and a preset's token hash) and `edit` (`set` and `reset` by byte span). Every cap of doc 20 section 7.1 is a field of `config::Limits`.
+- Not built here (later steps of doc 20 section 16.1): surprise resolution and `rando settings roll` and `generate --settings` (step 8, with `spec-rng` sub-streams, step 3), community presets from the registry (step 9), room files (`room settings` is refused with `settings.header`; steps 12 and 13), the settings string (step 17), the SDK API (step 10's `sdk-*` part), the language server (step 15) and the importer (step 18). The `requires` walk over surprise combinations waits for `requires` in `settings.json`.
+
 ## What the manifest cannot express (gaps)
 
 - `format`, the display name, option labels and scopes and other player-facing texts, and `requires` (labels and scopes are in `settings.json`). The manifest has no header fields beyond `game` and `version`.

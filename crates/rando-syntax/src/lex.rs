@@ -288,6 +288,16 @@ pub fn lex(src: &str, base: Pos, kind: Kind) -> Result<(Vec<Token>, Vec<Comment>
                 if chars.get(end) == Some(&'.') && chars.get(end + 1) != Some(&'.') {
                     return Err((at, format!("`{word}.` is not a name")));
                 }
+                if kind == Kind::Settings
+                    && word.bytes().any(|b| b.is_ascii_uppercase() || b == b'.')
+                {
+                    return Err((
+                        at,
+                        format!(
+                            "`{word}` is not a name: a settings file writes names in lowercase letters, digits and `_`"
+                        ),
+                    ));
+                }
                 let kw = if kind == Kind::World { keyword(&word) } else { None };
                 (kw.map_or(Tok::Name(word), Tok::Kw), end - i)
             }
@@ -403,6 +413,14 @@ mod tests {
         );
         assert_eq!(settings("k -= 3"), [Tok::Name("k".into()), Tok::Minus, Tok::Eq, Tok::Int(3)]);
         assert_eq!(kinds("x -2")[1], Tok::Minus);
+    }
+
+    #[test]
+    fn a_settings_name_is_lowercase_without_dots() {
+        for bad in ["Goal", "goal.x", "gOal"] {
+            assert!(lex(bad, Pos::new(1, 1), Kind::Settings).is_err(), "{bad}");
+            assert!(lex(bad, Pos::new(1, 1), Kind::World).is_ok(), "{bad}");
+        }
     }
 
     #[test]
