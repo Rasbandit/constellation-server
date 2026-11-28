@@ -149,7 +149,7 @@ fn an_overlay_on_a_base_that_did_not_parse_is_not_a_missing_target() {
 #[test]
 fn a_check_declared_in_several_regions_is_one_location() {
     let b = ok(&world(
-        "item lamp progression\nregion a {\n  check drop: has(lamp)\n  check torch\n  exit b\n}\nregion b {\n  check drop vanilla k\n  exit a\n}",
+        "item lamp progression\nregion a {\n  check drop: has(lamp)\n  check torch\n  exit b\n}\nregion b {\n  check drop also vanilla k\n  exit a\n}",
     ));
     let locs: Vec<&str> = b.manifest["locations"]
         .as_array()
@@ -180,9 +180,9 @@ fn a_check_declared_in_several_regions_is_one_location() {
 fn a_check_in_several_regions_gives_each_modifier_once() {
     fails(
         &world(
-            "region a {\n  check drop vanilla k\n  exit b\n}\nregion b {\n  check drop vanilla junk\n  exit a\n}",
+            "region a {\n  check drop vanilla k\n  exit b\n}\nregion b {\n  check drop also vanilla junk\n  exit a\n}",
         ),
-        &format!("world.rando:{}:22", line(6)),
+        &format!("world.rando:{}:27", line(6)),
         "`vanilla` of check `drop` is also given in region `a`",
     );
     fails(
@@ -475,7 +475,7 @@ mod review {
     #[test]
     fn a_check_site_in_a_removed_region_gives_nothing() {
         let b = ok(&world(
-            "option vault: toggle = off\nregion a {\n  check drop: has(k)\n  check a1\n  exit b\n}\nregion b when opt.vault {\n  check drop\n  exit a\n}",
+            "option vault: toggle = off\nregion a {\n  check drop: has(k)\n  check a1\n  exit b\n}\nregion b when opt.vault {\n  check drop also\n  exit a\n}",
         ));
         let site = &region(&b, "b")["checks"][0];
         assert_eq!(site["rule"], serde_json::json!({"ne": [{"opt": "vault"}, 0]}), "{site}");
@@ -487,7 +487,7 @@ mod review {
     /// `key` and `was` of a check in several regions are given once and keep one id.
     #[test]
     fn key_and_was_of_a_check_in_several_regions() {
-        let two = "region a {\n  check drop KEY_A\n  exit b\n}\nregion b {\n  check drop KEY_B\n  exit a\n}";
+        let two = "region a {\n  check drop KEY_A\n  exit b\n}\nregion b {\n  check drop also KEY_B\n  exit a\n}";
         let ledger = |b: &world_build::Built| -> serde_json::Value {
             serde_json::from_str(b.ledger.as_ref().unwrap()).unwrap()
         };
@@ -583,5 +583,59 @@ mod review {
         let one = world_build::front::stamp(body, "x 1", &[], &[], &folder).unwrap();
         let noted = one.replacen("  tool", "  # a note\n  tool", 1);
         assert_eq!(world_build::front::stamp(&noted, "x 1", &[], &[], &folder).unwrap(), one);
+    }
+}
+
+/// A repeat of a check in another region is marked `also` (owner decision on PR 228), so a
+/// copied name is never merged by accident: exactly one declaration has no `also`.
+mod also {
+    use super::*;
+
+    #[test]
+    fn a_repeat_without_also_is_an_error_naming_both_places() {
+        fails(
+            &world(
+                "region a {\n  check drop\n  exit b\n}\nregion b {\n  check drop: has(k)\n  exit a\n}",
+            ),
+            &format!("world.rando:{}:9", line(6)),
+            &format!("check `drop` is already declared in region `a` (world.rando:{}:9)", line(2)),
+        );
+    }
+
+    #[test]
+    fn a_repeat_marked_also_merges() {
+        let b = ok(&world(
+            "region a {\n  check drop\n  exit b\n}\nregion b {\n  check drop also: has(k)\n  exit a\n}",
+        ));
+        assert_eq!(b.manifest["locations"].as_array().unwrap().len(), 1);
+        assert_eq!(region(&b, "b")["checks"][0]["rule"], serde_json::json!({"has": "k"}));
+    }
+
+    #[test]
+    fn also_on_the_only_declaration_is_an_error() {
+        fails(
+            &world("region a {\n  check drop also\n}"),
+            &format!("world.rando:{}:9", line(2)),
+            "check `drop` is marked `also`, and no other declaration of it lacks `also`",
+        );
+    }
+}
+
+/// `fmt` is stable around the width when it adds parentheses that close right after a part
+/// (`a or b and (c and d)`): a first pass measured the added `)` as part of the inner part and
+/// broke it, the second did not (found on the local real-scale world).
+#[test]
+fn fmt_is_stable_where_it_adds_parentheses_at_the_width() {
+    for n in 0..60 {
+        let pad = "x".repeat(n);
+        let src = format!(
+            "world t\nregion a {{\n  exit b: has(flute) and has(song_tide) and (has(flute_key_north_{pad}) and has(flute_key_west) and has(flute_key_east)) or (counter(cows_home) >= 1 and is_night)\n}}\n"
+        );
+        let once = world_build::front::format_text(&src, "w.rando").unwrap();
+        assert_eq!(
+            world_build::front::format_text(&once, "w.rando").unwrap(),
+            once,
+            "n = {n}\n{once}"
+        );
     }
 }

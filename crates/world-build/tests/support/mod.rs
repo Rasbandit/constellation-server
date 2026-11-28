@@ -52,6 +52,7 @@ impl F {
 
     pub fn check(&self, key: &str, rule: &str) -> Check {
         Check {
+            also: false,
             key: self.s(key),
             id: None,
             rule: self.r(rule),

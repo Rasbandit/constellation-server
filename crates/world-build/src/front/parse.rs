@@ -77,6 +77,8 @@ pub struct CheckD {
     pub placement: Option<At<String>>,
     pub key: Option<At<String>>,
     pub was: Option<At<String>>,
+    /// `also`: a repeat of a check another region declares.
+    pub also: bool,
 }
 
 /// An exit, as written.
@@ -964,6 +966,10 @@ impl P<'_> {
         match kw {
             "check" => {
                 let name = self.tname("the check's name")?;
+                let also = self.ctx("also");
+                if also {
+                    self.k += 1;
+                }
                 let rule = if self.peek() == Some(&Tok::Colon) {
                     self.k += 1;
                     Some(self.rule(depth)?)
@@ -980,6 +986,7 @@ impl P<'_> {
                     placement: None,
                     key: None,
                     was: None,
+                    also,
                 };
                 // Each modifier once: a second would silently replace the first.
                 let mut seen: Vec<&str> = Vec::new();

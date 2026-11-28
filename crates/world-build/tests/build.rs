@@ -661,6 +661,7 @@ fn many_generated_checks_build_quickly_and_keep_their_source_place() {
     let family = Pos::new(500, 3);
     let n = 20_000;
     w.regions[0].checks.extend((0..n).map(|k| world_build::model::Check {
+        also: false,
         key: At::new(format!("shelf_{k}"), family),
         id: None,
         rule: At::new(

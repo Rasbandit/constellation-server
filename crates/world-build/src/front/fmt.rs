@@ -64,15 +64,30 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
         wraps.values_mut().for_each(|v| v.sort_by_key(|w| w.2));
     }
     let mut wrap_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // Per token, the ends of the parentheses `fmt` adds that open at it.
+    let mut opens_at: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &(a, b) in &ast.layout.parens {
+        opens_at.entry(a).or_default().push(b);
+    }
     for i in from..=toks.len() {
         for (end, at, level) in wraps.get(&i).into_iter().flatten() {
             let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
             let mut len = 0;
             for k in i..(*end).min(toks.len()) {
                 let glue = ast.layout.glue.get(k).copied().unwrap_or(false);
-                len += text(&toks[k].t).chars().count() + open[k] + close[k];
+                len += text(&toks[k].t).chars().count();
                 len += usize::from(k > i && space(&toks[k - 1], &toks[k], glue));
             }
+            // Only the parentheses `fmt` adds inside the node: one it closes after the node
+            // is a token outside it once written, so counting it would break the node on
+            // the first pass and not the second.
+            let end = (*end).min(toks.len());
+            len += 2
+                * (i..end)
+                    .flat_map(|k| opens_at.get(&k).into_iter().flatten())
+                    .filter(|b| **b <= end)
+                    .count();
             if line + 1 + len > WIDTH {
                 for k in at.iter() {
                     wrap_at.insert(*k, depth + 1 + level);

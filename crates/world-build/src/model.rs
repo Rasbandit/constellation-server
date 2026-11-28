@@ -229,6 +229,9 @@ pub struct Check {
     pub no_progression: Option<RuleAt>,
     /// Its placement set.
     pub placement: Option<At<String>>,
+    /// A repeat of a check declared in another region (`also`): the same location, reachable
+    /// from this region too.
+    pub also: bool,
     /// Fields not carried.
     pub later: Vec<At<String>>,
 }

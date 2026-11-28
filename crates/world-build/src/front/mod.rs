@@ -1274,6 +1274,7 @@ impl X {
             holds,
             no_progression,
             placement: c.placement.clone(),
+            also: c.also,
             later: Vec::new(),
         })
     }
