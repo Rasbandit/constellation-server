@@ -90,13 +90,13 @@ The web UI is a Vite and React app in `web/`, served by the server binary on the
 
 Each person can start on day one without waiting for anyone:
 
-1. Lane A: #19 client matrix, then #20 and #21.
-2. Lane B: #12 schema and #13 cursors, then #14 and #15.
-3. Lane C: #27 validator, then #28 and #29.
+1. Lane A: #19 client matrix, then #21 (#20 is done).
+2. Lane B: #13 cursors (#12 schema is done), then #14 and #15.
+3. Lane C: #28 rule evaluator, then #29 (#27 validator is done).
 4. Lane D: #35 chaos run and #37 simulator, then #33 once approved, then #22, #23 or #31 wherever is behind.
 5. Lane E (if a fifth person joins): pick from the open `lane:web` issues.
 
-Cross-lane handoffs to watch: #17 needs lane A's test helpers (`crates/e2e`); #32 needs lane A's bundle loading (`seed-bundle`) unchanged; #20 and #13 both touch `room-core` and `runtime`, so agree on the command shape first in the issue.
+Cross-lane handoff to watch: #17 needs lane A's test helpers (`crates/e2e`).
 
 ## Findings
 
