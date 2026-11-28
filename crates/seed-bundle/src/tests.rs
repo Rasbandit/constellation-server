@@ -178,17 +178,13 @@ fn bundle_errors_display_which_check_failed() {
 }
 
 #[test]
-fn start_hints_and_the_hint_economy_reach_the_fresh_room() {
+fn start_hints_and_the_hint_economy_are_kept() {
     let mut v = good();
     // B's location 101 holds A's item 7; A asked for it at generation (a start hint).
     v["start_hints"] = json!([{"finding": 2, "location": 101, "status": 30}]);
     let (seed, _) = import_v1(v.to_string().as_bytes(), 1 << 26).unwrap();
-    let s = room_state(&Arc::new(seed)).unwrap();
-    let hints = s.hints_of(SlotNo(1));
-    assert_eq!(hints.len(), 1);
-    assert_eq!((hints[0].finding, hints[0].location, hints[0].status), (SlotNo(2), 101, 30));
-    assert_eq!(s.hint_rules(), room_core::HintRules { cost_pct: 10, check_points: 1 });
-    assert_eq!(s.head(), proto::Seq(0), "start hints are not log events");
+    assert_eq!(seed.start_hints().collect::<Vec<_>>(), [(SlotNo(2), 101, 30)]);
+    assert_eq!((seed.hint_cost(), seed.location_check_points()), (10, 1));
     assert_eq!(parse(&good()).unwrap().start_hints, [], "absent means none");
 }
 

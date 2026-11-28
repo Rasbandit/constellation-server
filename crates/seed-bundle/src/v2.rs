@@ -13,7 +13,7 @@ use crate::{BundleError, GameData, Mode, Placed, SeedBundle, ServerOptions, Slot
 use crate::{FORMAT, Version};
 use bits::{self, Packer};
 use proto::SlotNo;
-use room_core::{World, hint_status};
+use proto::hint_status;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ const HINTS: usize = 20;
 const HINT_SLOT: usize = 12;
 /// Bits of a start hint's status code: its position in [`STATUSES`].
 const STATUS_BITS: u8 = 3;
-/// Hint status values by code (`room_core::hint_status`).
+/// Hint status values by code (`proto::hint_status`).
 const STATUSES: [u8; 5] = [
     hint_status::UNSPECIFIED,
     hint_status::NO_PRIORITY,
@@ -813,16 +813,6 @@ impl Seed {
         self.r().u8(HEADER + 28)
     }
 
-    /// The room's hint economy: the one place it is read from a seed (the room and the edge
-    /// both use it).
-    #[must_use]
-    pub fn hint_rules(&self) -> room_core::HintRules {
-        room_core::HintRules {
-            cost_pct: self.hint_cost(),
-            check_points: self.location_check_points(),
-        }
-    }
-
     /// Hint points per checked location.
     #[must_use]
     pub fn location_check_points(&self) -> u32 {
@@ -881,6 +871,12 @@ impl Seed {
     /// Every slot number.
     pub fn slot_nos(&self) -> impl Iterator<Item = SlotNo> + '_ {
         self.ids.iter().copied()
+    }
+
+    /// Every slot number, strictly ascending, by position.
+    #[must_use]
+    pub fn slot_ids(&self) -> &[SlotNo] {
+        &self.ids
     }
 
     /// The (team, slot) a client may connect to with `name`.
@@ -1582,28 +1578,6 @@ impl<'a> SlotView<'a> {
 fn unreachable_package() -> &'static GamePackage {
     static EMPTY: std::sync::OnceLock<GamePackage> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| GamePackage::new([0; 32], "", &GameData::default()))
-}
-
-impl World for Seed {
-    fn slots(&self) -> &[SlotNo] {
-        &self.ids
-    }
-
-    fn placed(&self, pos: usize) -> usize {
-        self.slot_at(pos).map_or(0, |s| s.placed())
-    }
-
-    fn find(&self, pos: usize, location: i64) -> Option<usize> {
-        self.slot_at(pos)?.find(location)
-    }
-
-    fn target(&self, pos: usize, index: usize) -> Option<(usize, i64)> {
-        self.slot_at(pos)?.target(index)
-    }
-
-    fn location(&self, pos: usize, index: usize) -> Option<i64> {
-        self.slot_at(pos)?.location(index)
-    }
 }
 
 #[cfg(test)]

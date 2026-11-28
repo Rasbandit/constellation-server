@@ -263,7 +263,7 @@ pub fn parse_seed(
 /// # Errors
 /// When the bundle does not make a valid room.
 pub fn fresh_state(loaded: &Loaded) -> Result<RoomState, String> {
-    seed_bundle::room_state(&loaded.bundle).map_err(|e| e.to_string())
+    room_core::seed::room_state(&loaded.bundle).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]

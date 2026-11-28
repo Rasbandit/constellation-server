@@ -28,13 +28,17 @@ extern crate std;
 
 mod hint;
 mod kv;
+#[cfg(feature = "seed")]
+pub mod seed;
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use config::Limits;
 use core::fmt;
-pub use hint::{Hint, valid as valid_hint_status};
-pub use hint::{HintRefusal, HintRules, HintShown, Hinted, status as hint_status};
+pub use hint::Hint;
+pub use hint::{HintRefusal, HintRules, HintShown, Hinted};
+// Re-exported under the names the room used before they moved to the protocol crate.
 pub use kv::KvRefusal;
+pub use proto::hint_status::{self, valid as valid_hint_status};
 use proto::{Cid, Command, Event, EventKind, ItemSeq, KvWrite, Seq, SlotNo, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

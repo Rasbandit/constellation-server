@@ -17,10 +17,7 @@ config = { path = "../config", default-features = false }
 bits = { path = "../bits" }
 # Raw deflate for game packages and slot_data (already in the tree through yawc).
 flate2 = "1"
-# The blob key function (no store: the default features build only the trait and memory store).
-log = { path = "../log" }
 proto = { path = "../proto" }
-room-core = { path = "../room-core" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 # Content addresses and the file checksums (the same crate the server hashes bundles with).

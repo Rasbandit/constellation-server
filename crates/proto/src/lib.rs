@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod cwp;
+pub mod hint_status;
 
 mod error;
 mod ids;

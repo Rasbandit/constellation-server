@@ -17,7 +17,7 @@ fn seed(v: &Value) -> Arc<Seed> {
 }
 
 fn state_of(b: &Arc<Seed>) -> room_core::RoomState {
-    seed_bundle::room_state(b).unwrap()
+    room_core::seed::room_state(b).unwrap()
 }
 
 fn bundle(password: &Value) -> Arc<Seed> {

@@ -17,12 +17,10 @@ pub use package::GamePackage;
 pub use v2::{Seed, SlotView};
 
 use proto::SlotNo;
-use room_core::{CoreError, Placement, RoomState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 
 /// The bundle format this crate reads.
 pub const FORMAT: u32 = 1;
@@ -284,16 +282,6 @@ pub fn import_v1(bytes: &[u8], max_bytes: u64) -> Result<(Seed, Vec<Vec<u8>>), S
     Seed::from_v1(&bundle, &hash, max_bytes).map_err(|e| e.to_string())
 }
 
-/// A room's state before any event, on its seed: the placement, the hint economy and the
-/// start hints. The one place a room is built from a seed.
-///
-/// # Errors
-/// What room-core refuses (`Seed::open` rules most of it out).
-pub fn room_state(seed: &Arc<Seed>) -> Result<RoomState, CoreError> {
-    let world: Arc<dyn room_core::World> = Arc::clone(seed) as _;
-    RoomState::from_world(world)?.with_hints(seed.hint_rules(), seed.start_hints())
-}
-
 fn id_ok(id: i64) -> bool {
     (-MAX_ID..=MAX_ID).contains(&id)
 }
@@ -384,9 +372,10 @@ impl SeedBundle {
         self.slots.iter().find(|s| s.id == id)
     }
 
-    /// The placement table room-core runs on.
+    /// The placement table: per slot, location id to (receiving slot, item id). The map form
+    /// room-core calls `Placement`.
     #[must_use]
-    pub fn placement(&self) -> Placement {
+    pub fn placement(&self) -> BTreeMap<SlotNo, BTreeMap<i64, (SlotNo, i64)>> {
         self.slots
             .iter()
             .map(|s| {
@@ -536,7 +525,7 @@ impl SeedBundle {
                 h.finding,
                 h.location
             );
-            ensure!(room_core::valid_hint_status(h.status), "start hint has status {}", h.status);
+            ensure!(proto::hint_status::valid(h.status), "start hint has status {}", h.status);
         }
         for (name, (team, slot)) in &self.connect_names {
             ensure!(

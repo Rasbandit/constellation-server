@@ -539,8 +539,12 @@ pub fn inflate(bytes: &[u8], max: u64) -> Result<Vec<u8>, BundleError> {
     Ok(out)
 }
 
-/// The key of a package file: the blob store's content address (one function for both).
-pub use log::blob_key as key_of;
+/// The content address of a file: its SHA-256. The key of a package file, and the one
+/// definition the server's blob store keys every blob by (`log::blob_key`).
+#[must_use]
+pub fn key_of(bytes: &[u8]) -> Key {
+    Sha256::digest(bytes).into()
+}
 
 /// The game's name and data in a package file (its game section).
 ///
