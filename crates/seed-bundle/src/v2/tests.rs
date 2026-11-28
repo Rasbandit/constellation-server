@@ -1182,7 +1182,7 @@ fn a_repeated_slot_id_resolves_to_the_first_slot_of_that_id() {
 /// A receiver past 255 slots takes more than a byte: 300 slots, each sending to two others,
 /// round trip. The format's bound on slots is its 16-bit count in the header (`u16_of` in
 /// `encode_on`): 65,536 slots are refused there. (A room is capped far lower, at
-/// `config::ROOM_MAX_PLAYERS`, by the fill.)
+/// `rando_limits::ROOM_MAX_PLAYERS`, by the fill.)
 #[test]
 fn a_room_over_255_slots_round_trips_and_one_over_65535_is_refused() {
     let mut v: Value = serde_json::from_str(&wide(4, 300, 0)).unwrap();

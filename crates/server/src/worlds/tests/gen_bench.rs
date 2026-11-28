@@ -147,7 +147,7 @@ impl Room {
 
     /// A generation's fill request for these players on random stream `rng`.
     fn head(&self, rng: u64) -> Vec<u8> {
-        fill_head("bench", &self.files, (rng, Limits::DESIGN.bundle_max_bytes)).unwrap()
+        fill_head("bench", &self.files, (rng, Limits::DESIGN.format.bundle_max_bytes)).unwrap()
     }
 }
 

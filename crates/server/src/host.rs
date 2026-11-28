@@ -184,7 +184,7 @@ async fn export<S: LogStore + BlobStore>(
         let file = s.get(&key).await.map_err(|e| format!("a package: {e:?}"))?;
         files.insert(key, file.ok_or("a package the seed names is not in the store")?);
     }
-    let max = limits.bundle_max_bytes;
+    let max = limits.format.bundle_max_bytes;
     let decoded = tokio::task::spawn_blocking(move || {
         let fetch = |k: &BlobKey| {
             files.get(k).cloned().ok_or_else(|| seed_bundle::BundleError::Parse("unfetched".into()))
@@ -203,7 +203,8 @@ pub(crate) fn open_fetched(
     let fetch = |k: &BlobKey| {
         files.get(k).cloned().ok_or_else(|| seed_bundle::BundleError::Parse("unfetched".into()))
     };
-    let seed = Seed::read(seed, fetch, limits.bundle_max_bytes).map_err(|e| e.to_string())?;
+    let seed =
+        Seed::read(seed, fetch, limits.format.bundle_max_bytes).map_err(|e| e.to_string())?;
     Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages: Vec::new() })
 }
 

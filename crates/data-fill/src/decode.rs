@@ -137,7 +137,7 @@ fn i(w: &World, pc: usize) -> (Value, usize) {
             // Terms the compiler merges back into these members: a weight past the largest
             // literal in parts of at most that, and a lone member with a zero-weight twin (the
             // compiler makes a group of two terms or more).
-            let most = u32::try_from(config::RULE_WEIGHT_MAX).unwrap_or(u32::MAX);
+            let most = u32::try_from(rando_limits::RULE_WEIGHT_MAX).unwrap_or(u32::MAX);
             let mut args = vec![json!("+")];
             for (item, cap, weight) in w.group_members(usize::from(g)) {
                 let copies = match cap {

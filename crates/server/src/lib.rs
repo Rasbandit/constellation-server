@@ -212,14 +212,14 @@ pub struct Loaded {
 }
 
 /// Import a v1 bundle file (`--bundle`, the `--rooms` folder), refusing files over
-/// `limits.bundle_max_bytes`. Seeds and packages then live in the store, never in files.
+/// `limits.format.bundle_max_bytes`. Seeds and packages then live in the store, never in files.
 ///
 /// # Errors
 /// A message for an unreadable, oversized or invalid file.
 pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut bytes = Vec::new();
-    let cap = limits.bundle_max_bytes;
+    let cap = limits.format.bundle_max_bytes;
     file.take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -238,7 +238,7 @@ pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
     if seed_bundle::v2::is_v2(file) {
         return Err("a v2 seed file is not imported from disk; seeds live in the store".into());
     }
-    let (seed, packages) = seed_bundle::import_v1(file, limits.bundle_max_bytes)?;
+    let (seed, packages) = seed_bundle::import_v1(file, limits.format.bundle_max_bytes)?;
     Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages })
 }
 
@@ -988,7 +988,10 @@ mod tests {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
         assert!(load_bundle(&fixture, &Limits::DESIGN).is_ok());
-        let small = Limits { bundle_max_bytes: 10, ..Limits::DESIGN };
+        let small = Limits {
+            format: rando_limits::Limits { bundle_max_bytes: 10, ..rando_limits::Limits::DESIGN },
+            ..Limits::DESIGN
+        };
         assert!(load_bundle(&fixture, &small).unwrap_err().contains("larger than 10 bytes"));
         assert!(load_bundle(std::path::Path::new("/nonexistent/b.json"), &small).is_err());
     }
@@ -998,9 +1001,18 @@ mod tests {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/fixtures/two-slot.json");
         let len = std::fs::metadata(&fixture).unwrap().len();
-        let at = Limits { bundle_max_bytes: len, ..Limits::DESIGN };
+        let at = Limits {
+            format: rando_limits::Limits { bundle_max_bytes: len, ..rando_limits::Limits::DESIGN },
+            ..Limits::DESIGN
+        };
         assert!(load_bundle(&fixture, &at).is_ok(), "a file of exactly the cap is allowed");
-        let under = Limits { bundle_max_bytes: len - 1, ..Limits::DESIGN };
+        let under = Limits {
+            format: rando_limits::Limits {
+                bundle_max_bytes: len - 1,
+                ..rando_limits::Limits::DESIGN
+            },
+            ..Limits::DESIGN
+        };
         let e = load_bundle(&fixture, &under).unwrap_err();
         assert!(e.contains(&format!("larger than {} bytes", len - 1)), "{e}");
     }

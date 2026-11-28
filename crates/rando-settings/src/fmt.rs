@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use config::Limits;
+use rando_limits::Limits;
 use rando_syntax::lex::{Tok, Token};
 use rando_syntax::{Diagnostic, hex};
 use sha2::{Digest, Sha256};

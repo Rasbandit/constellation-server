@@ -82,7 +82,7 @@ impl Memo {
     /// An evaluation from the current root goes `deep` nodes down.
     fn reach(&mut self, deep: u32) -> R<()> {
         self.peak = self.peak.max(deep);
-        if deep > config::RULES_MAX_DEPTH {
+        if deep > rando_limits::RULES_MAX_DEPTH {
             return Err(bad("a rule nested too deep"));
         }
         Ok(())
@@ -553,14 +553,14 @@ impl World {
         let mut per: Vec<Vec<(u16, u16, u32)>> = vec![Vec::new(); self.counts[ITEMS]];
         // What merged terms can add up to (`section::merged`). It keeps every sum far inside
         // `i64`: under 2^31 per copy of an item, and copies are bounded by locations.
-        let total_max =
-            config::RULE_WEIGHT_MAX.unsigned_abs() * config::RULE_GROUP_MAX_MEMBERS as u64;
+        let total_max = rando_limits::RULE_WEIGHT_MAX.unsigned_abs()
+            * rando_limits::RULE_GROUP_MAX_MEMBERS as u64;
         for g in 0..n {
             let (a, z) = (self.at(starts, g) as usize, self.at(starts, g + 1) as usize);
             if a > z {
                 return Err(bad("item group lists are not ascending"));
             }
-            if z - a > config::RULE_GROUP_MAX_MEMBERS {
+            if z - a > rando_limits::RULE_GROUP_MAX_MEMBERS {
                 return Err(bad("item group has too many members"));
             }
             let mut total = 0u64;
@@ -716,7 +716,7 @@ impl World {
     }
 
     /// What the rule at `start` reads, through the defs it references. Runs on a checked
-    /// section: defs form a DAG and nest at most `config::RULES_MAX_DEPTH`, so this ends.
+    /// section: defs form a DAG and nest at most `rando_limits::RULES_MAX_DEPTH`, so this ends.
     fn reads(&self, start: usize, memo: &mut Memo, defs: &mut [Option<Reads>]) -> Reads {
         let code = self.code();
         let end = self.node_ok(code, start, memo, true).map_or(start, |x| x.0);

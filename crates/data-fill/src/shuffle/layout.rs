@@ -147,11 +147,11 @@ impl Layout {
                 }
             };
             steps += behind[d.behind].len();
-            if steps > config::SHUFFLE_MAX_BEHIND {
+            if steps > rando_limits::SHUFFLE_MAX_BEHIND {
                 return Err(format!(
                     "shuffles: the regions that reach a shuffled exit's region by exits that are \
                      not shuffled take more than {} steps to list",
-                    config::SHUFFLE_MAX_BEHIND
+                    rando_limits::SHUFFLE_MAX_BEHIND
                 ));
             }
             doors_at[d.behind] += 1;

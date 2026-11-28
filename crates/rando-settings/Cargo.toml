@@ -15,7 +15,7 @@ categories.workspace = true
 # `sdk-core` can embed it and it builds for WebAssembly. No engine and no world compiler.
 [dependencies]
 # The caps of doc 20 section 7.1 (`Limits`), without `std`.
-config = { path = "../config", default-features = false }
+rando-limits = { path = "../rando-limits" }
 # The lexer, `Pos`, the diagnostics type, "did you mean" and canonical JSON.
 rando-syntax = { path = "../rando-syntax" }
 # The `version "..."` requirement on the header, in Cargo's syntax (doc 20 section 2.8).

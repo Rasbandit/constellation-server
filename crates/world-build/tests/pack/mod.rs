@@ -173,9 +173,9 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
     use sha2::Digest;
     let root = packable("pack");
     let dir = world_build::front::Dir(root.clone());
-    let a = world_build::pack::pack(&dir, true, &config::Limits::DESIGN)
+    let a = world_build::pack::pack(&dir, true, &rando_limits::Limits::DESIGN)
         .unwrap_or_else(|e| panic!("{e:#?}"));
-    let b = world_build::pack::pack(&dir, true, &config::Limits::DESIGN).unwrap();
+    let b = world_build::pack::pack(&dir, true, &rando_limits::Limits::DESIGN).unwrap();
     assert_eq!(a.bytes, b.bytes, "two packs of one folder differ");
     assert_eq!(a.file_name, "tide-1.2.0.randopack");
     let e = entries(&a.bytes);
@@ -227,8 +227,9 @@ fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
     );
     assert_eq!(v["tool"], format!("rando {}", env!("CARGO_PKG_VERSION")));
     // Without the source, `source/` is left out.
-    let bare =
-        entries(&world_build::pack::pack(&dir, false, &config::Limits::DESIGN).unwrap().bytes);
+    let bare = entries(
+        &world_build::pack::pack(&dir, false, &rando_limits::Limits::DESIGN).unwrap().bytes,
+    );
     assert!(bare.keys().all(|k| !k.starts_with("source/")), "{:?}", bare.keys());
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -241,7 +242,7 @@ fn pack_refuses_missing_fields_bad_assets_and_oversized_files() {
     let root = packable("refuse");
     let dir = world_build::front::Dir(root.clone());
     let refused = |needle: &str| {
-        let e = world_build::pack::pack(&dir, true, &config::Limits::DESIGN)
+        let e = world_build::pack::pack(&dir, true, &rando_limits::Limits::DESIGN)
             .err()
             .unwrap_or_default()
             .join("\n");
@@ -254,7 +255,8 @@ fn pack_refuses_missing_fields_bad_assets_and_oversized_files() {
         .unwrap();
     refused("needs a LICENSE file");
     std::fs::write(root.join("LICENSE"), "All mine.\n").unwrap();
-    let e = entries(&world_build::pack::pack(&dir, true, &config::Limits::DESIGN).unwrap().bytes);
+    let e =
+        entries(&world_build::pack::pack(&dir, true, &rando_limits::Limits::DESIGN).unwrap().bytes);
     assert!(e.contains_key("assets/LICENSE"), "{:?}", e.keys());
     std::fs::write(root.join("rando.toml"), &toml).unwrap();
     std::fs::write(root.join("art/map.png"), b"GIF89a\x00\x01").unwrap();
@@ -317,7 +319,7 @@ fn pack_pins_time_mode_compression_and_the_source_filter() {
     let toml = std::fs::read_to_string(root.join("src/tide.rando")).unwrap();
     std::fs::write(root.join("src/tide.rando"), toml.replace("use more\n", "use more\nuse made\n"))
         .unwrap();
-    let limits = config::Limits::DESIGN;
+    let limits = rando_limits::Limits::DESIGN;
     let a = world_build::pack::pack(&dir, true, &limits).unwrap_or_else(|e| panic!("{e:#?}"));
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(&a.bytes)).unwrap();
     let mut names = Vec::new();
@@ -349,45 +351,51 @@ fn pack_pins_time_mode_compression_and_the_source_filter() {
 }
 
 /// The package caps refuse a pack that passes everything else: too many entries, a path too
-/// long, too much source, and a package too large. Each cap is `config::Limits`, set low here.
+/// long, too much source, and a package too large. Each cap is `rando_limits::Limits`, set low here.
 #[test]
 fn pack_refuses_past_the_package_caps() {
     let root = packable("caps");
     let dir = world_build::front::Dir(root.clone());
-    let d = config::Limits::DESIGN;
-    let refused = |l: config::Limits, needle: &str| {
+    let d = rando_limits::Limits::DESIGN;
+    let refused = |l: rando_limits::Limits, needle: &str| {
         let e = world_build::pack::pack(&dir, true, &l).err().unwrap_or_default().join("\n");
         assert!(e.contains(needle), "want {needle:?} in {e}");
     };
     assert!(world_build::pack::pack(&dir, true, &d).is_ok());
-    refused(config::Limits { package_max_entries: 10, ..d }, "more than 10 entries");
+    refused(rando_limits::Limits { package_max_entries: 10, ..d }, "more than 10 entries");
     refused(
-        config::Limits { package_max_path_bytes: 20, ..d },
+        rando_limits::Limits { package_max_path_bytes: 20, ..d },
         "source/src/tide.rando is a path over 20 bytes",
     );
-    refused(config::Limits { package_max_source_bytes: 100, ..d }, "the source is over 100 bytes");
     refused(
-        config::Limits { package_max_settings_bytes: 50, ..d },
+        rando_limits::Limits { package_max_source_bytes: 100, ..d },
+        "the source is over 100 bytes",
+    );
+    refused(
+        rando_limits::Limits { package_max_settings_bytes: 50, ..d },
         "settings.json is over 50 bytes",
     );
-    refused(config::Limits { package_max_bytes: 1000, ..d }, "the package is over 1000 bytes");
     refused(
-        config::Limits { world_assets_max_bytes: 20, ..d },
+        rando_limits::Limits { package_max_bytes: 1000, ..d },
+        "the package is over 1000 bytes",
+    );
+    refused(
+        rando_limits::Limits { world_assets_max_bytes: 20, ..d },
         "the assets are over 20 bytes in all",
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-/// `rando.toml`'s caps come from `config::Limits` too, and an asset listed twice is refused.
+/// `rando.toml`'s caps come from `rando_limits::Limits` too, and an asset listed twice is refused.
 #[test]
 fn rando_toml_caps_are_limits_and_a_repeated_asset_is_refused() {
-    let d = config::Limits::DESIGN;
-    let has = |toml: &str, l: &config::Limits, needle: &str| {
+    let d = rando_limits::Limits::DESIGN;
+    let has = |toml: &str, l: &rando_limits::Limits, needle: &str| {
         let e = world_build::meta::parse(toml, l).unwrap_err().join("\n");
         assert!(e.contains(needle), "want {needle:?} in {e}");
     };
     assert!(world_build::meta::parse(TOML, &d).is_ok());
-    has(TOML, &config::Limits { world_name_max_bytes: 3, ..d }, "`world.name`");
+    has(TOML, &rando_limits::Limits { world_name_max_bytes: 3, ..d }, "`world.name`");
     for name in ["_", "__", "_9", "a.b"] {
         has(
             &TOML.replace("name = \"tide\"", &format!("name = \"{name}\"")),
@@ -395,17 +403,17 @@ fn rando_toml_caps_are_limits_and_a_repeated_asset_is_refused() {
             "`world.name` is required",
         );
     }
-    has(TOML, &config::Limits { world_version_max_bytes: 3, ..d }, "`world.version`");
-    has(TOML, &config::Limits { world_authors_max: 0, ..d }, "`world.authors` takes 1 to 0");
-    has(TOML, &config::Limits { world_author_max_chars: 3, ..d }, "1 to 3 characters");
-    has(TOML, &config::Limits { world_description_max_chars: 3, ..d }, "1 to 3 characters");
-    has(TOML, &config::Limits { world_license_max_bytes: 2, ..d }, "`world.license`");
-    has(TOML, &config::Limits { world_toml_max_bytes: 10, ..d }, "is over 10 bytes");
+    has(TOML, &rando_limits::Limits { world_version_max_bytes: 3, ..d }, "`world.version`");
+    has(TOML, &rando_limits::Limits { world_authors_max: 0, ..d }, "`world.authors` takes 1 to 0");
+    has(TOML, &rando_limits::Limits { world_author_max_chars: 3, ..d }, "1 to 3 characters");
+    has(TOML, &rando_limits::Limits { world_description_max_chars: 3, ..d }, "1 to 3 characters");
+    has(TOML, &rando_limits::Limits { world_license_max_bytes: 2, ..d }, "`world.license`");
+    has(TOML, &rando_limits::Limits { world_toml_max_bytes: 10, ..d }, "is over 10 bytes");
     let url = format!("{TOML}homepage = \"https://example.com/a\"\n");
-    has(&url, &config::Limits { world_url_max_bytes: 10, ..d }, "at most 10 bytes");
+    has(&url, &rando_limits::Limits { world_url_max_bytes: 10, ..d }, "at most 10 bytes");
     let twice = format!("{TOML}\n[assets]\nfiles = [\"a.png\", \"a.png\"]\n");
     has(&twice, &d, "asset \"a.png\" is listed twice");
-    has(&twice, &config::Limits { world_assets_max: 1, ..d }, "more than 1 files");
+    has(&twice, &rando_limits::Limits { world_assets_max: 1, ..d }, "more than 1 files");
 }
 
 /// With no `-o`, the package is written beside `rando.toml`, wherever `rando` was run from.
@@ -427,13 +435,14 @@ fn the_package_lands_beside_rando_toml() {
 fn rando_toml_name_follows_the_game_key_rule() {
     for key in ["tide-well", "9lives", "tide"] {
         let toml = TOML.replace("name = \"tide\"", &format!("name = \"{key}\""));
-        let m = world_build::meta::parse(&toml, &config::Limits::DESIGN)
+        let m = world_build::meta::parse(&toml, &rando_limits::Limits::DESIGN)
             .unwrap_or_else(|e| panic!("{key}: {e:#?}"));
         assert_eq!(m.name, key);
     }
     for bad in ["Tide", "__", "tide well", "-9"] {
         let toml = TOML.replace("name = \"tide\"", &format!("name = \"{bad}\""));
-        let e = world_build::meta::parse(&toml, &config::Limits::DESIGN).unwrap_err().join("\n");
+        let e =
+            world_build::meta::parse(&toml, &rando_limits::Limits::DESIGN).unwrap_err().join("\n");
         assert!(e.contains("`world.name` is required"), "{bad}: {e}");
     }
 }

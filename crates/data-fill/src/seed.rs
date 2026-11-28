@@ -26,7 +26,7 @@ pub struct Player {
 }
 
 /// A game or version name from a manifest, trimmed: not empty, at most
-/// `config::MANIFEST_NAME_MAX_BYTES`, no control characters (it is kept in listing columns, an
+/// `rando_limits::MANIFEST_NAME_MAX_BYTES`, no control characters (it is kept in listing columns, an
 /// index and file names).
 ///
 /// # Errors
@@ -36,10 +36,10 @@ pub fn checked_name<'a>(what: &str, name: &'a str) -> Result<&'a str, String> {
     if name.is_empty() {
         return Err(format!("the manifest needs a {what:?}"));
     }
-    if name.len() > config::MANIFEST_NAME_MAX_BYTES {
+    if name.len() > rando_limits::MANIFEST_NAME_MAX_BYTES {
         return Err(format!(
             "the manifest's {what:?} is longer than {} bytes",
-            config::MANIFEST_NAME_MAX_BYTES
+            rando_limits::MANIFEST_NAME_MAX_BYTES
         ));
     }
     if name.chars().any(char::is_control) {
@@ -122,7 +122,7 @@ impl From<GenerateError> for String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillReport {
     /// Full fills started: above 1, the exact fill restarted (a net for what its repairs
-    /// could not mend, at most `config::FILL_MAX_ATTEMPTS`).
+    /// could not mend, at most `rando_limits::FILL_MAX_ATTEMPTS`).
     pub attempts: u32,
     /// Items moved in the seed out of a location an item with nowhere else to go took.
     pub swaps: u32,
@@ -243,7 +243,7 @@ fn fill_on(
     let (filled, spheres) = room::fill_room_spheres(
         &seats,
         &mut SpecRng::from_u64(rng_seed),
-        config::FILL_MAX_ATTEMPTS,
+        rando_limits::FILL_MAX_ATTEMPTS,
     )?;
     if let Some(p) = filled.beatable.iter().position(|b| !b) {
         return Err(GenerateError::Unbeatable { player: p });
@@ -330,14 +330,14 @@ fn assemble(
         format: seed_bundle::FORMAT,
         seed_name: seed_name.to_owned(),
         generator_version: Version {
-            major: config::SEED_GENERATOR_VERSION.0,
-            minor: config::SEED_GENERATOR_VERSION.1,
-            build: config::SEED_GENERATOR_VERSION.2,
+            major: rando_limits::SEED_GENERATOR_VERSION.0,
+            minor: rando_limits::SEED_GENERATOR_VERSION.1,
+            build: rando_limits::SEED_GENERATOR_VERSION.2,
         },
         server_options: ServerOptions {
             password: None,
-            hint_cost: config::SEED_HINT_COST_PCT,
-            location_check_points: config::SEED_CHECK_POINTS,
+            hint_cost: rando_limits::SEED_HINT_COST_PCT,
+            location_check_points: rando_limits::SEED_CHECK_POINTS,
             release_mode: Mode::Auto,
             collect_mode: Mode::Goal,
             remaining_mode: Mode::Goal,

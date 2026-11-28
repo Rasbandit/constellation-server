@@ -18,7 +18,7 @@
 //! cycle is a load error), then one joint layout solve over every `layout` shuffle, then the
 //! whole-world check: holding every item of the pool, every region of the world and every
 //! check that exists this seed is reached and the goal holds. A failed attempt starts all of
-//! it again on the next attempt's streams, at most [`config::SHUFFLE_MAX_ATTEMPTS`] times.
+//! it again on the next attempt's streams, at most [`rando_limits::SHUFFLE_MAX_ATTEMPTS`] times.
 //! Streams are keyed by seed, player, shuffle name and attempt, never by position, and are
 //! apart from the fill's.
 //!
@@ -294,7 +294,7 @@ pub const STEPS: [&str; 6] = ["draws", "layout", "world", "plan", "check", "tabl
 ///
 /// # Errors
 /// An instance the world lacks keys for; a region or check that is closed whatever the
-/// shuffles do; or no valid result within [`config::SHUFFLE_MAX_ATTEMPTS`] attempts, where the
+/// shuffles do; or no valid result within [`rando_limits::SHUFFLE_MAX_ATTEMPTS`] attempts, where the
 /// message names the shuffles, the attempts and what the last attempt failed on.
 pub fn stage(w: &World, inst: &Instance, seed: u64, player: u32) -> R<Option<Staged>> {
     let Some(bound) = w.shuffles() else { return Ok(None) };
@@ -303,7 +303,7 @@ pub fn stage(w: &World, inst: &Instance, seed: u64, player: u32) -> R<Option<Sta
     let of_world = spec_rng::derive(&root, b"shuffles", player).ok_or("no random stream")?;
     let mut inst = Cow::Borrowed(inst);
     let mut last = (String::new(), String::new());
-    let cap = config::SHUFFLE_MAX_ATTEMPTS;
+    let cap = rando_limits::SHUFFLE_MAX_ATTEMPTS;
     for attempt in 1..=cap {
         // Keyed by name and attempt, never by position (doc 17 section 4.3).
         let stream = |name: &str| {

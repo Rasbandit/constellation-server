@@ -235,7 +235,7 @@ type R<T> = Result<T, String>;
 
 /// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`, each
 /// alone or times a weight (`{"int": ["*", that, w]}`, either side, `w` an integer from 0 to
-/// `config::RULE_WEIGHT_MAX`): its members as (key, cap, weight).
+/// `rando_limits::RULE_WEIGHT_MAX`): its members as (key, cap, weight).
 fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
     fn copies(a: &Value) -> Option<(&str, Option<u16>)> {
         if let Some(k) = a.get("count").and_then(Value::as_str) {
@@ -250,7 +250,7 @@ fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
         }
     }
     let weight = |w: &Value| {
-        u16::try_from(w.as_i64().filter(|w| (0..=config::RULE_WEIGHT_MAX).contains(w))?).ok()
+        u16::try_from(w.as_i64().filter(|w| (0..=rando_limits::RULE_WEIGHT_MAX).contains(w))?).ok()
     };
     args.iter()
         .map(|a| {
@@ -267,8 +267,8 @@ fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
 }
 
 /// A group's members with one entry per item, so adding a copy costs one step per group: terms
-/// of one item and cap add their weights (at most `config::RULE_GROUP_MAX_MEMBERS` times
-/// `config::RULE_WEIGHT_MAX`). `None` when one item is named with two caps, which no single
+/// of one item and cap add their weights (at most `rando_limits::RULE_GROUP_MAX_MEMBERS` times
+/// `rando_limits::RULE_WEIGHT_MAX`). `None` when one item is named with two caps, which no single
 /// (cap, weight) says: that sum stays bytecode.
 fn merged(members: Vec<(u16, Option<u16>, u16)>) -> Option<Vec<(u16, Option<u16>, u32)>> {
     let mut out: Vec<(u16, Option<u16>, u32)> = Vec::with_capacity(members.len());
@@ -830,8 +830,11 @@ impl<'m> Compiler<'m> {
     /// An evaluation from the rule being compiled goes `deep` nodes down.
     fn reach(&mut self, deep: u32, path: &str) -> R<()> {
         self.peak = self.peak.max(deep);
-        if deep > config::RULES_MAX_DEPTH {
-            return Err(format!("{path}: rules nested more than {} deep", config::RULES_MAX_DEPTH));
+        if deep > rando_limits::RULES_MAX_DEPTH {
+            return Err(format!(
+                "{path}: rules nested more than {} deep",
+                rando_limits::RULES_MAX_DEPTH
+            ));
         }
         Ok(())
     }
@@ -1134,10 +1137,10 @@ impl<'m> Compiler<'m> {
                     Ok((self.item(&json!(k), &format!("{p}[{}]", j + 1))?, cap, w))
                 })
                 .collect::<R<Vec<_>>>()?;
-            if members.len() > config::RULE_GROUP_MAX_MEMBERS {
+            if members.len() > rando_limits::RULE_GROUP_MAX_MEMBERS {
                 return Err(format!(
                     "{p}: a sum of more than {} members",
-                    config::RULE_GROUP_MAX_MEMBERS
+                    rando_limits::RULE_GROUP_MAX_MEMBERS
                 ));
             }
             if let Some(members) = merged(members) {

@@ -114,7 +114,7 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
     // fixed run, so this is no flake.
     let p = r["baseline"]["p_value"].as_f64().unwrap_or(0.0);
     assert!(
-        p >= config::FILL_FAIRNESS_MIN_P,
+        p >= rando_limits::FILL_FAIRNESS_MIN_P,
         "the fill is told apart from uniform placements: p {p}"
     );
     assert!(

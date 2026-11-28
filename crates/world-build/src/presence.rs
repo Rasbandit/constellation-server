@@ -89,7 +89,7 @@ pub(crate) fn check(
         errs.warn_whole(
             format!(
                 "the region conditions were tried with each option alone at its two ends: over {} combinations",
-                config::WORLD_POOL_TEST_MAX_COMBINATIONS
+                rando_limits::WORLD_POOL_TEST_MAX_COMBINATIONS
             ),
             "generation still refuses a seed whose options leave a region unreachable",
         );

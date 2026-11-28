@@ -69,11 +69,13 @@ impl<'b> Generator<'b> {
     ) -> Result<Seed, String> {
         // Before any copy is made: a room has at most `ROOM_MAX_PLAYERS`, and a seed number
         // stays within what a JSON spoiler holds exactly.
-        if players == 0 || usize::try_from(players).is_ok_and(|n| n > config::ROOM_MAX_PLAYERS) {
-            return Err(format!("a room has 1 to {} players", config::ROOM_MAX_PLAYERS));
+        if players == 0
+            || usize::try_from(players).is_ok_and(|n| n > rando_limits::ROOM_MAX_PLAYERS)
+        {
+            return Err(format!("a room has 1 to {} players", rando_limits::ROOM_MAX_PLAYERS));
         }
-        if seed > config::SEED_NUMBER_MAX {
-            return Err(format!("a seed is a number from 0 to {}", config::SEED_NUMBER_MAX));
+        if seed > rando_limits::SEED_NUMBER_MAX {
+            return Err(format!("a seed is a number from 0 to {}", rando_limits::SEED_NUMBER_MAX));
         }
         let instance = self.built.instance(options)?;
         let players: Vec<Player> = (1..=players)
@@ -345,11 +347,13 @@ impl Generator<'_> {
         count: u64,
     ) -> Result<SeedCheck, String> {
         let after = count.checked_sub(1).ok_or("checking seeds takes at least 1 seed")?;
-        let last =
-            from.checked_add(after).filter(|l| *l <= config::SEED_NUMBER_MAX).ok_or_else(|| {
+        let last = from
+            .checked_add(after)
+            .filter(|l| *l <= rando_limits::SEED_NUMBER_MAX)
+            .ok_or_else(|| {
                 format!(
                     "{count} seeds from {from} go past the largest seed number, {}",
-                    config::SEED_NUMBER_MAX
+                    rando_limits::SEED_NUMBER_MAX
                 )
             })?;
         let mut c = SeedCheck::default();

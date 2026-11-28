@@ -20,7 +20,7 @@
 //! a round that does not fit its state divided in halves, down to single items; an item that
 //! still has nowhere to go given the location of a placed one, which is placed again
 //! (`Steps::displace`); a restart with new draws only when that fails too, each player's items
-//! then deepest first (`depth.rs`), at most `config::FILL_MAX_ATTEMPTS` attempts; an item with a
+//! then deepest first (`depth.rs`), at most `rando_limits::FILL_MAX_ATTEMPTS` attempts; an item with a
 //! placement group stays in its owner's world; progression never goes on an excluded location;
 //! every progression item lies where it is reached, so every player's goal holds; no local-item
 //! option (#91), no progression balancing (#92).
@@ -188,15 +188,15 @@ impl Compiled {
     }
 }
 
-/// A room takes 1 to `config::ROOM_MAX_PLAYERS` players.
+/// A room takes 1 to `rando_limits::ROOM_MAX_PLAYERS` players.
 ///
 /// # Errors
 /// [`FillError::Instance`] outside that range.
 pub fn too_many(players: usize) -> Result<(), FillError> {
-    if players == 0 || players > config::ROOM_MAX_PLAYERS {
+    if players == 0 || players > rando_limits::ROOM_MAX_PLAYERS {
         return Err(FillError::Instance(format!(
             "a room takes 1 to {} players, got {players}",
-            config::ROOM_MAX_PLAYERS
+            rando_limits::ROOM_MAX_PLAYERS
         )));
     }
     Ok(())
@@ -238,7 +238,7 @@ pub struct RoomFilled {
     /// that made these placements.
     pub divided: u32,
     /// Rule evaluations the fill's repairs spent over all its attempts, tried moves
-    /// included (`config::FILL_REPAIR_EVALS`, and the solve that crosses it).
+    /// included (`rando_limits::FILL_REPAIR_EVALS`, and the solve that crosses it).
     pub repair_evals: u64,
     /// What the rounds of fresh solves did, for measurements.
     pub profile: Rounds,
@@ -301,7 +301,7 @@ pub fn fill_room(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<RoomFilled, FillError> {
-    let tries = (max_attempts, config::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule);
+    let tries = (max_attempts, rando_limits::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule);
     fill_by(seats, rng, tries, false, false).map(|x| x.0)
 }
 
@@ -314,8 +314,13 @@ pub fn fill_room_spheres(
     rng: &mut SpecRng,
     max_attempts: u32,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
-    let (f, s) =
-        fill_by(seats, rng, (max_attempts, config::FILL_REPAIR_EVALS, Rule::of), false, true)?;
+    let (f, s) = fill_by(
+        seats,
+        rng,
+        (max_attempts, rando_limits::FILL_REPAIR_EVALS, Rule::of),
+        false,
+        true,
+    )?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -335,7 +340,7 @@ pub fn fill_room_fresh(
     max_attempts: u32,
 ) -> Result<(RoomFilled, RoomSpheres), FillError> {
     let (f, s) =
-        fill_by(seats, rng, (max_attempts, config::FILL_REPAIR_EVALS, Rule::of), true, true)?;
+        fill_by(seats, rng, (max_attempts, rando_limits::FILL_REPAIR_EVALS, Rule::of), true, true)?;
     Ok((f, s.unwrap_or_else(|| unreachable!("asked for spheres"))))
 }
 
@@ -343,7 +348,7 @@ pub fn fill_room_fresh(
 type Placed = Vec<Option<Given>>;
 
 /// Tests only: [`fill_room_spheres`] with what a test holds the fill against: a budget of
-/// repair work of its own (`config::FILL_REPAIR_EVALS` in the product), how every attempt
+/// repair work of its own (`rando_limits::FILL_REPAIR_EVALS` in the product), how every attempt
 /// forms its rounds ([`Rule::of`] in the product; a test's baseline otherwise), and with
 /// `fresh` the cross-check of [`fill_room_fresh`].
 #[cfg(test)]
@@ -810,7 +815,7 @@ struct Steps<'a, 'w> {
     seated: Vec<((u16, u32), Given)>,
     moved: usize,
     /// Rule evaluations [`Steps::displace`] spent in this fill, over all its attempts, and the
-    /// most it may (`config::FILL_REPAIR_EVALS`).
+    /// most it may (`rando_limits::FILL_REPAIR_EVALS`).
     repair_evals: u64,
     repair_budget: u64,
     /// What one division of a round is charged against `repair_budget`: the rule evaluations
@@ -1002,9 +1007,9 @@ impl Steps<'_, '_> {
     /// again, against the state that has `item` there and holds neither (the items of `later`
     /// held): the assumed fill's own step, so the seed is beatable for the same reason. The
     /// candidates are the seated items reached without `item`, at most
-    /// `config::FILL_DISPLACE_TRIES` of them spread evenly over the order they were seated in,
+    /// `rando_limits::FILL_DISPLACE_TRIES` of them spread evenly over the order they were seated in,
     /// each one fresh solve; a fill's solves here stop once they have spent
-    /// `config::FILL_REPAIR_EVALS` rule evaluations.
+    /// `rando_limits::FILL_REPAIR_EVALS` rule evaluations.
     ///
     /// # Errors
     /// [`FillError::Stuck`] when no seated item tried can be placed again, or the attempt's
@@ -1042,7 +1047,7 @@ impl Steps<'_, '_> {
         // state: charged as this first solve again, the same for the fill and its cross-check
         // (the pass's own counters differ between them).
         let mut pass = 0;
-        for k in 0..=config::FILL_DISPLACE_TRIES {
+        for k in 0..=rando_limits::FILL_DISPLACE_TRIES {
             // A budget of work, not of time: within it means spent at most the budget, so a
             // room whose repair has spent more is stuck (the same test as `charge_division`).
             if self.repair_evals > self.repair_budget {
@@ -1078,7 +1083,7 @@ impl Steps<'_, '_> {
                         g != item && models[usize::from(p)].reached(l) && permits(seats, item, p, l)
                     })
                     .collect();
-                let step = reached.len().div_ceil(config::FILL_DISPLACE_TRIES).max(1);
+                let step = reached.len().div_ceil(rando_limits::FILL_DISPLACE_TRIES).max(1);
                 tried = reached.into_iter().step_by(step).collect();
                 tried.reverse();
             } else {
@@ -1384,10 +1389,11 @@ mod tests {
         let (mut with, mut without, mut crossed) = (0, 0, 0);
         for seed in 1u64..=100 {
             let (a, sa) =
-                fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
-            let oracle = (config::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
+                fill_room_spheres(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS).unwrap();
+            let oracle = (rando_limits::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
             let (b, sb) =
-                fill_room_test(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, oracle).unwrap();
+                fill_room_test(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS, oracle)
+                    .unwrap();
             assert_eq!(
                 (&a.placed, &sa, a.attempts, a.rounds, &a.beatable, &a.reached),
                 (&b.placed, &sb, b.attempts, b.rounds, &b.beatable, &b.reached),
@@ -1429,10 +1435,11 @@ mod tests {
                 let c = Compiled::new(&manifests, &insts).unwrap();
                 let seats = c.seats();
                 let (a, sa) =
-                    fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
-                let oracle = (config::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
+                    fill_room_spheres(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS)
+                        .unwrap();
+                let oracle = (rando_limits::FILL_REPAIR_EVALS, Rule::of as fn(u32) -> Rule, true);
                 let (b, sb) =
-                    fill_room_test(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS, oracle)
+                    fill_room_test(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS, oracle)
                         .unwrap();
                 assert_eq!((&a.placed, &sa), (&b.placed, &sb), "{players} players, seed {seed}");
                 let (beatable, _) = validate_room(&seats, &a.placed).unwrap();
@@ -1472,9 +1479,10 @@ mod tests {
         };
         let c = Compiled::new(&[&m], &[&inst]).unwrap();
         for seed in 1..=5 {
-            let got = fill_room_spheres(&c.seats(), &mut rng(seed), config::FILL_MAX_ATTEMPTS);
+            let got =
+                fill_room_spheres(&c.seats(), &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS);
             assert!(
-                matches!(got, Err(FillError::Stuck { ref item, attempts, .. }) if item == "key" && attempts == config::FILL_MAX_ATTEMPTS),
+                matches!(got, Err(FillError::Stuck { ref item, attempts, .. }) if item == "key" && attempts == rando_limits::FILL_MAX_ATTEMPTS),
                 "seed {seed}: {:?}",
                 got.err()
             );

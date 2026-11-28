@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// What a seed or one part of it may take: the server's bundle cap, from `config`.
-const MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
+const MAX_BYTES: u64 = rando_limits::Limits::DESIGN.bundle_max_bytes;
 
 const USAGE: &str =
     "usage: bundle v2-encode <v1.json> <out-dir> | bundle v2-decode <seed> [--packages <dir>]";

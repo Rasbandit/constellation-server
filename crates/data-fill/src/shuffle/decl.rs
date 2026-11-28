@@ -33,17 +33,17 @@ fn truth() -> Value {
 /// A name of a shuffle's vocabulary (slot, thing, group, exit, door), bounded.
 fn key<'a>(v: &'a Value, path: &str) -> R<&'a str> {
     let k = s(v, path)?;
-    let most = config::MANIFEST_NAME_MAX_BYTES;
+    let most = rando_limits::MANIFEST_NAME_MAX_BYTES;
     if k.is_empty() || k.len() > most || k.chars().any(char::is_control) {
         return Err(format!("{path}: a name is 1 to {most} bytes without control characters"));
     }
     Ok(k)
 }
 
-/// An error text cut to [`config::SHUFFLE_ERROR_MAX_BYTES`]: it may quote a name whose length
+/// An error text cut to [`rando_limits::SHUFFLE_ERROR_MAX_BYTES`]: it may quote a name whose length
 /// nothing has bounded yet.
 pub(super) fn clip(mut e: String) -> String {
-    let mut cut = config::SHUFFLE_ERROR_MAX_BYTES;
+    let mut cut = rando_limits::SHUFFLE_ERROR_MAX_BYTES;
     if e.len() > cut {
         while !e.is_char_boundary(cut) {
             cut -= 1;
@@ -169,7 +169,7 @@ impl<'a> Side<'a> {
             None => Ok(&[][..]),
         };
         let (names, groups) = (list("names")?, list("groups")?);
-        let most = config::SHUFFLE_MAX_SLOTS;
+        let most = rando_limits::SHUFFLE_MAX_SLOTS;
         if names.len() + groups.len() > most {
             return Err(format!("{path}: a selector lists at most {most} names and groups"));
         }
@@ -274,7 +274,7 @@ impl Shuffle {
             return Err(format!(
                 "{sp}: {} slots; a world's shuffles have 1 to at most {} slots together",
                 names.len(),
-                config::SHUFFLE_MAX_SLOTS
+                rando_limits::SHUFFLE_MAX_SLOTS
             ));
         }
         *left -= names.len();
@@ -333,8 +333,12 @@ impl Shuffle {
         let (slot_side, thing_side) = (Side::of(&of_slots), Side::of(&of_things));
         let ap = format!("{path}.allow");
         let rows = o.get("allow").map(|a| arr(a, &ap)).transpose()?.map_or(&[][..], Vec::as_slice);
-        if rows.len() > config::SHUFFLE_MAX_ROWS {
-            return Err(format!("{ap}: {} rows, at most {}", rows.len(), config::SHUFFLE_MAX_ROWS));
+        if rows.len() > rando_limits::SHUFFLE_MAX_ROWS {
+            return Err(format!(
+                "{ap}: {} rows, at most {}",
+                rows.len(),
+                rando_limits::SHUFFLE_MAX_ROWS
+            ));
         }
         for (k, row) in rows.iter().enumerate() {
             let rp = format!("{ap}[{k}]");
@@ -423,7 +427,7 @@ impl Shuffle {
             ("weight", json!(1)),
             ("when", truth()),
         ];
-        let most = config::SHUFFLE_MAX_SLOTS;
+        let most = rando_limits::SHUFFLE_MAX_SLOTS;
         let count = v.as_array().map(Vec::len).or_else(|| v.as_object().map(Map::len));
         if count.is_some_and(|n| n == 0 || n > most) {
             return Err(format!("{path}: a shuffle has 1 to at most {most} things"));
@@ -547,20 +551,20 @@ impl Decl {
                 return Err(format!("exit key {:?} is used twice", e.key));
             }
         }
-        if raw.len() > config::SHUFFLES_MAX {
+        if raw.len() > rando_limits::SHUFFLES_MAX {
             return Err(format!(
                 "shuffles: {} declared, at most {}",
                 raw.len(),
-                config::SHUFFLES_MAX
+                rando_limits::SHUFFLES_MAX
             ));
         }
         let mut shuffles: Vec<Shuffle> = Vec::new();
         // Exit to the name of the shuffle that lists it.
         let mut taken: HashMap<usize, &str> = HashMap::new();
-        let mut left = config::SHUFFLE_MAX_SLOTS;
+        let mut left = rando_limits::SHUFFLE_MAX_SLOTS;
         for (name, sv) in raw {
             let p = format!("shuffles.{name}");
-            let most = config::SHUFFLE_NAME_MAX_BYTES;
+            let most = rando_limits::SHUFFLE_NAME_MAX_BYTES;
             if name.is_empty() || name.len() > most || name.contains('.') {
                 return Err(format!("{p}: a shuffle name is 1 to {most} bytes without a dot"));
             }
@@ -660,15 +664,15 @@ impl Decl {
         let d: Decl =
             serde_json::from_slice(section).map_err(|e| format!("shuffle section: {e}"))?;
         let bad = |what: &str| Err(format!("shuffle section: {what}"));
-        let most = config::SHUFFLE_MAX_SLOTS;
-        if d.shuffles.is_empty() || d.shuffles.len() > config::SHUFFLES_MAX {
+        let most = rando_limits::SHUFFLE_MAX_SLOTS;
+        if d.shuffles.is_empty() || d.shuffles.len() > rando_limits::SHUFFLES_MAX {
             return bad("shuffle count");
         }
         let (mut slots, mut listed) = (0usize, vec![false; d.exits.len()]);
         for sh in &d.shuffles {
             let (n, m) = (sh.slots.len(), sh.things.len());
             slots += n;
-            let name = sh.name.len() <= config::SHUFFLE_NAME_MAX_BYTES && !sh.name.is_empty();
+            let name = sh.name.len() <= rando_limits::SHUFFLE_NAME_MAX_BYTES && !sh.name.is_empty();
             let table = n > 0 && m > 0 && m <= most && sh.allowed.len() == (n * m).div_ceil(64);
             let kind = if sh.layout {
                 sh.exits.len() == n && m == n && sh.keys.is_empty()
@@ -735,7 +739,7 @@ impl Decl {
     /// section 5.4): "this thing is there, and its rule", which the per-seed fold cuts down
     /// to the one that is there.
     fn union(sh: &Shuffle, option: &str, path: &str) -> R<Value> {
-        let most = config::SHUFFLE_MAX_READ_THINGS;
+        let most = rando_limits::SHUFFLE_MAX_READ_THINGS;
         if sh.things.len() > most {
             return Err(format!(
                 "{path}: shuffle {:?} is read as a rule and has {} things, at most {most}",

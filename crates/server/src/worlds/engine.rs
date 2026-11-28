@@ -102,7 +102,7 @@ async fn prepare_again(w: &Worlds, id: &str) -> Result<PreparedWorld, String> {
 /// and its prepared world in the database. The same content again returns the stored record
 /// without a check.
 pub(super) async fn upload_manifest(w: &Worlds, query: Option<&str>, body: &[u8]) -> Reply {
-    let (name, id) = checked_upload(query, body, w.limits.manifest_max_bytes)?;
+    let (name, id) = checked_upload(query, body, w.limits.format.manifest_max_bytes)?;
     if let Some(stored) = w.manifests.record(&id).await.map_err(store_error)? {
         // A stored manifest whose bytes no longer hash to its id (a torn row) is not served as
         // stored: it falls through to the check and is written again, which heals it.
@@ -267,9 +267,10 @@ pub(super) async fn generate_data_only(
     let players = yamls.len();
     // Building the request is blocking work.
     let limits = w.limits;
-    let head =
-        try_blocking(move || fill_head(&seed_name, &files, (rng_seed, limits.bundle_max_bytes)))
-            .await?;
+    let head = try_blocking(move || {
+        fill_head(&seed_name, &files, (rng_seed, limits.format.bundle_max_bytes))
+    })
+    .await?;
     laps.lap("request");
     // The job answers with the seed file itself; it names the game's package of the prepared
     // world.

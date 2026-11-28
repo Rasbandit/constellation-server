@@ -3,7 +3,7 @@
 //! `+`, `-`; comparisons and `in` (no chaining); `not`; `and`; `or`. It reads the language's
 //! tokens ([`crate::lex`]) and stops at the first token a rule cannot continue with, so a rule
 //! written bare in a file ends where the next keyword or row begins. Nesting is capped at
-//! [`config::WORLD_RULE_MAX_DEPTH`], arithmetic chains included, so no input can exhaust the
+//! [`rando_limits::WORLD_RULE_MAX_DEPTH`], arithmetic chains included, so no input can exhaust the
 //! stack. Names are not resolved here: that is the lowering's job (`crate::lower`).
 
 use crate::lex::{Kind, Tok, Token, lex, show};
@@ -220,8 +220,8 @@ impl P<'_> {
 
     fn enter(&mut self) -> Result<(), Fail> {
         self.depth += 1;
-        if self.depth > config::WORLD_RULE_MAX_DEPTH {
-            let most = config::WORLD_RULE_MAX_DEPTH;
+        if self.depth > rando_limits::WORLD_RULE_MAX_DEPTH {
+            let most = rando_limits::WORLD_RULE_MAX_DEPTH;
             return Err((self.here(), format!("the rule nests more than {most} deep")));
         }
         Ok(())
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn deep_nesting_is_an_error_not_a_stack_overflow() {
-        let n = config::WORLD_RULE_MAX_DEPTH;
+        let n = rando_limits::WORLD_RULE_MAX_DEPTH;
         let ok = "(".repeat(n - 1) + "a" + &")".repeat(n - 1);
         assert!(parse(&ok, Pos::new(1, 1)).is_ok());
         assert!(parse(&("a".to_owned() + &" + a".repeat(10_000)), Pos::new(1, 1)).is_ok());

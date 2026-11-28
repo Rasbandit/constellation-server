@@ -295,10 +295,10 @@ impl Ctx {
 /// program, so it is checked against the room limit before any instance is fetched.
 fn players_of(hello: &Value) -> R<u64> {
     let n = hello["players"].as_u64().unwrap_or(1);
-    if n == 0 || n > config::ROOM_MAX_PLAYERS as u64 {
+    if n == 0 || n > rando_limits::ROOM_MAX_PLAYERS as u64 {
         return Err(format!(
             "adapter reports {n} players; a room takes 1 to {}",
-            config::ROOM_MAX_PLAYERS
+            rando_limits::ROOM_MAX_PLAYERS
         ));
     }
     Ok(n)
@@ -556,7 +556,7 @@ fn run(a: &Args) -> R<Value> {
                 let (filled, sp) = fill_room_spheres(
                     &seat,
                     &mut SpecRng::from_u64(fill_seed),
-                    config::FILL_MAX_ATTEMPTS,
+                    rando_limits::FILL_MAX_ATTEMPTS,
                 )
                 .map_err(|e| format!("fill {seed}: {}", String::from(e)))?;
                 model = Some(Spheres::from(sp));
@@ -665,7 +665,7 @@ mod tests {
         let n = |v: Value| players_of(&json!({"players": v}));
         assert_eq!(players_of(&json!({})), Ok(1));
         assert_eq!(n(json!(3)), Ok(3));
-        let max = config::ROOM_MAX_PLAYERS as u64;
+        let max = rando_limits::ROOM_MAX_PLAYERS as u64;
         assert_eq!(n(json!(max)), Ok(max));
         for bad in [json!(0), json!(max + 1), json!(u64::MAX)] {
             assert!(n(bad.clone()).is_err(), "{bad}");

@@ -158,7 +158,7 @@ fn run(args: &[String]) -> Result<Value, String> {
     let seat = [Seat { w: &w, plan: &plan, progression: &progression }];
     let mut rng = SpecRng::from_u64(seed);
     let t = Instant::now();
-    let filled = fill_room(&seat, &mut rng, config::FILL_MAX_ATTEMPTS)?;
+    let filled = fill_room(&seat, &mut rng, rando_limits::FILL_MAX_ATTEMPTS)?;
     let fill_ms = ms(t);
     let t = Instant::now();
     let (beatable, reached) = validate_room(&seat, &filled.placed)?;

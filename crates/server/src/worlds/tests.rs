@@ -753,7 +753,13 @@ fn hex_key(id: &str) -> [u8; 32] {
 #[tokio::test]
 async fn a_manifest_over_its_cap_is_refused_and_the_cap_itself_is_taken() {
     let root = temp("manifest-cap");
-    let w = worlds(&root, Limits { manifest_max_bytes: 8, ..Limits::DESIGN });
+    let w = worlds(
+        &root,
+        Limits {
+            format: rando_limits::Limits { manifest_max_bytes: 8, ..rando_limits::Limits::DESIGN },
+            ..Limits::DESIGN
+        },
+    );
     let stored = w
         .manifests
         .put("m.json", b"12345678", &json!({"game": "G", "version": "1"}))

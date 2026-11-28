@@ -262,7 +262,7 @@ fn one(
     let seats = c.seats();
     let fill = || {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_spheres(&seats, &mut rng, config::FILL_MAX_ATTEMPTS)
+        fill_room_spheres(&seats, &mut rng, rando_limits::FILL_MAX_ATTEMPTS)
     };
     let t = Instant::now();
     let (first, heap) = peak(fill);

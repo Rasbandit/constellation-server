@@ -173,7 +173,7 @@ fn every_shuffled_layout_passes_the_whole_world_check() {
     let w = World::load(&m).unwrap();
     for seed in 1..=300 {
         let s = staged(&w, &inst, seed);
-        assert!(s.attempts <= config::SHUFFLE_MAX_ATTEMPTS);
+        assert!(s.attempts <= rando_limits::SHUFFLE_MAX_ATTEMPTS);
         assert_whole_world(&s, &inst, &format!("seed {seed}"));
     }
 }
@@ -294,7 +294,7 @@ fn a_world_that_can_never_pass_the_check_errors_at_the_cap() {
     let (m, inst) = bell(&[], swap);
     let w = World::load(&m).unwrap();
     let e = stage(&w, &inst, 1, 0).unwrap_err();
-    let cap = format!("{} attempts", config::SHUFFLE_MAX_ATTEMPTS);
+    let cap = format!("{} attempts", rando_limits::SHUFFLE_MAX_ATTEMPTS);
     assert!(e.contains(&cap) && e.contains("entrances") && e.contains("region \"a\""), "{e}");
     // Through the seed path the error also names the player and the world.
     let p = [Player { name: "Ann".into(), instance: inst }];
@@ -551,10 +551,10 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
         }),
         ("rows", |s| {
             let row = s["entrances"]["allow"][0].clone();
-            s["entrances"]["allow"] = json!(vec![row; config::SHUFFLE_MAX_ROWS + 1]);
+            s["entrances"]["allow"] = json!(vec![row; rando_limits::SHUFFLE_MAX_ROWS + 1]);
         }),
         ("names and groups", |s| {
-            let many = vec!["cave"; config::SHUFFLE_MAX_SLOTS + 1];
+            let many = vec!["cave"; rando_limits::SHUFFLE_MAX_SLOTS + 1];
             s["entrances"]["allow"][0]["only"] = json!({"groups": many});
         }),
         ("only a shuffle that moves exits", |s| {
@@ -603,12 +603,12 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
         ("`item`", |s| s["guardians"]["things"]["wisp"]["item"] = json!("sword")),
         ("things", |s| {
             let many: Vec<String> =
-                (0..=config::SHUFFLE_MAX_SLOTS).map(|i| format!("g{i}")).collect();
+                (0..=rando_limits::SHUFFLE_MAX_SLOTS).map(|i| format!("g{i}")).collect();
             s["guardians"]["things"] = json!(many);
         }),
         ("read as a rule", |s| {
             // More candidates than one rule can list.
-            for k in 0..config::SHUFFLE_MAX_READ_THINGS {
+            for k in 0..rando_limits::SHUFFLE_MAX_READ_THINGS {
                 s["guardians"]["things"][format!("g{k}")] = json!({"rule": {"true": {}}});
             }
         }),
@@ -629,7 +629,7 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
         ("twice", |s| s["guardians"]["slots"]["names"][1] = json!("marsh_hall")),
         ("at most", |s| {
             let many: Vec<String> =
-                (0..=config::SHUFFLE_MAX_SLOTS).map(|i| format!("h{i}")).collect();
+                (0..=rando_limits::SHUFFLE_MAX_SLOTS).map(|i| format!("h{i}")).collect();
             s["guardians"]["slots"]["names"] = json!(many);
         }),
     ];
@@ -700,7 +700,7 @@ fn what_is_outside_the_slice_or_malformed_is_refused_by_name() {
     let mut s = entrances();
     s["entrances"]["slots"]["names"][0] = json!("x".repeat(1 << 20));
     let e = World::load(&manifest(doors_regions(), s).0).unwrap_err();
-    assert!(e.len() <= config::SHUFFLE_ERROR_MAX_BYTES + 8, "{} bytes", e.len());
+    assert!(e.len() <= rando_limits::SHUFFLE_ERROR_MAX_BYTES + 8, "{} bytes", e.len());
     // A door with three sides, a side that is not the other's way back, a group without a key.
     let mut regions = doors_regions();
     regions[4]["exits"][1] = json!({"to": "attic", "rule": t(), "key": "x", "door": "cave_mouth"});
@@ -851,9 +851,9 @@ fn a_shuffled_room_fills_the_same_by_a_solve_per_round() {
     let fill = |c: &Compiled, seed: u64, fresh: bool| {
         let mut rng = SpecRng::from_u64(seed);
         let (f, sp) = if fresh {
-            fill_room_fresh(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS)
+            fill_room_fresh(&c.seats(), &mut rng, rando_limits::FILL_MAX_ATTEMPTS)
         } else {
-            fill_room_spheres(&c.seats(), &mut rng, config::FILL_MAX_ATTEMPTS)
+            fill_room_spheres(&c.seats(), &mut rng, rando_limits::FILL_MAX_ATTEMPTS)
         }
         .unwrap_or_else(|e| panic!("seed {seed}, fresh {fresh}: {e:?}"));
         assert!(f.all_beatable(), "seed {seed}, fresh {fresh}");
@@ -1032,7 +1032,7 @@ fn a_world_whose_fixed_regions_around_its_doors_are_too_many_is_refused() {
         regions.push(region(&format!("r{k}"), &[], json!(exits)));
     }
     regions.push(region("r1101", &[], json!([])));
-    assert_eq!(names.len(), config::SHUFFLE_MAX_SLOTS);
+    assert_eq!(names.len(), rando_limits::SHUFFLE_MAX_SLOTS);
     let shuffles =
         json!({"entrances": {"coupled": true, "slots": {"type": "exit", "names": names}}});
     let e = World::load(&manifest(regions, shuffles).0).unwrap_err();

@@ -9,7 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::Limits;
+use rando_limits::Limits;
 use rando_syntax::Diagnostic;
 use rando_syntax::lex::{Kind, Tok, lex};
 

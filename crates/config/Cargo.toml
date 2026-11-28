@@ -15,5 +15,9 @@ categories.workspace = true
 default = ["std"]
 std = []
 
+[dependencies]
+# The format and settings-language limits, held as `Limits::format`.
+rando-limits = { path = "../rando-limits" }
+
 [lints]
 workspace = true

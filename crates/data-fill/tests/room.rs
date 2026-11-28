@@ -147,7 +147,7 @@ fn three_players_fill_beatable_rooms_with_items_crossing_both_ways() {
     // crossed[a][b]: a progression item of player a seen in player b's world.
     let mut crossed = [[false; 3]; 3];
     for seed in 1u64..=60 {
-        let (f, sp) = fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS)
+        let (f, sp) = fill_room_spheres(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS)
             .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
         assert!(f.all_beatable(), "seed {seed}");
         assert_eq!(f.solves, 1, "seed {seed}: one full solve, then every step is incremental");
@@ -195,7 +195,7 @@ fn the_same_seed_gives_the_same_bytes_and_other_seeds_differ() {
     let r = players(3);
     let seats = r.seats();
     let run = |seed| {
-        let f = room::fill_room(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS).unwrap();
+        let f = room::fill_room(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS).unwrap();
         lines(&seats, &f.placed)
     };
     assert_eq!(run(7), run(7));
@@ -219,10 +219,13 @@ fn the_fixture_fills_what_a_solve_per_round_fills() {
                 }
                 Err(e) => (Err(format!("{e:?}")), 0),
             };
-            let (fresh, _) =
-                shown(room::fill_room_fresh(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
+            let (fresh, _) = shown(room::fill_room_fresh(
+                &seats,
+                &mut rng(seed),
+                rando_limits::FILL_MAX_ATTEMPTS,
+            ));
             let (got, solves) =
-                shown(fill_room_spheres(&seats, &mut rng(seed), config::FILL_MAX_ATTEMPTS));
+                shown(fill_room_spheres(&seats, &mut rng(seed), rando_limits::FILL_MAX_ATTEMPTS));
             assert_eq!(got, fresh, "{n} players, seed {seed}");
             if got.is_ok() {
                 assert_eq!(solves, 1, "{n} players");
@@ -344,7 +347,7 @@ fn placements_that_do_not_fit_the_room_are_refused_not_indexed() {
 #[test]
 fn a_room_is_capped_in_players() {
     let (m, insts) = load();
-    let n = config::ROOM_MAX_PLAYERS + 1;
+    let n = rando_limits::ROOM_MAX_PLAYERS + 1;
     let manifests: Vec<&Value> = vec![&m; n];
     assert!(room::worlds(&manifests).is_err());
     let w = World::load(&m).unwrap();

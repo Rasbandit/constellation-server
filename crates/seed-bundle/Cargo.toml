@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 # The one source of limits (the CLI uses the bundle cap).
-config = { path = "../config", default-features = false }
+rando-limits = { path = "../rando-limits" }
 bits = { path = "../bits" }
 # Raw deflate for game packages and slot_data (already in the tree through yawc).
 flate2 = "1"

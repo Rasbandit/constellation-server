@@ -4,7 +4,7 @@
 //! The early capacity ratio of a world as one player plays it: draw the progression pool in a
 //! random order; holding the first `j - 1` items of it, count the free locations that may take
 //! progression and are reached, and divide by `j`, the items that would have to fit there.
-//! Mean over `config::FILL_CAPACITY_ORDERS` orders, lowest over `j`. Under 1, at some point
+//! Mean over `rando_limits::FILL_CAPACITY_ORDERS` orders, lowest over `j`. Under 1, at some point
 //! there are more items to seat than places to seat them, which is a likely cause when an
 //! assumed fill of such a world needs repairs. It is a forward-fill notion (the first `j - 1`
 //! items held, where the assumed fill holds everything unplaced), so worlds under 1 can fill
@@ -36,7 +36,7 @@ pub fn early(w: &World, plan: &Plan) -> Option<f64> {
         return None;
     }
     let mut sum = vec![0.0; n];
-    for k in 0..config::FILL_CAPACITY_ORDERS {
+    for k in 0..rando_limits::FILL_CAPACITY_ORDERS {
         SpecRng::from_u64(u64::from(k)).shuffle(&mut pool);
         let mut r = plan.state(w, &[], &locked);
         for (j, item) in pool.iter().enumerate() {
@@ -47,7 +47,7 @@ pub fn early(w: &World, plan: &Plan) -> Option<f64> {
             r.run();
         }
     }
-    let orders = f64::from(config::FILL_CAPACITY_ORDERS);
+    let orders = f64::from(rando_limits::FILL_CAPACITY_ORDERS);
     sum.into_iter().map(|s| s / orders).reduce(f64::min)
 }
 

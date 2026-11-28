@@ -285,7 +285,7 @@ impl<'a> Lower<'a> {
     /// bounds the loader's.
     fn deep(&mut self, deep: usize, at: Pos) -> Option<()> {
         self.peak = self.peak.max(deep);
-        let most = config::RULES_MAX_DEPTH as usize;
+        let most = rando_limits::RULES_MAX_DEPTH as usize;
         if deep > most {
             self.err(
                 at,
@@ -510,13 +510,13 @@ impl<'a> Lower<'a> {
                 Some((json!({"not": v}), false))
             }
             E::And(xs) | E::Or(xs) => {
-                if xs.len() > config::RULE_MAX_PARTS {
+                if xs.len() > rando_limits::RULE_MAX_PARTS {
                     return self.err(
                         e.at,
                         format!(
                             "{} parts; the engine takes at most {} in one `and` or `or`",
                             xs.len(),
-                            config::RULE_MAX_PARTS
+                            rando_limits::RULE_MAX_PARTS
                         ),
                         "split it with a def",
                     );
@@ -609,10 +609,10 @@ impl<'a> Lower<'a> {
                 let n = folded.as_ref().or(n);
                 match n.map(|n| &n.e) {
                     None | Some(E::Int(1)) => Some((json!({"has": item}), true)),
-                    Some(E::Int(k)) if usize::try_from(*k).is_ok_and(|k| k <= config::RULE_MAX_PARTS) => Some((json!({"has": item, "n": k}), true)),
+                    Some(E::Int(k)) if usize::try_from(*k).is_ok_and(|k| k <= rando_limits::RULE_MAX_PARTS) => Some((json!({"has": item, "n": k}), true)),
                     Some(E::Int(k)) => self.err(
                         n.map_or(at, |n| n.at),
-                        format!("`has` counts 0 to {} copies, not {k} (the engine's limit)", config::RULE_MAX_PARTS),
+                        format!("`has` counts 0 to {} copies, not {k} (the engine's limit)", rando_limits::RULE_MAX_PARTS),
                         "for more, write `count(x) >= n`",
                     ),
                     // A count that reads options: the engine compares the item's count with it.
@@ -627,8 +627,8 @@ impl<'a> Lower<'a> {
                 }
             }
             "has_all" | "has_any" => {
-                if args.is_empty() || args.len() > config::RULE_MAX_PARTS {
-                    return self.err(at, format!("`{f}` takes 1 to {} items", config::RULE_MAX_PARTS), "");
+                if args.is_empty() || args.len() > rando_limits::RULE_MAX_PARTS {
+                    return self.err(at, format!("`{f}` takes 1 to {} items", rando_limits::RULE_MAX_PARTS), "");
                 }
                 let mut items = Vec::new();
                 for a in args {
@@ -893,10 +893,10 @@ impl<'a> Lower<'a> {
                 ),
             },
             "min" | "max" => {
-                if args.is_empty() || args.len() > config::RULE_MAX_PARTS {
+                if args.is_empty() || args.len() > rando_limits::RULE_MAX_PARTS {
                     return self.err(
                         at,
-                        format!("`{f}` takes 1 to {} numbers", config::RULE_MAX_PARTS),
+                        format!("`{f}` takes 1 to {} numbers", rando_limits::RULE_MAX_PARTS),
                         "",
                     );
                 }
@@ -929,13 +929,13 @@ impl<'a> Lower<'a> {
                 _ => terms.push(t),
             }
         }
-        if terms.len() > config::RULE_MAX_PARTS {
+        if terms.len() > rando_limits::RULE_MAX_PARTS {
             return self.err(
                 at,
                 format!(
                     "{} terms in one sum; the engine takes at most {}",
                     terms.len(),
-                    config::RULE_MAX_PARTS
+                    rando_limits::RULE_MAX_PARTS
                 ),
                 "",
             );

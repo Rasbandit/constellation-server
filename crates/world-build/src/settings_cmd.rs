@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use config::Limits;
+use rando_limits::Limits;
 use rando_settings::canon::{Presets, settle};
 use rando_settings::schema::Schema;
 use world_build::front::{Dir, Options};

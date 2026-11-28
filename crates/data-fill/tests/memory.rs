@@ -27,7 +27,7 @@ fn a_reused_solve_state_allocates_nothing() {
 /// A world heavy in what is built at load: the keys world with one definition of sixteen ways
 /// of thirty items each (overlapping runs of its items), read by every check beside the
 /// check's own rule, so the bit rules written out per check are large
-/// (`config::RULE_BITS_MAX_WORLD_TESTS` bounds them).
+/// (`rando_limits::RULE_BITS_MAX_WORLD_TESTS` bounds them).
 fn shared_definition() -> Value {
     use data_fill::synth::{Hostile, Shape, world};
     let (mut manifest, _) = world(&Shape::hostile(Hostile::Keys), 1, 0);

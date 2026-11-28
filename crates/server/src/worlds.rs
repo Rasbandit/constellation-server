@@ -308,7 +308,7 @@ fn routes(state: Arc<Worlds>) -> Router {
         .route("/api/yamls", get(list_yamls).merge(put(put_yaml).layer(capped(l.yaml_max_bytes))))
         .route(
             "/api/manifests",
-            get(list_manifests).merge(put(put_manifest).layer(capped(l.manifest_max_bytes))),
+            get(list_manifests).merge(put(put_manifest).layer(capped(l.format.manifest_max_bytes))),
         )
         .merge(crate::room_admins::routes())
         .merge(crate::catalogue::routes())

@@ -146,7 +146,7 @@ fn a_stuck_fill_names_the_item_and_its_player() {
             Err(GenerateError::Fill(FillError::Stuck { item, player, attempts })) => {
                 assert_eq!(
                     (item.as_str(), player, attempts),
-                    ("key", 1, config::FILL_MAX_ATTEMPTS)
+                    ("key", 1, rando_limits::FILL_MAX_ATTEMPTS)
                 );
             }
             other => panic!("seed {seed}: {:?}", other.map(|x| x.1)),
@@ -221,10 +221,10 @@ fn a_game_or_version_that_is_long_or_holds_control_characters_is_refused() {
     };
     for key in ["game", "version"] {
         assert!(
-            check(key, &"x".repeat(config::MANIFEST_NAME_MAX_BYTES)).is_ok(),
+            check(key, &"x".repeat(rando_limits::MANIFEST_NAME_MAX_BYTES)).is_ok(),
             "{key} at the cap"
         );
-        let long = check(key, &"x".repeat(config::MANIFEST_NAME_MAX_BYTES + 1)).unwrap_err();
+        let long = check(key, &"x".repeat(rando_limits::MANIFEST_NAME_MAX_BYTES + 1)).unwrap_err();
         assert!(long.contains("longer than"), "{key}: {long}");
         for bad in ["a\u{0}b", "a\nb", "\u{7f}"] {
             assert!(check(key, bad).unwrap_err().contains("control"), "{key} {bad:?}");

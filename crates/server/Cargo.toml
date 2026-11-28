@@ -61,6 +61,7 @@ allocation-counter = { version = "0.8", optional = true }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 config = { path = "../config" }
+rando-limits = { path = "../rando-limits" }
 # Generation for a data-only manifest world, and its upload check (compile).
 data-fill = { path = "../data-fill" }
 edge-compat = { path = "../edge-compat" }

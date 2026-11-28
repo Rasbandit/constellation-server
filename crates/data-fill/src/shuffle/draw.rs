@@ -42,7 +42,7 @@ pub(super) fn assign(
 }
 
 /// Give `slot` a thing, moving the slots that hold its allowed things on to others. Nests at
-/// most one level per slot ([`config::SHUFFLE_MAX_SLOTS`]).
+/// most one level per slot ([`rando_limits::SHUFFLE_MAX_SLOTS`]).
 fn augment(
     slot: usize,
     allows: &dyn Fn(usize, usize) -> bool,

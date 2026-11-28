@@ -55,7 +55,7 @@ pub struct Dir(pub PathBuf);
 impl Files for Dir {
     fn read(&self, path: &str) -> Option<Result<String, String>> {
         Some(
-            self.read_bytes(path, config::WORLD_SOURCE_MAX_BYTES)?
+            self.read_bytes(path, rando_limits::WORLD_SOURCE_MAX_BYTES)?
                 .and_then(|b| String::from_utf8(b).map_err(|e| format!("{path}: {e}"))),
         )
     }
@@ -101,8 +101,11 @@ pub struct Mem(pub BTreeMap<String, String>);
 impl Files for Mem {
     fn read(&self, path: &str) -> Option<Result<String, String>> {
         let text = self.0.get(path)?;
-        if text.len() > config::WORLD_SOURCE_MAX_BYTES {
-            return Some(Err(format!("{path} is over {} bytes", config::WORLD_SOURCE_MAX_BYTES)));
+        if text.len() > rando_limits::WORLD_SOURCE_MAX_BYTES {
+            return Some(Err(format!(
+                "{path} is over {} bytes",
+                rando_limits::WORLD_SOURCE_MAX_BYTES
+            )));
         }
         Some(Ok(text.clone()))
     }
@@ -174,7 +177,7 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let (meta, meta_errs) = match files.read(crate::meta::FILE) {
         None => (None, Vec::new()),
         Some(Err(e)) => (None, vec![e]),
-        Some(Ok(t)) => match crate::meta::parse(&t, &config::Limits::DESIGN) {
+        Some(Ok(t)) => match crate::meta::parse(&t, &rando_limits::Limits::DESIGN) {
             Ok(m) => (Some(m), Vec::new()),
             Err(e) => (None, e),
         },
@@ -536,10 +539,12 @@ impl X {
             if let Some(u) = uses.get(at) {
                 stack.push((f, from, at + 1));
                 let path = format!("{}{EXT}", u.v);
-                if self.paths.len() >= config::WORLD_MODULES_MAX && !self.paths.contains(&path) {
+                if self.paths.len() >= rando_limits::WORLD_MODULES_MAX
+                    && !self.paths.contains(&path)
+                {
                     self.errs.err(
                         u.pos,
-                        format!("more than {} files", config::WORLD_MODULES_MAX),
+                        format!("more than {} files", rando_limits::WORLD_MODULES_MAX),
                         "",
                     );
                     continue;
@@ -738,7 +743,7 @@ impl X {
                     let (lo, hi) = (lo.v, hi.v);
                     if hi
                         .checked_sub(lo)
-                        .is_none_or(|d| d < 0 || d >= config::WORLD_FAMILY_MAX as i64)
+                        .is_none_or(|d| d < 0 || d >= rando_limits::WORLD_FAMILY_MAX as i64)
                     {
                         self.errs.err(
                             b.var.pos,
@@ -780,12 +785,12 @@ impl X {
                         }
                     }
                     self.made += 1;
-                    if self.made > config::WORLD_FAMILY_MAX {
+                    if self.made > rando_limits::WORLD_FAMILY_MAX {
                         self.errs.err(
                             b.var.pos,
                             format!(
                                 "families expand to more than {} declarations",
-                                config::WORLD_FAMILY_MAX
+                                rando_limits::WORLD_FAMILY_MAX
                             ),
                             "",
                         );
@@ -1068,16 +1073,16 @@ impl X {
         });
     }
 
-    /// One more declaration written by a family: within [`config::WORLD_FAMILY_MAX`], or the
+    /// One more declaration written by a family: within [`rando_limits::WORLD_FAMILY_MAX`], or the
     /// error (once) and `false`.
     fn grow(&mut self, env: &Env, at: Pos) -> bool {
         if env.is_empty() {
             return true;
         }
         self.grown += 1;
-        if self.grown > config::WORLD_FAMILY_MAX && !self.over {
+        if self.grown > rando_limits::WORLD_FAMILY_MAX && !self.over {
             self.over = true;
-            let most = config::WORLD_FAMILY_MAX;
+            let most = rando_limits::WORLD_FAMILY_MAX;
             self.errs.err(at, format!("families expand to more than {most} declarations"), "");
         }
         !self.over

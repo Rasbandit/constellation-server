@@ -16,17 +16,17 @@ use crate::seed::{game_data, manifest_game};
 use crate::world::World;
 
 /// The layout of a prepared world's file, as text: the versions of everything in it (the rules
-/// section, the package file format it is and embeds, and `config::PREPARED_WORLD_LAYOUT` for
+/// section, the package file format it is and embeds, and `rando_limits::PREPARED_WORLD_LAYOUT` for
 /// which sections it holds). Part of what a stored world is found under, with the build that
 /// made it: the file does not carry it.
 #[must_use]
 pub fn layout() -> String {
-    format!("{}.{}.{}", section::VERSION, package::VERSION, config::PREPARED_WORLD_LAYOUT)
+    format!("{}.{}.{}", section::VERSION, package::VERSION, rando_limits::PREPARED_WORLD_LAYOUT)
 }
 
 /// The design cap of a seed file, where no configured one is at hand: the default of a fill
 /// request, and the most the game's names and ids may inflate to (a seed names them).
-pub const SEED_MAX_BYTES: u64 = config::Limits::DESIGN.bundle_max_bytes;
+pub const SEED_MAX_BYTES: u64 = rando_limits::Limits::DESIGN.bundle_max_bytes;
 
 /// A loaded prepared world: the compiled world, and the tables every seed of it shares.
 #[derive(Debug)]

@@ -2,7 +2,7 @@
 //! entry file and holds what is not game logic (name, version, authors, license, links,
 //! assets). The engine never reads it; `rando pack` writes it, normalised, as `meta.json`.
 
-use config::Limits;
+use rando_limits::Limits;
 use toml::{Table, Value};
 
 /// The file that marks a world folder.

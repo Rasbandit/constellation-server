@@ -90,7 +90,7 @@ fn main() -> Result<(), String> {
     let room = Compiled { worlds: vec![w], plans, progression };
     let seats = room.seats();
     let (filled, fill_ms) = run.phase("fill room", || {
-        fill_room_spheres(&seats, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
+        fill_room_spheres(&seats, &mut SpecRng::from_u64(seed), rando_limits::FILL_MAX_ATTEMPTS)
     });
     let (f, sp) = filled.map_err(|x| format!("{x:?}"))?;
     // Times without the counting allocator's bookkeeping in the closure: the median of five fills.
@@ -100,7 +100,7 @@ fn main() -> Result<(), String> {
             drop(fill_room_spheres(
                 &seats,
                 &mut SpecRng::from_u64(seed + 1 + u64::from(k)),
-                config::FILL_MAX_ATTEMPTS,
+                rando_limits::FILL_MAX_ATTEMPTS,
             ));
             t.elapsed().as_secs_f64() * 1e3
         })

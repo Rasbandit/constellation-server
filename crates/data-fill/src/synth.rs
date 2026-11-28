@@ -680,7 +680,12 @@ mod tests {
         fresh: bool,
     ) -> Result<(crate::RoomFilled, RoomSpheres), crate::FillError> {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_test(&c.seats(), &mut rng, attempts, (config::FILL_REPAIR_EVALS, Rule::of, fresh))
+        fill_room_test(
+            &c.seats(),
+            &mut rng,
+            attempts,
+            (rando_limits::FILL_REPAIR_EVALS, Rule::of, fresh),
+        )
     }
 
     /// A beatable fill, of the product or with `fresh` of the cross-check.
@@ -690,9 +695,13 @@ mod tests {
         fresh: bool,
     ) -> (Vec<Vec<Option<Given>>>, crate::Stats, usize) {
         let (f, sp) = if fresh {
-            filled(c, seed, config::FILL_MAX_ATTEMPTS, true)
+            filled(c, seed, rando_limits::FILL_MAX_ATTEMPTS, true)
         } else {
-            fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
+            fill_room_spheres(
+                &c.seats(),
+                &mut SpecRng::from_u64(seed),
+                rando_limits::FILL_MAX_ATTEMPTS,
+            )
         }
         .unwrap();
         assert!(f.all_beatable(), "seed {seed}: {:?}", f.beatable);
@@ -720,8 +729,9 @@ mod tests {
                 out += &format!("{:?}\n", fill_on(&c, seed, fresh).0);
                 // Player 1 alone: a room of one, its locations' items as one world's.
                 let one = &c.seats()[..1];
-                let f = fill_room(one, &mut SpecRng::from_u64(seed), config::FILL_MAX_ATTEMPTS)
-                    .unwrap();
+                let f =
+                    fill_room(one, &mut SpecRng::from_u64(seed), rando_limits::FILL_MAX_ATTEMPTS)
+                        .unwrap();
                 assert!(f.all_beatable(), "seed {seed}");
                 let placed: Vec<Option<u16>> =
                     f.placed[0].iter().map(|g| g.map(|g| g.item)).collect();
@@ -865,7 +875,7 @@ mod tests {
                     rooms += 1;
                     stuck += u32::from(split.is_err());
                     retried += u32::from(split.is_ok_and(|x| x.2 > 1));
-                    let f = filled(&c, seed, config::FILL_MAX_ATTEMPTS, false);
+                    let f = filled(&c, seed, rando_limits::FILL_MAX_ATTEMPTS, false);
                     undone += f.map_or(0, |f| f.0.profile.undone);
                 }
             }
@@ -925,7 +935,7 @@ mod tests {
         rule: fn(u32) -> Rule,
     ) -> Result<crate::RoomFilled, String> {
         let mut rng = SpecRng::from_u64(seed);
-        fill_room_test(&c.seats(), &mut rng, 1, (config::FILL_REPAIR_EVALS, rule, false))
+        fill_room_test(&c.seats(), &mut rng, 1, (rando_limits::FILL_REPAIR_EVALS, rule, false))
             .map(|(f, _)| f)
             .map_err(String::from)
     }
@@ -1017,7 +1027,7 @@ mod tests {
         assert!(moved > 2, "{moved} seeds moved an item");
     }
 
-    /// The work an attempt may spend on moves is bounded (`config::FILL_REPAIR_EVALS`): with no
+    /// The work an attempt may spend on moves is bounded (`rando_limits::FILL_REPAIR_EVALS`): with no
     /// budget at all, or one that stops after the first solve, the room of chains that needs
     /// divisions and moves (both charged) is stuck in one attempt, with the clean error and the item's name; given a second
     /// attempt, it goes deepest first and fills without a move. With the configured budget it
@@ -1045,7 +1055,7 @@ mod tests {
         let f = fill_room_budget(&seats, &mut rng(), (2, 0), false).unwrap();
         assert_eq!((f.attempts, f.swaps, f.divided, f.repair_evals), (2, 0, 0, 242));
         sound(&c, &f, "deepest first");
-        let budget = config::FILL_REPAIR_EVALS;
+        let budget = rando_limits::FILL_REPAIR_EVALS;
         let f = fill_room_budget(&seats, &mut rng(), (1, budget), false).unwrap();
         assert!(f.swaps > 0 && f.repair_evals > 0, "{} moved", f.swaps);
         assert!(f.repair_evals < budget, "{} evaluations", f.repair_evals);
@@ -1266,7 +1276,7 @@ mod tests {
         Result<(Vec<Vec<Option<Given>>>, RoomSpheres, u32, u32, Vec<bool>, Vec<usize>), String>;
 
     fn outcome(c: &Compiled, seed: u64, fresh: bool) -> (Outcome, crate::Stats, u32) {
-        match filled(c, seed, config::FILL_MAX_ATTEMPTS, fresh) {
+        match filled(c, seed, rando_limits::FILL_MAX_ATTEMPTS, fresh) {
             Ok((f, sp)) => {
                 (Ok((f.placed, sp, f.attempts, f.rounds, f.beatable, f.reached)), f.stats, f.solves)
             }
@@ -1435,9 +1445,12 @@ mod tests {
     #[test]
     fn a_room_solves_once_and_undoes_what_it_added_for_its_rounds() {
         let c = room(&small(false), 5, 1).unwrap();
-        let (f, _) =
-            fill_room_spheres(&c.seats(), &mut SpecRng::from_u64(1), config::FILL_MAX_ATTEMPTS)
-                .unwrap();
+        let (f, _) = fill_room_spheres(
+            &c.seats(),
+            &mut SpecRng::from_u64(1),
+            rando_limits::FILL_MAX_ATTEMPTS,
+        )
+        .unwrap();
         assert!(f.solves == 1, "solves {}", f.solves);
         assert!(f.profile.undone > 0, "nothing was undone");
     }

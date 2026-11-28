@@ -286,7 +286,7 @@ pub(super) fn run(
                 let (filled, sp) = fill_room_spheres(
                     &seats,
                     &mut SpecRng::from_u64(fill_seed),
-                    config::FILL_MAX_ATTEMPTS,
+                    rando_limits::FILL_MAX_ATTEMPTS,
                 )
                 .map_err(|e| format!("fill {seed}: {}", String::from(e)))?;
                 cx.engine_seconds += t.elapsed().as_secs_f64();

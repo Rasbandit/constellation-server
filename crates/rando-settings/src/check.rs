@@ -11,7 +11,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::Limits;
+use rando_limits::Limits;
 use rando_syntax::{Diagnostic, Pos, suggest};
 use serde_json::{Map, Value, json};
 use unicode_normalization::UnicodeNormalization;

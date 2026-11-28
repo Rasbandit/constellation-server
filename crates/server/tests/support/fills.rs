@@ -34,7 +34,7 @@ pub fn head(names: &[&str], instance: &Instance, rng: u64) -> Vec<u8> {
         seed_name: format!("s{rng}"),
         players,
         rng_seed: rng,
-        seed_max_bytes: config::Limits::DESIGN.bundle_max_bytes,
+        seed_max_bytes: config::Limits::DESIGN.format.bundle_max_bytes,
     };
     serde_json::to_vec(&fill).unwrap()
 }

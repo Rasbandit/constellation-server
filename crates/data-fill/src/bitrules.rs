@@ -3,9 +3,9 @@
 //! (or group sum) is at least n", "this region is reached", or a comparison over options and
 //! rolls alone, which a seed decides once. A solve keeps one bit per atom and answers such a
 //! rule with a few bit tests; a rule of any other shape, of more than
-//! `config::RULE_BITS_MAX_TERMS` terms or of a term of more than
-//! `config::RULE_BITS_MAX_TERM_TESTS` tests, stays bytecode, and so does every rule once the
-//! world holds `config::RULE_BITS_MAX_WORLD_TESTS` tests.
+//! `rando_limits::RULE_BITS_MAX_TERMS` terms or of a term of more than
+//! `rando_limits::RULE_BITS_MAX_TERM_TESTS` tests, stays bytecode, and so does every rule once the
+//! world holds `rando_limits::RULE_BITS_MAX_WORLD_TESTS` tests.
 //!
 //! Built once per loaded world from its bytecode ([`Bits::of`]) and read by every player and
 //! seed of it: a seed only evaluates the option atoms ([`Bits::statics`]). A room that clones
@@ -156,7 +156,7 @@ struct Builder<'a> {
 impl Bits {
     /// The bit rules of a loaded world.
     pub fn of(w: &World) -> Self {
-        Self::within(w, config::RULE_BITS_MAX_WORLD_TESTS)
+        Self::within(w, rando_limits::RULE_BITS_MAX_WORLD_TESTS)
     }
 
     /// [`Bits::of`] holding at most `budget` tests in all: a rule that would pass it stays
@@ -324,12 +324,12 @@ impl Builder<'_> {
                 a.push(t);
             }
         }
-        (a.len() <= config::RULE_BITS_MAX_TERMS).then_some(a)
+        (a.len() <= rando_limits::RULE_BITS_MAX_TERMS).then_some(a)
     }
 
     /// `a` and `b`; `None` past the term cap, or for a term past the cap on its tests.
     fn and(a: &[And], b: &[And]) -> Option<Vec<And>> {
-        if a.len() * b.len() > config::RULE_BITS_MAX_TERMS {
+        if a.len() * b.len() > rando_limits::RULE_BITS_MAX_TERMS {
             return None;
         }
         let mut out = Vec::new();
@@ -338,7 +338,7 @@ impl Builder<'_> {
                 let mut atoms = [x.atoms.as_slice(), &y.atoms].concat();
                 atoms.sort_unstable();
                 atoms.dedup();
-                if atoms.len() > config::RULE_BITS_MAX_TERM_TESTS {
+                if atoms.len() > rando_limits::RULE_BITS_MAX_TERM_TESTS {
                     return None;
                 }
                 let t = And { atoms };
@@ -472,13 +472,13 @@ mod tests {
 
     /// A def of 40 `has` tests referred to from 50 sites that each add one test: copying the
     /// def's term into every site would hold 50 times 41 tests for a bytecode of about 90
-    /// nodes, so a term past `config::RULE_BITS_MAX_TERM_TESTS` stays bytecode, the def and
+    /// nodes, so a term past `rando_limits::RULE_BITS_MAX_TERM_TESTS` stays bytecode, the def and
     /// every site that refers to it. A def of 31 tests still fits with the site's own. Both
     /// decide what their bytecode decides. And a world stops at its budget of tests: the rules
     /// after it stay bytecode.
     #[test]
     fn a_long_def_copied_into_many_sites_and_a_world_past_its_budget_stay_bytecode() {
-        assert_eq!(config::RULE_BITS_MAX_TERM_TESTS, 32, "the cap the defs are written for");
+        assert_eq!(rando_limits::RULE_BITS_MAX_TERM_TESTS, 32, "the cap the defs are written for");
         let keys: Vec<String> =
             (0..60).map(|k| format!("x{k}")).chain(["c", "d"].map(String::from)).collect();
         let all = |n: usize| json!({"all": keys[..n].iter().map(|k| json!({"has": k})).collect::<Vec<_>>()});
@@ -550,7 +550,7 @@ mod tests {
     /// The term cap at its edge: an OR of 16 distinct atoms is a bit rule, of 17 it is not.
     #[test]
     fn the_seventeenth_term_stays_bytecode() {
-        assert_eq!(config::RULE_BITS_MAX_TERMS, 16);
+        assert_eq!(rando_limits::RULE_BITS_MAX_TERMS, 16);
         let any = |n: u32| json!({"any": (1..=n).map(|k| json!({"has": "a", "n": k})).collect::<Vec<_>>()});
         let (w, inst) = world(&[any(16), any(17)]);
         assert_eq!(bytecode(&w), 1);
@@ -747,7 +747,7 @@ mod tests {
     }
 
     /// The compiler refuses a weight that is negative, not an integer or past
-    /// `config::RULE_WEIGHT_MAX`, and a group past `config::RULE_GROUP_MAX_MEMBERS` members.
+    /// `rando_limits::RULE_WEIGHT_MAX`, and a group past `rando_limits::RULE_GROUP_MAX_MEMBERS` members.
     #[test]
     fn weighted_sums_refuse_bad_weights_and_oversized_groups() {
         let keys: Vec<String> = ('a'..='j').map(String::from).collect();
@@ -756,14 +756,14 @@ mod tests {
             crate::World::load(&m).map(|_| ())
         };
         let weighted = |w: Value| json!({"ge": [{"int": ["+", {"int": ["*", {"count": "a"}, w]}, {"count": "b"}]}, 1]});
-        assert_eq!(config::RULE_WEIGHT_MAX, 32_767);
+        assert_eq!(rando_limits::RULE_WEIGHT_MAX, 32_767);
         assert!(load(weighted(json!(32_767))).is_ok());
         for bad in [json!(-1), json!(1.5), json!(32_768), json!("2"), json!(null)] {
             assert!(load(weighted(bad.clone())).is_err(), "weight {bad}");
         }
         let members = |n: usize| sum_at_least(&vec![json!({"count": "a"}); n], 1);
-        assert!(load(members(config::RULE_GROUP_MAX_MEMBERS)).is_ok());
-        let e = load(members(config::RULE_GROUP_MAX_MEMBERS + 1)).unwrap_err();
+        assert!(load(members(rando_limits::RULE_GROUP_MAX_MEMBERS)).is_ok());
+        let e = load(members(rando_limits::RULE_GROUP_MAX_MEMBERS + 1)).unwrap_err();
         assert!(e.contains("members"), "{e}");
     }
 
@@ -807,8 +807,8 @@ mod tests {
         assert!(with(&[3, 1, 1]).is_err(), "three weights for two members");
         // Merged terms make any weight up to the group's total legal (2 x 16,384 is 32,768),
         // so the cap is on the total.
-        let total =
-            config::RULE_WEIGHT_MAX * i64::try_from(config::RULE_GROUP_MAX_MEMBERS).unwrap();
+        let total = rando_limits::RULE_WEIGHT_MAX
+            * i64::try_from(rando_limits::RULE_GROUP_MAX_MEMBERS).unwrap();
         let total = u32::try_from(total).unwrap();
         assert!(with(&[total, 0]).is_ok());
         assert!(with(&[total, 1]).is_err(), "a weight past the cap");
@@ -824,7 +824,7 @@ mod tests {
     /// A random weighted sum over the test world's items, and its twin with a trailing `0`
     /// term, which the compiler leaves as plain bytecode that sums every term again on every
     /// read: the oracle the incremental group sums are held against. Half the sums have small
-    /// weights and thresholds; the other half weights up to `config::RULE_WEIGHT_MAX` and a
+    /// weights and thresholds; the other half weights up to `rando_limits::RULE_WEIGHT_MAX` and a
     /// threshold up to the sum at two copies of each term (capped at the largest literal), so
     /// thresholds near what is reachable are drawn. An item keeps one cap within a sum, and an
     /// item named twice is merged into one member.
@@ -839,7 +839,7 @@ mod tests {
             let n = json!({"count": item(k)});
             let c = if caps[k] > 0 { json!({"int": ["min", n, caps[k]]}) } else { n };
             let w = if wide && below(2) == 0 {
-                config::RULE_WEIGHT_MAX - below(4) as i64
+                rando_limits::RULE_WEIGHT_MAX - below(4) as i64
             } else if wide {
                 i64::try_from(below(1000)).unwrap()
             } else {
@@ -852,7 +852,7 @@ mod tests {
                 x => times(c, w, x == 1),
             });
         }
-        let top = if wide { at_two.clamp(1, config::RULE_WEIGHT_MAX) } else { 12 };
+        let top = if wide { at_two.clamp(1, rando_limits::RULE_WEIGHT_MAX) } else { 12 };
         let n = 1 + i64::try_from(below(u64::try_from(top).unwrap())).unwrap();
         let twin = [terms.clone(), vec![json!(0)]].concat();
         (sum_at_least(&terms, n), sum_at_least(&twin, n))
@@ -947,7 +947,7 @@ mod tests {
         }
         // The two events are plain rule sites too.
         want[1] += 2;
-        assert_eq!(config::RULE_BITS_MAX_TERMS, 16, "the cap `wide` is written for");
+        assert_eq!(rando_limits::RULE_BITS_MAX_TERMS, 16, "the cap `wide` is written for");
         // Inventories: every item alone, growing prefixes with up to three copies of each.
         let mut held: Vec<Vec<u16>> = (0..10).map(|i| vec![i]).collect();
         held.push(Vec::new());

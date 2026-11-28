@@ -477,7 +477,7 @@ fn one_fill(
     seats: &[crate::Seat<'_>],
     s: u64,
 ) -> Result<(RoomFilled, RoomSpheres), crate::FillError> {
-    fill_room_spheres(seats, &mut seeded(s, FILLS), config::FILL_MAX_ATTEMPTS)
+    fill_room_spheres(seats, &mut seeded(s, FILLS), rando_limits::FILL_MAX_ATTEMPTS)
 }
 
 /// What the fill's seeds look like over a room. Sphere 0 is what is reachable from the start; "progression" is every progression item at a

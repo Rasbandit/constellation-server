@@ -49,7 +49,7 @@ impl Errs {
         Error::new(file.cloned().unwrap_or_default(), pos, msg.into(), help)
     }
 
-    /// An error at `pos`. Past [`config::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
+    /// An error at `pos`. Past [`rando_limits::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
     /// are dropped and [`Errs::finish`] says how many.
     pub(crate) fn err(&mut self, pos: Pos, msg: impl Into<String>, help: &str) {
         self.push(Some(pos), msg, help);
@@ -72,7 +72,7 @@ impl Errs {
         if !self.seen.insert((pos, msg.clone())) {
             return;
         }
-        if self.errors.len() < config::WORLD_BUILD_MAX_ERRORS {
+        if self.errors.len() < rando_limits::WORLD_BUILD_MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.errors.push(e);
         } else {
@@ -93,7 +93,7 @@ impl Errs {
         if !self.seen.insert((pos, msg.clone())) {
             return;
         }
-        if self.warnings.len() < config::WORLD_BUILD_MAX_ERRORS {
+        if self.warnings.len() < rando_limits::WORLD_BUILD_MAX_ERRORS {
             let e = self.make(pos, msg, help);
             self.warnings.push(e);
         } else {
@@ -194,27 +194,27 @@ pub(crate) struct Model {
 }
 
 /// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*` with at least one
-/// letter, at most [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for `.rando` identifiers.
+/// letter, at most [`rando_limits::MANIFEST_NAME_MAX_BYTES`]. The one rule for `.rando` identifiers.
 pub(crate) fn name_shape(s: &str) -> bool {
-    s.len() <= config::MANIFEST_NAME_MAX_BYTES
+    s.len() <= rando_limits::MANIFEST_NAME_MAX_BYTES
         && s.bytes().any(|b| b.is_ascii_lowercase())
         && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// A game key: lowercase letters, digits, `_` and `-`, with at least one letter, at most
-/// [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for the `world` line and `rando.toml`'s
+/// [`rando_limits::MANIFEST_NAME_MAX_BYTES`]. The one rule for the `world` line and `rando.toml`'s
 /// `name`; looser than [`name_shape`] on purpose, since a game key is never read in a rule.
 pub(crate) fn game_key_ok(s: &str) -> bool {
     s.bytes().any(|b| b.is_ascii_lowercase())
-        && s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.len() <= rando_limits::MANIFEST_NAME_MAX_BYTES
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// A name the rule language can read: [`name_shape`], not reserved.
 fn name_ok(errs: &mut Errs, n: &At<String>, what: &str) -> bool {
     let s = n.v.as_str();
-    let most = config::MANIFEST_NAME_MAX_BYTES;
+    let most = rando_limits::MANIFEST_NAME_MAX_BYTES;
     if !name_shape(s) {
         errs.err(
             n.pos,
@@ -313,7 +313,7 @@ pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
     // for that bound keeps it off the caller's stack, whatever that stack is.
     std::thread::scope(|s| {
         std::thread::Builder::new()
-            .stack_size(config::WORLD_BUILD_STACK_BYTES)
+            .stack_size(rando_limits::WORLD_BUILD_STACK_BYTES)
             .spawn_scoped(s, || build_here(w, file))
             .map_or_else(
                 |e| {
@@ -428,7 +428,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     // Options: their own namespace, read as `opt.<key>`.
     let mut names = Names::default();
     let mut options = Vec::new();
-    let most = config::WORLD_OPTIONS_MAX;
+    let most = rando_limits::WORLD_OPTIONS_MAX;
     if w.options.len() > most {
         errs.err(
             w.options[most].key.pos,
@@ -570,11 +570,15 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             }
         };
         let count = match &it.count {
-            Some(c) if (0..=config::WORLD_ITEM_COPIES_MAX).contains(&c.v) => c.v,
+            Some(c) if (0..=rando_limits::WORLD_ITEM_COPIES_MAX).contains(&c.v) => c.v,
             Some(c) => {
                 errs.err(
                     c.pos,
-                    format!("count {} is outside 0 to {}", c.v, config::WORLD_ITEM_COPIES_MAX),
+                    format!(
+                        "count {} is outside 0 to {}",
+                        c.v,
+                        rando_limits::WORLD_ITEM_COPIES_MAX
+                    ),
                     "doc 16 section 5.3 bounds copies of one item",
                 );
                 continue;
@@ -594,12 +598,12 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             errs.err(k.pos, format!("`{}` in `fill_with` is not an item", k.v), "");
         } else if !seen.insert(k.v.clone()) {
             errs.err(k.pos, format!("`{}` is in `fill_with` twice", k.v), "");
-        } else if wt.v < 1 || wt.v > config::WORLD_ITEM_COPIES_MAX {
+        } else if wt.v < 1 || wt.v > rando_limits::WORLD_ITEM_COPIES_MAX {
             errs.err(
                 wt.pos,
                 format!(
                     "a fill weight is a whole number from 1 to {}",
-                    config::WORLD_ITEM_COPIES_MAX
+                    rando_limits::WORLD_ITEM_COPIES_MAX
                 ),
                 "",
             );
@@ -627,14 +631,14 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 errs.err(m.pos, format!("`{}` is in item group `{}` twice", m.v, g.v), "");
             }
         }
-        if members.len() > config::RULE_MAX_PARTS {
+        if members.len() > rando_limits::RULE_MAX_PARTS {
             errs.err(
                 g.pos,
                 format!(
                     "item group `{}` has {} items; a sum the engine reads has at most {}",
                     g.v,
                     members.len(),
-                    config::RULE_MAX_PARTS
+                    rando_limits::RULE_MAX_PARTS
                 ),
                 "",
             );
@@ -692,12 +696,12 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             space.declare(errs, e, Sort::Event);
         }
     }
-    if w.regions.len() > config::WORLD_TABLE_MAX {
+    if w.regions.len() > rando_limits::WORLD_TABLE_MAX {
         errs.whole(
             format!(
                 "{} regions; the engine indexes at most {}",
                 w.regions.len(),
-                config::WORLD_TABLE_MAX
+                rando_limits::WORLD_TABLE_MAX
             ),
             "",
         );
@@ -721,7 +725,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
     for sh in &w.shuffles {
         let n = &sh.name;
-        let most = config::SHUFFLE_NAME_MAX_BYTES;
+        let most = rando_limits::SHUFFLE_NAME_MAX_BYTES;
         if n.v.len() > most {
             errs.err(n.pos, format!("a shuffle name is at most {most} bytes"), "");
             continue;
@@ -1028,10 +1032,10 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
                 continue;
             }
-            if !(0..=config::WORLD_ITEM_COPIES_MAX).contains(&n) {
+            if !(0..=rando_limits::WORLD_ITEM_COPIES_MAX).contains(&n) {
                 lw.errs().err(
                     g.n.as_ref().map_or(g.item.pos, |n| n.pos),
-                    format!("a grant is 0 to {} copies", config::WORLD_ITEM_COPIES_MAX),
+                    format!("a grant is 0 to {} copies", rando_limits::WORLD_ITEM_COPIES_MAX),
                     "",
                 );
                 continue;
@@ -1567,8 +1571,8 @@ fn ids(errs: &mut Errs, given: &[Option<&At<i64>>], what: &str) -> Vec<i64> {
             );
         }
     }
-    if given.len() > config::WORLD_TABLE_MAX {
-        let most = config::WORLD_TABLE_MAX;
+    if given.len() > rando_limits::WORLD_TABLE_MAX {
+        let most = rando_limits::WORLD_TABLE_MAX;
         errs.whole(format!("{} {what}s; the engine indexes at most {most}", given.len()), "");
     }
     let mut next = used.iter().max().map_or(1, |m| m + 1);

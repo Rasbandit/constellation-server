@@ -11,7 +11,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use config::Limits;
+use rando_limits::Limits;
 use serde_json::{Map, Value, json};
 
 /// The `format` this reader knows.

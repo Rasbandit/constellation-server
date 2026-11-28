@@ -84,9 +84,9 @@ fn fmt(dir: &Path, check_only: bool) -> ExitCode {
     for p in files {
         let name = p.strip_prefix(dir).unwrap_or(&p).display().to_string();
         let text = match std::fs::read_to_string(&p) {
-            Ok(t) if t.len() <= config::WORLD_SOURCE_MAX_BYTES => t,
+            Ok(t) if t.len() <= rando_limits::WORLD_SOURCE_MAX_BYTES => t,
             Ok(_) => {
-                eprintln!("error: {name} is over {} bytes", config::WORLD_SOURCE_MAX_BYTES);
+                eprintln!("error: {name} is over {} bytes", rando_limits::WORLD_SOURCE_MAX_BYTES);
                 bad = true;
                 continue;
             }
@@ -97,7 +97,7 @@ fn fmt(dir: &Path, check_only: bool) -> ExitCode {
             }
         };
         let formatted = if p.extension().is_some_and(|x| x == settings_cmd::EXT) {
-            rando_settings::fmt::format_text(&text, &name, &config::Limits::DESIGN)
+            rando_settings::fmt::format_text(&text, &name, &rando_limits::Limits::DESIGN)
         } else {
             format_text(&text, &name)
         };
@@ -357,14 +357,17 @@ fn write_lock(dir: &Path, text: &str) -> Result<(), String> {
 /// `rando pack`: the package first, then the lock with its ids marked published; nothing is
 /// written when the pack is refused.
 fn pack(dir: &Path, out: Option<&Path>, source: bool) -> ExitCode {
-    let packed =
-        match world_build::pack::pack(&Dir(dir.to_path_buf()), source, &config::Limits::DESIGN) {
-            Ok(p) => p,
-            Err(list) => {
-                list.iter().for_each(|e| eprintln!("{e}"));
-                return ExitCode::FAILURE;
-            }
-        };
+    let packed = match world_build::pack::pack(
+        &Dir(dir.to_path_buf()),
+        source,
+        &rando_limits::Limits::DESIGN,
+    ) {
+        Ok(p) => p,
+        Err(list) => {
+            list.iter().for_each(|e| eprintln!("{e}"));
+            return ExitCode::FAILURE;
+        }
+    };
     // Beside `rando.toml` unless `-o` says otherwise, wherever `rando` was run from.
     let path = out.map_or_else(|| dir.join(&packed.file_name), Path::to_path_buf);
     match write_file(&path, &packed.bytes).and_then(|()| write_lock(dir, &packed.lock)) {
@@ -399,17 +402,21 @@ impl Gen {
         };
         match flag {
             "--seed" => {
-                let n = Some(num("--seed")?).filter(|n| *n <= config::SEED_NUMBER_MAX);
+                let n = Some(num("--seed")?).filter(|n| *n <= rando_limits::SEED_NUMBER_MAX);
                 self.seed = Some(n.ok_or_else(|| {
-                    format!("--seed takes a whole number from 0 to {}", config::SEED_NUMBER_MAX)
+                    format!(
+                        "--seed takes a whole number from 0 to {}",
+                        rando_limits::SEED_NUMBER_MAX
+                    )
                 })?);
             }
             "--players" => {
                 let n = u32::try_from(num("--players")?).ok().filter(|n| {
-                    *n >= 1 && usize::try_from(*n).is_ok_and(|n| n <= config::ROOM_MAX_PLAYERS)
+                    *n >= 1
+                        && usize::try_from(*n).is_ok_and(|n| n <= rando_limits::ROOM_MAX_PLAYERS)
                 });
                 self.players = Some(n.ok_or_else(|| {
-                    format!("--players takes a number from 1 to {}", config::ROOM_MAX_PLAYERS)
+                    format!("--players takes a number from 1 to {}", rando_limits::ROOM_MAX_PLAYERS)
                 })?);
             }
             "--check-seeds" => {
@@ -451,7 +458,8 @@ fn pair(v: &str) -> Result<(String, String), String> {
 fn random_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     // `SEED_NUMBER_MAX` is 2^53 - 1, all ones, so the mask keeps the number in range.
-    std::collections::hash_map::RandomState::new().build_hasher().finish() & config::SEED_NUMBER_MAX
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+        & rando_limits::SEED_NUMBER_MAX
 }
 
 #[cfg(feature = "engine")]

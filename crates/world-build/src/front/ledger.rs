@@ -14,7 +14,7 @@ use crate::model::{At, World};
 use crate::world::Errs;
 
 /// Largest id: inside 2^53 - 1, the range world ids keep to.
-const MAX_ID: i64 = config::ID_MAX;
+const MAX_ID: i64 = rando_limits::ID_MAX;
 
 /// The lock format this tool reads and writes. A lock with no `format` predates the field and
 /// has the same shape.

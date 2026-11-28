@@ -63,7 +63,7 @@ fn text(b: &[u8]) -> bool {
 ///
 /// # Errors
 /// Every reason it was refused, one line each, printed as `rando check` prints them.
-pub fn pack(dir: &Dir, source: bool, l: &config::Limits) -> Result<Packed, Vec<String>> {
+pub fn pack(dir: &Dir, source: bool, l: &rando_limits::Limits) -> Result<Packed, Vec<String>> {
     if dir.read(FILE).is_none() {
         return Err(vec![format!(
             "rando pack requires a {FILE} in {}; see design doc 19 section 2",
@@ -141,7 +141,7 @@ pub fn pack(dir: &Dir, source: bool, l: &config::Limits) -> Result<Packed, Vec<S
 fn assets(
     dir: &Dir,
     meta: &Meta,
-    l: &config::Limits,
+    l: &rando_limits::Limits,
     entries: &mut BTreeMap<String, Vec<u8>>,
     errs: &mut Vec<String>,
 ) -> Option<String> {

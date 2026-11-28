@@ -220,6 +220,9 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 [[package]]
 name = "config"
 version = "0.1.0"
+dependencies = [
+ "rando-limits",
+]
 
 [[package]]
 name = "constant_time_eq"
@@ -343,8 +346,8 @@ version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "bits",
- "config",
  "data-fill",
+ "rando-limits",
  "rule-ops",
  "seed-bundle",
  "serde",
@@ -1267,10 +1270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rando-limits"
+version = "0.1.0"
+
+[[package]]
 name = "rando-settings"
 version = "0.1.0"
 dependencies = [
- "config",
+ "rando-limits",
  "rando-syntax",
  "semver",
  "serde_json",
@@ -1507,9 +1514,9 @@ name = "seed-bundle"
 version = "0.1.0"
 dependencies = [
  "bits",
- "config",
  "flate2",
  "proto",
+ "rando-limits",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1600,6 +1607,7 @@ dependencies = [
  "httpdate",
  "log 0.1.0",
  "proto",
+ "rando-limits",
  "room-core",
  "runtime",
  "seed-bundle",
@@ -2477,9 +2485,9 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 name = "world-build"
 version = "0.1.0"
 dependencies = [
- "config",
  "data-fill",
  "flate2",
+ "rando-limits",
  "rando-settings",
  "rando-syntax",
  "rule-ops",

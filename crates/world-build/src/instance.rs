@@ -158,10 +158,10 @@ fn settle<'m>(m: &'m Model, given: &HashMap<String, i64>) -> Result<Settled<'m>,
             Some(v) => {
                 let n = int(v, &o)
                     .ok_or_else(|| format!("item {key:?}: its copies read more than options"))?;
-                if !(0..=config::WORLD_ITEM_COPIES_MAX).contains(&n) {
+                if !(0..=rando_limits::WORLD_ITEM_COPIES_MAX).contains(&n) {
                     return Err(format!(
                         "item {key:?} has {n} copies, outside 0 to {}",
-                        config::WORLD_ITEM_COPIES_MAX
+                        rando_limits::WORLD_ITEM_COPIES_MAX
                     ));
                 }
                 n
@@ -187,7 +187,7 @@ fn settle<'m>(m: &'m Model, given: &HashMap<String, i64>) -> Result<Settled<'m>,
         return Err(format!("{placed} items to place and {slots} checks to hold them"));
     }
     let start: i64 = granted.iter().map(|g| g.n).sum();
-    let most = config::WORLD_START_COPIES_MAX;
+    let most = rando_limits::WORLD_START_COPIES_MAX;
     if start > i64::try_from(most).unwrap_or(i64::MAX) {
         return Err(format!("{start} start item copies, at most {most}"));
     }
@@ -286,13 +286,13 @@ pub(crate) fn options_read<'v>(
 
 /// The option settings a build-time test tries for the options `keys` (each a key of
 /// `options`): every combination; when there are more than
-/// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
+/// [`rando_limits::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
 /// highest value; when those are still too many, each option alone at its two ends, and `true`
 /// for "only partly tried". An option left out of a setting takes its default.
 pub(crate) fn settings(options: &[OptM], keys: &[String]) -> (Vec<Vec<(String, i64)>>, bool) {
     let opts: Vec<&OptM> =
         keys.iter().filter_map(|k| options.iter().find(|o| o.key == *k)).collect();
-    let most = config::WORLD_POOL_TEST_MAX_COMBINATIONS;
+    let most = rando_limits::WORLD_POOL_TEST_MAX_COMBINATIONS;
     let ends = |o: &OptM| {
         let (lo, hi) = bounds(&o.ty);
         if lo == hi { vec![lo] } else { vec![lo, hi] }
@@ -359,7 +359,7 @@ pub(crate) fn setting_text(options: &[OptM], given: &[(String, i64)]) -> String 
 
 /// Doc 16 section 3.4: too many items for the checks is an error at build time. Every
 /// combination of the options the counts read is tried; when there are more than
-/// [`config::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
+/// [`rando_limits::WORLD_POOL_TEST_MAX_COMBINATIONS`], every combination of each option's lowest and
 /// highest value; when those are still too many, each option alone at its two ends (with a
 /// warning). Generation checks the actual settings again.
 pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
@@ -368,7 +368,7 @@ pub(crate) fn pool_test(m: &Model, errs: &mut Errs) {
         errs.warn_whole(
             format!(
                 "the pool test tried each option alone at its two ends: over {} combinations",
-                config::WORLD_POOL_TEST_MAX_COMBINATIONS
+                rando_limits::WORLD_POOL_TEST_MAX_COMBINATIONS
             ),
             "generation still checks the pool for the actual settings",
         );

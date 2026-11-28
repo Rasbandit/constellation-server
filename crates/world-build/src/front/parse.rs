@@ -643,10 +643,10 @@ impl P<'_> {
     }
 
     fn deep(&self, depth: usize) -> R<()> {
-        if depth > config::WORLD_BLOCK_MAX_DEPTH {
+        if depth > rando_limits::WORLD_BLOCK_MAX_DEPTH {
             return Err((
                 self.here(),
-                format!("blocks nest more than {} deep", config::WORLD_BLOCK_MAX_DEPTH),
+                format!("blocks nest more than {} deep", rando_limits::WORLD_BLOCK_MAX_DEPTH),
             ));
         }
         Ok(())
