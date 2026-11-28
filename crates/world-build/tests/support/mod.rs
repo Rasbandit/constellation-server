@@ -148,6 +148,8 @@ pub fn tidewell() -> World {
         min: range.map(|r| f.at(r.0)),
         max: range.map(|r| f.at(r.1)),
         default: Some(f.at(default)),
+        scope: None,
+        label: None,
     };
     let options = vec![
         opt("tricky_climbs", "toggle", &[], None, Lit::Bool(false)),

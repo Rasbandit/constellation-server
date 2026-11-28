@@ -168,6 +168,8 @@ pub enum Decl {
         values: Vec<At<String>>,
         range: Option<(At<i64>, At<i64>)>,
         default: Option<At<Lit>>,
+        scope: Option<At<String>>,
+        label: Option<At<String>>,
     },
     Item(ItemD),
     Pool(Vec<(At<String>, Expr)>),
@@ -339,6 +341,11 @@ impl P<'_> {
         if let Some(b) = self.layout.brk.get_mut(at) {
             *b = Some(depth);
         }
+    }
+
+    /// A plain name next, on the same line as the token before it.
+    fn name_on_line(&self) -> bool {
+        self.toks.get(self.k).is_some_and(|t| matches!(t.t, Tok::Name(_)) && !t.nl)
     }
 
     fn got(&self) -> String {
@@ -841,11 +848,24 @@ impl P<'_> {
         } else {
             None
         };
-        // Player-facing text: read and kept for later (the manifest has no place for it).
-        if matches!(self.peek(), Some(Tok::Str(_))) {
-            self.k += 1;
+        // The player-facing label, then a scope word on the same line (checked by the build),
+        // in doc 18 section 2.14's order.
+        let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+            Some(self.string("the option's label")?)
+        } else {
+            None
+        };
+        let scope = if self.name_on_line() { Some(self.name("the scope")?) } else { None };
+        if label.is_none() && scope.is_some() && matches!(self.peek(), Some(Tok::Str(_))) {
+            return Err((
+                self.here(),
+                "the label goes before the scope: write `= teal \"Lamp color\" cosmetic`".into(),
+            ));
         }
-        Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default })
+        if self.name_on_line() {
+            return Err((self.here(), format!("an option takes one scope, found {}", self.got())));
+        }
+        Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default, scope, label })
     }
 
     fn ident(&mut self, key: &mut Option<At<String>>, was: &mut Option<At<String>>) -> R<bool> {

@@ -1,5 +1,5 @@
 //! `rando pack` (design doc 19 sections 3 and 4): a world folder to one `.randopack`, a zip of
-//! `manifest.json`, `meta.json`, `assets/`, optional `source/` and `sha256.txt`. The same
+//! `manifest.json`, `meta.json`, `settings.json`, `assets/`, optional `source/` and `sha256.txt`. The same
 //! folder gives the same bytes with the same `rando`: entries in path order, one fixed time
 //! and mode, one compression level. Nothing is written here; the caller writes the package,
 //! then the lock.
@@ -89,6 +89,11 @@ pub fn pack(dir: &Dir, source: bool, l: &config::Limits) -> Result<Packed, Vec<S
         errs.push(format!("the manifest is over {manifest_max} bytes"));
     }
     entries.insert("manifest.json".into(), built.json().as_bytes().to_vec());
+    let settings = built.settings_schema().map_err(|e| vec![format!("error: {e}")])?;
+    if settings.len() > l.package_max_settings_bytes {
+        errs.push(format!("settings.json is over {} bytes", l.package_max_settings_bytes));
+    }
+    entries.insert("settings.json".into(), settings.into_bytes());
     let license_file = assets(dir, &meta, l, &mut entries, &mut errs);
     let meta_json = crate::canon::to_string(&meta_json(&meta, license_file))
         .map_err(|e| vec![format!("meta.json: {e}")])?;

@@ -137,12 +137,18 @@ impl Errs {
     }
 }
 
+/// An option's scopes, the default first (doc 20 section 5).
+const SCOPES: [&str; 3] = ["seed", "cosmetic", "knowledge"];
+
 /// An option as the per-seed step reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct OptM {
     pub key: String,
     pub ty: OptTy,
     pub default: i64,
+    /// `seed`, `cosmetic` or `knowledge` (doc 20 section 5).
+    pub scope: String,
+    pub label: Option<String>,
 }
 
 /// A check as the per-seed step reads it: its rules already lowered (options only).
@@ -508,8 +514,25 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 continue;
             }
         };
+        let scope = o.scope.as_ref().map_or(SCOPES[0], |w| w.v.as_str());
+        if let Some(w) = o.scope.as_ref().filter(|w| !SCOPES.contains(&w.v.as_str())) {
+            errs.err(
+                w.pos,
+                format!("`{}` is not an option scope", w.v),
+                "write `cosmetic` or `knowledge`, or nothing for an option that changes the seed",
+            );
+        }
+        if let Some(l) = o.label.as_ref().filter(|l| l.v.trim().is_empty()) {
+            errs.err(l.pos, "an option's label cannot be empty", "write the text, or leave it out");
+        }
         names.options.insert(o.key.v.clone(), ty.clone());
-        options.push(OptM { key: o.key.v.clone(), ty, default });
+        options.push(OptM {
+            key: o.key.v.clone(),
+            ty,
+            default,
+            scope: scope.to_owned(),
+            label: o.label.as_ref().map(|l| l.v.clone()),
+        });
     }
 
     // Items.

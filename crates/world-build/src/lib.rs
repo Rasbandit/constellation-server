@@ -25,6 +25,7 @@ pub mod model;
 pub mod pack;
 mod presence;
 pub mod rule;
+mod schema;
 mod suggest;
 mod world;
 
@@ -128,6 +129,17 @@ impl Built {
                 (k, t)
             })
             .collect()
+    }
+
+    /// The settings schema, `settings.json` (design doc 20 section 5), as canonical JSON: each
+    /// option's kind, values or bounds, default, scope and label, and the item, place (check)
+    /// and door names a settings file may name.
+    ///
+    /// # Errors
+    /// The world has no `rando.toml`, which gives the schema its name and version.
+    pub fn settings_schema(&self) -> Result<String, String> {
+        let meta = self.meta.as_ref().ok_or("settings.json needs the world's rando.toml")?;
+        schema::of(&self.model, &self.manifest, meta)
     }
 
     /// The instance at every option's default.

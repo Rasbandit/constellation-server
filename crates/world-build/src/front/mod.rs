@@ -1113,7 +1113,7 @@ impl X {
                 }
                 self.world.start = Some(s.clone());
             }
-            Decl::Option { name, ty, values, range, default } => {
+            Decl::Option { name, ty, values, range, default, scope, label } => {
                 no_cond(self, "an option", name.pos);
                 self.world.options.push(Opt {
                     key: name.clone(),
@@ -1122,6 +1122,8 @@ impl X {
                     min: range.as_ref().map(|r| r.0.clone()),
                     max: range.as_ref().map(|r| r.1.clone()),
                     default: default.clone(),
+                    scope: scope.clone(),
+                    label: label.clone(),
                 });
             }
             Decl::Item(i) => {

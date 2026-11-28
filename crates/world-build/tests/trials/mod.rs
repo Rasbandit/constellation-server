@@ -250,6 +250,34 @@ fn the_adventure_trial_world_builds_keeps_its_ids_and_confines_its_keys() {
     assert_eq!(on.locations.len(), inst.locations.len() + 9);
 }
 
+/// Cinderfall's settings schema is pinned byte for byte: the settings checker's tests (doc 20,
+/// `rando-settings`) read the same committed file, so a change to the schema's shape shows here
+/// first.
+#[test]
+fn the_adventure_trial_world_settings_schema_matches_the_golden_file() {
+    let b = ok(&Dir(root("cinderfall")));
+    let golden =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cinderfall.settings.json");
+    let want = std::fs::read_to_string(&golden).unwrap_or_default();
+    assert_eq!(b.settings_schema().unwrap(), want, "{}", golden.display());
+    assert!(want.contains("{\"name\":\"hut_door\"}"), "the shuffled doors are listed");
+    assert!(want.contains("{\"name\":\"anvil\"}"), "places are objects");
+    // A fill-only item is marked filler, with no count: the fill decides how many.
+    assert!(want.contains("{\"filler\":true,\"name\":\"coin\"}"), "coin is filler");
+}
+
+/// An item whose copies read options has no `copies` in the schema: there is no one number.
+#[test]
+fn the_settings_schema_leaves_out_copies_that_read_options() {
+    let b = ok(&Dir(root("gloam_delve")));
+    let v: serde_json::Value = serde_json::from_str(&b.settings_schema().unwrap()).unwrap();
+    let items = v["items"].as_array().unwrap();
+    let shard = items.iter().find(|i| i["name"] == "ember_shard").cloned();
+    assert_eq!(shard, Some(serde_json::json!({"name": "ember_shard"})));
+    let rest = items.iter().filter(|i| i["name"] != "ember_shard");
+    assert!(rest.into_iter().all(|i| i["copies"].is_i64() || i["filler"] == true), "{items:?}");
+}
+
 #[test]
 fn the_adventure_trial_world_fills_beatable_at_its_option_extremes() {
     let b = ok(&Dir(root("cinderfall")));
