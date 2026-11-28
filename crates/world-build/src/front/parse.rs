@@ -3,7 +3,7 @@
 //! after an error the parser skips to the next one and goes on: one pass reports every error.
 //! It also records where the canonical layout breaks lines, for the formatter.
 
-use crate::lex::{CHECK_MODIFIERS, Comment, Tok, Token, lex, show};
+use crate::lex::{CHECK_MODIFIERS, Comment, Kind, Tok, Token, lex, show};
 use crate::model::{At, Lit, Pos, Verb};
 use crate::rule::{E, Expr, Piece, parse_in};
 
@@ -269,7 +269,7 @@ type R<T> = Result<T, (Pos, String)>;
 /// Parse `src`, file number `file` of its world, every error collected.
 #[must_use]
 pub fn parse(src: &str, file: u32) -> FileAst {
-    let (toks, comments) = match lex(src, Pos::in_file(file, 1, 1)) {
+    let (toks, comments) = match lex(src, Pos::in_file(file, 1, 1), Kind::World) {
         Ok(x) => x,
         Err(e) => return FileAst { errors: vec![e], ..FileAst::default() },
     };

@@ -9,16 +9,12 @@
 //! the model. What is checked and the choices made where the design doc is silent are in
 //! `docs/world-build.md`.
 
-use std::fmt;
-
 use serde_json::Value;
 
-pub mod canon;
 pub mod front;
 #[cfg(feature = "engine")]
 pub mod generate;
 mod instance;
-pub mod lex;
 mod lower;
 pub mod meta;
 pub mod model;
@@ -26,36 +22,13 @@ pub mod pack;
 mod presence;
 pub mod rule;
 mod schema;
-mod suggest;
 mod world;
 
-pub use model::Pos;
+use rando_syntax::suggest;
+pub use rando_syntax::{Diagnostic, Pos, Severity, canon, lex};
 
-/// One build error or warning: where, what, and what to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error {
-    /// The file it is in, as the caller named it.
-    pub file: String,
-    /// Where in the file, when it is about one place.
-    pub pos: Option<Pos>,
-    /// What is wrong.
-    pub msg: String,
-    /// What to do about it, when there is something to say.
-    pub help: Option<String>,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.pos {
-            Some(p) => write!(f, "{}:{}:{}: {}", self.file, p.line, p.col, self.msg)?,
-            None => write!(f, "{}: {}", self.file, self.msg)?,
-        }
-        match &self.help {
-            Some(h) => write!(f, "\n  help: {h}"),
-            None => Ok(()),
-        }
-    }
-}
+/// One build error or warning: the shared diagnostics type.
+pub type Error = Diagnostic;
 
 /// A built world.
 #[derive(Debug, Clone)]

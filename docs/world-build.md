@@ -76,12 +76,12 @@ Tests: `cargo test -p world-build` (`tests/build.rs` for the checks on the model
 
 | Part | Where | What it does |
 |---|---|---|
-| Lexer | `src/lex.rs` | Tokens with file, line and column, glue (no space before) and line breaks; comments kept. |
+| Lexer | `crates/rando-syntax/src/lex.rs` | Tokens with file, line and column, glue (no space before) and line breaks; comments kept. |
 | Rule parser | `src/rule.rs` | Doc 16 section 5.0 precedence, recursive descent on tokens, depth cap (arithmetic chains count; a sum is one node). |
 | Front end | `src/front/` | `parse.rs`: one file to a tree with error recovery and layout marks. `mod.rs`: modules, tables and families, overlays, visibility, generated headers. `ledger.rs`: ids. `fmt.rs`: the formatter. |
 | Model | `src/model.rs` | The world as written, syntax-neutral, every value with its place; ledger ids apart from names. |
 | Checks and lowering | `src/world.rs`, `src/lower.rs` | Names, the format rules, the shuffle slice, the pool test; rules to the engine's trees. |
-| Canonical JSON | `src/canon.rs` | Keys sorted by bytes, integers only, no whitespace, one newline at the end. |
+| Canonical JSON | `crates/rando-syntax/src/canon.rs` | Keys sorted by bytes, integers only, no whitespace, one newline at the end. |
 | Instance | `src/instance.rs` | Per option values: checks that exist, the pool, classes, start items, fixed placements, placement sets, as the engine's instance JSON. |
 | CLI | `src/main.rs` | `rando check`, `fmt`, `build`. |
 

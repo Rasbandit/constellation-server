@@ -200,5 +200,6 @@ pub fn text(t: &Tok) -> String {
         Tok::Plus => "+".into(),
         Tok::Minus => "-".into(),
         Tok::Star => "*".into(),
+        Tok::Percent => "%".into(),
     }
 }

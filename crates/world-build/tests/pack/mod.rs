@@ -2,7 +2,7 @@
 //! of a world folder, and the package `rando pack` writes from it.
 
 use world_build::front::{Mem, Options};
-use world_build::{Built, build};
+use world_build::{Built, Severity, build};
 
 use super::lang::{errors, mem, ok};
 
@@ -69,6 +69,7 @@ fn a_missing_publish_field_is_a_warning_not_an_error() {
     let b = ok(&with_toml(&TOML.replace("license = \"MIT\"\n", "")));
     let w = warnings(&b);
     assert!(w.contains("rando.toml: `world.license` is missing; `rando pack` requires it"), "{w}");
+    assert!(!b.warnings.is_empty() && b.warnings.iter().all(|e| e.severity == Severity::Warning));
     // `--publish` refuses any warning, so the field is required there too.
     let publish = Options { publish: true, ..Options::default() };
     assert!(

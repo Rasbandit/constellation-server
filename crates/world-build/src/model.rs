@@ -5,37 +5,7 @@
 //! checks nothing a model can say wrongly (names, rules, the format rules), so every front end
 //! gets the same checks.
 
-/// A place in the source: the file (an index into [`World::files`]), line and column, both
-/// from 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Pos {
-    /// The file, by index.
-    pub file: u32,
-    /// Line, from 1.
-    pub line: usize,
-    /// Column in characters, from 1.
-    pub col: usize,
-}
-
-impl Pos {
-    /// A place.
-    #[must_use]
-    pub fn new(line: usize, col: usize) -> Pos {
-        Pos { file: 0, line, col }
-    }
-
-    /// A place in file `file`.
-    #[must_use]
-    pub fn in_file(file: u32, line: usize, col: usize) -> Pos {
-        Pos { file, line, col }
-    }
-
-    /// `n` characters further along the same line.
-    #[must_use]
-    pub fn right(self, n: usize) -> Pos {
-        Pos { file: self.file, line: self.line, col: self.col + n }
-    }
-}
+pub use rando_syntax::Pos;
 
 /// A value and where it was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
