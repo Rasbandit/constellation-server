@@ -850,3 +850,35 @@ mod tests {
         let _ = vec![0];
     }
 }
+
+/// Untrusted text never panics: every cut of the doc's files, and every one-byte deletion of
+/// the advanced file, goes through parse, check, layering and (when it parses) the formatter,
+/// which must then be idempotent. A cheap stand-in for the fuzz target of doc 20 section 8.5.
+#[cfg(test)]
+mod robust {
+    use super::*;
+    use crate::ast::tests::{ADVANCED, BEGINNER};
+    use crate::check::tests::lanternfall;
+    use crate::fmt::format_text;
+
+    #[test]
+    fn no_cut_or_deletion_panics() {
+        let l = Limits::DESIGN;
+        let s = lanternfall();
+        let mut inputs: Vec<String> = Vec::new();
+        for src in [BEGINNER, ADVANCED] {
+            inputs.extend(src.char_indices().map(|(i, _)| src[..i].into()));
+        }
+        inputs.extend(ADVANCED.char_indices().map(|(i, c)| {
+            let mut t = String::from(&ADVANCED[..i]);
+            t.push_str(&ADVANCED[i + c.len_utf8()..]);
+            t
+        }));
+        for t in &inputs {
+            let _ = settle(t, "f", &s, &NoPresets, &l);
+            if let Ok(once) = format_text(t, "f", &l) {
+                assert_eq!(format_text(&once, "f", &l).ok().as_ref(), Some(&once), "{t}");
+            }
+        }
+    }
+}
