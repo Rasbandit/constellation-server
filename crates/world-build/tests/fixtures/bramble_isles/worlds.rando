@@ -1,4 +1,4 @@
-# The five worlds, as data: a world is an entrance and an inner area behind a move, its sun
+# The five worlds, as data: a world is an entrance and an inner area behind a move, its lucky
 # marbles are rows of a table, and its seed pods are a numbered family. Worlds in this genre share
 # one shape, so the shape is written once and each world is its rows.
 use items
@@ -15,14 +15,14 @@ table isle(key: name, marbles: int, inner: rule) {
 
 # Every lucky marble: its world, whether it is in the inner area, and what reaching it needs there.
 table marble(key: name, home: name, inner: bool, need: rule) {
-  sandcastle_marble reef_cove false true
-  lighthouse_marble reef_cove false has(high_bounce)
-  shipwreck_marble reef_cove false has(swim_fins)
+  driftwood_arch_marble reef_cove false true
+  tide_bell_marble reef_cove false has(high_bounce)
+  kelp_forest_marble reef_cove false has(swim_fins)
   clam_marble reef_cove true true
   coral_arch_marble reef_cove true has(roll_dash)
-  crab_king_marble reef_cove true has(ground_pound)
+  eel_den_marble reef_cove true has(ground_pound)
   stump_marble mossy_canopy false true
-  beehive_marble mossy_canopy false has(ground_pound)
+  pinecone_marble mossy_canopy false has(ground_pound)
   mushroom_marble mossy_canopy false has(high_bounce)
   treetop_marble mossy_canopy true true
   owl_nest_marble mossy_canopy true has(glide_cape)
@@ -30,13 +30,13 @@ table marble(key: name, home: name, inner: bool, need: rule) {
   obsidian_marble cinder_caldera false true
   lava_bridge_marble cinder_caldera false has(roll_dash)
   geyser_marble cinder_caldera false has(glide_cape)
-  magma_golem_marble cinder_caldera true has(ground_pound)
+  basalt_columns_marble cinder_caldera true has(ground_pound)
   ember_race_marble cinder_caldera true can_reach_high
   crater_rim_marble cinder_caldera true has(high_bounce)
-  snowman_marble frostcap_peaks false true
+  sled_jump_marble frostcap_peaks false true
   ice_lake_marble frostcap_peaks false has(swim_fins)
   ski_slope_marble frostcap_peaks false has(roll_dash)
-  yeti_marble frostcap_peaks true has(ground_pound)
+  ice_cavern_marble frostcap_peaks true has(ground_pound)
   icicle_marble frostcap_peaks true has(high_bounce) and has(glide_cape)
   aurora_marble frostcap_peaks true true
   cog_marble clockwork_isle false true

@@ -8,14 +8,14 @@ item swim_fins progression
 item high_bounce progression
 item roll_dash progression
 
-# Minor rewards: extra lives, health and a hat. Filler fills every check the marbles and moves
-# leave.
+# Minor rewards: pebbles, bonus tickets, health and a hat. Filler fills every check the marbles
+# and moves leave.
 item health_berry useful x 4
-item feather filler
-item extra_life filler
+item shiny_pebble filler
+item bonus_ticket filler
 item fancy_hat filler
-item bee_swarm trap
-pool fill { feather 10, extra_life 4, fancy_hat 1, bee_swarm 1 }
+item rain_cloud trap
+pool fill { shiny_pebble 10, bonus_ticket 4, fancy_hat 1, rain_cloud 1 }
 
 # Two moves reach high places: either one gets up a tall ledge.
 group lift_moves = { glide_cape, high_bounce }
