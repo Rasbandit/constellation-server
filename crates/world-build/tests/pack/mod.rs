@@ -114,3 +114,174 @@ fn rando_finds_the_world_by_walking_up_and_a_folder_without_rando_toml_warns() {
     assert!(err.contains("name = \"tide\"\nversion = \"3.0.0\""), "{err}");
     std::fs::remove_dir_all(&old).unwrap();
 }
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000IHDR";
+
+/// A world ready to pack: a module, a table file, an icon and two assets.
+fn packable(tag: &str) -> std::path::PathBuf {
+    let root = temp_world(
+        tag,
+        &[
+            (
+                "rando.toml",
+                &format!(
+                    "{TOML}icon = \"art/icon.png\"\nrepository = \"https://example.com/tide\"\n\n[assets]\nfiles = [\"art/map.png\", \"CREDITS.txt\"]\n"
+                ),
+            ),
+            (
+                "src/tide.rando",
+                &WORLD
+                    .replace("start a\n", "use more\nstart a\n")
+                    .replace("check c\n", "check c\n  exit b\n"),
+            ),
+            (
+                "more.rando",
+                "table more(key: name) from \"data/more.csv\"\nregion b {\n  for m in more { check {m.key}_m }\n}\n",
+            ),
+            ("data/more.csv", "key\nx\n"),
+            ("CREDITS.txt", "Made for a test.\n"),
+            ("notes.py", "print('never packed')\n"),
+        ],
+    );
+    std::fs::create_dir_all(root.join("art")).unwrap();
+    std::fs::write(root.join("art/icon.png"), PNG).unwrap();
+    std::fs::write(root.join("art/map.png"), PNG).unwrap();
+    root
+}
+
+fn entries(bytes: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    (0..z.len())
+        .map(|i| {
+            let mut f = z.by_index(i).unwrap();
+            let name = f.name().unwrap().into_owned();
+            assert!(f.is_file(), "{name}");
+            assert_eq!(f.extra_data().map_or(0, |x| x.len()), 0, "{name} has an extra field");
+            assert_eq!(f.unix_mode(), Some(0o100_644), "{name}");
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b).unwrap();
+            (name, b)
+        })
+        .collect()
+}
+
+/// `rando pack` writes the layout of doc 19 section 4.1, with a SHA-256 for every entry, and
+/// the same input gives the same bytes.
+#[test]
+fn pack_writes_the_layout_with_hashes_and_the_same_bytes_every_time() {
+    use sha2::Digest;
+    let root = packable("pack");
+    let dir = world_build::front::Dir(root.clone());
+    let a = world_build::pack::pack(&dir, true).unwrap_or_else(|e| panic!("{e:#?}"));
+    let b = world_build::pack::pack(&dir, true).unwrap();
+    assert_eq!(a.bytes, b.bytes, "two packs of one folder differ");
+    assert_eq!(a.file_name, "tide-1.2.0.randopack");
+    let e = entries(&a.bytes);
+    let names: Vec<&str> = e.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "assets/CREDITS.txt",
+            "assets/art/icon.png",
+            "assets/art/map.png",
+            "manifest.json",
+            "meta.json",
+            "sha256.txt",
+            "source/data/more.csv",
+            "source/more.rando",
+            "source/rando.lock",
+            "source/rando.toml",
+            "source/src/tide.rando",
+        ]
+    );
+    // Every other entry is listed once, sorted by path, with its hash.
+    let sums = String::from_utf8(e["sha256.txt"].clone()).unwrap();
+    let want: String = e
+        .iter()
+        .filter(|(p, _)| *p != "sha256.txt")
+        .map(|(p, b)| {
+            let hex: String = sha2::Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect();
+            format!("{hex}  {p}\n")
+        })
+        .collect();
+    assert_eq!(sums, want);
+    // The manifest is what `build` writes; the lock in the package marks the ids published.
+    let built = build(&dir, &Options { publish: true, ..Options::default() }).unwrap();
+    assert_eq!(e["manifest.json"], built.json().as_bytes());
+    assert_eq!(e["source/rando.lock"], a.lock.as_bytes());
+    assert!(a.lock.contains("\"published\":true"), "{}", a.lock);
+    // `meta.json` is the normalised `rando.toml`: canonical, defaults filled, asset paths
+    // under `assets/`, and the tool version.
+    let meta = String::from_utf8(e["meta.json"].clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(world_build::canon::to_string(&v).unwrap(), meta);
+    assert_eq!(v["world"]["icon"], "assets/art/icon.png");
+    assert_eq!(v["world"]["entry"], "src/tide.rando");
+    assert_eq!(
+        v["assets"]["files"],
+        serde_json::json!(["assets/art/map.png", "assets/CREDITS.txt"])
+    );
+    assert_eq!(v["tool"], format!("rando {}", env!("CARGO_PKG_VERSION")));
+    // Without the source, `source/` is left out.
+    let bare = entries(&world_build::pack::pack(&dir, false).unwrap().bytes);
+    assert!(bare.keys().all(|k| !k.starts_with("source/")), "{:?}", bare.keys());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `rando pack` refuses what the portal would: a missing publish field, any warning, an asset
+/// that is not PNG, WebP or plain text, one over its size cap, and a `LicenseRef` with no
+/// `LICENSE` file. Nothing is written when it fails.
+#[test]
+fn pack_refuses_missing_fields_bad_assets_and_oversized_files() {
+    let root = packable("refuse");
+    let dir = world_build::front::Dir(root.clone());
+    let refused = |needle: &str| {
+        let e = world_build::pack::pack(&dir, true).err().unwrap_or_default().join("\n");
+        assert!(e.contains(needle), "want {needle:?} in {e}");
+    };
+    let toml = std::fs::read_to_string(root.join("rando.toml")).unwrap();
+    std::fs::write(root.join("rando.toml"), toml.replace("license = \"MIT\"\n", "")).unwrap();
+    refused("`world.license` is missing");
+    std::fs::write(root.join("rando.toml"), toml.replace("\"MIT\"", "\"LicenseRef-Mine\""))
+        .unwrap();
+    refused("needs a LICENSE file");
+    std::fs::write(root.join("LICENSE"), "All mine.\n").unwrap();
+    let e = entries(&world_build::pack::pack(&dir, true).unwrap().bytes);
+    assert!(e.contains_key("assets/LICENSE"), "{:?}", e.keys());
+    std::fs::write(root.join("rando.toml"), &toml).unwrap();
+    std::fs::write(root.join("art/map.png"), b"GIF89a\x00\x01").unwrap();
+    refused("art/map.png is not a PNG, WebP or plain-text file");
+    std::fs::write(root.join("art/map.png"), vec![b'a'; 2 * 1024 * 1024 + 1]).unwrap();
+    refused("art/map.png is over 2097152 bytes");
+    std::fs::write(root.join("art/map.png"), PNG).unwrap();
+    let mut big = PNG.to_vec();
+    big.resize(256 * 1024 + 1, 0);
+    std::fs::write(root.join("art/icon.png"), big).unwrap();
+    refused("art/icon.png is over 262144 bytes");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `rando pack` on the command line writes `<name>-<version>.randopack` and marks the ids
+/// published in `rando.lock`; a folder with no `rando.toml` is refused.
+#[test]
+fn rando_pack_writes_the_package_and_the_published_lock() {
+    let root = packable("cli");
+    let run = rando(&root, &["pack"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(root.join("tide-1.2.0.randopack").is_file());
+    assert!(
+        std::fs::read_to_string(root.join("rando.lock")).unwrap().contains("\"published\":true")
+    );
+    let out = root.join("out/x.randopack");
+    std::fs::create_dir_all(root.join("out")).unwrap();
+    let run = rando(&root, &["pack", ".", "-o", out.to_str().unwrap(), "--no-source"]);
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(entries(&std::fs::read(&out).unwrap()).keys().all(|k| !k.starts_with("source/")));
+    std::fs::remove_dir_all(&root).unwrap();
+    let old = temp_world("cli-old", &[("world.rando", WORLD)]);
+    let run = rando(&old, &["pack"]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("rando pack requires a rando.toml"));
+    assert!(!old.join("rando.lock").exists(), "a refused pack wrote the lock");
+    std::fs::remove_dir_all(&old).unwrap();
+}

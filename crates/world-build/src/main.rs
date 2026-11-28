@@ -13,6 +13,9 @@
 //!   [-o out/] [--format text|json] [--check-seeds K]`: build in memory with the checks of
 //!   `build`, fill a room of N copies with the engine's fill and write `<world>-<seed>.seed` and
 //!   a spoiler log into `out/`; `--check-seeds K` fills K seeds instead and reports how it went.
+//! - `rando pack [dir] [-o file] [--no-source]`: check and build with the rules of `build
+//!   --publish`, require `rando.toml`'s publish fields, and write `<name>-<version>.randopack`
+//!   (design doc 19), then `rando.lock` with its ids marked published.
 //! - `rando stamp FILE --tool "NAME VERSION" [--source PATH ...] [--expect TABLE>=N ...]`:
 //!   write or refresh the `generated` header of FILE (a generator's output in any language),
 //!   with the SHA-256 of each source (paths relative to the world's folder, the nearest folder
@@ -27,7 +30,7 @@ use world_build::{Error, build};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: rando check|fmt|build|generate [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
+        "usage: rando check|fmt|build|generate|pack [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
     );
     ExitCode::from(2)
 }
@@ -201,7 +204,7 @@ fn main() -> ExitCode {
     }
     let mut dir = None::<PathBuf>;
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
-    let (mut opts, mut check_only) = (Options::default(), false);
+    let (mut opts, mut check_only, mut no_source) = (Options::default(), false, false);
     #[cfg(feature = "engine")]
     let (mut g, mut gen_flags) = (Gen::default(), false);
     #[cfg(not(feature = "engine"))]
@@ -229,6 +232,7 @@ fn main() -> ExitCode {
             "--allow-edited" => opts.allow_edited = true,
             "--publish" => opts.publish = true,
             "--check" => check_only = true,
+            "--no-source" => no_source = true,
             s if s.starts_with('-') => return usage(),
             s => dir = Some(PathBuf::from(s)),
         }
@@ -242,10 +246,17 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| PathBuf::from("."))
     });
     // A flag of one command given to another is a mistake, not something to ignore.
+    let pack_only = no_source;
     if (gen_flags && verb != "generate")
         || (verb == "generate" && (instance.is_some() || check_only))
+        || (pack_only && verb != "pack")
+        || (verb == "pack"
+            && (instance.is_some() || check_only || opts.allow_edited || opts.publish))
     {
         return usage();
+    }
+    if verb == "pack" {
+        return pack(&dir, out.as_deref(), !no_source);
     }
     if verb == "fmt" {
         return fmt(&dir, check_only);
@@ -302,19 +313,48 @@ fn main() -> ExitCode {
     if steps.iter().all(Result::is_ok)
         && let Some(l) = &built.ledger
     {
-        let lock = dir.join(LEDGER);
-        let fresh = std::fs::symlink_metadata(&lock).is_err();
-        steps.push(write(&lock, l));
-        if fresh && steps.iter().all(Result::is_ok) {
-            eprintln!(
-                "warning: there was no {LEDGER}, so new ids were assigned to every item and check and written to {}: commit it, and never delete it. Seeds and clients carry these ids, so a published world must keep them.",
-                lock.display()
-            );
-        }
+        steps.push(write_lock(&dir, l));
     }
     let failed: Vec<String> = steps.into_iter().filter_map(Result::err).collect();
     failed.iter().for_each(|e| eprintln!("error: {e}"));
     if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Write `rando.lock` into `dir`, warning loudly when there was none: every id in it is new.
+fn write_lock(dir: &Path, text: &str) -> Result<(), String> {
+    let lock = dir.join(LEDGER);
+    let fresh = std::fs::symlink_metadata(&lock).is_err();
+    write_file(&lock, text.as_bytes())?;
+    if fresh {
+        eprintln!(
+            "warning: there was no {LEDGER}, so new ids were assigned to every item and check and written to {}: commit it, and never delete it. Seeds and clients carry these ids, so a published world must keep them.",
+            lock.display()
+        );
+    }
+    Ok(())
+}
+
+/// `rando pack`: the package first, then the lock with its ids marked published; nothing is
+/// written when the pack is refused.
+fn pack(dir: &Path, out: Option<&Path>, source: bool) -> ExitCode {
+    let packed = match world_build::pack::pack(&Dir(dir.to_path_buf()), source) {
+        Ok(p) => p,
+        Err(list) => {
+            list.iter().for_each(|e| eprintln!("{e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = out.map_or_else(|| PathBuf::from(&packed.file_name), Path::to_path_buf);
+    match write_file(&path, &packed.bytes).and_then(|()| write_lock(dir, &packed.lock)) {
+        Ok(()) => {
+            println!("wrote {} ({} bytes)", path.display(), packed.bytes.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// What `rando generate` was asked for.

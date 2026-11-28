@@ -22,6 +22,7 @@ pub mod lex;
 mod lower;
 pub mod meta;
 pub mod model;
+pub mod pack;
 mod presence;
 pub mod rule;
 mod suggest;

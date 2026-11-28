@@ -54,6 +54,19 @@ pub struct Dir(pub PathBuf);
 
 impl Files for Dir {
     fn read(&self, path: &str) -> Option<Result<String, String>> {
+        Some(
+            self.read_bytes(path, config::WORLD_SOURCE_MAX_BYTES)?
+                .and_then(|b| String::from_utf8(b).map_err(|e| format!("{path}: {e}"))),
+        )
+    }
+}
+
+impl Dir {
+    /// The bytes of `path` (relative to the folder), at most `max`: `None` when it does not
+    /// exist. Refused like [`Files::read`]: a path out of the folder, a link that leads out or
+    /// nowhere, anything but a plain file.
+    #[must_use]
+    pub fn read_bytes(&self, path: &str, max: usize) -> Option<Result<Vec<u8>, String>> {
         if !safe(path) {
             return Some(Err(format!(
                 "{path:?} is not a plain relative path inside the world's folder"
@@ -74,10 +87,10 @@ impl Files for Dir {
         if !meta.is_file() {
             return Some(Err(format!("{path} is not a plain file")));
         }
-        if meta.len() > config::WORLD_SOURCE_MAX_BYTES as u64 {
-            return Some(Err(format!("{path} is over {} bytes", config::WORLD_SOURCE_MAX_BYTES)));
+        if meta.len() > max as u64 {
+            return Some(Err(format!("{path} is over {max} bytes")));
         }
-        Some(std::fs::read_to_string(&real).map_err(|e| format!("{path}: {e}")))
+        Some(std::fs::read(&real).map_err(|e| format!("{path}: {e}")))
     }
 }
 
@@ -326,7 +339,7 @@ pub fn stamp(
     write_generated(tool, sources, expect, &body, files)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

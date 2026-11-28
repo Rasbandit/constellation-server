@@ -486,6 +486,31 @@ pub const WORLD_TOML_MAX_BYTES: usize = 64 * 1024;
 /// value).
 pub const WORLD_ASSETS_MAX: usize = 64;
 
+/// Largest asset file `rando pack` takes, bytes (design doc 19 section 2.3, a design value).
+pub const WORLD_ASSET_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Largest sum of a world's asset files, bytes (design doc 19 section 2.3, a design value).
+pub const WORLD_ASSETS_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest icon, bytes (design doc 19 section 2.3, a design value).
+pub const WORLD_ICON_MAX_BYTES: usize = 256 * 1024;
+
+/// Largest `source/` of a package, all files together, bytes (design doc 19 section 5.2, a
+/// design value: 256 files at the per-file cap would be 2 GiB). `rando pack` holds to it so a
+/// package it writes is never one the server refuses for size.
+pub const PACKAGE_MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest package file, bytes (design doc 19 section 5.2: 8 MiB manifest, 16 MiB source and
+/// 16 MiB assets, a design value).
+pub const PACKAGE_MAX_BYTES: usize = 40 * 1024 * 1024;
+
+/// Most entries in a package (design doc 19 section 5.2: 256 modules, 64 assets and the fixed
+/// entries, a design value).
+pub const PACKAGE_MAX_ENTRIES: usize = 512;
+
+/// Longest entry path in a package, bytes (design doc 19 section 5.2, a design value).
+pub const PACKAGE_MAX_PATH_BYTES: usize = 255;
+
 /// Most declarations the families of one world may expand to, so a product of a few long
 /// lists cannot run away (a design value: the survey's largest family is a few thousand).
 pub const WORLD_FAMILY_MAX: usize = 100_000;
