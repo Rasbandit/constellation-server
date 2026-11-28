@@ -339,9 +339,7 @@ pub fn stamp(
     write_generated(tool, sources, expect, &body, files)
 }
 
-pub(crate) fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+pub(crate) use rando_syntax::hex;
 
 /// A family variable's value.
 #[derive(Debug, Clone)]

@@ -16,6 +16,10 @@
 //! - `rando pack [dir] [-o file] [--no-source]`: check and build with the rules of `build
 //!   --publish`, require `rando.toml`'s publish fields, and write `<name>-<version>.randopack`
 //!   (design doc 19), then `rando.lock` with its ids marked published.
+//! - `rando check FILE.randoset [--world PATH]` and `rando settings json FILE [--world PATH]`:
+//!   check a settings file against its world, layered with its presets; `json` also prints its
+//!   canonical JSON and, on the next line, its settings hash (design doc 20 section 8.2).
+//!   `rando fmt` formats `.randoset` files beside `.rando` ones.
 //! - `rando stamp FILE --tool "NAME VERSION" [--source PATH ...] [--expect TABLE>=N ...]`:
 //!   write or refresh the `generated` header of FILE (a generator's output in any language),
 //!   with the SHA-256 of each source (paths relative to the world's folder, the nearest folder
@@ -24,13 +28,15 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod settings_cmd;
+
 use world_build::front::{Dir, LEDGER, Options, format_text};
 use world_build::meta::FILE;
 use world_build::{Error, build};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: rando check|fmt|build|generate|pack [dir] [options], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
+        "usage: rando check|fmt|build|generate|pack [dir] [options], rando check FILE.randoset [--world PATH], rando settings json FILE [--world PATH], or rando stamp FILE --tool NAME [--source PATH] [--expect TABLE>=N]; see docs/world-build.md"
     );
     ExitCode::from(2)
 }
@@ -41,7 +47,7 @@ fn report(list: &[Error], what: &str) {
     }
 }
 
-/// Every `.rando` file under `dir`, hidden folders skipped, in path order.
+/// Every `.rando` and `.randoset` file under `dir`, hidden folders skipped, in path order.
 fn rando_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
@@ -57,7 +63,7 @@ fn rando_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
             }
             if kind.is_dir() {
                 todo.push(p);
-            } else if p.extension().is_some_and(|x| x == "rando") {
+            } else if p.extension().is_some_and(|x| x == "rando" || x == settings_cmd::EXT) {
                 out.push(p);
             }
         }
@@ -90,7 +96,12 @@ fn fmt(dir: &Path, check_only: bool) -> ExitCode {
                 continue;
             }
         };
-        match format_text(&text, &name) {
+        let formatted = if p.extension().is_some_and(|x| x == settings_cmd::EXT) {
+            rando_settings::fmt::format_text(&text, &name, &config::Limits::DESIGN)
+        } else {
+            format_text(&text, &name)
+        };
+        match formatted {
             Err(list) => {
                 report(&list, "error");
                 bad = true;
@@ -195,6 +206,15 @@ fn main() -> ExitCode {
     let Some(verb) = args.first() else { return usage() };
     if verb == "stamp" {
         return stamp(&args[1..]);
+    }
+    let settings_file = |a: Option<&String>| {
+        a.is_some_and(|a| Path::new(a).extension().is_some_and(|x| x == settings_cmd::EXT))
+    };
+    let json = verb == "settings" && args.get(1).is_some_and(|a| a == "json");
+    if json || (verb == "check" && settings_file(args.get(1))) {
+        let from = if json { 2 } else { 1 };
+        let Some((file, world)) = settings_cmd::args(&args[from..]) else { return usage() };
+        return settings_cmd::run(&file, world.as_deref(), json);
     }
     if verb == "generate" && !cfg!(feature = "engine") {
         eprintln!(

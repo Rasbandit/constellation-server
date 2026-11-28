@@ -51,14 +51,15 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - if: steps.scope.outputs.code != 'false'
         run: cargo fmt --all --check
-      # Lints on the fill engine, the build tool, its shared syntax crate and config, every target
-      # (tests included).
+      # Lints on the fill engine, the build tool, its shared syntax crate, the settings language
+      # and config, every target (tests included).
       - if: steps.scope.outputs.code != 'false'
-        run: cargo clippy -p world-build -p rando-syntax -p data-fill -p config --all-targets --locked -- -D warnings
-      # The shared syntax crate is no_std and must build for WebAssembly (design doc 20 8.1).
+        run: cargo clippy -p world-build -p rando-syntax -p rando-settings -p data-fill -p config --all-targets --locked -- -D warnings
+      # The shared syntax crate and the settings language are no_std and must build for
+      # WebAssembly (design doc 20 8.1).
       # `wasm32v1-none` has no std, so this fails if std gets back in; the browser target too.
       - if: steps.scope.outputs.code != 'false'
-        run: cargo check -p rando-syntax --target wasm32v1-none --target wasm32-unknown-unknown --locked
+        run: cargo check -p rando-syntax -p rando-settings --target wasm32v1-none --target wasm32-unknown-unknown --locked
       # Every library's unit tests but the fill engine's and the build tool's: the next steps
       # run those.
       - if: steps.scope.outputs.code != 'false'
