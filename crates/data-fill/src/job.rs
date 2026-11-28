@@ -97,9 +97,9 @@ pub fn fill(input: &[u8]) -> Result<Vec<u8>, String> {
     if report.tight_players > 0 {
         eprintln!(
             "fill: the fill needed repairs, and {} players' worlds have an early capacity ratio \
-             under 1 (lowest {:.3}), a likely cause: {report:?}",
+             under 1 (lowest {}), a likely cause: {report:?}",
             report.tight_players,
-            f64::from(report.capacity_milli) / 1000.0
+            crate::seed::thousandths(report.capacity_milli.into())
         );
     }
     if report.attempts > 1 {

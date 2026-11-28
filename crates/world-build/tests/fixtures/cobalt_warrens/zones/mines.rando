@@ -1,0 +1,45 @@
+# The mines: the first zone, under the yards. The rockgrinder, a boss, works the deepest seam.
+use items
+use logic
+
+region mine_shaft {
+  check shaft_cage
+  check miners_cache
+  exit airlock
+  exit ore_hall
+}
+
+region ore_hall {
+  check ore_cart
+  check gantry_perch: can_reach_high
+  check sealed_cell: can_break_walls
+  exit mine_shaft
+  exit collapsed_mine: can_see_dark
+  exit flooded_drift
+}
+
+region collapsed_mine {
+  check cave_in_crate
+  check fallen_lift
+  check echoing_seam: can_see_dark
+  # Back up to the hall needs a way up the rubble.
+  exit ore_hall: can_climb_shaft
+  exit grinder_seam: can_see_dark
+  # The blast door at the bottom, into the reactor.
+  exit reactor_door: can_break_walls
+}
+
+region flooded_drift {
+  check drift_mouth
+  check sunken_toolbox: can_swim
+  check air_pocket: can_swim and can_see_dark
+  exit ore_hall
+  # Swimming under the foundry's floor comes up in its loft.
+  exit conveyor_loft: can_swim
+}
+
+region grinder_seam {
+  check rockgrinder: can_fight_boss
+  event boss_down: can_fight_boss
+  exit collapsed_mine
+}

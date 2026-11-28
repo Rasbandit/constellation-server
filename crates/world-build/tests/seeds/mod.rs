@@ -332,3 +332,34 @@ fn world_errors_print_exactly_as_check_prints_them() {
     assert_eq!(text(&generate.stderr), text(&check.stderr));
     assert!(!t.0.join("out").exists());
 }
+
+/// A seed whose fill measured its early room reports the lowest early capacity, and the JSON
+/// spoiler still writes: the canonical writer takes integers only, so the capacity is kept in
+/// thousandths. Bramble Isles at two pods a world, seed 1, is such a seed. The text spoiler
+/// says it as a decimal when it warns.
+#[test]
+fn a_seed_that_reports_its_early_capacity_writes_its_json_spoiler() {
+    let t = Temp::new("capacity");
+    let world = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bramble_isles");
+    let r = rando(&[
+        "generate",
+        world.to_str().unwrap(),
+        "--option",
+        "pods_per_world=2",
+        "--seed",
+        "1",
+        "--format",
+        "json",
+        "-o",
+        &t.s("out"),
+    ]);
+    assert!(r.status.success(), "{}", text(&r.stderr));
+    let spoiler = std::fs::read_to_string(t.s("out/bramble_isles-1-spoiler.json")).unwrap();
+    let mut s: serde_json::Value = serde_json::from_str(&spoiler).unwrap();
+    let milli = s["fill"]["lowest_early_capacity_milli"].as_u64().unwrap();
+    assert!(milli > 0, "{}", s["fill"]);
+    s["fill"]["tight_players"] = 1.into();
+    s["fill"]["lowest_early_capacity_milli"] = 1125.into();
+    let t = spoiler_text(&s);
+    assert!(t.contains("(lowest early capacity 1.125)"), "{t}");
+}

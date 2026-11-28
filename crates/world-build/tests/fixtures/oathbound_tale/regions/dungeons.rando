@@ -1,0 +1,42 @@
+# The dungeons, each with a boss. The first boss always holds the ferry pass.
+use items
+use logic
+
+region goblin_warren {
+  check warren_chest
+  check goblin_pantry
+  check goblin_chief: rank(1) holds ferry_pass
+  exit west_fields
+}
+
+region lighthouse_steps {
+  check keeper_log: can_read_script
+  check lantern_room: rank(2)
+  check drowned_captain: rank(2) and party(2)
+  exit saltmere
+}
+
+region mine_entrance {
+  check ore_cart
+  check collapsed_shaft: can_clear_rubble
+  check deep_vein: rank(3) and has(miners_lamp)
+  exit cragholm
+}
+
+region frost_crypt {
+  check crypt_sarcophagus: can_pick_locks
+  check frost_lich: rank(4) and can_endure
+  exit frost_pass
+}
+
+region keep_gate {
+  check gate_armory: can_pick_locks
+  exit highmarch
+  exit warlord_hall: rank(6)
+}
+
+region warlord_hall {
+  check warlord_hoard
+  event oath_fulfilled: rank(6) and party(opt.party_needed) and can_endure
+  exit keep_gate
+}

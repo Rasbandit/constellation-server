@@ -1,0 +1,31 @@
+# Named movement checks every zone reads. Each says what opens it with no tricks, and what the
+# `tricks` option adds.
+use items
+
+# A dash off a wall, kicked at the right frame: a trick only `advanced` counts.
+def can_wall_dash = opt.tricks == advanced and has(thruster)
+
+# A high ledge: a second jump or the gloves, or the wall dash.
+def can_reach_high = has_any(spring_boots, magnet_gloves) or can_wall_dash
+
+# A tall shaft wants the gloves. Tricks let a player climb it with jumps alone.
+def can_climb_shaft = has(magnet_gloves) or match opt.tricks {
+  none => false
+  basic => has(spring_boots) and has(thruster)
+  advanced => has(spring_boots)
+}
+
+# A long double jump, timed to the last frame: a trick only `advanced` counts.
+def can_long_jump = opt.tricks == advanced and has(spring_boots)
+
+# A wide gap: the thruster or the hook, or the long jump.
+def can_cross_gap = has_any(thruster, tether_hook) or can_long_jump
+
+def can_break_walls = has(breach_charge)
+def can_swim = has(rebreather)
+
+# Dark rooms: the flare lamp lights them. Any trick setting assumes the player knows them blind.
+def can_see_dark = has(flare_lamp) or opt.tricks != none
+
+# Bosses fight across arenas that move: any two of the four movement pieces.
+def can_fight_boss = group_count(movement) >= 2

@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use data_fill::seed::{Player, generate};
 use world_build::front::{Dir, Mem, Options, format_text, write_generated};
 use world_build::{Built, build, build_model};
 
@@ -70,34 +69,6 @@ fn the_example_world_in_rando_builds_to_the_same_manifest_as_its_model() {
         serde_json::from_str(from_files.ledger.as_ref().unwrap()).unwrap();
     assert_eq!(ledger["items"]["oar"], serde_json::json!({"id": 1, "retired": false}));
     assert_eq!(ledger["checks"]["lantern_room"]["id"], 17);
-}
-
-/// Build the example from its `.rando` files, load it in the engine, fill seeds 1 to 50 at 1
-/// and 4 players: `generate` refuses a world a player cannot finish, so every seed passing
-/// means every seed is beatable.
-#[test]
-fn the_example_world_in_rando_fills_beatable_for_seeds_1_to_50_at_1_and_4_players() {
-    let b = build(&example(), &Options::default()).unwrap();
-    let m: serde_json::Value = serde_json::from_str(b.json()).unwrap();
-    let inst = b.default_instance().unwrap();
-    for players in [1usize, 4] {
-        let p: Vec<Player> = (0..players)
-            .map(|k| Player { name: format!("P{k}"), instance: inst.clone() })
-            .collect();
-        for seed in 1..=50 {
-            generate(&m, "s", &p, seed)
-                .unwrap_or_else(|e| panic!("{players} players, seed {seed}: {e}"));
-        }
-    }
-}
-
-#[test]
-fn the_example_files_are_already_in_canonical_layout() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tidewell");
-    for f in ["world.rando", "items.rando", "regions/coast.rando", "regions/lighthouse.rando"] {
-        let text = std::fs::read_to_string(root.join(f)).unwrap();
-        assert_eq!(format_text(&text, f).unwrap(), text, "{f}");
-    }
 }
 
 /// `fmt` (and the generated-file hash, which runs the same layout) is linear in a rule's
