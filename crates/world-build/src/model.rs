@@ -157,6 +157,10 @@ pub struct Opt {
     pub max: Option<At<i64>>,
     /// Its default.
     pub default: Option<At<Lit>>,
+    /// `cosmetic` or `knowledge` when written; `seed` otherwise (doc 20 section 5).
+    pub scope: Option<At<String>>,
+    /// The player-facing label.
+    pub label: Option<At<String>>,
 }
 
 /// An item.

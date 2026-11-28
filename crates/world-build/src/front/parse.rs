@@ -168,6 +168,8 @@ pub enum Decl {
         values: Vec<At<String>>,
         range: Option<(At<i64>, At<i64>)>,
         default: Option<At<Lit>>,
+        scope: Option<At<String>>,
+        label: Option<At<String>>,
     },
     Item(ItemD),
     Pool(Vec<(At<String>, Expr)>),
@@ -841,11 +843,17 @@ impl P<'_> {
         } else {
             None
         };
-        // Player-facing text: read and kept for later (the manifest has no place for it).
-        if matches!(self.peek(), Some(Tok::Str(_))) {
-            self.k += 1;
-        }
-        Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default })
+        // A scope word on the same line (checked by the build), then the player-facing label.
+        let scope = match self.toks.get(self.k) {
+            Some(t) if matches!(t.t, Tok::Name(_)) && !t.nl => Some(self.name("the scope")?),
+            _ => None,
+        };
+        let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+            Some(self.string("the option's label")?)
+        } else {
+            None
+        };
+        Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default, scope, label })
     }
 
     fn ident(&mut self, key: &mut Option<At<String>>, was: &mut Option<At<String>>) -> R<bool> {

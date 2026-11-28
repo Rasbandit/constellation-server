@@ -168,6 +168,20 @@ fn negative_numbers_where_a_number_is_expected() {
     ok(&world("option p: range -3..5 = 4\nregion a {\n  check c\n}"));
 }
 
+/// An option's scope is `cosmetic`, `knowledge` or `seed`; any other word there is an error
+/// at that word. A word on the next line is not the option's.
+#[test]
+fn an_option_scope_word_is_checked() {
+    let w = world("option a: toggle = off spicy\nregion a {\n  check c\n}");
+    fails(&w, &format!("world.rando:{}:24", line(1)), "`spicy` is not an option scope");
+    let ok_too =
+        world("option a: toggle cosmetic \"A\"\noption b: toggle\nregion a {\n  check c\n}");
+    ok(&ok_too);
+    // `fmt` keeps the scope and the label.
+    let text = "option c: choice(teal, amber) = teal cosmetic \"Lamp color\"\n";
+    assert_eq!(format_text(text, "m").unwrap(), text);
+}
+
 /// A bare `no_progression` ends before the next modifier word, so `key` and `was` on the
 /// next line stay what they are.
 #[test]
