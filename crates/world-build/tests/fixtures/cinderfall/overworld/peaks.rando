@@ -1,0 +1,49 @@
+# The mountains: the foothills, the ridge and two dungeons.
+use items
+use logic
+
+region ember_foothills {
+  check lava_vent: can_burn
+  check goat_trail
+  check fallen_rocks: can_blast
+  exit ashen_fields
+  exit peak_path: can_cross_gap
+  exit ember_gate: can_fight(1)
+}
+
+region peak_path {
+  check cairn
+  check eagle_perch: has(quiver, 2)
+  exit ember_foothills
+  exit frost_ridge: can_lift(2)
+  exit peak_lodge door lodge_door group outside
+}
+
+region frost_ridge {
+  check frozen_chest: can_burn
+  check ice_ledge: can_cross_gap
+  exit peak_path
+  exit frost_gate
+  exit frost_summit: has(glider)
+}
+
+region frost_summit {
+  for i in 1..3 {
+    check snow_cairn_{i}: can_burn
+  }
+  check summit_cairn
+  check wind_shrine: can_shoot
+  exit frost_ridge
+}
+
+region ember_gate {
+  check gate_brazier: can_burn
+  exit ember_foothills
+  exit ember_entry
+}
+
+region frost_gate {
+  check snowdrift
+  exit frost_ridge
+  exit frost_entry: can_burn
+}

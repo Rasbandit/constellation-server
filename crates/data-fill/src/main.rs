@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::{Instance, Plan, World, decode, fill, placements, section, validate};
+use data_fill::room::{self, Seat, fill_room, validate_room};
+use data_fill::{Instance, Plan, World, decode, section};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
@@ -113,7 +114,7 @@ fn run(args: &[String]) -> Result<Value, String> {
     let parse_ms = ms(t);
     let t = Instant::now();
     let w = load(manifest)?;
-    let plan = Plan::new(&w, &inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(&w, &inst)?;
     let compile_ms = ms(t);
 
     let mut oracle = json!(null);
@@ -145,22 +146,26 @@ fn run(args: &[String]) -> Result<Value, String> {
             }
         }
         oracle = json!({
-            "no_items": compare(&w, &plan, &o["no_items"], &inst.start_inventory)?,
+            // Nothing extra: the plan already holds the start inventory on every solve.
+            "no_items": compare(&w, &plan, &o["no_items"], &[])?,
             "all_items": compare(&w, &plan, &o["all_items"], &inv("all_inventory"))?,
             "samples": {"total": sampled.0, "identical": sampled.1, "mismatches": sampled.2},
         });
     }
 
+    // A room of this one player: the product's fill.
+    let progression = inst.progression(&w);
+    let seat = [Seat { w: &w, plan: &plan, progression: &progression }];
     let mut rng = SpecRng::from_u64(seed);
     let t = Instant::now();
-    let filled =
-        fill(&w, &plan, &mut rng, config::FILL_MAX_ATTEMPTS).map_err(|e| format!("{e:?}"))?;
+    let filled = fill_room(&seat, &mut rng, config::FILL_MAX_ATTEMPTS)?;
     let fill_ms = ms(t);
     let t = Instant::now();
-    let (beatable, reached) = validate(&w, &plan, &filled.placed);
+    let (beatable, reached) = validate_room(&seat, &filled.placed)?;
+    let (beatable, reached) = (beatable[0], reached[0]);
     let validate_ms = ms(t);
-    let progression = inst.progression(&w);
-    let placed = placements(&w, &filled, &progression);
+    let placed = room::placements(&seat, &filled.placed, None)?;
+    let placed = &placed[0];
     if let Some(out) = rest.get(1) {
         std::fs::write(out, serde_json::to_string(&placed).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -170,6 +175,7 @@ fn run(args: &[String]) -> Result<Value, String> {
         "world": {"items": w.items(), "locations": w.locations(), "regions": w.regions(),
                   "defs": w.defs(), "rules_bytes": w.rules_bytes(),
                   "existing_locations": plan.included.len()},
+        "rules": plan.rules_summary(&w),
         "oracle": oracle,
         "fill": {"placed": placed.len(), "attempts": filled.attempts, "solves": filled.solves,
                  "rule_evals": filled.stats.evals,
@@ -190,5 +196,51 @@ fn main() -> ExitCode {
             eprintln!("data-fill: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use serde_json::json;
+
+    /// The "no items" oracle solve holds the start items once, as the legacy side does: a rule
+    /// that needs two copies of a start item is not met by the one copy the player starts with.
+    #[test]
+    fn the_no_items_comparison_holds_the_start_items_once() {
+        let manifest = json!({
+            "options": [],
+            "items": [{"key": "a", "id": 1}, {"key": "junk", "id": 2}],
+            "locations": [{"key": "l0", "id": 1}, {"key": "l1", "id": 2}],
+            "start": "s",
+            "x.time": {"slices": 1, "start_mask": 1},
+            "defs": {},
+            "regions": [{"key": "s", "can_stay": false, "stays": [], "exits": [], "events": [],
+                         "checks": [{"loc": "l0", "rule": {"true": {}}},
+                                    {"loc": "l1", "rule": {"has": "a", "n": 2}}]}],
+            "goal": {"reach": "region:s"}
+        });
+        let solve = |checks: &[&str]| json!({"checks": checks, "regions": {"s": 1}, "events": {}});
+        let instance = json!({
+            "locations": ["l0", "l1"],
+            "pool": ["a", "junk"],
+            "pool_class": {"a": "progression", "junk": "filler"},
+            "start_inventory": ["a"],
+            "oracle": {"no_items": solve(&["l0"]), "all_items": solve(&["l0", "l1"]),
+                       "all_inventory": ["a"], "samples": []}
+        });
+        let dir = std::env::temp_dir();
+        let path = |name: &str| dir.join(format!("data-fill-{}-{name}.json", std::process::id()));
+        let (m, i) = (path("manifest"), path("instance"));
+        std::fs::write(&m, manifest.to_string()).unwrap();
+        std::fs::write(&i, instance.to_string()).unwrap();
+        let args = ["data-fill", m.to_str().unwrap(), i.to_str().unwrap()].map(str::to_owned);
+        let out = run(&args);
+        std::fs::remove_file(&m).unwrap();
+        std::fs::remove_file(&i).unwrap();
+        let oracle = &out.unwrap()["oracle"];
+        assert_eq!(oracle["no_items"]["only_engine"], json!([]), "{oracle}");
+        assert_eq!(oracle["no_items"]["checks_engine"], json!(1));
+        assert_eq!(oracle["all_items"]["only_python"], json!([]), "{oracle}");
     }
 }

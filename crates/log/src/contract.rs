@@ -19,7 +19,13 @@ const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
 trait Store:
-    LogStore + BlobStore + ManifestStore + UploadStore + JobStore + crate::AccountStore
+    LogStore
+    + BlobStore
+    + ManifestStore
+    + UploadStore
+    + JobStore
+    + crate::AccountStore
+    + crate::CatalogueStore
 {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
     /// Change a stored upload's file without its id: a torn row.
@@ -269,6 +275,23 @@ async fn blobs_are_stored_once_by_key_and_checked_on_write<S: Store>(s: Arc<S>) 
     assert_eq!(s.get(&kb).await.unwrap(), None, "the refused put wrote nothing");
 }
 
+/// A prepared world is found by its manifest and the engine that prepared it: another engine
+/// (an older build) or another manifest reads as none, and a later put replaces the key.
+async fn a_prepared_world_is_found_by_manifest_and_layout<S: Store>(s: Arc<S>) {
+    let (m, other) = (blob_key(b"manifest"), blob_key(b"another manifest"));
+    let (a, b) = (blob_key(b"prepared a"), blob_key(b"prepared b"));
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@a", &a).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(a));
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), None, "another build's is stale");
+    assert_eq!(s.prepared_key(&other, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@b", &b).await.unwrap();
+    s.prepared_put(&m, "1@a", &b).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(b), "rebuilt: the key is replaced");
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), Some(b));
+    assert_eq!(s.prepared_key(&m, "").await.unwrap(), None);
+}
+
 fn manifest(name: &str, game: &str, body: &[u8]) -> ManifestRecord {
     ManifestRecord {
         id: blob_key(body),
@@ -474,6 +497,154 @@ fn upload(kind: UploadKind, game: &str, body: &[u8]) -> UploadRecord {
     let id = blob_key(body);
     let meta = format!("{game} {}", String::from_utf8_lossy(body));
     UploadRecord { kind, id, game: game.to_owned(), meta }
+}
+
+fn game(name: &str) -> crate::Game {
+    crate::Game {
+        name: name.to_owned(),
+        description: format!("about {name}"),
+        created_by: "admin".to_owned(),
+    }
+}
+
+/// A game name is taken once ignoring case and keeps the case it was made with; games list
+/// a page at a time by key, bytewise on both stores (so a non-ASCII name sorts after `z`).
+async fn catalogue_games_are_unique_ignoring_case_and_listed_bytewise<S: Store>(s: Arc<S>) {
+    for name in ["Wind Waker", "Ōkami", "beta", "Alpha", "Zelda"] {
+        assert!(s.game_create(&game(name)).await.unwrap(), "{name}");
+    }
+    assert!(!s.game_create(&game("wind WAKER")).await.unwrap(), "taken ignoring case");
+    assert_eq!(s.game_get("WIND waker").await.unwrap(), Some(game("Wind Waker")));
+    assert_eq!(s.game_get("ŌKAMI").await.unwrap().map(|g| g.name).as_deref(), Some("Ōkami"));
+    assert_eq!(s.game_get("nothing").await.unwrap(), None);
+    let names = |page: Vec<crate::Game>| page.into_iter().map(|g| g.name).collect::<Vec<_>>();
+    assert_eq!(names(s.game_list(None, 2).await.unwrap()), ["Alpha", "beta"]);
+    let rest = s.game_list(Some("BETA"), 10).await.unwrap();
+    assert_eq!(names(rest), ["Wind Waker", "Zelda", "Ōkami"]);
+    assert_eq!(s.game_list(Some("Ōkami"), 10).await.unwrap(), []);
+}
+
+/// An owner is an existing account of an existing game, granted once (the first grant is
+/// kept); removing it says whether there was one, and deleting the account ends it.
+async fn catalogue_owners_are_granted_once_and_end_with_their_account<S: Store>(s: Arc<S>) {
+    use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+    for name in ["bob", "ann", "cyd"] {
+        assert!(s.user_create(name, "hash").await.unwrap());
+    }
+    // A game's maker is its first owner when it is an account.
+    let made = crate::Game { created_by: "cyd".to_owned(), ..game("Cyd's Game") };
+    assert!(s.game_create(&made).await.unwrap());
+    assert_eq!(s.game_owners("cyd's game").await.unwrap(), ["cyd"]);
+    assert_eq!(s.game_owner_remove("Cyd's Game", "cyd").await.unwrap(), LastOwner);
+    assert_eq!(s.game_owners("Cyd's Game").await.unwrap(), ["cyd"], "the last owner stays");
+    assert!(s.game_create(&game("Owned Game")).await.unwrap());
+    assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new(), "admin: none");
+    assert!(s.game_owner_add("owned game", "bob", "admin").await.unwrap());
+    assert!(s.game_owner_add("Owned Game", "bob", "ann").await.unwrap(), "already: still true");
+    assert!(s.game_owner_add("OWNED GAME", "ann", "bob").await.unwrap());
+    assert!(!s.game_owner_add("Owned Game", "nobody", "admin").await.unwrap(), "no account");
+    assert!(!s.game_owner_add("No Game", "ann", "admin").await.unwrap(), "no game");
+    assert_eq!(s.game_owners("owned game").await.unwrap(), ["ann", "bob"]);
+    assert_eq!(s.game_owners("No Game").await.unwrap(), Vec::<String>::new());
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), Removed);
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), NotOwner, "once");
+    assert_eq!(s.game_owner_remove("No Game", "ann").await.unwrap(), NotOwner);
+    assert_eq!(s.game_owner_remove("Owned Game", "ann").await.unwrap(), LastOwner);
+    s.user_delete("ann").await.unwrap();
+    assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new());
+}
+
+/// A version is added only to an existing game, for an existing apworld upload, under a
+/// version number the game does not have; it starts as checking. A new room uses the newest
+/// live version checked with the server's generator; a withdrawal is final.
+async fn catalogue_versions_follow_their_states_and_the_newest_live_one_is_used<S: Store>(
+    s: Arc<S>,
+) {
+    use crate::NewVersion;
+    use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+    use crate::VersionState::{Checking, Failed, Live, NeedsUpdate, Withdrawn};
+    for v in [Checking, Live, Failed, Withdrawn, NeedsUpdate] {
+        assert_eq!(crate::VersionState::parse(v.as_str()), Some(v));
+    }
+    assert!(s.game_create(&game("Versioned")).await.unwrap());
+    let world = upload(UploadKind::Apworld, "Versioned", b"world zip");
+    s.upload_put(&world, b"world zip").await.unwrap();
+    let player = upload(UploadKind::Yaml, "Versioned", b"player yaml");
+    s.upload_put(&player, b"player yaml").await.unwrap();
+    let new = |game: &str, version: &str, apworld: crate::BlobKey| NewVersion {
+        game: game.to_owned(),
+        version: version.to_owned(),
+        note: format!("notes for {version}"),
+        apworld,
+        generator: "gen-1".to_owned(),
+    };
+    assert_eq!(s.version_add(&new("No Game", "1.0", world.id)).await.unwrap(), NoGame);
+    let none = blob_key(b"never uploaded");
+    assert_eq!(s.version_add(&new("Versioned", "1.0", none)).await.unwrap(), NoUpload);
+    let yaml = s.version_add(&new("Versioned", "1.0", player.id)).await.unwrap();
+    assert_eq!(yaml, NoUpload, "a player file is not a world");
+    assert_eq!(s.version_add(&new("versioned", "1.0", world.id)).await.unwrap(), Added);
+    assert_eq!(s.version_add(&new("VERSIONED", "1.0", world.id)).await.unwrap(), Taken);
+    assert_eq!(s.version_add(&new("Versioned", "1.1", world.id)).await.unwrap(), Added);
+    let latest = async |generator: &str| {
+        let found = s.version_latest_live("versioned", generator).await.unwrap();
+        found.map(|v| v.version)
+    };
+    assert_eq!(latest("gen-1").await, None, "both are checking");
+    assert!(s.version_set("Versioned", "1.0", Live, "gen-1", None).await.unwrap());
+    assert!(s.version_set("Versioned", "1.1", Failed, "gen-1", Some("boom")).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.0"), "a failed one is never used");
+    assert!(s.version_set("Versioned", "1.1", Live, "gen-1", None).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.1"), "the newest live one");
+    assert_eq!(latest("gen-2").await, None, "checked with another generator");
+    assert!(s.version_set("Versioned", "1.1", Withdrawn, "gen-1", None).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.0"));
+    assert!(!s.version_set("Versioned", "1.1", Live, "gen-1", None).await.unwrap(), "final");
+    assert!(!s.version_set("Versioned", "9.9", Live, "gen-1", None).await.unwrap(), "none");
+    assert!(s.version_set("Versioned", "1.0", NeedsUpdate, "gen-2", Some("x")).await.unwrap());
+    assert_eq!((latest("gen-1").await, latest("gen-2").await), (None, None));
+    let all = s.versions("VERSIONED").await.unwrap();
+    let want = [("1.1", Withdrawn, "gen-1", None), ("1.0", NeedsUpdate, "gen-2", Some("x"))];
+    let got: Vec<_> = all
+        .iter()
+        .map(|v| (v.version.as_str(), v.state, v.generator.as_str(), v.error.as_deref()))
+        .collect();
+    assert_eq!(got, want, "newest upload first");
+    assert!(all.iter().all(|v| v.game == "Versioned" && v.apworld == world.id));
+    assert_eq!(all[1].note, "notes for 1.0");
+    assert_eq!(s.versions("No Game").await.unwrap(), []);
+}
+
+/// A restart finds every version still checking, oldest upload first; a scan is recorded on
+/// a version whatever its state, and reads back with it.
+async fn catalogue_checking_versions_are_found_and_scans_recorded<S: Store>(s: Arc<S>) {
+    use crate::VersionState::{Checking, Live};
+    assert!(s.game_create(&game("Scanned")).await.unwrap());
+    let world = upload(UploadKind::Apworld, "Scanned", b"scanned zip");
+    s.upload_put(&world, b"scanned zip").await.unwrap();
+    for v in ["1", "2", "3"] {
+        let new = crate::NewVersion {
+            game: "Scanned".to_owned(),
+            version: v.to_owned(),
+            note: String::new(),
+            apworld: world.id,
+            generator: String::new(),
+        };
+        assert_eq!(s.version_add(&new).await.unwrap(), crate::VersionAdded::Added);
+    }
+    assert!(s.version_set("Scanned", "2", Live, "gen-1", None).await.unwrap());
+    // Other tests' versions may share the store: only this game's count here.
+    let checking = s.versions_checking().await.unwrap();
+    let mine: Vec<_> = checking.iter().filter(|v| v.game == "Scanned").collect();
+    let mine: Vec<_> = mine.iter().map(|v| (v.version.as_str(), v.state)).collect();
+    assert_eq!(mine, [("1", Checking), ("3", Checking)], "oldest first, live ones not");
+    assert!(s.versions("Scanned").await.unwrap().iter().all(|v| v.scan.is_none()));
+    let flags = r#"[{"file":"w/__init__.py","line":3,"reason":"opens a network connection"}]"#;
+    assert!(s.version_scan_set("scanned", "2", flags).await.unwrap(), "any state");
+    assert!(s.version_scan_set("Scanned", "3", "[]").await.unwrap());
+    assert!(!s.version_scan_set("Scanned", "9", "[]").await.unwrap(), "no such version");
+    let scans: Vec<_> = s.versions("Scanned").await.unwrap().into_iter().map(|v| v.scan).collect();
+    assert_eq!(scans, [Some("[]".to_owned()), Some(flags.to_owned()), None]);
 }
 
 /// An upload is stored once by kind and id with its record, read back whole and checked on
@@ -697,10 +868,15 @@ macro_rules! contract {
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
                 manifests_are_deduplicated_checked_and_listed_in_pages,
+                a_prepared_world_is_found_by_manifest_and_layout,
                 uploads_are_deduplicated_by_kind_checked_and_listed,
                 jobs_are_read_back_and_only_stale_unfinished_ones_fail,
                 a_job_put_if_absent_never_replaces_a_stored_status,
                 accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted,
+                catalogue_games_are_unique_ignoring_case_and_listed_bytewise,
+                catalogue_owners_are_granted_once_and_end_with_their_account,
+                catalogue_versions_follow_their_states_and_the_newest_live_one_is_used,
+                catalogue_checking_versions_are_found_and_scans_recorded,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,

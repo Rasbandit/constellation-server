@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub const FORMAT: u32 = 1;
 
 /// Largest id magnitude a JSON number carries exactly (2^53 - 1); the protocol document's range.
-pub const MAX_ID: i64 = (1 << 53) - 1;
+pub const MAX_ID: i64 = config::ID_MAX;
 
 /// One room's seed data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +202,33 @@ pub struct GameData {
     pub hint_blacklist: BTreeSet<String>,
 }
 
+impl GameData {
+    /// Bytes this data holds, itself and on the heap: every name's bytes, and its maps' nodes
+    /// as an upper bound (`package::map_bytes`). What a cache that keeps it counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        let ids = |m: &BTreeMap<String, i64>| package::map_bytes(m, |k, _| k.capacity());
+        let groups = |m: &BTreeMap<String, Vec<String>>| {
+            package::map_bytes(m, |k, v| {
+                k.capacity()
+                    + v.capacity() * size_of::<String>()
+                    + v.iter().map(String::capacity).sum::<usize>()
+            })
+        };
+        size_of::<Self>()
+            + ids(&self.item_name_to_id)
+            + ids(&self.location_name_to_id)
+            + self.checksum.capacity()
+            + groups(&self.item_name_groups)
+            + groups(&self.location_name_groups)
+            + self
+                .hint_blacklist
+                .iter()
+                .map(|n| n.capacity() + 2 * size_of::<String>())
+                .sum::<usize>()
+    }
+}
+
 /// Why a bundle was refused. Names the first rule that failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleError {
@@ -271,6 +298,75 @@ fn id_ok(id: i64) -> bool {
     (-MAX_ID..=MAX_ID).contains(&id)
 }
 
+/// Write `key` (a JSON key with what stands before it) and the canonical JSON of `value` into
+/// the hash. For the small parts of a bundle: the value is built as a JSON tree.
+fn member(h: &mut Sha256, key: &str, value: &impl Serialize) -> Result<(), String> {
+    h.update(key);
+    h.update(package::canonical(serde_json::to_value(value).map_err(|e| e.to_string())?));
+    Ok(())
+}
+
+/// A [`Placed`] as its canonical JSON has it: the keys in sorted order.
+#[derive(Serialize)]
+struct CanonicalPlaced {
+    flags: u8,
+    item: i64,
+    location: i64,
+    receiver: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sphere: Option<u32>,
+}
+
+impl Slot {
+    /// This slot's canonical JSON into the hash. `text` is scratch space, kept between slots.
+    fn hash_into(&self, h: &mut Sha256, text: &mut Vec<u8>) -> Result<(), String> {
+        // Every field is named, so a new one does not compile until it is hashed here.
+        let Self {
+            id,
+            team,
+            name,
+            game,
+            kind,
+            minimum_client_version,
+            group_members,
+            locations,
+            slot_data,
+            start_inventory,
+            entrances,
+        } = self;
+        if entrances.is_empty() {
+            h.update(b"{");
+        } else {
+            member(h, "{\"entrances\":", entrances)?;
+            h.update(b",");
+        }
+        member(h, "\"game\":", game)?;
+        member(h, ",\"group_members\":", group_members)?;
+        member(h, ",\"id\":", id)?;
+        member(h, ",\"kind\":", kind)?;
+        // The placements, written as text with no tree: numbers only, so nothing to sort.
+        text.clear();
+        text.extend_from_slice(b",\"locations\":[");
+        for (k, &Placed { location, item, receiver, flags, sphere }) in locations.iter().enumerate()
+        {
+            if k > 0 {
+                text.push(b',');
+            }
+            let p = CanonicalPlaced { flags, item, location, receiver, sphere };
+            serde_json::to_writer(&mut *text, &p).map_err(|e| e.to_string())?;
+        }
+        text.push(b']');
+        h.update(&*text);
+        member(h, ",\"minimum_client_version\":", minimum_client_version)?;
+        member(h, ",\"name\":", name)?;
+        member(h, ",\"slot_data\":", slot_data)?;
+        member(h, ",\"start_inventory\":", start_inventory)?;
+        member(h, ",\"team\":", team)?;
+        h.update(b"}");
+        Ok(())
+    }
+}
+
 impl SeedBundle {
     /// Parse and validate.
     ///
@@ -309,7 +405,70 @@ impl SeedBundle {
         self.slots.iter().map(|s| SlotNo(s.id))
     }
 
-    fn validate(&self) -> Result<(), BundleError> {
+    /// The [`bundle_hash`] of this bundle's JSON text, from the bundle itself: the canonical
+    /// form is built from its values, so no text is written and parsed back.
+    ///
+    /// # Errors
+    /// Never in practice (a bundle always has a JSON form).
+    pub fn hash(&self) -> Result<[u8; 32], String> {
+        let games = serde_json::to_value(&self.games).map_err(|e| e.to_string())?;
+        self.hash_with_games(&package::canonical(games))
+    }
+
+    /// [`SeedBundle::hash`] with the canonical JSON of the bundle's `games` given (`games`: the
+    /// whole map, as [`package::canonical`] writes it), so the names and ids of every game,
+    /// which are the same for every seed of a world, are hashed from bytes made once. This
+    /// bundle's own `games` are not read: take them out first and nothing of them is written.
+    ///
+    /// The canonical text goes into the hasher a member at a time, keys in sorted order, and
+    /// no JSON tree is built of the placements (most of a seed).
+    ///
+    /// # Errors
+    /// Never in practice (a bundle always has a JSON form).
+    pub fn hash_with_games(&self, games: &[u8]) -> Result<[u8; 32], String> {
+        // Every field is named, so a new one does not compile until it is hashed here.
+        let Self {
+            format,
+            seed_name,
+            generator_version,
+            server_options,
+            slots,
+            connect_names,
+            games: _,
+            race_mode,
+            start_hints,
+        } = self;
+        let mut h = Sha256::new();
+        member(&mut h, "{\"connect_names\":", connect_names)?;
+        member(&mut h, ",\"format\":", format)?;
+        h.update(b",\"games\":");
+        h.update(games);
+        member(&mut h, ",\"generator_version\":", generator_version)?;
+        member(&mut h, ",\"race_mode\":", race_mode)?;
+        member(&mut h, ",\"seed_name\":", seed_name)?;
+        member(&mut h, ",\"server_options\":", server_options)?;
+        let mut text = Vec::new();
+        h.update(b",\"slots\":[");
+        for (k, s) in slots.iter().enumerate() {
+            if k > 0 {
+                h.update(b",");
+            }
+            s.hash_into(&mut h, &mut text)?;
+        }
+        h.update(b"]");
+        if !start_hints.is_empty() {
+            member(&mut h, ",\"start_hints\":", start_hints)?;
+        }
+        h.update(b"}");
+        Ok(h.finalize().into())
+    }
+
+    /// Check every rule a room trusts (what [`SeedBundle::from_json`] checks after parsing): a
+    /// bundle built in this process is checked with this before it is encoded.
+    ///
+    /// # Errors
+    /// [`BundleError::Invalid`] naming the first broken rule.
+    pub fn validate(&self) -> Result<(), BundleError> {
         ensure!(self.format == FORMAT, "format {} is not {FORMAT}", self.format);
         ensure!(!self.slots.is_empty(), "no slots");
         ensure!(self.server_options.hint_cost <= 100, "hint_cost above 100 percent");
@@ -318,11 +477,12 @@ impl SeedBundle {
             self.server_options.remaining_mode != Mode::AutoEnabled,
             "remaining_mode cannot be auto-enabled"
         );
-        let mut ids = BTreeSet::new();
+        // Every slot by id, so nothing below scans the slots for one.
+        let mut by_id = BTreeMap::new();
         let mut names = BTreeSet::new();
         for s in &self.slots {
             ensure!(s.id >= 1, "slot id 0 is reserved for the server");
-            ensure!(ids.insert(s.id), "slot id {} repeats", s.id);
+            ensure!(by_id.insert(s.id, s).is_none(), "slot id {} repeats", s.id);
             ensure!(names.insert(s.name.as_str()), "slot name {:?} repeats", s.name);
             ensure!(
                 self.games.contains_key(&s.game),
@@ -341,23 +501,27 @@ impl SeedBundle {
             let all = g.item_name_to_id.values().chain(g.location_name_to_id.values());
             ensure!(all.copied().all(id_ok), "game {game:?} has an id outside +-(2^53 - 1)");
         }
-        let ids_of =
-            |pick: fn(&GameData) -> &BTreeMap<String, i64>| -> BTreeMap<&str, BTreeSet<i64>> {
-                self.games
-                    .iter()
-                    .map(|(n, g)| (n.as_str(), pick(g).values().copied().collect()))
-                    .collect()
+        // Each game's ids, sorted to be searched.
+        let ids_of = |pick: fn(&GameData) -> &BTreeMap<String, i64>| -> BTreeMap<&str, Vec<i64>> {
+            let sorted = |g: &GameData| {
+                let mut ids: Vec<i64> = pick(g).values().copied().collect();
+                ids.sort_unstable();
+                ids
             };
+            self.games.iter().map(|(n, g)| (n.as_str(), sorted(g))).collect()
+        };
         let items = ids_of(|g| &g.item_name_to_id);
         let locations = ids_of(|g| &g.location_name_to_id);
+        // Each slot's game is resolved once: slot id to the item ids that slot can receive.
+        let receives: BTreeMap<u32, &[i64]> =
+            self.slots.iter().map(|s| (s.id, ids_in(&items, s))).collect();
         for s in &self.slots {
             for m in &s.group_members {
-                ensure!(ids.contains(m), "group {} names missing slot {m}", s.id);
+                ensure!(by_id.contains_key(m), "group {} names missing slot {m}", s.id);
             }
-            self.validate_locations(s, &items, &locations)?;
-            let own = items.get(s.game.as_str());
-            if let Some(i) = s.start_inventory.iter().find(|i| !own.is_some_and(|g| g.contains(i)))
-            {
+            validate_locations(s, &receives, ids_in(&locations, s))?;
+            let own = ids_in(&items, s);
+            if let Some(i) = s.start_inventory.iter().find(|i| own.binary_search(i).is_err()) {
                 return Err(BundleError::Invalid(format!(
                     "slot {} starts with item {i}, which game {:?} lacks",
                     s.id, s.game
@@ -365,7 +529,7 @@ impl SeedBundle {
             }
         }
         for h in &self.start_hints {
-            let world = self.slot(h.finding).map(|s| &s.locations);
+            let world = by_id.get(&h.finding).map(|s| &s.locations);
             ensure!(
                 world.is_some_and(|w| w.iter().any(|p| p.location == h.location)),
                 "start hint for slot {} location {} is outside that world",
@@ -376,67 +540,72 @@ impl SeedBundle {
         }
         for (name, (team, slot)) in &self.connect_names {
             ensure!(
-                self.slot(*slot).is_some_and(|s| s.team == *team),
+                by_id.get(slot).is_some_and(|s| s.team == *team),
                 "connect name {name:?} points at no slot"
             );
         }
         Ok(())
     }
+}
 
-    fn validate_locations(
-        &self,
-        s: &Slot,
-        items: &BTreeMap<&str, BTreeSet<i64>>,
-        locations: &BTreeMap<&str, BTreeSet<i64>>,
-    ) -> Result<(), BundleError> {
-        let none = BTreeSet::new();
-        let own = locations.get(s.game.as_str()).unwrap_or(&none);
-        let mut seen = BTreeSet::new();
-        for l in s.entrances.keys() {
-            ensure!(
-                s.locations.iter().any(|p| p.location == *l),
-                "slot {} entrance for location {l}, which its world lacks",
-                s.id
-            );
-        }
-        for p in &s.locations {
-            ensure!(seen.insert(p.location), "slot {} location {} repeats", s.id, p.location);
-            ensure!(
-                own.contains(&p.location),
-                "slot {} location {} is not in game {:?}",
-                s.id,
-                p.location,
-                s.game
-            );
-            ensure!(
-                p.flags <= 0b111,
-                "slot {} location {} has flags {}",
-                s.id,
-                p.location,
-                p.flags
-            );
-            let receiver = self.slot(p.receiver);
-            ensure!(
-                receiver.is_some(),
-                "slot {} location {} sends to missing slot {}",
-                s.id,
-                p.location,
-                p.receiver
-            );
-            let known = receiver
-                .and_then(|r| items.get(r.game.as_str()))
-                .is_some_and(|set| set.contains(&p.item));
-            ensure!(
-                known,
-                "slot {} location {} places item {} that slot {}'s game lacks",
-                s.id,
-                p.location,
-                p.item,
-                p.receiver
-            );
-        }
-        Ok(())
+/// The sorted ids of `s`'s game in `of` (none for a game the bundle lacks).
+fn ids_in<'a>(of: &'a BTreeMap<&str, Vec<i64>>, s: &Slot) -> &'a [i64] {
+    of.get(s.game.as_str()).map_or(&[], Vec::as_slice)
+}
+
+/// The rules of one slot's locations: `receives` is each slot's receivable item ids and `own`
+/// the location ids of this slot's game, both sorted.
+fn validate_locations(
+    s: &Slot,
+    receives: &BTreeMap<u32, &[i64]>,
+    own: &[i64],
+) -> Result<(), BundleError> {
+    let mut placed: Vec<i64> = s.locations.iter().map(|p| p.location).collect();
+    placed.sort_unstable();
+    for l in s.entrances.keys() {
+        ensure!(
+            placed.binary_search(l).is_ok(),
+            "slot {} entrance for location {l}, which its world lacks",
+            s.id
+        );
     }
+    // A repeat shows as neighbours once sorted; only a slot that has one is walked with a set,
+    // to name the first repeat in file order.
+    let repeats = placed.windows(2).any(|w| w.first() == w.last());
+    let mut seen = BTreeSet::new();
+    for p in &s.locations {
+        ensure!(
+            !repeats || seen.insert(p.location),
+            "slot {} location {} repeats",
+            s.id,
+            p.location
+        );
+        ensure!(
+            own.binary_search(&p.location).is_ok(),
+            "slot {} location {} is not in game {:?}",
+            s.id,
+            p.location,
+            s.game
+        );
+        ensure!(p.flags <= 0b111, "slot {} location {} has flags {}", s.id, p.location, p.flags);
+        let receiver = receives.get(&p.receiver);
+        ensure!(
+            receiver.is_some(),
+            "slot {} location {} sends to missing slot {}",
+            s.id,
+            p.location,
+            p.receiver
+        );
+        ensure!(
+            receiver.is_some_and(|items| items.binary_search(&p.item).is_ok()),
+            "slot {} location {} places item {} that slot {}'s game lacks",
+            s.id,
+            p.location,
+            p.item,
+            p.receiver
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

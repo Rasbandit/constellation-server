@@ -1,0 +1,73 @@
+# The five worlds, as data: a world is an entrance and an inner area behind a move, its lucky
+# marbles are rows of a table, and its seed pods are a numbered family. Worlds in this genre share
+# one shape, so the shape is written once and each world is its rows.
+use items
+
+# Each world: the lucky marbles its door on the hub asks for, and the move that opens its inner
+# area.
+table isle(key: name, marbles: int, inner: rule) {
+  reef_cove 0 has(swim_fins)
+  mossy_canopy 3 can_reach_high
+  cinder_caldera 8 has(roll_dash)
+  frostcap_peaks 14 can_reach_high
+  clockwork_isle 20 has(ground_pound)
+}
+
+# Every lucky marble: its world, whether it is in the inner area, and what reaching it needs there.
+table marble(key: name, home: name, inner: bool, need: rule) {
+  driftwood_arch_marble reef_cove false true
+  tide_bell_marble reef_cove false has(high_bounce)
+  kelp_forest_marble reef_cove false has(swim_fins)
+  clam_marble reef_cove true true
+  coral_arch_marble reef_cove true has(roll_dash)
+  eel_den_marble reef_cove true has(ground_pound)
+  stump_marble mossy_canopy false true
+  pinecone_marble mossy_canopy false has(ground_pound)
+  mushroom_marble mossy_canopy false has(high_bounce)
+  treetop_marble mossy_canopy true true
+  owl_nest_marble mossy_canopy true has(glide_cape)
+  vine_race_marble mossy_canopy true has(roll_dash)
+  obsidian_marble cinder_caldera false true
+  lava_bridge_marble cinder_caldera false has(roll_dash)
+  geyser_marble cinder_caldera false has(glide_cape)
+  basalt_columns_marble cinder_caldera true has(ground_pound)
+  ember_race_marble cinder_caldera true can_reach_high
+  crater_rim_marble cinder_caldera true has(high_bounce)
+  sled_jump_marble frostcap_peaks false true
+  ice_lake_marble frostcap_peaks false has(swim_fins)
+  ski_slope_marble frostcap_peaks false has(roll_dash)
+  ice_cavern_marble frostcap_peaks true has(ground_pound)
+  icicle_marble frostcap_peaks true has(high_bounce) and has(glide_cape)
+  aurora_marble frostcap_peaks true true
+  cog_marble clockwork_isle false true
+  piston_marble clockwork_isle false has(ground_pound)
+  pendulum_marble clockwork_isle false can_reach_high and has(roll_dash)
+  gear_maze_marble clockwork_isle true has(roll_dash)
+  belltower_marble clockwork_isle true has(high_bounce) and has(glide_cape)
+  mainspring_marble clockwork_isle true has(swim_fins)
+}
+
+for w in isle {
+  region {w.key} {
+    for g in marble where g.home == w.key and not g.inner {
+      check {g.key}: g.need
+    }
+    # Seed pods lie all over: four by the entrance, four further in. `pods_per_world` of the
+    # eight are checks; the rest stay where the game put them.
+    for i in 1..4 where i <= opt.pods_per_world {
+      check {w.key}_pod_{i}
+    }
+    exit {w.key}_inner: w.inner
+    exit hub_meadow
+  }
+
+  region {w.key}_inner {
+    for g in marble where g.home == w.key and g.inner {
+      check {g.key}: g.need
+    }
+    for i in 5..8 where i <= opt.pods_per_world {
+      check {w.key}_pod_{i}
+    }
+    exit {w.key}
+  }
+}

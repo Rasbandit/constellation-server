@@ -813,6 +813,60 @@ impl crate::ManifestStore for PgLogStore {
         }
     }
 
+    /// In the `prepared_worlds` table (migration 0011).
+    async fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> Result<(), StoreError> {
+        let (id, engine, package) = (id.to_vec(), engine.to_owned(), package.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO prepared_worlds (manifest, engine, package) VALUES ($1, $2, $3) \
+                     ON CONFLICT (manifest, engine) DO UPDATE SET package = EXCLUDED.package",
+                )
+                .bind(&id)
+                .bind(&engine)
+                .bind(&package)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        let (id, engine) = (id.to_vec(), engine.to_owned());
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT package FROM prepared_worlds WHERE manifest = $1 AND engine = $2",
+                    )
+                    .bind(&id)
+                    .bind(&engine)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        found
+            .map(|k| {
+                k.try_into()
+                    .map_err(|_| StoreError::Corrupt("a prepared key is not 32 bytes".into()))
+            })
+            .transpose()
+    }
+
     async fn manifest_list(
         &self,
         game: Option<&str>,
@@ -1646,5 +1700,378 @@ impl PgLogStore {
                 })
             })
             .collect()
+    }
+}
+
+/// A catalogue game's row.
+#[derive(sqlx::FromRow)]
+struct GameRow {
+    name: String,
+    description: String,
+    created_by: String,
+}
+
+impl From<GameRow> for crate::Game {
+    fn from(r: GameRow) -> Self {
+        Self { name: r.name, description: r.description, created_by: r.created_by }
+    }
+}
+
+/// A catalogue version's row, with its game's name.
+#[derive(sqlx::FromRow)]
+struct VersionRow {
+    name: String,
+    version: String,
+    note: String,
+    apworld: Vec<u8>,
+    generator: String,
+    state: String,
+    error: Option<String>,
+    scan: Option<String>,
+}
+
+impl VersionRow {
+    fn version(self) -> Result<crate::GameVersion, StoreError> {
+        let bad = |what: &str| StoreError::Corrupt(format!("a catalogue version has a bad {what}"));
+        Ok(crate::GameVersion {
+            game: self.name,
+            version: self.version,
+            note: self.note,
+            apworld: self.apworld.try_into().map_err(|_| bad("apworld id"))?,
+            generator: self.generator,
+            state: crate::VersionState::parse(&self.state).ok_or_else(|| bad("state"))?,
+            error: self.error,
+            scan: self.scan,
+        })
+    }
+}
+
+impl crate::CatalogueStore for PgLogStore {
+    async fn game_create(&self, game: &crate::Game) -> Result<bool, StoreError> {
+        let (key, game) = (crate::game_key(&game.name), game.clone());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // One statement: the owner row goes in only with the new game, and only when
+                // its maker is an account.
+                sqlx::query_scalar(
+                    "WITH g AS (INSERT INTO catalogue_games (key, name, description, created_by) \
+                       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING key), \
+                     o AS (INSERT INTO catalogue_owners (game, username, granted_by) \
+                       SELECT g.key, u.name, u.name FROM g, users u WHERE u.name = $4) \
+                     SELECT EXISTS (SELECT 1 FROM g)",
+                )
+                .bind(&key)
+                .bind(&game.name)
+                .bind(&game.description)
+                .bind(&game.created_by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn game_get(&self, name: &str) -> Result<Option<crate::Game>, StoreError> {
+        let key = crate::game_key(name);
+        let row: Option<GameRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT name, description, created_by FROM catalogue_games WHERE key = $1",
+                    )
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::Game>, StoreError> {
+        let after = after.map(crate::game_key);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<GameRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT name, description, created_by FROM catalogue_games \
+                         WHERE $1::text IS NULL OR key > $1 ORDER BY key LIMIT $2",
+                    )
+                    .bind(&after)
+                    .bind(limit)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, user, by) = (crate::game_key(game), username.to_owned(), granted_by.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // As room_admin_add: the insert takes a game only when the account exists too,
+                // and a repeat grant inserts nothing and keeps the first.
+                sqlx::query_scalar(
+                    "WITH ins AS (INSERT INTO catalogue_owners (game, username, granted_by) \
+                       SELECT g.key, u.name, $3 FROM catalogue_games g, users u \
+                       WHERE g.key = $1 AND u.name = $2 ON CONFLICT DO NOTHING) \
+                     SELECT EXISTS (SELECT 1 FROM catalogue_games WHERE key = $1) \
+                        AND EXISTS (SELECT 1 FROM users WHERE name = $2)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .bind(&by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> Result<crate::OwnerRemoved, StoreError> {
+        use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+        let (key, user) = (crate::game_key(game), username.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                let err = |e: sqlx::Error| db::<StoreError>(&e);
+                let mut tx = c.begin().await.map_err(err)?;
+                // Removals of one game's owners take turns on its row. Each statement after the
+                // lock reads afresh (READ COMMITTED), so it counts what the one before left.
+                sqlx::query("SELECT 1 FROM catalogue_games WHERE key = $1 FOR UPDATE")
+                    .bind(&key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(err)?;
+                let (owner, owners): (bool, i64) = sqlx::query_as(
+                    "SELECT EXISTS (SELECT 1 FROM catalogue_owners \
+                       WHERE game = $1 AND username = $2), \
+                     (SELECT count(*) FROM catalogue_owners WHERE game = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(err)?;
+                let done = match (owner, owners) {
+                    (false, _) => NotOwner,
+                    (true, ..=1) => LastOwner,
+                    (true, _) => {
+                        sqlx::query(
+                            "DELETE FROM catalogue_owners WHERE game = $1 AND username = $2",
+                        )
+                        .bind(&key)
+                        .bind(&user)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(err)?;
+                        Removed
+                    }
+                };
+                tx.commit().await.map_err(err)?;
+                Ok(done)
+            })
+        })
+        .await
+    }
+
+    async fn game_owners(&self, game: &str) -> Result<Vec<String>, StoreError> {
+        let key = crate::game_key(game);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT username FROM catalogue_owners WHERE game = $1 \
+                     ORDER BY username COLLATE \"C\"",
+                )
+                .bind(&key)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn version_add(
+        &self,
+        version: &crate::NewVersion,
+    ) -> Result<crate::VersionAdded, StoreError> {
+        use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+        let (key, v) = (crate::game_key(&version.game), version.clone());
+        let (game, upload, added): (bool, bool, bool) = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    // One statement: the insert runs only when the game and the upload exist,
+                    // and the result says which were found and whether it went in.
+                    sqlx::query_as(
+                        "WITH g AS (SELECT key FROM catalogue_games WHERE key = $1), \
+                         u AS (SELECT id FROM world_uploads WHERE kind = 'apworld' AND id = $4), \
+                         ins AS (INSERT INTO catalogue_versions \
+                           (game, version, note, apworld, generator, state) \
+                           SELECT g.key, $2, $3, u.id, $5, 'checking' FROM g, u \
+                           ON CONFLICT (game, version) DO NOTHING RETURNING 1) \
+                         SELECT EXISTS (SELECT 1 FROM g), EXISTS (SELECT 1 FROM u), \
+                           EXISTS (SELECT 1 FROM ins)",
+                    )
+                    .bind(&key)
+                    .bind(&v.version)
+                    .bind(&v.note)
+                    .bind(v.apworld.as_slice())
+                    .bind(&v.generator)
+                    .fetch_one(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(match (game, upload, added) {
+            (false, _, _) => NoGame,
+            (true, false, _) => NoUpload,
+            (true, true, false) => Taken,
+            (true, true, true) => Added,
+        })
+    }
+
+    async fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: crate::VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let key = crate::game_key(game);
+        let (version, generator) = (version.to_owned(), generator.to_owned());
+        let error = error.map(str::to_owned);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE catalogue_versions \
+                     SET state = $3, generator = $4, error = $5, updated_at = now() \
+                     WHERE game = $1 AND version = $2 AND state <> 'withdrawn'",
+                )
+                .bind(&key)
+                .bind(&version)
+                .bind(state.as_str())
+                .bind(&generator)
+                .bind(&error)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn versions(&self, game: &str) -> Result<Vec<crate::GameVersion>, StoreError> {
+        let key = crate::game_key(game);
+        let rows: Vec<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.game = $1 ORDER BY v.seq DESC",
+                    )
+                    .bind(&key)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(VersionRow::version).collect()
+    }
+
+    async fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> Result<Option<crate::GameVersion>, StoreError> {
+        let (key, generator) = (crate::game_key(game), generator.to_owned());
+        let row: Option<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.game = $1 AND v.generator = $2 AND v.state = 'live' \
+                         ORDER BY v.seq DESC LIMIT 1",
+                    )
+                    .bind(&key)
+                    .bind(&generator)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        row.map(VersionRow::version).transpose()
+    }
+
+    async fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, version, scan) = (crate::game_key(game), version.to_owned(), scan.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE catalogue_versions SET scan = $3, updated_at = now() \
+                     WHERE game = $1 AND version = $2",
+                )
+                .bind(&key)
+                .bind(&version)
+                .bind(&scan)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn versions_checking(&self) -> Result<Vec<crate::GameVersion>, StoreError> {
+        let rows: Vec<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.state = 'checking' ORDER BY v.seq",
+                    )
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(VersionRow::version).collect()
     }
 }

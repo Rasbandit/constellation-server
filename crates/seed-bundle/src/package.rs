@@ -27,6 +27,12 @@ pub const VERSION: u16 = 1;
 pub const SECTION_GAME: u16 = 1;
 /// Section, reserved: the game's rules and regions (not written yet).
 pub const SECTION_RULES: u16 = 2;
+/// Section of a prepared world (`data_fill::prepared`): the whole package file of the game as
+/// seeds of that world name it ([`GamePackage::file`]), stored as is.
+pub const SECTION_SEED_GAME: u16 = 3;
+/// Section of a compiled world that declares shuffles (`data_fill::shuffle`): the declarations
+/// and the exits they name, as JSON. A world without shuffles has no such section.
+pub const SECTION_SHUFFLES: u16 = 4;
 /// Bytes of one table of contents entry.
 const ENTRY: usize = 48;
 /// Section flag: the bytes are raw deflate.
@@ -227,7 +233,30 @@ pub struct Names {
 /// A name group: its name and its member indexes.
 type Group = (Box<str>, Box<[u32]>);
 
+/// Heap bytes a map of `m`'s size holds for its nodes, as an upper bound (every node counted at
+/// the fewest entries a node may hold), and for what `more` says each entry owns besides.
+pub(crate) fn map_bytes<K, V>(m: &BTreeMap<K, V>, more: impl Fn(&K, &V) -> usize) -> usize {
+    // The standard B-tree: up to 11 entries a node, at least 5; a parent pointer, two lengths,
+    // and in an inner node 12 child pointers (charged to every node here).
+    let node = 11 * (size_of::<K>() + size_of::<V>()) + 16 + 12 * size_of::<usize>();
+    let nodes = if m.is_empty() { 0 } else { m.len() / 5 + 1 };
+    nodes * node + m.iter().map(|(k, v)| more(k, v)).sum::<usize>()
+}
+
 impl Names {
+    /// Heap bytes held: every name, the index in name order, the groups.
+    fn held_bytes(&self) -> usize {
+        let strs =
+            |s: &[Box<str>]| s.iter().map(|n| n.len() + size_of::<Box<str>>()).sum::<usize>();
+        strs(&self.by_index)
+            + self.by_name.len() * 4
+            + self
+                .groups
+                .iter()
+                .map(|(g, ids)| size_of::<Group>() + g.len() + ids.len() * 4)
+                .sum::<usize>()
+    }
+
     /// The names `by_index` (one per index) and their `groups`; a member that is not a name
     /// of the game is left out of its group.
     fn new(by_index: Box<[Box<str>]>, groups: &BTreeMap<String, Vec<String>>) -> Self {
@@ -296,6 +325,15 @@ fn sorted(names: &BTreeMap<String, i64>) -> (Box<[i64]>, Box<[Box<str>]>) {
     v.sort_by_key(|p| p.0);
     v.dedup_by_key(|p| p.0);
     (v.iter().map(|p| p.0).collect(), v.iter().map(|p| p.1.into()).collect())
+}
+
+/// The canonical JSON of the game's data inside package `content` ([`GamePackage::content`]
+/// of game `name`): the bytes between its two keys, so they need not be written again. `None`
+/// when `content` is not laid out that way.
+#[must_use]
+pub fn data_json<'a>(content: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let tail = format!(",\"game\":{}}}", serde_json::Value::from(name));
+    content.strip_prefix(b"{\"data\":")?.strip_suffix(tail.as_bytes())
 }
 
 impl GamePackage {
@@ -367,6 +405,21 @@ impl GamePackage {
             )));
         }
         Ok((f.game, f.data))
+    }
+
+    /// Bytes this package holds, itself and on the heap: what a cache of packages counts.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.name.len()
+            + self.checksum.len()
+            + (self.locations.len() + self.items.len()) * size_of::<i64>()
+            + self.location_names.held_bytes()
+            + self.item_names.held_bytes()
+            + self.data_package.len()
+            + self.item_groups.len()
+            + self.location_groups.len()
+            + self.hint_blacklist.iter().map(|n| n.len() + size_of::<Box<str>>()).sum::<usize>()
     }
 
     /// The content address.

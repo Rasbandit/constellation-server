@@ -1,0 +1,71 @@
+# Neon Cadence: a rhythm game invented for the trial worlds of doc 18 (no game's names, data or
+# logic). 64 songs come from a catalog file a tool writes (`catalog.rando`, from
+# `data/songs.csv`); each song has a check per chart and goal. `fixes.rando` is the hand-written
+# overlay over that catalog.
+world neon_cadence "Neon Cadence" version 1
+use catalog
+use fixes
+start lobby
+
+option songs_needed: range 8..48 = 24
+option star_target: range 10..60 = 30
+option expert_charts: toggle = off
+
+# Song packs: owning a pack opens its songs at their tier.
+table pack(key: name) {
+  dawn
+  dusk
+  neon
+  static
+  orbit
+  harbor
+  glass
+  ember
+}
+for p in pack {
+  item {p.key}_pack progression
+}
+start_item dawn_pack
+
+# A chart per difficulty; `focus` is how many focus lenses it needs. Expert charts exist only
+# with `expert_charts` on (the `where` in the catalog's family).
+table chart(key: name, focus: int) {
+  normal 0
+  hard 1
+  expert 2
+}
+
+# What each objective on a chart asks for.
+table objective(key: name, need: rule) {
+  clear true
+  perfect has(metronome)
+}
+
+item tier_pass progression x 3
+item focus_lens progression x 2
+item metronome progression
+item bronze_star progression x 20
+item silver_star progression x 10
+item gold_star progression x 4
+item confetti filler
+item off_beat trap
+pool fill { confetti 12, off_beat 1 }
+
+# Stars are worth 1, 2 and 5.
+def stars(n) = count(bronze_star) + 2 * count(silver_star) + 5 * count(gold_star) >= n
+
+region lobby {
+  check welcome_gift
+  check practice_room
+  check poster_wall: has_any(dusk_pack, neon_pack)
+  exit song_select
+  exit encore_stage: stars(20)
+}
+
+region encore_stage {
+  check encore_normal
+  check encore_perfect: has(metronome) and stars(40)
+  exit lobby
+}
+
+goal counter(song_cleared) >= opt.songs_needed and stars(opt.star_target)

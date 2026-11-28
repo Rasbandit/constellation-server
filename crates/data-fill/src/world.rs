@@ -5,14 +5,18 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use bits::{BitSet, PackedRef, bytes_for, read};
-use seed_bundle::package::{SECTION_GAME, SECTION_RULES, stored};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, SECTION_SHUFFLES, stored};
 use serde_json::Value;
 
+use crate::bitrules::Bits;
 use crate::section::{
-    self, CMP_OPS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths, node, sub,
+    self, CMP_OPS, EXITS, GROUPS, HEADER, MAX_SLICES, Node, STAYS, SUBSECTIONS, VERSION, Widths,
+    node, sub,
 };
+use crate::shuffle::Bound;
 
 type R<T> = Result<T, String>;
 
@@ -32,16 +36,20 @@ struct Names {
     sorted: Vec<u16>,
 }
 
-/// Unpacked copies of the indexes a solve reads per step.
+/// A list shared by every copy of a world: read like a `Vec`, never changed once loaded.
+type Shared<T> = Arc<[T]>;
+
+/// Unpacked copies of the indexes a solve reads per step. Shared between the copies of a world
+/// ([`Shared`]), so a copy costs pointers and a seed's staged world owns only what it moves.
 #[derive(Debug, Clone, Default)]
 struct Hot {
-    target: Vec<u32>,
-    place: Vec<(u16, u8)>,
-    starts: Vec<u32>,
-    item_sites: (Vec<u32>, Vec<u32>),
-    counter_sites: (Vec<u32>, Vec<u32>),
+    target: Shared<u32>,
+    place: Shared<(u16, u8)>,
+    starts: Shared<u32>,
+    item_sites: (Shared<u32>, Shared<u32>),
+    counter_sites: (Shared<u32>, Shared<u32>),
     /// Per group (exits, events, checks): sites by target, the reverse of `target`.
-    into: [(Vec<u32>, Vec<u32>); 3],
+    into: [(Shared<u32>, Shared<u32>); 3],
     time_dep: BitSet,
     def_time: BitSet,
     def_items: BitSet,
@@ -107,8 +115,8 @@ pub struct Time {
 /// One world version, loaded from its package sections.
 #[derive(Debug, Clone)]
 pub struct World {
-    rules: Vec<u8>,
-    game: Vec<u8>,
+    rules: Shared<u8>,
+    game: Shared<u8>,
     pub(crate) widths: Widths,
     counts: [usize; 6],
     /// Start region.
@@ -133,12 +141,18 @@ pub struct World {
     vanilla: List,
     roll_ids: List,
     roll_locs: List,
-    names: [Names; 7],
+    names: Arc<[Names; 7]>,
     loc_ids: usize,
-    /// Members of every item group (starts, items, caps + 1 with 0 for none).
-    groups: (List, List, List),
-    /// Per item, the groups it is a member of and its cap there (computed at load).
-    item_groups: (Vec<u32>, Vec<(u16, u16)>),
+    /// Members of every item group (starts, items, caps + 1 with 0 for none, and weights when
+    /// the section has them; every weight is 1 without).
+    groups: (List, List, List, Option<List>),
+    /// Per item, the groups it is a member of with its cap and weight there (computed at load).
+    item_groups: (Shared<u32>, Shared<(u16, u16, u32)>),
+    /// The shuffles the world declares, still to run for a seed ([`crate::shuffle::stage`]);
+    /// `None` for a world that declares none, and for a seed's staged world.
+    shuffles: Option<Arc<Bound>>,
+    /// The rules as bit rules, where they fit (computed at load).
+    bits: Arc<Bits>,
 }
 
 const ITEMS: usize = 0;
@@ -229,15 +243,95 @@ impl World {
         let section = |id| stored(file, id).map_err(|e| e.to_string());
         let rules = section(SECTION_RULES)?.ok_or("package: no rules section")?;
         let game = section(SECTION_GAME)?.ok_or("package: no game section")?;
-        Self::from_sections(rules.to_vec(), game.to_vec())
+        Self::from_parts(rules.to_vec(), game.to_vec(), section(SECTION_SHUFFLES)?)
     }
 
-    /// Load from the two sections' bytes.
+    /// Load from the sections' bytes, with the shuffle section the world was compiled with
+    /// ([`crate::shuffle::section`]) when it declares shuffles: checked against the world's
+    /// regions, exits and options.
+    ///
+    /// # Errors
+    /// As [`World::from_package`]; a shuffle section that does not parse or names what the
+    /// world lacks; rules that read shuffle results without their shuffle section.
+    pub fn from_parts(rules: Vec<u8>, game: Vec<u8>, shuffles: Option<&[u8]>) -> R<Self> {
+        let mut w = Self::loaded(rules, game)?;
+        match shuffles {
+            Some(bytes) => w.shuffles = Some(Arc::new(Bound::bind(&w, bytes)?)),
+            // Filled as it is, every slot a rule reads would hold its first thing.
+            None if (0..w.options()).any(|k| w.option_key(k).starts_with("at.")) => {
+                return Err(bad("`at.` options need the shuffle section they were compiled with"));
+            }
+            None => {}
+        }
+        Ok(w)
+    }
+
+    /// The shuffles still to run for a seed of this world.
+    pub(crate) fn shuffles(&self) -> Option<&Bound> {
+        self.shuffles.as_deref()
+    }
+
+    /// Whether the world declares shuffles that a seed has to run before its fill.
+    #[must_use]
+    pub fn has_shuffles(&self) -> bool {
+        self.shuffles.is_some()
+    }
+
+    /// Whether this world and `other` share one loaded form (a copy, or a seed's staged world
+    /// and the world it was staged from).
+    #[must_use]
+    pub fn shares_with(&self, other: &World) -> bool {
+        Arc::ptr_eq(&self.rules, &other.rules)
+    }
+
+    /// One seed's world: this one with every exit site of `exits` leading to its new region,
+    /// and no shuffle left to run. To the solver it is an ordinary world. It shares the loaded
+    /// form and owns only the targets and the exits' reverse index.
+    pub(crate) fn staged(&self, exits: &[(usize, u32)]) -> World {
+        let mut w = World { shuffles: None, ..self.clone() };
+        if !exits.is_empty() {
+            let mut target = self.hot.target.to_vec();
+            for (site, to) in exits {
+                if let Some(t) = target.get_mut(*site) {
+                    *t = *to;
+                }
+            }
+            w.hot.into[EXITS] = self.sites_by_target(&target, EXITS, self.counts[REGIONS]);
+            w.hot.target = target.into();
+        }
+        w
+    }
+
+    /// Sites of group `g` by target (`n` targets), the reverse of `target`.
+    fn sites_by_target(&self, target: &[u32], g: usize, n: usize) -> (Shared<u32>, Shared<u32>) {
+        let mut at = vec![0u32; n + 1];
+        let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
+        let sites = || (0..target.len()).filter(of_g);
+        sites().for_each(|s| at[target[s] as usize + 1] += 1);
+        (0..n).for_each(|k| at[k + 1] += at[k]);
+        let mut fill = at.clone();
+        let mut v = vec![0u32; at[n] as usize];
+        for s in sites() {
+            let t = target[s] as usize;
+            v[fill[t] as usize] = u32::try_from(s).unwrap_or(0);
+            fill[t] += 1;
+        }
+        (at.into(), v.into())
+    }
+
+    /// Load from the two sections' bytes: a world that declares no shuffle. Rules that read
+    /// shuffle results are refused here: without their shuffle section every slot would read
+    /// as its first thing ([`World::from_parts`] loads them).
     ///
     /// # Errors
     /// As [`World::from_package`].
-    #[allow(clippy::too_many_lines)] // one pass in section order
     pub fn from_sections(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
+        Self::from_parts(rules, game, None)
+    }
+
+    /// The two sections' bytes, checked.
+    #[allow(clippy::too_many_lines)] // one pass in section order
+    fn loaded(rules: Vec<u8>, game: Vec<u8>) -> R<Self> {
         let b = &rules;
         if u16_at(b, 0)? != VERSION {
             return Err(bad("unknown layout version"));
@@ -307,7 +401,14 @@ impl World {
         let gd = dir[sub::GROUPS].clone();
         let (g_starts, e) = list(b, gd.start, gd.end)?;
         let (g_items, e) = list(b, e, gd.end)?;
-        let (g_caps, _) = list(b, e, gd.end)?;
+        let (g_caps, e) = list(b, e, gd.end)?;
+        let (g_weights, e) = match (e < gd.end).then(|| list(b, e, gd.end)).transpose()? {
+            Some((w, e)) => (Some(w), e),
+            None => (None, e),
+        };
+        if e != gd.end {
+            return Err(bad("bytes after the item group lists"));
+        }
         let lc = dir[sub::LOCATIONS].clone();
         let (vanilla, _) = list(b, lc.start, lc.end)?;
         let t = dir[sub::TIME].start;
@@ -353,14 +454,16 @@ impl World {
             vanilla,
             roll_ids,
             roll_locs,
-            names,
+            names: Arc::new(names),
             loc_ids,
-            groups: (g_starts, g_items, g_caps),
-            item_groups: (Vec::new(), Vec::new()),
-            game,
-            rules: Vec::new(),
+            groups: (g_starts, g_items, g_caps, g_weights),
+            item_groups: Default::default(),
+            shuffles: None,
+            bits: Arc::new(Bits::clone(&crate::bitrules::NONE)),
+            game: game.into(),
+            rules: Shared::default(),
         };
-        w.rules = rules;
+        w.rules = rules.into();
         w.check_groups()?;
         w.hot.starts = (0..w.region_starts.len).map(|k| w.at(w.region_starts, k)).collect();
         let mut memo = w.check()?;
@@ -373,6 +476,7 @@ impl World {
         });
         w.hot.time_dep = td;
         w.check_index(&mut memo)?;
+        w.bits = Arc::new(Bits::of(&w));
         for k in [ITEMS, LOCS, N_REGIONS] {
             let mut v: Vec<u16> = (0..u16::try_from(w.names[k].spans.len()).unwrap_or(0)).collect();
             let bytes = if k == N_REGIONS { &w.rules } else { &w.game };
@@ -383,41 +487,105 @@ impl World {
                     usize::from(*y),
                 ))
             });
-            w.names[k].sorted = v;
+            Arc::make_mut(&mut w.names)[k].sorted = v;
         }
+        w.pack();
         Ok(w)
+    }
+
+    /// A copy of this world that owns everything a solve reads, list after list in one run of
+    /// memory, where [`Clone`] shares the lists. A room of several worlds without shuffles
+    /// fills on such copies, taken one after another, so the worlds sit together as they do
+    /// in a room that clones them: a fill on 100 shared worlds measured up to 4% slower than
+    /// on copies (PR 207). One world for the whole room is shared as loaded, and so is a
+    /// seed's staged world.
+    #[must_use]
+    pub fn packed(&self) -> Self {
+        let mut w = self.clone();
+        w.pack();
+        w
+    }
+
+    /// Copy every list once more, one after another. The loader does it as its last step: it
+    /// makes the lists between its own scratch work, which leaves them apart in memory (1% of
+    /// a one world fill, measured, PR 207).
+    fn pack(&mut self) {
+        fn again<T: Clone>(x: &mut Shared<T>) {
+            *x = Shared::from(&x[..]);
+        }
+        again(&mut self.rules);
+        again(&mut self.game);
+        let h = &mut self.hot;
+        again(&mut h.target);
+        again(&mut h.place);
+        again(&mut h.starts);
+        for pair in [&mut h.item_sites, &mut h.counter_sites].into_iter().chain(&mut h.into) {
+            again(&mut pair.0);
+            again(&mut pair.1);
+        }
+        self.hot = Hot {
+            time_dep: h.time_dep.clone(),
+            def_time: h.def_time.clone(),
+            def_items: h.def_items.clone(),
+            def_counters: h.def_counters.clone(),
+            ..std::mem::take(h)
+        };
+        self.names = Arc::new((*self.names).clone());
+        again(&mut self.item_groups.0);
+        again(&mut self.item_groups.1);
+        self.bits = Arc::new(Bits::clone(&self.bits));
     }
 
     /// Group member lists, and the per-item membership index built from them.
     fn check_groups(&mut self) -> R<()> {
-        let (starts, items, caps) = self.groups;
+        let (starts, items, caps, weights) = self.groups;
         let n = starts.len.saturating_sub(1);
         if starts.len == 0
             || self.at(starts, 0) != 0
             || self.at(starts, n) as usize != items.len
             || caps.len != items.len
+            || weights.is_some_and(|w| w.len != items.len)
+            // One encoding per world: a list of only 1s is written as no list.
+            || weights.is_some_and(|w| (0..w.len).all(|k| self.at(w, k) == 1))
         {
             return Err(bad("item group lists"));
         }
-        let mut per: Vec<Vec<(u16, u16)>> = vec![Vec::new(); self.counts[ITEMS]];
+        let mut per: Vec<Vec<(u16, u16, u32)>> = vec![Vec::new(); self.counts[ITEMS]];
+        // What merged terms can add up to (`section::merged`). It keeps every sum far inside
+        // `i64`: under 2^31 per copy of an item, and copies are bounded by locations.
+        let total_max =
+            config::RULE_WEIGHT_MAX.unsigned_abs() * config::RULE_GROUP_MAX_MEMBERS as u64;
         for g in 0..n {
             let (a, z) = (self.at(starts, g) as usize, self.at(starts, g + 1) as usize);
             if a > z {
                 return Err(bad("item group lists are not ascending"));
             }
+            if z - a > config::RULE_GROUP_MAX_MEMBERS {
+                return Err(bad("item group has too many members"));
+            }
+            let mut total = 0u64;
             for k in a..z {
                 let i = self.at(items, k) as usize;
                 let cap = self.at(caps, k);
                 let cap =
                     if cap == 0 { u16::MAX } else { u16::try_from(cap - 1).unwrap_or(u16::MAX) };
-                per.get_mut(i)
-                    .ok_or_else(|| bad("group member out of range"))?
-                    .push((u16::try_from(g).unwrap_or(0), cap));
+                let weight = self.weight(k);
+                total += u64::from(weight);
+                if total > total_max {
+                    return Err(bad("group weights out of range"));
+                }
+                let g = u16::try_from(g).unwrap_or(0);
+                let of = per.get_mut(i).ok_or_else(|| bad("group member out of range"))?;
+                // One entry per item and group, so a copy costs one step per group.
+                if of.last().is_some_and(|x| x.0 == g) {
+                    return Err(bad("item named twice in one group"));
+                }
+                of.push((g, cap, weight));
             }
         }
         let mut at = vec![0u32];
         per.iter().for_each(|p| at.push(at[at.len() - 1] + u32::try_from(p.len()).unwrap_or(0)));
-        self.item_groups = (at, per.concat());
+        self.item_groups = (at.into(), per.concat().into());
         Ok(())
     }
 
@@ -426,20 +594,29 @@ impl World {
         self.groups.0.len.saturating_sub(1)
     }
 
-    /// Members of group `g`: item and cap (`None` for an uncapped count).
-    pub(crate) fn group_members(&self, g: usize) -> impl Iterator<Item = (u16, Option<u16>)> + '_ {
-        let (starts, items, caps) = self.groups;
+    /// Weight of group member `k` (in member order over every group): 1 without a weights list.
+    fn weight(&self, k: usize) -> u32 {
+        self.groups.3.map_or(1, |w| self.at(w, k))
+    }
+
+    /// Members of group `g`: item, cap (`None` for an uncapped count) and weight.
+    pub(crate) fn group_members(
+        &self,
+        g: usize,
+    ) -> impl Iterator<Item = (u16, Option<u16>, u32)> + '_ {
+        let (starts, items, caps, _) = self.groups;
         (self.at(starts, g) as usize..self.at(starts, g + 1) as usize).map(move |k| {
             let cap = self.at(caps, k);
             (
                 u16::try_from(self.at(items, k)).unwrap_or(0),
                 cap.checked_sub(1).map(|c| u16::try_from(c).unwrap_or(0)),
+                self.weight(k),
             )
         })
     }
 
-    /// Groups item `i` is a member of, with its cap there (`u16::MAX` for none).
-    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16)] {
+    /// Groups item `i` is a member of, with its cap (`u16::MAX` for none) and weight there.
+    pub(crate) fn item_groups(&self, i: usize) -> &[(u16, u16, u32)] {
         let (at, m) = &self.item_groups;
         &m[at[i] as usize..at[i + 1] as usize]
     }
@@ -457,6 +634,7 @@ impl World {
             return Err(bad("region site ranges"));
         }
         let halves = self.time.owned.map_or(0, |o| o.halves);
+        let (mut targets, mut places) = (Vec::new(), Vec::new());
         for r in 0..c[REGIONS] {
             for g in 0..GROUPS {
                 let span = self.group(r, g);
@@ -471,27 +649,14 @@ impl World {
                         return Err(bad("site target out of range"));
                     }
                     self.rule_ok(rule, &mut memo)?;
-                    self.hot.target.push(target);
-                    self.hot
-                        .place
-                        .push((u16::try_from(r).unwrap_or(0), u8::try_from(g).unwrap_or(0)));
+                    targets.push(target);
+                    places.push((u16::try_from(r).unwrap_or(0), u8::try_from(g).unwrap_or(0)));
                 }
             }
         }
+        (self.hot.target, self.hot.place) = (targets.into(), places.into());
         for (g, n) in [c[REGIONS], c[COUNTERS], c[LOCS]].into_iter().enumerate() {
-            let mut at = vec![0u32; n + 1];
-            let of_g = |s: &usize| usize::from(self.hot.place[*s].1) == g;
-            let sites = || (0..self.hot.target.len()).filter(of_g);
-            sites().for_each(|s| at[self.hot.target[s] as usize + 1] += 1);
-            (0..n).for_each(|k| at[k + 1] += at[k]);
-            let mut fill = at.clone();
-            let mut v = vec![0u32; at[n] as usize];
-            for s in sites() {
-                let t = self.hot.target[s] as usize;
-                v[fill[t] as usize] = u32::try_from(s).unwrap_or(0);
-                fill[t] += 1;
-            }
-            self.hot.into[g] = (at, v);
+            self.hot.into[g] = self.sites_by_target(&self.hot.target, g, n);
         }
         if self.defs.len != c[DEFS] || self.vanilla.len != c[LOCS] {
             return Err(bad("def or location table length"));
@@ -623,7 +788,7 @@ impl World {
             lists.iter().for_each(|l| {
                 at.push(at[at.len() - 1] + u32::try_from(l.len()).unwrap_or(u32::MAX))
             });
-            (at, lists.concat())
+            (Shared::from(at), Shared::from(lists.concat()))
         };
         if csr(items) != self.hot.item_sites
             || csr(counters) != self.hot.counter_sites
@@ -832,6 +997,19 @@ impl World {
             .unwrap_or(0)
     }
 
+    /// For the bench only (feature `memory-harness`): build this world's bit rules again
+    /// (what a load does once) and return the bytes they take; the world is not changed.
+    #[cfg(feature = "memory-harness")]
+    #[must_use]
+    pub fn build_bit_rules(&self) -> usize {
+        Bits::of(self).bytes()
+    }
+
+    /// The rules as bit rules.
+    pub(crate) fn bits(&self) -> &Bits {
+        &self.bits
+    }
+
     pub(crate) fn code(&self) -> &[u8] {
         &self.rules[self.code.clone()]
     }
@@ -885,7 +1063,7 @@ impl World {
         (u64_at(&self.rules, at).unwrap_or(0), u32_at(&self.rules, at + 8).unwrap_or(1))
     }
 
-    fn csr(&self, (starts, list): (List, List)) -> (Vec<u32>, Vec<u32>) {
+    fn csr(&self, (starts, list): (List, List)) -> (Shared<u32>, Shared<u32>) {
         (
             (0..starts.len).map(|k| self.at(starts, k)).collect(),
             (0..list.len).map(|k| self.at(list, k)).collect(),
@@ -945,6 +1123,40 @@ impl World {
             .binary_search_by(|i| self.text(table, usize::from(*i)).cmp(key))
             .map(|k| u32::from(t.sorted[k]))
             .map_err(|_| format!("unknown {what} {key:?}"))
+    }
+
+    /// Bytes this world holds, itself and on the heap: the two sections, every index unpacked
+    /// from them at load, its shuffles, and the bit rules. What a cache of loaded worlds counts. A field
+    /// added to the world, its indexes or its bit rules that owns heap memory belongs here
+    /// (`tests/memory.rs` fails when one is missing).
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        use crate::bitrules::vec_bytes as v;
+        // A shared list or value: its two counts and what it holds.
+        let shared = 2 * size_of::<usize>();
+        fn s<T>(x: &Shared<T>) -> usize {
+            2 * size_of::<usize>() + size_of_val(&x[..])
+        }
+        let h = &self.hot;
+        let pairs = [&h.item_sites, &h.counter_sites, &h.into[0], &h.into[1], &h.into[2]];
+        let sets = [&h.time_dep, &h.def_time, &h.def_items, &h.def_counters];
+        size_of::<Self>()
+            + s(&self.rules)
+            + s(&self.game)
+            + s(&h.target)
+            + s(&h.place)
+            + s(&h.starts)
+            + pairs.iter().map(|(a, b)| s(a) + s(b)).sum::<usize>()
+            + sets.iter().map(|s| size_of_val(s.words())).sum::<usize>()
+            + shared
+            + size_of_val(&*self.names)
+            + self.names.iter().map(|n| v(&n.spans) + v(&n.sorted)).sum::<usize>()
+            + s(&self.item_groups.0)
+            + s(&self.item_groups.1)
+            + self.shuffles.as_ref().map_or(0, |b| shared + b.held_bytes())
+            + shared
+            + size_of::<Bits>()
+            + self.bits.heap_bytes()
     }
 
     /// Size of the rules section in bytes.

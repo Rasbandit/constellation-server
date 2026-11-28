@@ -1,0 +1,13 @@
+# What the party can do, named once for every area.
+use items
+
+# Fights and areas ask for a rank: rank 0 is a fresh party.
+def rank(n) = has(veteran_rank, n)
+def party(n) = group_count(companions) >= n
+
+# Tamsin reads old script, Rourke picks locks, Ilse heals through poison and cold, Bram lifts
+# what blocks a path.
+def can_read_script = has(tamsin)
+def can_pick_locks = has(rourke)
+def can_endure = has(ilse)
+def can_clear_rubble = has(bram)

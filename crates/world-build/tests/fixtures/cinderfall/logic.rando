@@ -1,0 +1,25 @@
+# Named conditions shared by every area.
+use items
+
+def can_cut = has(blade)
+def can_burn = has_any(lantern, cinder_wand)
+def can_swim = has(kelp_charm)
+def can_blast = has(bombs)
+def can_shoot = has(quiver)
+def can_lift(n) = has(gauntlet, n)
+def keys(k, n) = has(k, n)
+
+# Gaps: a grapple always works; a glider jump is out of logic on casual.
+def can_cross_gap = has(grapple) or (has(glider) and opt.difficulty != casual)
+
+# Fights scale with difficulty: casual wants a shield too, expert accepts one blade tier less.
+def can_fight(tier) = match opt.difficulty {
+  casual => has(blade, tier) and has(shield)
+  standard => has(blade, tier)
+  expert => count(blade) >= tier - 1
+}
+
+def can_see_dark = match opt.difficulty {
+  expert => true
+  _ => group_count(fire_tools) >= 1
+}

@@ -17,7 +17,7 @@ postgres = ["dep:config", "dep:sqlx", "dep:tokio", "dep:tracing"]
 # Runs the contract suite and the G-DB tests against a real Postgres. Needs
 # CONSTELLATION_DATABASE_URL and fails loudly without it (docs/TESTING.md rule 5).
 pg-tests = ["postgres"]
-# The gate G-DB throughput benchmark (`tests/throughput.rs`). Manual `nightly` workflow only, never the PR gate.
+# The gate G-DB throughput benchmark (`tests/throughput.rs`). On demand only, never the PR gate.
 pg-bench = ["pg-tests"]
 
 [[test]]

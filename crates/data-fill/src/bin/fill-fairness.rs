@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use data_fill::fairness::{Flat, report, report_named, sample, sample_room};
-use data_fill::room::{self, Seat};
-use data_fill::{Instance, Plan, World};
+use data_fill::fairness::{Flat, report, report_named, sample, sample_room, shape, shape_report};
+use data_fill::room;
+use data_fill::{Plan, World};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: fill-fairness (--world <world.json> | --manifest <m.json> --instance <i.json>)
-    [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]";
+    [--seeds N] [--baseline N] [--max-attempts N] [--fail-p P] [--fail-deviation D] [--out report.json]
+  or, for the shape of the fill's seeds on one room:
+    fill-fairness (--world <world.json> | --synth light|heavy|mixed [--players N] [--checks N] [--room-seed S])
+    --shape on [--seeds N] [--required N] [--baseline N]";
 
 fn read(p: &str) -> Result<Value, String> {
     serde_json::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?)
@@ -31,30 +34,25 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
     let num = |k: &str, d: u64| {
         m.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|e| format!("{k}: {e}")))
     };
-    // A room: `--world` with an `instances` list is one world played by several players.
-    if let Some(w) = m.get("--world") {
-        let v = read(w)?;
-        if let Some(list) = v["instances"].as_array() {
-            let (seeds, baseline) =
-                (num("--seeds", 2000)?, num("--baseline", num("--seeds", 2000)?)?);
-            let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
-            return room_report(&v["manifest"], list, (seeds, baseline, max_attempts), &m);
-        }
+    if m.get("--shape") == Some(&"on") {
+        return shape_of(&m, &num);
     }
-    let (manifest, inst_raw) = match (m.get("--world"), m.get("--manifest"), m.get("--instance")) {
-        (Some(w), _, _) => {
-            let v = read(w)?;
-            (v["manifest"].clone(), v["instance"].clone())
-        }
-        (None, Some(a), Some(b)) => (read(a)?, read(b)?),
-        _ => return Err(USAGE.into()),
-    };
     let seeds = num("--seeds", 2000)?;
     let baseline = num("--baseline", seeds)?;
     let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
-    let inst: Instance = serde_json::from_value(inst_raw).map_err(|e| format!("instance: {e}"))?;
-    let w = World::load(&manifest)?;
-    let plan = Plan::new(&w, &inst).map_err(|e| format!("{e:?}"))?;
+    let doc = match (m.get("--world"), m.get("--manifest"), m.get("--instance")) {
+        (Some(w), _, _) => read(w)?,
+        (None, Some(a), Some(b)) => json!({"manifest": read(a)?, "instance": read(b)?}),
+        _ => return Err(USAGE.into()),
+    };
+    // A room: `--world` with an `instances` list is one world played by several players.
+    if doc["instances"].is_array() {
+        return room_report(&doc, (seeds, baseline, max_attempts), &m);
+    }
+    let (manifest, mut insts) = room::from_doc(&doc)?;
+    let inst = insts.remove(0);
+    let w = World::load(manifest)?;
+    let plan = Plan::new(&w, &inst)?;
     let pool = inst.pool.iter().map(|k| w.item(k)).collect::<Result<Vec<_>, _>>()?;
     let prog = inst.progression(&w);
     let t = Instant::now();
@@ -64,28 +62,66 @@ fn run(args: &[String]) -> Result<(Value, bool), String> {
 
 /// The fairness run of one room: the same report, over every player's world.
 fn room_report(
-    manifest: &Value,
-    list: &[Value],
+    doc: &Value,
     (seeds, baseline, max_attempts): (u64, u64, u64),
     m: &HashMap<&str, &str>,
 ) -> Result<(Value, bool), String> {
-    let workers = config::FILL_SETUP_WORKERS;
-    let worlds = room::worlds(&vec![manifest; list.len()], workers)?;
-    let insts = room::instances(list)?;
-    let pairs: Vec<_> = worlds.iter().zip(&insts).collect();
-    let plans = room::plans(&pairs, workers).map_err(|e| format!("{e:?}"))?;
-    let progression: Vec<Vec<bool>> =
-        worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
-    let seats: Vec<Seat<'_>> = (0..plans.len())
-        .map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &progression[p] })
-        .collect();
+    let room = room::Compiled::from_doc(doc)?;
+    let seats = room.seats();
     let flat = Flat::new(&seats)?;
     let t = Instant::now();
-    let s =
-        sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(|e| format!("{e:?}"))?;
+    let s = sample_room(&seats, &flat, seeds, baseline, max_attempts)?;
     let mut r = report_named(&|i| flat.item(i), &|l| flat.loc(l), &s);
     r["players"] = json!(seats.len());
     finish(r, s.failed == 0, t, m)
+}
+
+/// The fill's seeds over one room: their shape (spheres, where progression lies, waiting,
+/// required spheres for the first `--required` seeds), and with `--baseline N` (a small world)
+/// their distance from N uniform beatable rooms.
+fn shape_of(
+    m: &HashMap<&str, &str>,
+    num: &dyn Fn(&str, u64) -> Result<u64, String>,
+) -> Result<(Value, bool), String> {
+    let c = match (m.get("--world"), m.get("--synth")) {
+        (Some(w), _) => room::Compiled::from_doc(&read(w)?)?,
+        (None, Some(profile)) => {
+            use data_fill::synth::{Hostile, Shape};
+            let checks = usize::try_from(num("--checks", 1000)?).map_err(|e| e.to_string())?;
+            let sized = |d: Shape| Shape { checks, ..d };
+            // `mixed`: chain, light, keys and heavy worlds in turn (piles of different
+            // lengths and shapes in one room).
+            let shapes = match *profile {
+                "light" => vec![sized(Shape::default())],
+                "heavy" => vec![sized(Shape::heavy())],
+                "mixed" => vec![
+                    Shape::hostile(Hostile::Chain),
+                    sized(Shape::default()),
+                    Shape::hostile(Hostile::Keys),
+                    sized(Shape::heavy()),
+                ],
+                x => return Err(format!("--synth: light, heavy or mixed, got {x}")),
+            };
+            let players = usize::try_from(num("--players", 1)?).map_err(|e| e.to_string())?;
+            data_fill::synth::mixed(&shapes, num("--room-seed", 1)?, players)?
+        }
+        _ => return Err(USAGE.into()),
+    };
+    let seats = c.seats();
+    let flat = Flat::new(&seats)?;
+    let (seeds, required, baseline) =
+        (num("--seeds", 200)?, num("--required", 0)?, num("--baseline", 0)?);
+    let max_attempts = num("--max-attempts", baseline.saturating_mul(1000))?;
+    let t = Instant::now();
+    let err = String::from;
+    let mut out = shape_report(&shape(&seats, seeds, required).map_err(err)?);
+    if baseline > 0 {
+        let sampled = sample_room(&seats, &flat, seeds, baseline, max_attempts).map_err(err)?;
+        out["against_uniform"] =
+            report_named(&|i| flat.item(i), &|l| flat.loc(l), &sampled)["baseline"].clone();
+    }
+    out["players"] = json!(seats.len());
+    finish(out, true, t, m)
 }
 
 /// Add timing and the gates, write `--out`.

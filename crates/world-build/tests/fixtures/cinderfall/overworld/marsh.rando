@@ -1,0 +1,45 @@
+# The marsh west of town and the way to the mire temple.
+use items
+use logic
+
+region marsh_edge {
+  for i in 1..4 {
+    check cattail_{i}
+  }
+  check reed_bed
+  check frog_pond
+  exit hearth_gate
+  exit marsh_boardwalk
+  exit marsh_hut door hut_door group outside
+}
+
+region marsh_boardwalk {
+  check broken_plank
+  check heron_nest: has_any(quiver, grapple)
+  exit marsh_edge
+  exit marsh_deep: can_burn
+  exit marsh_islet: can_swim
+}
+
+region marsh_deep {
+  check bog_chest
+  check wisp_lure: can_burn and can_shoot
+  check sunk_log: can_cut
+  exit marsh_boardwalk
+  exit mire_gate
+}
+
+region marsh_islet {
+  check islet_stump
+  check sunken_cart: can_swim
+  for i in 1..3 {
+    check lily_pad_{i}
+  }
+  exit marsh_boardwalk
+}
+
+region mire_gate {
+  check temple_steps
+  exit marsh_deep
+  exit mire_entry: can_cut
+}

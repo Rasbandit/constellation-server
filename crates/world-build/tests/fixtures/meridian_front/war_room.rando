@@ -1,0 +1,15 @@
+# The war room is where every mission and finale is launched from. A mission needs its
+# planet's coordinates and, with `campaign_order` at `tree`, the missions before it in the
+# tree; at `open` the coordinates alone decide.
+use campaign
+use finales
+
+region war_room {
+  # An exit into a mission an option leaves out goes with it.
+  for m in mission {
+    exit {m.key}: has({m.planet}_coordinates) and (opt.campaign_order == open or m.after)
+  }
+  for f in finale {
+    exit {f.key}: has({f.planet}_coordinates) and (opt.campaign_order == open or f.after)
+  }
+}

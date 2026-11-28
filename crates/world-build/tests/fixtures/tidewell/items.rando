@@ -1,0 +1,8 @@
+item oar progression
+item lamp progression
+item crowbar progression
+item pearl progression x 3
+item chart useful
+item shell filler
+item gull trap
+pool fill { shell 8, gull 1 }

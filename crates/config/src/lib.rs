@@ -194,11 +194,67 @@ pub struct Limits {
     pub yaml_max_bytes: usize,
     /// Largest world manifest upload, bytes (design value: the large test world is 830 KB).
     pub manifest_max_bytes: usize,
+    /// Largest `rando.toml`, bytes (design doc 19 section 2.2, design value: a full one is
+    /// under 1 KiB).
+    pub world_toml_max_bytes: usize,
+    /// Longest `rando.toml` `name`, bytes (doc 19 section 2.3, design value).
+    pub world_name_max_bytes: usize,
+    /// Longest `rando.toml` `version`, bytes (doc 19 section 2.3, design value).
+    pub world_version_max_bytes: usize,
+    /// Most `authors` in `rando.toml` (doc 19 section 2.3, design value).
+    pub world_authors_max: usize,
+    /// Longest author, characters (doc 19 section 2.3, design value).
+    pub world_author_max_chars: usize,
+    /// Longest `description`, characters (doc 19 section 2.3, design value).
+    pub world_description_max_chars: usize,
+    /// Longest `license` expression, bytes (doc 19 section 2.3, design value).
+    pub world_license_max_bytes: usize,
+    /// Longest `homepage` or `repository` URL, bytes (doc 19 section 2.3, design value).
+    pub world_url_max_bytes: usize,
+    /// Most files `[assets] files` may list (doc 19 section 2.3, design value).
+    pub world_assets_max: usize,
+    /// Largest asset file, bytes (doc 19 section 2.3, design value).
+    pub world_asset_max_bytes: usize,
+    /// Largest sum of a world's assets, bytes (doc 19 section 2.3, design value).
+    pub world_assets_max_bytes: usize,
+    /// Largest icon, bytes (doc 19 section 2.3, design value).
+    pub world_icon_max_bytes: usize,
+    /// Largest `source/` of a world package, all files together, bytes (doc 19 section 5.2,
+    /// design value: 256 files at the per-file cap would be 2 GiB). `rando pack` holds to the
+    /// package caps too, so it never writes a package the server refuses for size.
+    pub package_max_source_bytes: usize,
+    /// Largest world package, bytes (doc 19 section 5.2, design value: 8 MiB manifest, 16 MiB
+    /// source and 16 MiB assets).
+    pub package_max_bytes: usize,
+    /// Most entries in a world package (doc 19 section 5.2, design value: 256 modules, 64
+    /// assets and the fixed entries).
+    pub package_max_entries: usize,
+    /// Longest entry path in a world package, bytes (doc 19 section 5.2, design value).
+    pub package_max_path_bytes: usize,
+    /// Largest `settings.json` in a world package, bytes (doc 20 section 5, a design value,
+    /// not derived: it repeats the manifest's names and adds labels).
+    pub package_max_settings_bytes: usize,
     /// Bytes of manifests the server keeps in memory for generation (least recently used go
     /// first); the database holds every one (design value).
     pub manifest_cache_bytes: usize,
     /// Most records one listing page returns, whatever the caller asks (design value).
     pub list_page_max: usize,
+    /// Longest catalogue game name, in bytes (design value: real game names are under 60).
+    pub catalogue_name_max_bytes: usize,
+    /// Longest catalogue game description, in bytes (design value).
+    pub catalogue_description_max_bytes: usize,
+    /// Longest catalogue version number, in bytes (design value).
+    pub catalogue_version_max_bytes: usize,
+    /// Longest catalogue version note ("what changed"), in bytes (design value).
+    pub catalogue_note_max_bytes: usize,
+    /// Test seeds a catalogue version must generate without an error before it goes live, each
+    /// with a random seed and a default player (design value, agreed in #189: a real world took
+    /// about 22 s, so 20 take about 7 minutes one at a time).
+    pub catalogue_check_seeds: usize,
+    /// Test seeds generating or waiting to, server-wide. Each also waits its turn for a
+    /// generation slot (`gen_concurrency`) in the same line as players, so a player is behind
+    /// at most this many; at most `gen_concurrency` (design value).
+    pub catalogue_check_concurrency: usize,
     /// Manifest checks (a child process each) running at once; more are refused as busy.
     pub manifest_check_concurrency: usize,
     /// Address-space cap of a fill or manifest check child process, bytes (design value).
@@ -211,6 +267,25 @@ pub struct Limits {
     pub fill_cpu_secs: u64,
     /// Wall-clock limit of one fill child process, after which it is killed (design value).
     pub fill_timeout_ms: u64,
+    /// Fill worker processes that stay up and take one fill job after another
+    /// (`server::pool`). 0, the default, is no pool: each fill runs in a process of its own.
+    /// With a pool, a fill needs a worker, so there must be one for every generation that may
+    /// run at once: the valid settings are 0, or `gen_concurrency` and up
+    /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
+    /// one core (a fill runs on one thread). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// Each worker runs under the same caps as a fill child process, and a job past
+    /// `fill_timeout_ms` ends its worker.
+    pub fill_pool_workers: usize,
+    /// Fill jobs a pooled worker takes before it is replaced by a fresh process (design
+    /// value, not measured).
+    pub fill_worker_jobs: usize,
+    /// Most memory the loaded worlds one pooled worker keeps between jobs may hold
+    /// ([`PREPARED_CACHE_BYTES`]).
+    pub fill_worker_cache_bytes: usize,
+    /// A pooled worker whose address space after a job is over this share of
+    /// `fill_memory_bytes`, in percent, is replaced by a fresh process: what earlier fills
+    /// left allocated must leave the next job at least the rest of the cap (design value).
+    pub fill_worker_recycle_percent: u64,
     /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
     pub gen_concurrency: usize,
     /// Most generations queued or running at once; a new one past it is refused as busy
@@ -277,22 +352,196 @@ pub struct Limits {
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
 pub const RULES_MAX_DEPTH: u32 = 256;
 
-/// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
-/// the next draws of the seed's random stream; a design value).
-pub const FILL_MAX_ATTEMPTS: u32 = 20;
+/// Largest weight of one member of a weighted group sum (`data_fill`'s `GROUP`): the largest
+/// integer a rule's bytecode holds (16 bits signed), so a weighted sum compares against any
+/// threshold a rule can write. With [`RULE_GROUP_MAX_MEMBERS`] it bounds a sum below 2^31 times
+/// the copies of one item, far inside `i64` (a design value).
+pub const RULE_WEIGHT_MAX: i64 = i16::MAX as i64;
 
-/// Worker threads that compile worlds and resolve instances of a room's players in parallel
-/// before a multiworld fill (a design value; the fill itself is sequential, and results never
-/// depend on this number).
-pub const FILL_SETUP_WORKERS: usize = 4;
+/// Most members of one group sum, plain or weighted; compiler and loader refuse more (a design
+/// value: the group index is 16 bits wide, and a group is not meant to be larger).
+pub const RULE_GROUP_MAX_MEMBERS: usize = u16::MAX as usize;
 
-/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
+/// Most terms a rule may take as a bit rule (`data_fill`'s fold: an OR of terms, each a set of
+/// atom bits that must all be set). Turning AND over OR into that form multiplies terms, so a
+/// rule that would need more, at any step of the way, stays bytecode (a design value: the real
+/// test world's rules are counted in the PR that added this).
+pub const RULE_BITS_MAX_TERMS: usize = 16;
+
+/// Most tests (atom bits and time windows) one term of a bit rule may hold. A def's terms are
+/// copied into every rule that refers to it and AND joins the lists, so without this a long
+/// def referred to from many sites grows the bit rules by sites times its length; a rule with a
+/// longer term, at any step of the way, stays bytecode (a design value).
+pub const RULE_BITS_MAX_TERM_TESTS: usize = 32;
+
+/// Most tests a loaded world's bit rules may hold in all (two bytes each), def terms copied
+/// into sites counted: once reached, the rules not yet compiled stay bytecode. A site's rule
+/// is at most [`RULE_BITS_MAX_TERMS`] terms of [`RULE_BITS_MAX_TERM_TESTS`] tests, so this
+/// bounds a load whatever the manifest (a design value: the heavy synthetic world of 1,000
+/// checks holds under a tenth of it).
+pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
+
+/// Full fills a seed may start before the data-only fill gives up as stuck: a net for what the
+/// exact fill's repairs in place cannot mend, not its way of coping (each retry takes the next
+/// draws of the seed's random stream and goes deepest first; how often it is entered is in the
+/// fill report, `attempts`). A design value. Counted on 9,926 rooms with 20 allowed (tight
+/// synthetic worlds of 60 to 1,000 checks at 1, 3, 10 and 100 players, both fixture worlds,
+/// 3,000 seeds each): none needed more than 3, one needed 3, and none that drawn order fills in
+/// 20 attempts is stuck here in 3.
+pub const FILL_MAX_ATTEMPTS: u32 = 3;
+
+/// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
+/// sections the file holds and what is in them. Raise it with any change to that. A world is
+/// also prepared again by every new server build, so this guards builds that share a version
+/// text (local and test builds).
+pub const PREPARED_WORLD_LAYOUT: u16 = 2;
+
+/// Attempts one world's shuffles get per seed (`data_fill::shuffle`): a failed layout or
+/// whole-world check starts every shuffle of that world again on the next attempt's random
+/// streams, and at the cap the room's generation fails naming the world and the shuffle (a
+/// design value, doc 17 section 4.7 of the design docs).
+pub const SHUFFLE_MAX_ATTEMPTS: u32 = 4;
+
+/// Most shuffles one world may declare (a design value).
+pub const SHUFFLES_MAX: usize = 64;
+
+/// Most slots over all shuffles of one world, and most things of one shuffle (a design value:
+/// the largest entrance shuffle we know of is reported at 611 exits). Bounds the permission
+/// tables, which hold a cell per slot and thing.
+pub const SHUFFLE_MAX_SLOTS: usize = 1024;
+
+/// Longest shuffle name in bytes: a name keys a random stream, and a stream label is short
+/// (`spec_rng::derive`).
+pub const SHUFFLE_NAME_MAX_BYTES: usize = 48;
+
+/// Most steps the load of a world's layout index may take: per shuffled exit, the regions
+/// that reach its region by exits that are not shuffled (what the layout solve tells a branch
+/// from a dead end by, about 2 bytes each), and the exits walked to find them (a design
 /// value).
-pub const FILL_MAX_WORKERS: usize = 64;
+pub const SHUFFLE_MAX_BEHIND: usize = 1 << 20;
+
+/// Most permission rows one shuffle may carry: a row is applied to the whole table of its
+/// shuffle when the world is compiled (a design value).
+pub const SHUFFLE_MAX_ROWS: usize = 64;
+
+/// Most things a shuffle may have when a rule reads its result as a rule: such a read is one
+/// shared rule listing every candidate, and a rule lists at most this many parts (the
+/// engine's limit, one byte).
+pub const SHUFFLE_MAX_READ_THINGS: usize = 255;
+
+/// Longest error text the shuffle checks give back, bytes: a message may quote names from the
+/// manifest, and a name's length is not known to be small when it is quoted (a design value).
+pub const SHUFFLE_ERROR_MAX_BYTES: usize = 4096;
+
+/// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
+/// (`server::pool`; the design value of `Limits::fill_worker_cache_bytes`), the least recently
+/// used going first. A kept world counts what it holds (`data_fill::prepared::Prepared::
+/// held_bytes`, checked against a counting allocator in CI). From issue 200.
+pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// CPU time kept in hand when a pooled fill worker is judged fit for one more job: its
+/// process CPU cap (`fill_cpu_secs`) must cover what its jobs so far may have used, one more
+/// whole job, and this much for its start and what it does between jobs (design value).
+pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
+
+/// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
+/// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
+/// (a design value).
+pub const FILL_DISPLACE_TRIES: usize = 32;
+
+/// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
+/// of moves, one solve's worth more per move for the pass over the rounds after it, and per
+/// divided round the evaluations of the attempt's first solve with none of the rounds' items
+/// (`data_fill::room`, `charge_division`), counted the same by the fill and its cross-check.
+/// Within the budget means at most this much spent: once more is spent, checked before each
+/// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
+/// it), and so is any later one that needs a move or a division. A budget of work, not of
+/// time: a seed is the same on every machine. A design value with a margin over the
+/// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
+/// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
+/// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about
+/// 120 players and chain rooms up to about 200 fill without a restart (estimated). Time is
+/// not bounded by it: on that run keys at 100 players took 4.3 to 4.4 s for 78 to 83 million
+/// evaluations in all (measured), about 55 ns an evaluation; at that rate the budget is about
+/// 3.5 s of repair, and at the heavy profile's 186 ns about 12 s (both estimated).
+pub const FILL_REPAIR_EVALS: u64 = 64_000_000;
+
+/// The least p value the product's fill may show against uniform beatable placements on the
+/// one-player fixture world (`data-fill` `tests/fairness.rs`; a design value: drawn order gives
+/// 0.39 there, each player's items deepest first gave 0.00008, counted over 300 seeds).
+pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
+
+/// Random orders of a world's progression the early capacity ratio is the mean over
+/// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
+/// (as many orders as the measurement that found the ratio used; a design value).
+pub const FILL_CAPACITY_ORDERS: u32 = 30;
 
 /// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
-/// listing columns and an index).
+/// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a
+/// thing, a group, an exit key, a door).
 pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
+
+/// Deepest a rule string may nest (parentheses, `not`, function arguments), as written: the
+/// provisional author cap of design doc 16 (question 2, a design value), well inside the
+/// engine's [`RULES_MAX_DEPTH`].
+pub const WORLD_RULE_MAX_DEPTH: usize = 64;
+
+/// Most errors one build reports before it stops collecting (a design value: enough to fix a
+/// file in one pass, bounded so a broken file cannot print without end).
+pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
+
+/// Most parts one rule node of the engine takes: the parts of an `all` or `any`, the items of
+/// `has_any` and `has_all`, the operands of a sum, `min` or `max`, and `n` in `has` (the
+/// engine's limit, one byte).
+pub const RULE_MAX_PARTS: usize = 255;
+
+/// Largest item or location id on the wire and in a world's ledger: 2^53 - 1, the range world
+/// ids keep to so every client holds them exactly (a format value, not a limit).
+pub const ID_MAX: i64 = (1 << 53) - 1;
+
+/// Largest seed number `rando generate` takes or draws: 2^53 - 1, so the number in a JSON
+/// spoiler reads back exactly in any JSON reader (a format value, not a limit).
+pub const SEED_NUMBER_MAX: u64 = (1 << 53) - 1;
+
+/// Deepest that blocks (`for`, `region`, `extend`) may nest in a `.rando` file: the parser and
+/// the expansion recurse once per block (a design value; a world nests three or four deep).
+pub const WORLD_BLOCK_MAX_DEPTH: usize = 32;
+
+/// Most items, checks or regions one world may declare: the engine's 16-bit index width
+/// (design doc 16 section 5.3).
+pub const WORLD_TABLE_MAX: usize = 65_536;
+
+/// Largest `.rando` file (or table file) the build tool reads, bytes: the input is untrusted,
+/// and a world of a few thousand checks is well under a megabyte (a design value).
+pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most files (modules and table files) one world may read (a design value).
+pub const WORLD_MODULES_MAX: usize = 256;
+
+/// Most declarations the families of one world may expand to, so a product of a few long
+/// lists cannot run away (a design value: the survey's largest family is a few thousand).
+pub const WORLD_FAMILY_MAX: usize = 100_000;
+
+/// Stack of the thread a world build runs on, bytes: lowering recurses once per rule node, up
+/// to [`RULES_MAX_DEPTH`] nodes deep through defs, at several frames a node (a design value,
+/// well over what that depth takes in a debug build; only the pages used are committed).
+pub const WORLD_BUILD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
+/// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
+pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;
+
+/// Most options a world may declare: the engine's limit, an option being one byte in a rule.
+pub const WORLD_OPTIONS_MAX: usize = 256;
+
+/// Most start item copies one seed's instance may grant in all, so a world's numbers never
+/// decide how much memory the per-seed step takes (a design value: start items are a handful).
+pub const WORLD_START_COPIES_MAX: usize = 1024;
+
+/// Most option combinations the build tool's pool test tries (design doc 16 section 3.4): past
+/// it the test is skipped with a warning, and generation still checks the actual settings (a
+/// design value).
+pub const WORLD_POOL_TEST_MAX_COMBINATIONS: usize = 4096;
 
 /// The generator version a data-only seed records (what clients of the compatible protocol
 /// expect; a format value, not a limit).
@@ -306,6 +555,15 @@ pub const SEED_CHECK_POINTS: u32 = 1;
 
 /// Most players one room's fill takes (a design value; player numbers are 16 bits).
 pub const ROOM_MAX_PLAYERS: usize = 1024;
+
+/// Writes of a generation's last status while the store is down: how many tries (a cost trade:
+/// with the doubling wait about 15 s in all, one `gen_heartbeat_secs`, which rides out a store
+/// restart).
+pub const GEN_FINAL_WRITE_TRIES: u32 = 6;
+
+/// The wait after the first failed write of a generation's last status, ms; it doubles after
+/// each further one ([`GEN_FINAL_WRITE_TRIES`]).
+pub const GEN_FINAL_WRITE_WAIT_MS: u64 = 500;
 
 impl Limits {
     /// The design values (see each field).
@@ -382,13 +640,40 @@ impl Limits {
         apworld_max_entries: 20_000,
         yaml_max_bytes: 1024 * 1024,
         manifest_max_bytes: 8 * 1024 * 1024,
+        world_toml_max_bytes: 64 * 1024,
+        world_name_max_bytes: 64,
+        world_version_max_bytes: 64,
+        world_authors_max: 16,
+        world_author_max_chars: 128,
+        world_description_max_chars: 1000,
+        world_license_max_bytes: 256,
+        world_url_max_bytes: 2048,
+        world_assets_max: 64,
+        world_asset_max_bytes: 2 * 1024 * 1024,
+        world_assets_max_bytes: 16 * 1024 * 1024,
+        world_icon_max_bytes: 256 * 1024,
+        package_max_source_bytes: 16 * 1024 * 1024,
+        package_max_bytes: 40 * 1024 * 1024,
+        package_max_entries: 512,
+        package_max_path_bytes: 255,
+        package_max_settings_bytes: 4 * 1024 * 1024,
         manifest_cache_bytes: 64 * 1024 * 1024,
         list_page_max: 200,
+        catalogue_name_max_bytes: 100,
+        catalogue_description_max_bytes: 2000,
+        catalogue_version_max_bytes: 32,
+        catalogue_note_max_bytes: 4000,
+        catalogue_check_seeds: 20,
+        catalogue_check_concurrency: 1,
         manifest_check_concurrency: 2,
         fill_memory_bytes: 1024 * 1024 * 1024,
         fill_cpu_secs: 120,
         fill_max_processes: 8192,
         fill_timeout_ms: 60_000,
+        fill_pool_workers: 0,
+        fill_worker_jobs: 256,
+        fill_worker_cache_bytes: PREPARED_CACHE_BYTES,
+        fill_worker_recycle_percent: 50,
         gen_concurrency: 1,
         gen_queue_max: 64,
         admin_write_burst: 30,
@@ -430,6 +715,28 @@ impl Limits {
         if self.password_min_chars == 0 || self.password_min_chars > self.password_max_bytes {
             return Err("password_min_chars must be 1 to password_max_bytes");
         }
+        if self.catalogue_check_concurrency == 0
+            // Generation treats 0 as 1.
+            || (self.catalogue_check_concurrency > self.gen_concurrency
+                && self.catalogue_check_concurrency > 1)
+        {
+            return Err("catalogue_check_concurrency must be 1 to gen_concurrency");
+        }
+        if self.catalogue_check_seeds == 0 {
+            return Err("catalogue_check_seeds must be at least 1");
+        }
+        if self.fill_worker_jobs == 0 {
+            return Err("fill_worker_jobs must be at least 1");
+        }
+        // Generation treats a gen_concurrency of 0 as 1.
+        let generations = if self.gen_concurrency == 0 { 1 } else { self.gen_concurrency };
+        if self.fill_pool_workers != 0 && self.fill_pool_workers < generations {
+            return Err("fill_pool_workers must be 0 (no pool) or at least gen_concurrency: \
+                 with fewer, generations that could fill side by side would wait for a worker");
+        }
+        if self.fill_worker_recycle_percent == 0 || self.fill_worker_recycle_percent > 100 {
+            return Err("fill_worker_recycle_percent must be 1 to 100");
+        }
         if self.password_hash_parallel == 0 {
             return Err("password_hash_parallel must be at least 1");
         }
@@ -470,7 +777,10 @@ pub fn load() -> Result<Limits, String> {
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
         ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
         ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
+        ("CONSTELLATION_FILL_POOL_WORKERS", &mut l.fill_pool_workers),
         ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
+        ("CONSTELLATION_CATALOGUE_CHECK_SEEDS", &mut l.catalogue_check_seeds),
+        ("CONSTELLATION_CATALOGUE_CHECK_CONCURRENCY", &mut l.catalogue_check_concurrency),
     ] {
         if let Some(v) = num(key).and_then(|v| usize::try_from(v).ok()) {
             *field = v;
@@ -983,11 +1293,60 @@ mod tests {
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
     }
 
+    /// The fill worker pool is off unless asked for (zero workers: each fill in a process of
+    /// its own). Asked for, it must have a worker for every generation that may run at once,
+    /// or fills that ran side by side would wait in line for a worker.
+    #[test]
+    fn the_fill_pool_is_off_by_default_and_never_smaller_than_gen_concurrency() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (0, 256));
+        assert_eq!((PREPARED_CACHE_BYTES, l.fill_worker_cache_bytes), (32 << 20, 32 << 20));
+        assert_eq!((l.fill_worker_recycle_percent, FILL_WORKER_CPU_MARGIN_MS), (50, 1000));
+        assert!(l.check().is_ok(), "off");
+        // On: 1 worker for 1 generation at a time, 4 or 6 for 4; never 1, 2 or 3 for 4.
+        let with = |fill_pool_workers, gen_concurrency| {
+            Limits { fill_pool_workers, gen_concurrency, ..l }.check()
+        };
+        for (workers, generations) in [(1, 1), (1, 0), (4, 4), (6, 4), (0, 4)] {
+            assert!(with(workers, generations).is_ok(), "{workers} for {generations}");
+        }
+        for (workers, generations) in [(1, 4), (3, 4), (1, 2)] {
+            let e = with(workers, generations).unwrap_err();
+            assert!(e.contains("fill_pool_workers"), "{workers} for {generations}: {e}");
+        }
+        let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
+        assert!(e.contains("fill_worker_jobs"), "{e}");
+        for percent in [0, 101] {
+            let e = Limits { fill_worker_recycle_percent: percent, ..l }.check().unwrap_err();
+            assert!(e.contains("fill_worker_recycle_percent"), "{e}");
+        }
+    }
+
     #[test]
     fn upload_and_generation_limits_are_design_values() {
         let l = Limits::DESIGN;
         assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
         assert_eq!(l.manifest_max_bytes, 8 << 20);
+        assert_eq!(
+            (l.world_toml_max_bytes, l.world_name_max_bytes, l.world_version_max_bytes),
+            (64 << 10, 64, 64)
+        );
+        assert_eq!(
+            (l.world_authors_max, l.world_author_max_chars, l.world_description_max_chars),
+            (16, 128, 1000)
+        );
+        assert_eq!((l.world_license_max_bytes, l.world_url_max_bytes), (256, 2048));
+        assert_eq!(
+            (l.world_assets_max, l.world_asset_max_bytes, l.world_assets_max_bytes),
+            (64, 2 << 20, 16 << 20)
+        );
+        assert_eq!(l.world_icon_max_bytes, 256 << 10);
+        assert_eq!(
+            (l.package_max_source_bytes, l.package_max_bytes, l.package_max_entries),
+            (16 << 20, 40 << 20, 512)
+        );
+        assert_eq!(l.package_max_path_bytes, 255);
+        assert_eq!(l.package_max_settings_bytes, 4 << 20);
         assert_eq!((l.gen_concurrency, l.gen_queue_max), (1, 64));
         assert_eq!(
             (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),

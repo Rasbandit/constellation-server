@@ -2,8 +2,9 @@
 //! generation statuses, over Postgres or memory. The one place that chooses between the two.
 
 use log::{
-    AccountStore, BlobKey, JobState, JobStore, ManifestRecord, ManifestStore, MemLogStore,
-    OwnedRoom, PgLogStore, StoreError, UploadKind, UploadRecord, UploadStore,
+    AccountStore, BlobKey, BlobStore, CatalogueStore, Game, GameVersion, JobState, JobStore,
+    ManifestRecord, ManifestStore, MemLogStore, NewVersion, OwnedRoom, OwnerRemoved, PgLogStore,
+    StoreError, UploadKind, UploadRecord, UploadStore, VersionAdded, VersionState,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,6 +138,33 @@ impl Db {
         on!(self, s => s.manifest_list(game, after, limit).await)
     }
 
+    pub(crate) async fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> Result<(), StoreError> {
+        on!(self, s => s.prepared_put(id, engine, package).await)
+    }
+
+    pub(crate) async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        on!(self, s => s.prepared_key(id, engine).await)
+    }
+
+    /// Store a blob under its content hash (`log::BlobStore`).
+    pub(crate) async fn blob_put(&self, key: &BlobKey, bytes: &[u8]) -> Result<(), StoreError> {
+        on!(self, s => s.put(key, bytes).await)
+    }
+
+    /// A blob, checked against its key.
+    pub(crate) async fn blob_get(&self, key: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        on!(self, s => s.get(key).await)
+    }
+
     pub(crate) async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
         on!(self, s => s.user_create(name, hash).await)
     }
@@ -216,5 +244,84 @@ impl Db {
         username: &str,
     ) -> Result<bool, StoreError> {
         on!(self, s => s.room_admin_remove(key, username).await)
+    }
+
+    pub(crate) async fn game_create(&self, game: &Game) -> Result<bool, StoreError> {
+        on!(self, s => s.game_create(game).await)
+    }
+
+    pub(crate) async fn game_get(&self, name: &str) -> Result<Option<Game>, StoreError> {
+        on!(self, s => s.game_get(name).await)
+    }
+
+    pub(crate) async fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Game>, StoreError> {
+        on!(self, s => s.game_list(after, limit).await)
+    }
+
+    pub(crate) async fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.game_owner_add(game, username, granted_by).await)
+    }
+
+    pub(crate) async fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> Result<OwnerRemoved, StoreError> {
+        on!(self, s => s.game_owner_remove(game, username).await)
+    }
+
+    pub(crate) async fn game_owners(&self, game: &str) -> Result<Vec<String>, StoreError> {
+        on!(self, s => s.game_owners(game).await)
+    }
+
+    pub(crate) async fn version_add(&self, v: &NewVersion) -> Result<VersionAdded, StoreError> {
+        on!(self, s => s.version_add(v).await)
+    }
+
+    pub(crate) async fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.version_set(game, version, state, generator, error).await)
+    }
+
+    pub(crate) async fn versions(&self, game: &str) -> Result<Vec<GameVersion>, StoreError> {
+        on!(self, s => s.versions(game).await)
+    }
+
+    pub(crate) async fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> Result<bool, StoreError> {
+        on!(self, s => s.version_scan_set(game, version, scan).await)
+    }
+
+    /// What a new room of `game` uses (making a room from a game is #190).
+    #[cfg(test)]
+    pub(crate) async fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> Result<Option<GameVersion>, StoreError> {
+        on!(self, s => s.version_latest_live(game, generator).await)
+    }
+
+    pub(crate) async fn versions_checking(&self) -> Result<Vec<GameVersion>, StoreError> {
+        on!(self, s => s.versions_checking().await)
     }
 }

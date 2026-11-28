@@ -16,16 +16,20 @@ name = "memory"
 required-features = ["memory-harness"]
 
 [[example]]
-name = "measure"
-required-features = ["memory-harness"]
-
-[[example]]
 name = "measure_room"
 required-features = ["memory-harness"]
 
+# The room bench: it reads counters only this feature keeps.
+[[example]]
+name = "synth_room"
+required-features = ["memory-harness"]
+
 [features]
-# The memory harness (`tests/memory.rs`, `examples/measure.rs`): a counting global allocator.
+# The memory harness (`tests/memory.rs`, `examples/measure_room.rs`): a counting global allocator.
 memory-harness = ["dep:allocation-counter"]
+# The fill's independent cross-check (`room::fill_room_fresh`), for tests only: this crate's
+# own integration tests turn it on (below); the product never does.
+cross-check = []
 
 [dependencies]
 # Counts allocations per thread for the memory harness only (feature `memory-harness`).
@@ -33,10 +37,16 @@ allocation-counter = { version = "0.8", optional = true }
 bits = { path = "../bits" }
 # The one source of limits (rule nesting depth, fill attempts).
 config = { path = "../config", default-features = false }
+# The comparison operators and their monotone rule, shared with the world build tool.
+rule-ops = { path = "../rule-ops" }
 seed-bundle = { path = "../seed-bundle" }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 spec-rng = { path = "../spec-rng" }
+
+[dev-dependencies]
+# Itself, with the cross-check on for the integration tests.
+data-fill = { path = ".", features = ["cross-check"] }
 
 [lints]
 workspace = true

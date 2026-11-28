@@ -1,0 +1,46 @@
+# The mire temple: two small keys and a great key, all kept inside it.
+use items
+use logic
+
+placement mire_keys { mire_key, mire_great_key } {
+  region mire_entry {
+    for i in 1..3 {
+      check mire_urn_{i}
+    }
+    check moss_chest
+    exit mire_gate
+    exit mire_hall
+  }
+
+  region mire_hall {
+    check hall_chest
+    check hall_statue: can_blast
+    check hall_balcony: can_cross_gap
+    # The flooded room's shelf can also be reached across the gap from the hall.
+    check flooded_shelf also: can_cross_gap and can_swim
+    exit mire_entry
+    exit mire_flooded: keys(mire_key, 1)
+    exit mire_crypt: keys(mire_key, 2) and can_burn
+  }
+
+  region mire_flooded {
+    check drowned_chest: can_swim
+    check eel_nest: can_fight(1)
+    check flooded_shelf
+    exit mire_hall
+  }
+
+  region mire_crypt {
+    check crypt_chest
+    check bone_pile: can_see_dark
+    check great_chest: has(mire_great_key)
+    exit mire_hall
+    exit mire_lair: has(mire_great_key)
+  }
+
+  region mire_lair {
+    check mire_heart: can_fight(1) holds relic
+    check mire_spoils: can_fight(1)
+    exit mire_crypt
+  }
+}

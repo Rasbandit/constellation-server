@@ -1,4 +1,4 @@
-# One entry point for local checks. CI runs fmt and the unit tests (see .github/workflows/ci.yml).
+# One entry point for local checks. CI: .github/workflows/ci.yml (fmt, unit, web, version, Postgres tests).
 default: check
 
 setup:
@@ -23,7 +23,7 @@ test:
 
 # The Postgres tests too: the log store contract suite, the G-DB race tests and the restart
 # scenarios. Needs CONSTELLATION_DATABASE_URL (a database you may create schemas in; each test
-# makes its own). Fails, never skips, without it. The manual nightly `properties` job runs this.
+# makes its own). Fails, never skips, without it. CI runs this on every PR.
 test-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --workspace --locked --features log/pg-tests,server/pg-tests
@@ -38,7 +38,7 @@ test-py:
     python3 -m unittest discover -s tools/ap-gen
     python3 -m unittest discover -s tools/ap-import
 
-# Gate G-DB throughput benchmark (manual nightly workflow). Heavy: never on a shared developer box.
+# Gate G-DB throughput benchmark (on demand, not in CI). Heavy: never on a shared developer box.
 bench-pg:
     @test -n "${CONSTELLATION_DATABASE_URL:-}" || (echo "set CONSTELLATION_DATABASE_URL" >&2; exit 1)
     cargo test --release --locked -p log@0.0.0 --features pg-bench --test throughput -- --nocapture

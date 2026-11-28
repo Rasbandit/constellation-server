@@ -247,7 +247,7 @@ pub fn job_argv(exe: &Path, job: &str, l: &Limits) -> Vec<OsString> {
     a
 }
 
-/// Run a data-only job (`generate` or `inspect`) in a capped child process: `input` on its
+/// Run a data-only job (one of `data_fill::job::run`'s) in a capped child process: `input` on its
 /// stdin, its stdout back. A child past `timeout` is killed and reaped before this returns.
 ///
 /// # Errors
@@ -281,19 +281,26 @@ fn without_deleted(exe: PathBuf) -> PathBuf {
     }
 }
 
-/// The child side of [`run_job`]: read stdin, run the job, print the result.
+/// How a job child that refused its job exited, as its refusal is worded
+/// ([`exec`]: `<its last words> (<status>)`): `main` ends it with a failure, status 1. A pooled
+/// worker's refusal is worded the same, so an error reads alike with and without the pool.
+pub(crate) const REFUSED_STATUS: &str = "exit status: 1";
+
+/// The child side of [`run_job`]: read stdin, run the job, print the result. A job name a
+/// pool made ([`crate::pool::caps_of`]) is the child side of the pool instead: fill after fill
+/// on the same two pipes, until stdin closes.
 ///
 /// # Errors
 /// What the job refused, or an IO error on the pipes.
 pub fn fill_job(job: &str) -> Result<(), String> {
     use std::io::{Read, Write};
+    if let Some(caps) = crate::pool::caps_of(job) {
+        let (stdin, stdout) = (std::io::stdin().lock(), std::io::stdout().lock());
+        return crate::pool::serve(stdin, stdout, caps?);
+    }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
-    let out = match job {
-        "generate" => data_fill::job::generate(&input)?,
-        "inspect" => data_fill::job::inspect(&input)?,
-        other => return Err(format!("unknown job {other:?}")),
-    };
+    let out = data_fill::job::run(job, &input)?;
     std::io::stdout().write_all(&out).map_err(|e| e.to_string())
 }
 
@@ -307,20 +314,7 @@ async fn exec(
     timeout: Duration,
     clean: bool,
 ) -> Result<Vec<u8>, Failure> {
-    let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
-    let mut command = tokio::process::Command::new(program);
-    if clean {
-        command.env_clear();
-    }
-    let mut child = command
-        .args(rest)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // Dropping the child on timeout kills bwrap; `--die-with-parent` takes the rest.
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| Failure::Broken(format!("cannot start the sandbox (is bwrap installed?): {e}")))?;
+    let mut child = spawn(argv, clean)?;
     let mut stdin = child.stdin.take();
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(Failure::Broken("no pipes to the sandbox".into()));
@@ -365,6 +359,25 @@ async fn exec(
     Ok(out)
 }
 
+/// Start `argv` (program first) with all three of its streams piped, killed when the handle is
+/// dropped. With `clean` it gets no environment at all (see [`exec`]).
+pub(crate) fn spawn(argv: &[OsString], clean: bool) -> Result<tokio::process::Child, Failure> {
+    let (program, rest) = argv.split_first().ok_or(Failure::Broken("empty command".into()))?;
+    let mut command = tokio::process::Command::new(program);
+    if clean {
+        command.env_clear();
+    }
+    command
+        .args(rest)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Dropping the child on timeout kills bwrap; `--die-with-parent` takes the rest.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Failure::Broken(format!("cannot start the sandbox (is bwrap installed?): {e}")))
+}
+
 /// Check once at startup that each job can get its own cgroup (`systemd-run --user`
 /// needs a user session with the memory controller); without it no job could run. In
 /// container mode there is no such cgroup, so nothing is checked and a warning says so.
@@ -398,14 +411,14 @@ pub fn check_host(container_mode: bool, l: &Limits) -> Result<(), String> {
 
 /// Which bytes of a stream [`drain`] keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Keep {
+pub(crate) enum Keep {
     Head,
     Tail,
 }
 
 /// Read `r` to its end, keeping at most `max` bytes (its start or its end), and return them
 /// with the total length. Never holds more than about twice `max` plus one read.
-async fn drain<R: AsyncRead + Unpin>(
+pub(crate) async fn drain<R: AsyncRead + Unpin>(
     mut r: R,
     max: usize,
     keep: Keep,

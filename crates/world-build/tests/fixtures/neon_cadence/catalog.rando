@@ -1,0 +1,88 @@
+generated {
+  tool "catalog-export 1"
+  source "data/songs.csv" sha256 "ab1ba7a5d01965f7c8b3c236a9580d9de6b4677d036ed1e68a17dfd82ef12d1e"
+  expect song >= 60
+  content sha256 "e26fbf62e345922f1002252ded7c7db08f91b3e178dd2edff4162929b5d08a31"
+}
+table song(key: name, tier: int, pack: name) {
+  amber_drift 1 dawn
+  amber_echo 1 dusk
+  amber_pulse 1 neon
+  amber_bloom 1 static
+  amber_spiral 1 orbit
+  amber_signal 1 harbor
+  amber_tide 1 glass
+  amber_lantern 1 ember
+  velvet_drift 1 dusk
+  velvet_echo 1 neon
+  velvet_pulse 1 static
+  velvet_bloom 1 orbit
+  velvet_spiral 1 harbor
+  velvet_signal 1 glass
+  velvet_tide 1 ember
+  velvet_lantern 1 dawn
+  copper_drift 2 neon
+  copper_echo 2 static
+  copper_pulse 2 orbit
+  copper_bloom 2 harbor
+  copper_spiral 2 glass
+  copper_signal 2 ember
+  copper_tide 2 dawn
+  copper_lantern 2 dusk
+  indigo_drift 2 static
+  indigo_echo 2 orbit
+  indigo_pulse 2 harbor
+  indigo_bloom 2 glass
+  indigo_spiral 2 ember
+  indigo_signal 2 dawn
+  indigo_tide 2 dusk
+  indigo_lantern 2 neon
+  silver_drift 3 orbit
+  silver_echo 3 harbor
+  silver_pulse 3 glass
+  silver_bloom 3 ember
+  silver_spiral 3 dawn
+  silver_signal 3 dusk
+  silver_tide 3 neon
+  silver_lantern 3 static
+  cobalt_drift 3 harbor
+  cobalt_echo 3 glass
+  cobalt_pulse 3 ember
+  cobalt_bloom 3 dawn
+  cobalt_spiral 3 dusk
+  cobalt_signal 3 neon
+  cobalt_tide 3 static
+  cobalt_lantern 3 orbit
+  crimson_drift 4 glass
+  crimson_echo 4 ember
+  crimson_pulse 4 dawn
+  crimson_bloom 4 dusk
+  crimson_spiral 4 neon
+  crimson_signal 4 static
+  crimson_tide 4 orbit
+  crimson_lantern 4 harbor
+  jade_drift 4 ember
+  jade_echo 4 dawn
+  jade_pulse 4 dusk
+  jade_bloom 4 neon
+  jade_spiral 4 static
+  jade_signal 4 orbit
+  jade_tide 4 harbor
+  jade_lantern 4 glass
+}
+
+region song_select {
+  for s in song {
+    exit {s.key}: has({s.pack}_pack) and count(tier_pass) >= s.tier - 1
+  }
+}
+
+for s in song {
+  region {s.key} {
+    for d in chart where d.focus <= 1 or opt.expert_charts, g in objective {
+      check {s.key}_{d.key}_{g.key}: count(focus_lens) >= d.focus and g.need
+    }
+    event song_cleared: true
+    exit song_select
+  }
+}

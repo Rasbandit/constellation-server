@@ -1,0 +1,21 @@
+# Each chapter ends in a finale: a bigger fight with an objective of its own (`feat`), a
+# no-losses objective, and the `chapter_won` event the goal counts.
+use army
+use campaign
+
+table finale(key: name, planet: name, chapter: int, after: rule, power: int, feat: name, feat_needs: rule) {
+  halvar_breakout halvar 1 halvar_relay_won 4 rearguard has(scout_buggy)
+  velkas_conductor velkas 2 velkas_pylons_won 9 ground_the_rods has_air
+  brannoc_crucible brannoc 3 (brannoc_railway_won and brannoc_furnace_won) 13 breach can_siege
+  ilvane_citadel ilvane 4 ilvane_descent_won 18 flagship has(command_barge)
+}
+
+for f in finale where in_campaign(f.chapter, false) {
+  region {f.key} {
+    check {f.key}_victory: army(f.power)
+    check {f.key}_{f.feat}: army(f.power) and f.feat_needs
+    check {f.key}_no_losses: army(f.power + 3)
+    event chapter_won: army(f.power)
+    exit war_room
+  }
+}
