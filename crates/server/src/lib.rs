@@ -12,12 +12,28 @@
 //! With `--data-dir` it also serves the admin API for uploads and seed generation
 //! ([`worlds`], run in [`sandbox`]).
 
+mod accounts;
+mod cache;
+mod catalogue;
+mod checks;
+mod manifests;
+mod room_admins;
 mod room_view;
 mod sandbox;
+mod store;
 mod web;
 mod worlds;
 
+pub use sandbox::fill_job;
+// The pool and the one-job runner, public only for the tests that drive them through real
+// worker processes (`tests/pool.rs`, feature `pool-tests`): not part of the server's interface.
+#[cfg(feature = "pool-tests")]
+pub use sandbox::{Failure, run_job};
 pub mod host;
+#[cfg(not(feature = "pool-tests"))]
+mod pool;
+#[cfg(feature = "pool-tests")]
+pub mod pool;
 pub mod rooms;
 
 use axum::Router;
@@ -63,11 +79,11 @@ pub struct Args {
     pub port: u16,
     /// Address to bind.
     pub host: IpAddr,
-    /// Folder for uploads and generated seeds; turns on the admin API on the same port, under
-    /// `/api` (needs the admin token, and every request must carry it).
+    /// Folder for uploads and generated seeds; turns on the world API on the same port, under
+    /// `/api` (every route but sign-up and login needs a signed-in session).
     pub data_dir: Option<PathBuf>,
     /// Header a trusted reverse proxy sets to the client address (for example `X-Forwarded-For`);
-    /// the admin API counts wrong tokens per that address. None (default): the peer address.
+    /// sign-up and login limits count per that address. None (default): the peer address.
     pub trusted_proxy_header: Option<axum::http::HeaderName>,
     /// How clients reach this server: a host name (a room's join address is then
     /// `{public_host}:{port}/{room_key}`) or a full `ws://` or `wss://` URL with no path, used
@@ -85,8 +101,8 @@ pub const USAGE: &str = "usage: constellation-server (--bundle <file> | --rooms 
      (room password: CONSTELLATION_ROOM_PASSWORD or CONSTELLATION_ROOM_PASSWORD_FILE; \
      durable log: CONSTELLATION_DATABASE_URL or CONSTELLATION_DATABASE_URL_FILE; --data-dir \
      needs CONSTELLATION_AP_DIR, \
-     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; CONSTELLATION_ADMIN_TOKEN or \
-     CONSTELLATION_ADMIN_TOKEN_FILE requires a token on /api, else it is open)";
+     CONSTELLATION_AP_PYTHON and CONSTELLATION_AP_GEN_SCRIPT; \
+     CONSTELLATION_SIGNUP=closed stops new sign-ups)";
 
 /// Check a `--public-host` value: a bare host name, or a `ws://` / `wss://` URL that is only
 /// `host:port` (a port is required: Archipelago clients use 38281 when none is typed; an
@@ -209,13 +225,30 @@ pub fn load_bundle(path: &std::path::Path, limits: &Limits) -> Result<Loaded, St
 /// Import a v1 bundle's bytes: validate and encode them to v2 (packages shared in-process).
 ///
 /// # Errors
-/// When it is not a valid v1 bundle (a v2 seed file is refused: seeds come from the store).
+/// When it is not a valid v1 bundle (a v2 seed file is refused: it names its packages by key,
+/// so it comes from the store, or with them through [`parse_seed`]).
 pub fn parse_bundle(file: &[u8], limits: &Limits) -> Result<Loaded, String> {
     if seed_bundle::v2::is_v2(file) {
         return Err("a v2 seed file is not imported from disk; seeds live in the store".into());
     }
     let (seed, packages) = seed_bundle::import_v1(file, limits.bundle_max_bytes)?;
     Ok(Loaded { hash: seed.hash().to_vec(), bundle: Arc::new(seed), packages })
+}
+
+/// Import a v2 seed file with the package files it names (what the engine's fill prints, and
+/// the game's package of the world it filled): checked as a seed read from the store is, with
+/// nothing parsed as JSON or encoded again. `packages` are kept for the host to store.
+///
+/// # Errors
+/// When the seed breaks the format, or names a package that is not among `packages`.
+pub fn parse_seed(
+    seed: Vec<u8>,
+    packages: Vec<Vec<u8>>,
+    limits: &Limits,
+) -> Result<Loaded, String> {
+    let files = packages.iter().map(|f| (log::blob_key(f), f.clone())).collect();
+    let loaded = host::open_fetched((seed, files, Vec::new()), limits)?;
+    Ok(Loaded { packages, ..loaded })
 }
 
 /// A new room's state for a loaded bundle: the one place a room is built from a bundle.
@@ -262,11 +295,10 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The admin API for `--data-dir`, or why it cannot start: it needs the generation paths. With
-/// no token it is open (see [`open_mode_warning`]). Checked before the port is bound or the room claimed.
+/// The world API for `--data-dir`, or why it cannot start: it needs the generation paths.
+/// Checked before the port is bound or the room claimed.
 fn worlds_api(
     data_dir: Option<&std::path::Path>,
-    token: Option<&str>,
     generation: Option<Generation>,
     limits: Limits,
 ) -> Result<Option<worlds::Worlds>, String> {
@@ -275,21 +307,13 @@ fn worlds_api(
         "--data-dir needs CONSTELLATION_AP_DIR, CONSTELLATION_AP_PYTHON and \
          CONSTELLATION_AP_GEN_SCRIPT",
     )?;
-    worlds::open(dir, token, generation, limits).map(Some)
+    worlds::open(dir, generation, limits).map(Some)
 }
 
-/// The startup warning when the admin API is served without a token.
-fn open_mode_warning(api_on: bool, token: Option<&str>) -> Option<&'static str> {
-    (api_on && token.is_none()).then_some(
-        "admin API is open: anyone who can reach this port can upload and run world code; \
-         set CONSTELLATION_ADMIN_TOKEN to require a token",
-    )
-}
-
-/// The admin API (`/api/*`, token-gated) on the room router, ahead of the WebSocket upgrade and
+/// The world API (`/api/*`, session-gated) on the room router, ahead of the WebSocket upgrade and
 /// the web UI, which only take what `/healthz`, `/version` and `/api` did not. No admin API
-/// without `--data-dir`.
-fn mount_admin(
+/// without `--data-dir`. Uploads an older server kept as files move into the host's store first.
+async fn mount_admin(
     router: Router,
     api: Option<worlds::Worlds>,
     host: &Host,
@@ -297,11 +321,15 @@ fn mount_admin(
     proxy_header: Option<axum::http::HeaderName>,
 ) -> Router {
     match api {
-        Some(w) => router.merge(w.router(
-            host.waker(),
-            host.folder().map(|f| (f, public_addr)),
-            proxy_header,
-        )),
+        Some(w) => router.merge(
+            w.router(
+                host.waker(),
+                host.folder().map(|f| (f, public_addr)),
+                proxy_header,
+                host.db(),
+            )
+            .await,
+        ),
         None => router,
     }
 }
@@ -326,9 +354,15 @@ fn version_string(version: &str, sha: Option<&str>) -> String {
     }
 }
 
+/// This build's version ([`version_string`]): what `GET /version` shows, and what a prepared
+/// world is stored under, so every build that says another version prepares its worlds again.
+pub(crate) fn build_version() -> String {
+    version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"))
+}
+
 /// `GET /version`: `{"version": "<version>[+<short sha>]"}`. The web UI compares it with its own.
 async fn version() -> impl IntoResponse {
-    let v = version_string(env!("CARGO_PKG_VERSION"), option_env!("CONSTELLATION_BUILD_SHA"));
+    let v = build_version();
     ([(header::CONTENT_TYPE, "application/json")], format!("{{\"version\":\"{v}\"}}"))
 }
 
@@ -417,6 +451,14 @@ pub async fn app(
     app_with_web(source, password, database_url, limits, None).await
 }
 
+/// Where the log lives: the URL the server runs as, and the one the migrations run as (the
+/// table owner; `None`: they run as the runtime role).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DatabaseUrls<'a> {
+    pub runtime: Option<&'a str>,
+    pub migrate: Option<&'a str>,
+}
+
 /// [`app`], also serving the web UI built in `web_dir` on every path that is not a room's
 /// WebSocket upgrade.
 ///
@@ -429,18 +471,35 @@ pub async fn app_with_web(
     limits: Limits,
     web_dir: Option<&std::path::Path>,
 ) -> Result<(Router, Host), String> {
+    let urls = DatabaseUrls { runtime: database_url, migrate: None };
+    app_with_urls(source, password, urls, limits, web_dir).await
+}
+
+/// [`app_with_web`] with a separate migration URL.
+///
+/// # Errors
+/// As [`app_with_web`].
+pub async fn app_with_urls(
+    source: &Source,
+    password: Option<String>,
+    urls: DatabaseUrls<'_>,
+    limits: Limits,
+    web_dir: Option<&std::path::Path>,
+) -> Result<(Router, Host), String> {
+    let (database_url, migrate_url) = (urls.runtime, urls.migrate);
     let web = web_dir.map(web::WebDir::open).transpose()?.map(Arc::new);
     let mut host = match source {
         Source::Bundle(path) => {
             let loaded = load_bundle(path, &limits)?;
-            let mut host = Host::new(database_url, password, limits, None).await?;
+            let mut host = Host::new(database_url, migrate_url, password, limits, None).await?;
             let key = host.import(loaded).await?;
             host.wake(&key).await?;
             host
         }
         Source::Rooms(dir) => {
             host::check_folder(dir)?;
-            let mut host = Host::new(database_url, password, limits, Some(dir.clone())).await?;
+            let mut host =
+                Host::new(database_url, migrate_url, password, limits, Some(dir.clone())).await?;
             host.list_stored().await?;
             host
         }
@@ -780,34 +839,31 @@ pub async fn run(
         if args.data_dir.is_some() {
             sandbox::check_host(generation.as_ref().is_some_and(|g| g.container_mode), &limits)?;
         }
-        let api = worlds_api(
-            args.data_dir.as_deref(),
-            secrets.admin_token.as_deref(),
-            generation,
-            limits,
-        )?;
+        let api = worlds_api(args.data_dir.as_deref(), generation, limits)?;
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port))
             .await
             .map_err(|e| format!("bind: {e}"))?;
-        let (router, host) = app_with_web(
+        let urls = DatabaseUrls {
+            runtime: secrets.database_url.as_deref(),
+            migrate: secrets.migrate_database_url.as_deref(),
+        };
+        let (router, host) = app_with_urls(
             &args.source,
             secrets.room_password,
-            secrets.database_url.as_deref(),
+            urls,
             limits,
             args.web_dir.as_deref(),
         )
         .await?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        if let Some(w) = open_mode_warning(api.is_some(), secrets.admin_token.as_deref()) {
-            tracing::warn!("{w}");
-        }
         let router = mount_admin(
             router,
             api,
             &host,
             join_base(&args.public_host, addr.port()),
             args.trusted_proxy_header,
-        );
+        )
+        .await;
         tracing::info!(%addr, rooms = host.len(), "listening");
         Ok::<_, RunError>((listener, router, host))
     };
@@ -1026,19 +1082,19 @@ mod tests {
     }
 
     #[test]
-    fn the_admin_api_is_off_without_a_data_dir_and_open_without_a_token() {
+    fn the_world_api_is_off_without_a_data_dir_and_needs_the_generation_paths() {
         let root = std::env::temp_dir().join(format!("server-api-{}", std::process::id()));
         let g = || Some(fake_generation(&root));
-        assert!(worlds_api(None, None, None, Limits::DESIGN).unwrap().is_none());
-        assert!(worlds_api(None, Some("t"), g(), Limits::DESIGN).unwrap().is_none());
+        assert!(worlds_api(None, None, Limits::DESIGN).unwrap().is_none());
+        assert!(worlds_api(None, g(), Limits::DESIGN).unwrap().is_none());
         let dir = root.join("data");
         // A temporary upload a previous process left behind is cleared at start.
         std::fs::create_dir_all(dir.join("tmp/left-behind")).unwrap();
-        assert!(worlds_api(Some(&dir), None, g(), Limits::DESIGN).unwrap().is_some(), "open mode");
-        let e = worlds_api(Some(&dir), Some("t"), None, Limits::DESIGN).unwrap_err();
+        let e = worlds_api(Some(&dir), None, Limits::DESIGN).unwrap_err();
         assert!(e.contains("CONSTELLATION_AP_DIR"), "{e}");
-        assert!(worlds_api(Some(&dir), Some("t"), g(), Limits::DESIGN).unwrap().is_some());
-        assert!(dir.join("apworlds").is_dir() && dir.join("worlds").is_dir());
+        assert!(worlds_api(Some(&dir), g(), Limits::DESIGN).unwrap().is_some());
+        // Uploads live in the store (#119): no upload folders, only job folders.
+        assert!(!dir.join("apworlds").exists() && dir.join("worlds").is_dir());
         assert!(dir.join("tmp").is_dir() && !dir.join("tmp/left-behind").exists());
     }
 
@@ -1058,36 +1114,38 @@ mod tests {
         }
     }
 
-    /// The status code of one HTTP/1.1 GET to `addr`.
-    async fn status_of(addr: SocketAddr, path: &str, token: Option<&str>) -> u16 {
+    /// The status code of one HTTP/1.1 request to `addr`, with `cookie` (a `name=value`) if given.
+    async fn status_of(addr: SocketAddr, method: &str, path: &str, cookie: Option<&str>) -> u16 {
+        let extra = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
+        let r = raw_method(addr, method, path, &extra).await;
+        r.get(9..12).unwrap().parse().unwrap()
+    }
+
+    /// Sign up `name` over HTTP and return the session cookie (`name=value`).
+    async fn sign_up(addr: SocketAddr, name: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = format!("{{\"username\":\"{name}\",\"password\":\"a long enough password\"}}");
+        let head = format!(
+            "POST /api/signup HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-        let head =
-            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
         s.write_all(head.as_bytes()).await.unwrap();
-        let mut first = [0_u8; 12];
-        s.read_exact(&mut first).await.unwrap();
-        String::from_utf8_lossy(&first[9..12]).parse().unwrap()
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 201"), "{out}");
+        let line = out.lines().find(|l| l.to_lowercase().starts_with("set-cookie:")).unwrap();
+        line.split_once(':').unwrap().1.trim().split(';').next().unwrap().to_owned()
     }
 
-    /// The whole router as `run` builds it: rooms, the admin API under `/api`, and the UI when
+    /// The whole router as `run` builds it: rooms, the world API under `/api`, and the UI when
     /// `dist` is given. Listens on a free loopback port.
-    async fn serve_with_admin(
+    async fn serve_with_api(
         name: &str,
         limits: Limits,
         dist: Option<&std::path::Path>,
         proxy_header: Option<&str>,
-    ) -> (PathBuf, SocketAddr) {
-        serve_admin_mode(name, limits, dist, proxy_header, Some(TOKEN)).await
-    }
-
-    async fn serve_admin_mode(
-        name: &str,
-        limits: Limits,
-        dist: Option<&std::path::Path>,
-        proxy_header: Option<&str>,
-        token: Option<&str>,
     ) -> (PathBuf, SocketAddr) {
         let root = std::env::temp_dir().join(format!("server-{name}-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&root));
@@ -1096,15 +1154,16 @@ mod tests {
             app_with_web(&Source::Rooms(root.join("rooms")), None, None, limits, dist)
                 .await
                 .unwrap();
-        let api = worlds_api(Some(&root.join("data")), token, Some(fake_generation(&root)), limits)
-            .unwrap();
+        let api =
+            worlds_api(Some(&root.join("data")), Some(fake_generation(&root)), limits).unwrap();
         let router = mount_admin(
             router,
             api,
             &host,
             "localhost:1".to_owned(),
             proxy_header.map(|h| h.parse().unwrap()),
-        );
+        )
+        .await;
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1114,88 +1173,81 @@ mod tests {
         (root, addr)
     }
 
-    const TOKEN: &str = "s3cret-s3cret-s3cret-s3cret-s3cr";
-
+    /// Every route under `/api` but the five public ones: 401 without a session (never the
+    /// UI's 404 or its `index.html`), not 401 with one; any other path under it too. Fails if a
+    /// route is added outside the gate. The web folder never answers under `/api`.
     #[tokio::test]
-    async fn the_admin_routes_on_the_room_port_need_the_admin_token() {
-        let (root, addr) = serve_with_admin("view-auth", Limits::DESIGN, None, None).await;
-        let id = "a".repeat(64);
-        for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
-            assert_eq!(status_of(addr, &path, None).await, 401, "{path} without the token");
-            assert_eq!(status_of(addr, &path, Some("wrong")).await, 401, "{path}, wrong token");
-            assert_eq!(status_of(addr, &path, Some(TOKEN)).await, 404, "{path}: no such world");
-        }
-        drop(std::fs::remove_dir_all(&root));
-    }
-
-    /// `/api`, any path under it, and the real routes: 401 without the token (never the UI's
-    /// 404 or its `index.html`), 200 with it; the web folder never answers under `/api`.
-    #[tokio::test]
-    async fn api_is_the_token_gate_and_never_served_from_the_web_folder() {
+    async fn every_api_route_but_the_public_ones_needs_a_session() {
         let (root, dist) = web_fixture("api-gate");
         std::fs::write(dist.join("api"), "from the web dir").unwrap();
-        std::fs::create_dir_all(dist.join("api-dir")).unwrap();
-        let (_, addr) = serve_with_admin(
-            "api-gate",
-            Limits { admin_auth_fail_burst: 100, ..Limits::DESIGN },
-            Some(&dist),
-            None,
-        )
-        .await;
-        for path in ["/api", "/api/", "/api/games", "/api/yamls", "/api/nope/deeper", "/api/assets"]
-        {
-            assert_eq!(status_of(addr, path, None).await, 401, "{path} without the token");
-            assert_eq!(status_of(addr, path, Some("wrong")).await, 401, "{path}, wrong token");
+        let limits = Limits { signup_burst: 10, ..Limits::DESIGN };
+        let (_, addr) = serve_with_api("api-gate", limits, Some(&dist), None).await;
+        let id = "a".repeat(64);
+        let gated: Vec<(&str, String)> = vec![
+            ("GET", "/api".into()),
+            ("GET", "/api/".into()),
+            ("GET", "/api/nope/deeper".into()),
+            ("GET", "/api/apworlds".into()),
+            ("PUT", "/api/apworlds?name=a.apworld".into()),
+            ("GET", "/api/yamls".into()),
+            ("PUT", "/api/yamls?name=a.yaml".into()),
+            ("GET", "/api/manifests".into()),
+            ("PUT", "/api/manifests?name=a.json".into()),
+            ("GET", "/api/rooms".into()),
+            ("GET", "/api/rooms/abcdefghij/admins".into()),
+            ("POST", "/api/rooms/abcdefghij/admins".into()),
+            ("PUT", "/api/rooms/abcdefghij/admins/bo".into()),
+            ("DELETE", "/api/rooms/abcdefghij/admins/bo".into()),
+            ("POST", "/api/worlds".into()),
+            ("GET", format!("/api/worlds/{id}")),
+            ("GET", format!("/api/worlds/{id}/room")),
+            ("GET", format!("/api/worlds/{id}/bundle")),
+            ("GET", format!("/api/worlds/{id}/room/events")),
+        ];
+        let ann = sign_up(addr, "ann").await;
+        for (method, path) in &gated {
+            assert_eq!(status_of(addr, method, path, None).await, 401, "{method} {path}");
+            let wrong = "constellation_session=".to_owned() + &"0".repeat(64);
+            assert_eq!(
+                status_of(addr, method, path, Some(&wrong)).await,
+                401,
+                "{method} {path} forged"
+            );
+            assert_ne!(
+                status_of(addr, method, path, Some(&ann)).await,
+                401,
+                "{method} {path} signed in"
+            );
         }
-        assert_eq!(status_of(addr, "/api/yamls", Some(TOKEN)).await, 200);
-        assert_eq!(status_of(addr, "/api/nope", Some(TOKEN)).await, 404, "unknown route, token");
+        assert_eq!(status_of(addr, "GET", "/api/yamls", Some(&ann)).await, 200);
+        assert_eq!(status_of(addr, "GET", "/api/rooms", Some(&ann)).await, 200);
+        assert_eq!(status_of(addr, "GET", "/api/nope", Some(&ann)).await, 404);
         let bare = raw(addr, "/api/yamls", "").await;
         assert!(bare.to_lowercase().contains("content-length: 0"), "no detail in the 401: {bare}");
+        // Public: they answer their own way (a missing body is 400, not the gate's 401).
+        for path in ["/api/signup", "/api/login"] {
+            assert_eq!(status_of(addr, "POST", path, None).await, 400, "{path}");
+        }
+        assert_ne!(status_of(addr, "POST", "/api/logout", None).await, 401);
+        assert_eq!(status_of(addr, "GET", "/api/me", Some(&ann)).await, 200);
+        let auth = raw(addr, "/api/auth", "").await;
+        assert!(
+            auth.starts_with("HTTP/1.1 200") && auth.ends_with("{\"signup_open\":true}"),
+            "{auth}"
+        );
         // The UI and the probes are untouched.
         assert!(raw(addr, "/create", "").await.starts_with("HTTP/1.1 200"));
         assert!(raw(addr, "/healthz", "").await.ends_with("ok"));
         drop(std::fs::remove_dir_all(&root));
     }
 
-    /// No token configured: `/api` is open, nothing is counted, and `/api/auth` says so. With a
-    /// token, `/api/auth` is still open and says a token is needed.
+    /// What an attacker can try without a session: other methods, odd spellings of the path,
+    /// and an oversize chunked upload. None reaches a handler.
     #[tokio::test]
-    async fn without_a_token_the_api_is_open_and_with_one_it_is_not() {
-        let limits = Limits { admin_auth_fail_burst: 1, ..Limits::DESIGN };
-        let (root, open) = serve_admin_mode("open", limits, None, None, None).await;
-        for _ in 0..4 {
-            assert_eq!(status_of(open, "/api/yamls", None).await, 200);
-        }
-        assert_eq!(status_of(open, "/api/nope", None).await, 404, "no gate, no such route");
-        let auth = raw(open, "/api/auth", "").await;
-        assert!(auth.ends_with("{\"token_required\":false}"), "{auth}");
-        let (root2, shut) = serve_admin_mode("shut", limits, None, None, Some(TOKEN)).await;
-        let auth = raw(shut, "/api/auth", "").await;
-        assert!(
-            auth.starts_with("HTTP/1.1 200") && auth.ends_with("{\"token_required\":true}"),
-            "{auth}"
-        );
-        assert_eq!(status_of(shut, "/api/yamls", None).await, 401);
-        for r in [root, root2] {
-            drop(std::fs::remove_dir_all(&r));
-        }
-    }
-
-    #[test]
-    fn open_mode_warns_loudly_and_a_token_or_no_api_does_not() {
-        let w = open_mode_warning(true, None).unwrap();
-        assert!(w.contains("admin API is open") && w.contains("CONSTELLATION_ADMIN_TOKEN"), "{w}");
-        assert!(open_mode_warning(true, Some("t")).is_none());
-        assert!(open_mode_warning(false, None).is_none());
-    }
-
-    /// What an attacker can try against a token-mode server: other methods, odd spellings of
-    /// the path, and an oversize chunked upload. None reaches an admin handler without the token.
-    #[tokio::test]
-    async fn odd_requests_never_reach_an_admin_handler_without_the_token() {
+    async fn odd_requests_never_reach_a_handler_without_a_session() {
         let (root, dist) = web_fixture("odd");
-        let limits = Limits { admin_auth_fail_burst: 100, apworld_max_bytes: 8, ..Limits::DESIGN };
-        let (_, addr) = serve_with_admin("odd", limits, Some(&dist), None).await;
+        let limits = Limits { apworld_max_bytes: 8, signup_burst: 10, ..Limits::DESIGN };
+        let (_, addr) = serve_with_api("odd", limits, Some(&dist), None).await;
         for method in ["HEAD", "OPTIONS", "POST", "DELETE"] {
             let r = raw_method(addr, method, "/api/yamls", "").await;
             assert!(r.starts_with("HTTP/1.1 401"), "{method}: {r}");
@@ -1210,7 +1262,7 @@ mod tests {
             );
             assert!(!r.contains("\"apworlds\"") && !r.contains('['), "{path}: {r}");
         }
-        // Chunked, over the cap, with the token: refused by the size cap; without it, 401 first.
+        // Chunked, over the cap, signed in: refused by the size cap; without a session, 401 first.
         let chunked = |auth: &str| {
             format!(
                 "{auth}Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
@@ -1218,65 +1270,46 @@ mod tests {
                 "x".repeat(64)
             )
         };
-        let mut head = chunked(&format!("Authorization: Bearer {TOKEN}\r\n"));
-        let big = raw_method(addr, "PUT", "/api/apworlds?name=a.apworld", &head).await;
+        let ann = sign_up(addr, "ann").await;
+        let big = raw_method(
+            addr,
+            "PUT",
+            "/api/apworlds?name=a.apworld",
+            &chunked(&format!("Cookie: {ann}\r\n")),
+        )
+        .await;
         assert!(big.starts_with("HTTP/1.1 413"), "{big}");
-        head = chunked("");
-        let anon = raw_method(addr, "PUT", "/api/apworlds?name=a.apworld", &head).await;
+        let anon = raw_method(addr, "PUT", "/api/apworlds?name=a.apworld", &chunked("")).await;
         assert!(anon.starts_with("HTTP/1.1 401"), "{anon}");
         drop(std::fs::remove_dir_all(&root));
     }
 
-    #[tokio::test]
-    async fn wrong_tokens_are_rate_limited_per_client_and_a_right_one_never_is() {
-        let limits = Limits {
-            admin_auth_fail_burst: 3,
-            admin_auth_fail_refill_milli_per_sec: 1,
-            ..Limits::DESIGN
-        };
-        let (root, addr) = serve_with_admin("rate", limits, None, None).await;
-        for n in 1..=3 {
-            assert_eq!(status_of(addr, "/api/yamls", Some("wrong")).await, 401, "failure {n}");
-        }
-        let limited = raw(addr, "/api/yamls", "Authorization: Bearer wrong\r\n").await;
-        assert!(limited.starts_with("HTTP/1.1 429"), "{limited}");
-        assert!(limited.to_lowercase().contains("retry-after: 1000"), "{limited}");
-        assert_eq!(status_of(addr, "/api/yamls", None).await, 429, "no token counts as wrong");
-        assert_eq!(status_of(addr, "/api/yamls", Some(TOKEN)).await, 200, "never locks out");
-        drop(std::fs::remove_dir_all(&root));
-    }
-
     /// The proxy header is ignored unless configured, and then only its last entry counts, so a
-    /// client cannot dodge the limit by sending its own `X-Forwarded-For`.
+    /// client cannot dodge the sign-up limit by sending its own `X-Forwarded-For`.
     #[tokio::test]
     async fn the_proxy_header_counts_only_when_trusted_and_by_its_last_entry() {
-        let limits = Limits {
-            admin_auth_fail_burst: 1,
-            admin_auth_fail_refill_milli_per_sec: 1,
-            ..Limits::DESIGN
+        let limits = Limits { signup_burst: 1, signup_refill_milli_per_sec: 1, ..Limits::DESIGN };
+        let fwd = |ip: &str| format!("X-Forwarded-For: {ip}\r\n");
+        let try_signup = async |addr, extra: &str| {
+            raw_method(addr, "POST", "/api/signup", extra).await.get(9..12).unwrap().to_owned()
         };
-        let fwd = |ip: &str| format!("Authorization: Bearer wrong\r\nX-Forwarded-For: {ip}\r\n");
-        let (root, off) = serve_with_admin("proxy-off", limits, None, None).await;
-        assert!(raw(off, "/api/yamls", &fwd("9.9.9.1")).await.starts_with("HTTP/1.1 401"));
-        let again = raw(off, "/api/yamls", &fwd("9.9.9.2")).await;
-        assert!(again.starts_with("HTTP/1.1 429"), "header ignored by default: {again}");
+        let (root, off) = serve_with_api("proxy-off", limits, None, None).await;
+        assert_eq!(try_signup(off, &fwd("9.9.9.1")).await, "400");
+        assert_eq!(try_signup(off, &fwd("9.9.9.2")).await, "429", "header ignored by default");
         let (root3, split) =
-            serve_with_admin("proxy-split", limits, None, Some("x-forwarded-for")).await;
+            serve_with_api("proxy-split", limits, None, Some("x-forwarded-for")).await;
         // The client's own line comes first; the proxy's line is the last one and is the key.
-        let two = |own: &str| {
-            format!(
-                "Authorization: Bearer wrong\r\nX-Forwarded-For: {own}\r\nX-Forwarded-For: 9.9.9.1\r\n"
-            )
-        };
-        assert!(raw(split, "/api/yamls", &two("1.1.1.1")).await.starts_with("HTTP/1.1 401"));
-        let again = raw(split, "/api/yamls", &two("2.2.2.2")).await;
-        assert!(again.starts_with("HTTP/1.1 429"), "a forged first line is not the key: {again}");
-        let (root2, on) = serve_with_admin("proxy-on", limits, None, Some("x-forwarded-for")).await;
-        assert!(raw(on, "/api/yamls", &fwd("1.1.1.1, 9.9.9.1")).await.starts_with("HTTP/1.1 401"));
-        let spoof = raw(on, "/api/yamls", &fwd("2.2.2.2, 9.9.9.1")).await;
-        assert!(spoof.starts_with("HTTP/1.1 429"), "same proxy-added entry: {spoof}");
-        let other = raw(on, "/api/yamls", &fwd("1.1.1.1, 9.9.9.2")).await;
-        assert!(other.starts_with("HTTP/1.1 401"), "another client: {other}");
+        let two = |own: &str| format!("X-Forwarded-For: {own}\r\nX-Forwarded-For: 9.9.9.1\r\n");
+        assert_eq!(try_signup(split, &two("1.1.1.1")).await, "400");
+        assert_eq!(
+            try_signup(split, &two("2.2.2.2")).await,
+            "429",
+            "a forged first line is not the key"
+        );
+        let (root2, on) = serve_with_api("proxy-on", limits, None, Some("x-forwarded-for")).await;
+        assert_eq!(try_signup(on, &fwd("1.1.1.1, 9.9.9.1")).await, "400");
+        assert_eq!(try_signup(on, &fwd("2.2.2.2, 9.9.9.1")).await, "429", "same proxy-added entry");
+        assert_eq!(try_signup(on, &fwd("1.1.1.1, 9.9.9.2")).await, "400", "another client");
         for r in [root, root2, root3] {
             drop(std::fs::remove_dir_all(&r));
         }

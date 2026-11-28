@@ -1,0 +1,21 @@
+# The hub island: a world door for each world, opened by a count of lucky marbles.
+use items
+use worlds
+
+region hub_meadow {
+  check meadow_stump
+  check windmill_roof: can_reach_high
+  check pond_bottom: has(swim_fins)
+  check fallen_log: has(roll_dash)
+  # Each world's door asks for the lucky marbles in its row of `isle`.
+  for w in isle {
+    exit {w.key}: count(lucky_marble) >= w.marbles
+  }
+  exit summit_path: count(lucky_marble) >= opt.marbles_for_summit
+}
+
+region summit_path {
+  check summit_lookout
+  event summit_reached: has(high_bounce) and has(glide_cape)
+  exit hub_meadow
+}

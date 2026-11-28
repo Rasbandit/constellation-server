@@ -1,0 +1,384 @@
+name: bench
+# The fill on synthetic worlds (crates/data-fill/examples/synth_room.rs), release build, one
+# thread, on one runner: light and heavy at 1, 10 and 100 players, a world each and every player
+# on one world (the rooms the server generates, with the seed's encode), rooms built to need
+# repair (chain, keys, mixed, tight), sum gates weighted and plain (`Shape::sums`), the bit
+# rules against plain bytecode (a gate: same
+# placements), and the seed-shape report. Base against head in turns (also on rooms with
+# confined items, a gate: same placements), and shuffled worlds, in
+# jobs of their own. Runs only on PRs labelled `perf` and on manual dispatch, never on every PR.
+# Tables go to the job summary, the JSON lines to an artifact. With `full` set to `on`, a
+# dispatch also runs where a generation's time goes through the server
+# (crates/server/src/worlds/tests/gen_bench.rs) and the seed-shape report at full size.
+# A file of its own: the `labeled` trigger in ci.yml would re-run the required `check` job and,
+# through its concurrency group, cancel the run already in progress.
+# The bench builds examples, so data-fill's own dev-dependency turns on `cross-check` (one
+# branch per placement phase), and `memory-harness` counts allocations: not the exact product build.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      players: { description: "Player counts, comma separated", default: "1,10,100" }
+      checks: { description: "Checks per world", default: "1000" }
+      full: { description: "on: also the server's generation bench and the full seed-shape report", default: "off" }
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  FULL: ${{ inputs.full || 'off' }}
+permissions:
+  contents: read
+jobs:
+  bench-room:
+    # On a PR: it carries `perf`, and a label event is the `perf` label itself.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      # Where a generation's time goes through the server and what the fill pool changes
+      # (crates/server/src/worlds/tests/gen_bench.rs), for a room of 1 and of 10 players, three
+      # runs. A dispatch with `full` on only: it builds the server in release.
+      - name: gen_bench
+        if: env.FULL == 'on'
+        run: |
+          set -o pipefail
+          cargo build --release --locked -p server --bin constellation-server
+          cargo test --release --locked -p server --lib --features gen-bench --no-run
+          for run in 1 2 3; do
+            cargo test --release --locked -p server --lib --features gen-bench gen_bench -- --nocapture \
+              | tee gen-bench.log
+            grep '^{"bench":"gen' gen-bench.log | jq -c --argjson run "$run" '. + {run: $run}' >> gen-bench.jsonl
+          done
+      # Compiled apart from the rows, so the summary can say where the job's time goes.
+      - name: build
+        run: |
+          start=$SECONDS
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room --bin fill-fairness
+          echo $((SECONDS - start)) > build_s
+      # Inputs go through the environment, never into the script text.
+      - name: synth_room
+        env:
+          PLAYERS: ${{ inputs.players || '1,10,100' }}
+          CHECKS: ${{ inputs.checks || '1000' }}
+        run: |
+          set -o pipefail
+          bench() { target/release/examples/synth_room "$@" | tee -a bench-room.jsonl; }
+          # Both profiles of `data_fill::synth`: a world per player, and a room as the server
+          # generates it, every player on one world, prepared once and loaded from its stored
+          # form, with the seed assembled and encoded (`--worlds one`).
+          for profile in light heavy; do for worlds in each one; do
+            bench --profile "$profile" --worlds "$worlds" --players "$PLAYERS" --checks "$CHECKS"
+          done; done
+          # The bit rules and skipping the absent checks against every rule as bytecode with
+          # every check evaluated, at 10 players: the gate below holds their placements equal.
+          for profile in light heavy; do
+            bench --profile "$profile" --rules bytecode --absent check --players 10 --checks "$CHECKS"
+          done
+          # Half the gates as sums of three kinds' copies (`Shape::sums`): weighted, against the
+          # same worlds with plain-count sums, and weighted as bytecode for the gate below (at 100
+          # players too, which parts the atom's own cost from the world's on the same placements).
+          for sums in counts weighted; do for profile in light heavy; do
+            bench --profile "$profile" --sums "$sums" --players "$PLAYERS" --checks "$CHECKS" --failed-row
+          done; done
+          for profile in light heavy; do
+            bench --profile "$profile" --sums weighted --rules bytecode --absent check --players 10,100 --checks "$CHECKS"
+          done
+          # Worlds built to need repair (`data_fill::synth::Hostile`): chains, keys, a room of
+          # chain, light, key and heavy worlds in turn (`mixed`), and as much progression as
+          # locations that take it (`tight`). A room that is stuck on every attempt prints a row
+          # that says so (`--failed-row`).
+          for profile in chain keys mixed; do
+            timeout 300 target/release/examples/synth_room --profile "$profile" --players 16,22,100 \
+              --reps 3 --failed-row | tee -a bench-room.jsonl || true
+          done
+          target/release/examples/synth_room --profile tight --players 1,10,100 --reps 3 --failed-row \
+            | tee -a bench-room.jsonl
+      # Bit rules and skipping the absent locations' checks must not change a seed. Every
+      # variant row has to find its partner: a gate that compared nothing fails.
+      - name: the engine variants change no placement
+        run: |
+          jq -s -e '
+            [.[] | select(.players != null)] as $rows
+            | [$rows[] | select(.rules == "bytecode") | . as $v
+               | {v: $v, now: [$rows[] | select(.rules == "bits" and .absent == "skip" and .profile == $v.profile
+                                               and .world == $v.world and .players == $v.players)]}] as $pairs
+            | if ($pairs | length) == 0 then error("no variant row") else . end
+            | [$pairs[] | select((.now | length) != 1 or .v.placements_hash != .now[0].placements_hash)
+               | "\(.v.profile) \(.v.players)"]
+            | if length == 0 then true else error("variants differ, or a row has no partner: \(.)") end' bench-room.jsonl
+      # How the fill's seeds are shaped (`fill-fairness --shape on`), and on the two small
+      # fixture worlds against uniform beatable placements. Full size only on a dispatch with
+      # `full` on; every other run draws few seeds, enough to fail when the report stops working.
+      - name: quality
+        env:
+          CHECKS: ${{ inputs.checks || '1000' }}
+        run: |
+          set -o pipefail
+          fair() { target/release/fill-fairness --shape on "$@" > /dev/null; }
+          if [ "$FULL" = on ]; then one=200; ten=20; fixture=10000; required=200; else one=10; ten=2; fixture=500; required=20; fi
+          for profile in light heavy; do
+            fair --synth "$profile" --players 1 --checks "$CHECKS" --seeds "$one" --required 5 --out "quality-$profile-1.json"
+            fair --synth "$profile" --players 10 --checks "$CHECKS" --seeds "$ten" --out "quality-$profile-10.json"
+          done
+          fair --synth mixed --players 8 --checks "$CHECKS" --seeds "$ten" --out "quality-mixed-8.json"
+          for world in fairness_world room_world; do
+            fair --world "crates/data-fill/tests/fixtures/$world.json" --seeds "$fixture" --baseline "$fixture" --required "$required" --out "quality-$world.json"
+          done
+      - name: summary
+        run: |
+          {
+            if [ -s gen-bench.jsonl ]; then
+            echo "### Where a generation's time goes through the server (measured on this runner, release build)"
+            echo
+            echo "One synthetic world per room, every player on it, in-memory store, no HTTP. Start: a job process that does nothing. Pipe in: the fill's input on its stdin, by difference. Load, fill and encode: the job's own steps. Rest: what the parts leave of the job (inferred by subtraction)."
+            echo
+            echo "| run | profile | players | start ms | pipe in ms | load ms | fill ms | encode ms | rest ms | job ms | prepared bytes | request bytes | seed bytes | reps |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.bench == "gen") | .split as $s | "| \(.run) | \(.profile) | \(.players) | \($s.start_ms) | \($s.pipe_in_ms) | \($s.load_ms) | \($s.fill_ms) | \($s.encode_ms) | \($s.rest_ms) | \($s.job_ms) | \($s.prepared_bytes) | \($s.request_bytes) | \($s.seed_bytes) | \(.reps) |"' gen-bench.jsonl
+            echo
+            echo "Own process against the fill pool (median of the three runs' medians, and in brackets the least and greatest sample):"
+            echo
+            echo "| profile | players | own process ms | pool cold ms | pool miss ms | pool warm ms |"
+            echo "|---|---|---|---|---|---|"
+            jq -r -s 'def mid: sort | .[(length / 2 | floor)]; def cell(f): "\([.[] | f.med] | mid) [\([.[] | f.min] | min) to \([.[] | f.max] | max)]"; [.[] | select(.bench == "gen")] | group_by([.profile, .players])[] | "| \(.[0].profile) | \(.[0].players) | \(cell(.job.own)) | \(cell(.job.cold)) | \(cell(.job.miss)) | \(cell(.job.warm)) |"' gen-bench.jsonl
+            echo
+            fi
+            echo "### Where the job's time went (measured: wall seconds on this runner)"
+            echo
+            echo "Compile of the bench and the fairness tool, release: $(cat build_s) s. Rows: $(jq -s '[.[] | select(.players != null) | .row_s] | add | round' bench-room.jsonl) s over $(jq -s '[.[] | select(.players != null)] | length' bench-room.jsonl) rows (a row draws and prepares its worlds, fills once for the heap figure and then \`fill reps\` times for the median)."
+            echo
+            echo "### The fill (measured on this runner, release build, one thread)"
+            echo
+            echo "Fill ms is the median of the fill reps (of 2 once a fill takes over a second). Rule evaluations, rounds, divided rounds, moved items, repair evaluations, spheres and attempts are counted; peak heap is measured for one fill. World each: a world per player; one: every player on one world, as the server generates a room. A failed row is a room stuck on all \`config::FILL_MAX_ATTEMPTS\` attempts, or past its time limit."
+            echo
+            echo "| profile | world | rules | players | result | fill ms | reps, ms | setup ms | rule evals | rounds | divided | items moved | repair evals | spheres | attempts | peak heap bytes | placements hash |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(.players != null or .failed != null) | "| \(.profile) | \(.world // "") | \(.rules // "") \(.absent // "") | \(.players // .room) | \(if .failed then "failed: \(.failed)" else "filled" end) | \(.fill_ms // "") | \(.fill_ms_runs // "") | \(.setup_ms // "") | \(.rule_evals // "") | \(.rounds // "") | \(.divided // "") | \(.swaps // "") | \(.repair_evals // "") | \(.spheres // "") | \(.attempts // "") | \(.peak_heap_bytes // "") | \(.placements_hash // "") |"' bench-room.jsonl
+            echo
+            echo "#### A room on one world: what is done once per world and what each seed pays"
+            echo
+            echo "Prepare (compile to the stored ready form) is paid once per world and server build, load by every generation that runs in its own process. Per seed: setup, fill, assemble (the bundle on the prepared tables), encode (check, hash, seed file) and open (the server opens the seed file on the world's package). Peak RSS is the whole process's high-water mark when the row was printed."
+            echo
+            echo "| profile | players | prepare ms | load ms | setup ms | fill ms | assemble ms | encode ms | of it: check ms | open ms | prepared file bytes | seed bytes | peak RSS bytes after the encode |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -r 'select(has("players") and .world == "one") | "| \(.profile) | \(.players) | \(.prepare_ms) | \(.load_ms) | \(.setup_ms) | \(.fill_ms) | \(.seed_file.assemble_ms) | \(.seed_file.encode_ms) | \(.seed_file.validate_ms) | \(.seed_file.open_ms) | \(.prepared_bytes) | \(.seed_file.seed_bytes) | \(.seed_file.peak_rss_after_encode_bytes) |"' bench-room.jsonl
+            echo
+            echo "### Seed shape (counted over fill seeds 1 to N of one room)"
+            echo
+            echo "Required spheres: spheres holding an item no goal can be reached without (first seeds only, n in brackets). Stuck: share of a player's rounds in which no location of theirs opens. Uniform columns exist only for the small fixture worlds (rejection sampling of beatable uniform placements)."
+            echo
+            echo "| report | players | seeds | failed | spheres mean | progression in sphere 0 | in first two | relative depth | required spheres (n) | stuck mean | items moved a seed | chi2 vs uniform (dof, p) | max gap vs uniform | fill ms median |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            for q in quality-*.json; do
+              jq -r --arg q "$q" 'def r(n): if . == null then "n/a" else (. * n | round) / n end; "| \($q) | \(.players) | \(.seeds) | \(.failed) | \(.spheres_mean | r(100)) | \(.progression_share_sphere_0 | r(1000)) | \(.progression_share_first_two_spheres | r(1000)) | \(.progression_relative_depth_mean | r(1000)) | \(.required_spheres_mean | r(100)) (\(.required_spheres_seeds)) | \(.stuck_share_mean | r(1000)) | \(.swaps_per_seed | r(100)) | \(.against_uniform.chi2 | r(1)) (\(.against_uniform.dof), \(.against_uniform.p_value | r(10000))) | \(.against_uniform.max_deviation.value | r(1000)) | \(.fill_ms_median | r(100)) |"' "$q"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-room
+          if-no-files-found: ignore
+          path: |
+            gen-bench.jsonl
+            bench-room.jsonl
+            quality-*.json
+  # The base branch against this one on one runner: both builds of the bench, run in turns
+  # (which side goes first alternates), on worlds without shuffles. Runners differ too much
+  # between jobs to compare two jobs' numbers.
+  bench-ab:
+    permissions:
+      contents: read
+      pull-requests: read
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - name: build both
+        env: { BASE: "${{ github.base_ref || 'main' }}" }
+        run: |
+          git worktree add ../base "origin/$BASE"
+          # shortcut: a base from before `Shape::confined` gets it from this patch (the synthetic
+          # world only, no fill code), so the confined rows run on both sides; delete the patch
+          # and this line once main has the flag.
+          grep -q 'pub confined: bool' ../base/crates/data-fill/src/synth.rs || git -C ../base apply "$PWD/.github/bench/base-confined.patch"
+          cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+          (cd ../base && cargo build --release --locked -p data-fill --features memory-harness --example synth_room)
+      - name: in turns
+        run: |
+          set -o pipefail
+          for pair in $(seq 12); do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --players 1,10,100 --checks 1000 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab.jsonl
+            done
+          done; done
+          # The seed of a room on one world (the rooms the server generates), which is where
+          # the bench times the seed's check, hash and encode: three runs a side, in turns.
+          for pair in 1 2 3; do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --worlds one --players 1,10,100 --checks 1000 --reps 3 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab-seed.jsonl
+            done
+          done; done
+          # Rooms with confined items (`Shape::confined`): placed before the rounds, a path of
+          # its own. Six runs a side, in turns.
+          for pair in $(seq 6); do for profile in light heavy; do
+            sides="base head"; [ $((pair % 2)) -eq 0 ] && sides="head base"
+            for side in $sides; do
+              bin=target/release/examples/synth_room; [ "$side" = base ] && bin="../base/$bin"
+              "$bin" --profile "$profile" --confined on --players 1,10 --checks 1000 \
+                | jq -c --arg side "$side" --argjson pair "$pair" 'select(has("players")) | . + {side: $side, pair: $pair}' \
+                | tee -a bench-ab-confined.jsonl
+            done
+          done; done
+      - name: summary
+        run: |
+          {
+            echo "### Base against head, worlds without shuffles, the fill (measured on this runner, release build, 12 runs a side in turns; each run's fill ms is its own median)"
+            echo
+            echo "| profile | players | base fill ms median | base range | head fill ms median | head range | head / base | base rule evals | head rule evals | same placements |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[]
+              | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
+              | "| \(.[0].profile) | \(.[0].players) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(select(.side == "base").rule_evals) | unique) | \(map(select(.side == "head").rule_evals) | unique) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab.jsonl
+            echo
+            echo "### Base against head, the seed of a room on one world: ms to encode it (check, hash and write the seed file), and its check and whole hash alone (measured on this runner, release build, 3 runs a side in turns; each run's number is its own median of 3; median and range of the runs)"
+            echo
+            echo "| profile | players | what | base ms | base range | head ms | head range | head / base | same placements and seed size |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[] | . as $g
+              | ("encode_ms", "validate_ms", "hash_whole_ms") as $k
+              | ($g | map(select(.side == "base").seed_file[$k])) as $b | ($g | map(select(.side == "head").seed_file[$k])) as $h
+              | "| \($g[0].profile) | \($g[0].players) | \($k) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \(if ($b | med) > 0 then (($h | med) / ($b | med) * 1000 | round) / 1000 else "n/a" end) | \($g | map([.placements_hash, .seed_file.seed_bytes]) | unique | length == 1) |"' bench-ab-seed.jsonl
+            echo
+            echo "### Base against head, rooms with confined items (measured on this runner, release build, 6 runs a side in turns; each run's fill ms is its own median)"
+            echo
+            echo "| profile | players | base fill ms median | base range | head fill ms median | head range | head / base | base rule evals | head rule evals | same placements |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              group_by([.profile, .players]) | .[]
+              | map(select(.side == "base").fill_ms) as $b | map(select(.side == "head").fill_ms) as $h
+              | "| \(.[0].profile) | \(.[0].players) | \($b | med) | \($b | min) to \($b | max) | \($h | med) | \($h | min) to \($h | max) | \((($h | med) / ($b | med) * 1000 | round) / 1000) | \(map(select(.side == "base").rule_evals) | unique) | \(map(select(.side == "head").rule_evals) | unique) | \(map(.placements_hash) | unique | length == 1) |"' bench-ab-confined.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Fails the job when base and head place differently on any row, or the seed's bytes
+      # differ: the guard for a refactor. A PR that changes placements on purpose (D-140 allows
+      # it) carries the label `changes-placements`, and the step lists the rows and passes. The
+      # label is read when the step runs, so adding it and re-running this job is enough.
+      - name: base and head place the same
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          differ=$(
+            for f in bench-ab.jsonl bench-ab-confined.jsonl; do
+              jq -s -r --arg f "$f" 'group_by([.profile, .players])[] | select(map(.placements_hash) | unique | length > 1) | "\($f): \(.[0].profile) \(.[0].players) players"' "$f"
+            done
+            jq -s -r 'group_by([.profile, .players])[] | select(map([.placements_hash, .seed_file.seed_bytes]) | unique | length > 1) | "bench-ab-seed.jsonl: \(.[0].profile) \(.[0].players) players"' bench-ab-seed.jsonl
+          )
+          [ -z "$differ" ] && { echo "base and head place the same on every row"; exit 0; }
+          echo "Rows where base and head place differently:"; echo "$differ"
+          { echo "### Rows where base and head place differently"; echo; echo "$differ" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+          labels=""; [ -n "$PR" ] && labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name')
+          if grep -qx changes-placements <<<"$labels"; then
+            echo "Label changes-placements is on: passing."
+          else
+            echo "::error::base and head place differently; add the label changes-placements if that is meant"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-ab
+          path: |
+            bench-ab.jsonl
+            bench-ab-seed.jsonl
+            bench-ab-confined.jsonl
+  # Shuffles (`data_fill::shuffle`), heavy worlds, one thread. The same doors-shaped worlds (no time context, which an exit shuffle needs) filled
+  # with their doors shuffled and with every door where the manifest has it, seed by seed:
+  # what a shuffled layout costs the fill, apart from what the shape costs. A `none` shuffle
+  # that rules read, against the same shape without it. And a room on one loaded world with
+  # and without an entrance shuffle, for what a player costs in memory. A room that does not
+  # fill prints a row that says so.
+  bench-shuffle:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with: { save-if: false }
+      - run: cargo build --release --locked -p data-fill --features memory-harness --example synth_room
+      - name: rows
+        run: |
+          set -o pipefail
+          run() {
+            target/release/examples/synth_room --profile heavy --checks 1000 \
+              --failed-row "$@"
+          }
+          for seed in 1 2 3 4 5 6 7 8 9 10; do for layout in vanilla on; do
+            run --timeless on --entrances "$layout" --seed "$seed" --players 1,100 --reps 3 \
+              | jq -c --arg layout "$layout" 'select(has("players") or has("failed")) | . + {asked: $layout}' \
+              | tee -a bench-layout.jsonl
+          done; done
+          for guards in off on; do run --guards "$guards" --players 1,100 | tee -a bench-shuffle.jsonl; done
+          for entrances in off on; do
+            run --timeless on --entrances "$entrances" --worlds one --players 100 | tee -a bench-shuffle.jsonl
+          done
+      - name: summary
+        run: |
+          {
+            echo "### Shuffled doors against the same worlds with every door in place (heavy profile without a time context, 1,000 checks, 209 doors per world, one thread, seeds 1 to 10; measured on this runner, release build)"
+            echo
+            echo "Ratio is shuffled over vanilla, seed by seed. Staging ms is what the shuffles add before the fill, whole room."
+            echo
+            echo "| players | seeds | vanilla fill ms median | range | shuffled fill ms median | range | ratio median | ratio range | rule evals ratio median | range | spheres vanilla median | shuffled | staging ms median | staging / vanilla fill |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r 'def med: sort | (.[(length - 1) / 2 | floor] + .[length / 2 | floor]) / 2;
+              def r3: (. * 1000 | round) / 1000;
+              [.[] | select(has("players"))] | group_by(.players) | .[]
+              | (map(select(.layout == "vanilla")) | map({key: (.seed | tostring), value: .}) | from_entries) as $v
+              | [.[] | select(.layout == "shuffled" and $v[.seed | tostring] != null) | {s: ., v: $v[.seed | tostring]}] as $p
+              | "| \(.[0].players) | \($p | length) | \($p | map(.v.fill_ms) | med) | \($p | map(.v.fill_ms) | min) to \($p | map(.v.fill_ms) | max) | \($p | map(.s.fill_ms) | med) | \($p | map(.s.fill_ms) | min) to \($p | map(.s.fill_ms) | max) | \($p | map(.s.fill_ms / .v.fill_ms) | med | r3) | \($p | map(.s.fill_ms / .v.fill_ms) | min | r3) to \($p | map(.s.fill_ms / .v.fill_ms) | max | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | med | r3) | \($p | map(.s.rule_evals / .v.rule_evals) | min | r3) to \($p | map(.s.rule_evals / .v.rule_evals) | max | r3) | \($p | map(.v.spheres) | med) | \($p | map(.s.spheres) | med) | \($p | map(.s.shuffle.shuffle_ms) | med) | \(($p | map(.s.shuffle.shuffle_ms) | med) / ($p | map(.v.fill_ms) | med) | r3) |"' bench-layout.jsonl
+            echo
+            echo "Rooms that did not fill: $(jq -s '[.[] | select(has("failed"))] | length' bench-layout.jsonl)"
+            echo
+            echo "### A \`none\` shuffle, and memory per player (same runner)"
+            echo
+            echo "guards: 8 things that one check in eight reads as a rule, against the heavy shape without it. entrances: a room on one loaded world. Room bytes per player is the heap the room keeps per player after setup; world bytes is one loaded world, which a room shares."
+            echo
+            echo "| shuffle | worlds | players | fill ms plain (median) | fill ms with (median) | shuffle ms (median) | per world | restarts | room bytes per player plain | with | world bytes | peak RSS plain | with |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            jq -s -r '[.[] | select(has("players"))] as $r | $r[] | select(.entrances or .guards) as $on
+              | ($r[] | select((.entrances or .guards | not) and .players == $on.players and .world == $on.world and .timeless == $on.timeless)) as $off
+              | "| \(if $on.entrances then "entrances" else "guards" end) | \($on.world) | \($on.players) | \($off.fill_ms) | \($on.fill_ms) | \($on.shuffle.shuffle_ms) | \($on.shuffle.per_world_ms) | \($on.shuffle.restarts) | \($off.room_bytes_per_player) | \($on.room_bytes_per_player) | \($on.world_bytes) | \($off.peak_rss_bytes) | \($on.peak_rss_bytes) |"' bench-shuffle.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-shuffle
+          path: |
+            bench-layout.jsonl
+            bench-shuffle.jsonl

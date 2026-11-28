@@ -13,7 +13,7 @@ By opening a pull request you agree that:
 ## Setup
 - Rust from `rust-toolchain.toml` (rustup picks it up), `just`, `cargo-deny`, `typos`.
 - `just setup` once: it turns on the git hooks (a fmt check before a commit, the commit message format).
-- Postgres is optional locally. CI runs only the unit tests; the Postgres and end-to-end tests run from the manual `nightly` workflow. To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
+- Postgres is optional locally. CI (`.github/workflows/ci.yml`) runs format, unit, web, version and Postgres tests on every PR; sandbox (bwrap) tests and mutation tests are not run in CI for now (see #185). To run them yourself, set `CONSTELLATION_DATABASE_URL` and run `just test-pg`.
 - The design docs live in the sibling `constellation` repo. Clone it next to this one.
 
 ## Workflow
@@ -21,6 +21,8 @@ By opening a pull request you agree that:
 - Branch off `main`: `feat/...`, `fix/...`, `docs/...`.
 - Conventional commits, subject at most 50 characters (the hook checks).
 - Tests first: a test that fails without your change and passes with it. Say which one in the PR.
+- The engine is in early development. The same seed must give the same result within one version on every machine and on every path that exists; results may change between versions. A test that pins exact output is a snapshot: when a change to generation moves it, update it on purpose in a commit that says so ("re-pin after ..."), and list it in the PR. Nobody has to prove that no pin changed.
+- The `perf` bench's base-against-head job fails when base and head place differently on any row. A PR that changes placements on purpose adds the label `changes-placements`: the job then lists the rows that differ and passes. The label is read when the job runs, so add it and re-run the job.
 - CI must be green before merge. `just check` is optional while this is a POC.
 - One reviewer who is not the author approves each PR.
 - Lints are default (POC mode). No `unsafe`.
@@ -30,7 +32,7 @@ By opening a pull request you agree that:
 Write all new code as if it runs on many cores, so scaling out never needs a rewrite. Existing code is not rewritten for this; it is brought in line only when an issue already changes that code.
 - Shared data is immutable and shared by reference (`&T`, `Arc<T>`). Mutable state is owned by one task and passed in, never global. No `static mut`, no `Rc`/`RefCell` in library types; core types must be `Send + Sync`.
 - Results never depend on thread count or scheduling. Each task gets its own RNG stream from `spec_rng::derive`, and parallel results are merged in a fixed order.
-- Parallelise across independent units (seeds, rooms, worlds, checks), not inside one inherently sequential step such as a single fill. Code that can run units in parallel takes its worker count from `crates/config`. Generation's one-job-at-a-time cap is still hardcoded in `crates/server/src/worlds.rs` (see #77). Its tests run with 1 worker and with several and expect the same result.
+- Parallelise across independent units (seeds, rooms, worlds, checks), not inside one inherently sequential step such as the loop of a fill that picks a location for each item. A room's fill, and its setup, run on one thread: generations run side by side instead, one per job process or pooled worker. Code that does run units in parallel takes its worker count from `crates/config`, merges what they produce in a fixed order, and has a test that expects the same result with 1 worker and with several. Generation's one-job-at-a-time cap is still hardcoded in `crates/server/src/worlds.rs` (see #77).
 - CPU-heavy work (generation, compiling worlds, bulk checks) runs in a subprocess (as generation does) or on `spawn_blocking` / a worker pool, never on the async runtime's I/O threads.
 - Locks guard small, short critical sections only. Never hold a `std::sync` lock across an `.await`. An async lock held across an `.await` only to order effects needs a comment saying why (see `edge-compat/src/presence.rs`).
 

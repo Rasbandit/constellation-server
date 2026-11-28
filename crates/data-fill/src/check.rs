@@ -326,10 +326,19 @@ pub fn compare_shapes(legacy: &Shape, ours: &Shape) -> Value {
     })
 }
 
-/// FNV-1a 64 of some bytes (a stable content hash for determinism reports).
+/// FNV-1a 64 of some bytes as 16 hex digits (a stable content hash for determinism reports
+/// and snapshots).
 #[must_use]
-pub fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes
+pub fn fnv1a(bytes: &[u8]) -> String {
+    let h = bytes
         .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{h:016x}")
+}
+
+/// [`fnv1a`] of a room's placements as their debug text: the one hash two fills are told
+/// apart by (snapshots, and the bench's placement gates).
+#[must_use]
+pub fn placements_hash(placed: &[Vec<Option<crate::Given>>]) -> String {
+    fnv1a(format!("{placed:?}").as_bytes())
 }

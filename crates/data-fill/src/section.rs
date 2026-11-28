@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 
 use bits::{Packer, width};
-use seed_bundle::package::{SECTION_GAME, SECTION_RULES, Section, file_bytes};
+use seed_bundle::package::{SECTION_GAME, SECTION_RULES, SECTION_SHUFFLES, Section, file_bytes};
 use serde_json::{Map, Value, json};
+
+use crate::shuffle::Decl;
 
 /// Layout version in the rules header.
 pub const VERSION: u16 = 1;
@@ -47,7 +49,8 @@ pub mod sub {
     pub const LOCATIONS: usize = 12;
     /// Region, counter, def, option and roll keys (diagnostics and binding by key).
     pub const NAMES: usize = 13;
-    /// Item groups that a sum of copies reads: packed starts, items, caps (0 = no cap).
+    /// Item groups that a sum of copies reads: packed starts, items, caps (0 = no cap), and
+    /// weights when one is not 1.
     pub const GROUPS: usize = 14;
 }
 /// Site groups of a region, in site order.
@@ -88,21 +91,8 @@ pub mod op {
     pub const GROUP: u8 = 22;
 }
 
-/// Comparison operators, in their `CMP` operand order (the manifest spells them the same).
-pub const CMP_OPS: [&str; 6] = ["eq", "ne", "lt", "le", "gt", "ge"];
-
-/// Compare two integers by `CMP` operand.
-#[must_use]
-pub fn compare(op: u8, a: i64, b: i64) -> bool {
-    match op {
-        0 => a == b,
-        1 => a != b,
-        2 => a < b,
-        3 => a <= b,
-        4 => a > b,
-        _ => a >= b,
-    }
-}
+/// The comparison operators, their evaluation and the monotone rule: one shared crate.
+pub use rule_ops::{CMP_OPS, compare, monotone_cmp};
 
 /// Operand sizes in bytes (1 when the count is at most 256, else 2), fixed per section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,36 +233,57 @@ fn put_ids(out: &mut Vec<u8>, rows: &[(&str, i64)]) {
 
 type R<T> = Result<T, String>;
 
-/// Whether `CMP` operand `op` over sides that do (or do not) read state can only turn from
-/// false to true as state grows: state may sit only on the side that must be larger.
-#[must_use]
-pub fn monotone_cmp(op: usize, left_state: bool, right_state: bool) -> bool {
-    match op {
-        // lt, le: the right side must be the larger one.
-        2 | 3 => !left_state,
-        // gt, ge.
-        4 | 5 => !right_state,
-        _ => !left_state && !right_state,
+/// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`, each
+/// alone or times a weight (`{"int": ["*", that, w]}`, either side, `w` an integer from 0 to
+/// `config::RULE_WEIGHT_MAX`): its members as (key, cap, weight).
+fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>, u16)>> {
+    fn copies(a: &Value) -> Option<(&str, Option<u16>)> {
+        if let Some(k) = a.get("count").and_then(Value::as_str) {
+            return (a.as_object()?.len() == 1).then_some((k, None));
+        }
+        match a.get("int")?.as_array()?.as_slice() {
+            [m, c, n] if m == "min" && c.as_object()?.len() == 1 => {
+                let cap = u16::try_from(n.as_i64()?).ok().filter(|x| *x < u16::MAX)?;
+                Some((c.get("count")?.as_str()?, Some(cap)))
+            }
+            _ => None,
+        }
     }
-}
-
-/// A sum whose every operand is `{"count": k}` or `{"int": ["min", {"count": k}, cap]}`:
-/// its members as (key, cap).
-fn group(args: &[Value]) -> Option<Vec<(&str, Option<u16>)>> {
+    let weight = |w: &Value| {
+        u16::try_from(w.as_i64().filter(|w| (0..=config::RULE_WEIGHT_MAX).contains(w))?).ok()
+    };
     args.iter()
         .map(|a| {
-            if let Some(k) = a.get("count").and_then(Value::as_str) {
-                return (a.as_object()?.len() == 1).then_some((k, None));
+            if let Some((k, cap)) = copies(a) {
+                return Some((k, cap, 1));
             }
-            match a.get("int")?.as_array()?.as_slice() {
-                [m, c, n] if m == "min" && c.as_object()?.len() == 1 => {
-                    let cap = u16::try_from(n.as_i64()?).ok().filter(|x| *x < u16::MAX)?;
-                    Some((c.get("count")?.as_str()?, Some(cap)))
-                }
-                _ => None,
-            }
+            let (c, w) = match a.get("int")?.as_array()?.as_slice() {
+                [m, x, y] if m == "*" => copies(x).zip(weight(y)).or(copies(y).zip(weight(x)))?,
+                _ => return None,
+            };
+            Some((c.0, c.1, w))
         })
         .collect()
+}
+
+/// A group's members with one entry per item, so adding a copy costs one step per group: terms
+/// of one item and cap add their weights (at most `config::RULE_GROUP_MAX_MEMBERS` times
+/// `config::RULE_WEIGHT_MAX`). `None` when one item is named with two caps, which no single
+/// (cap, weight) says: that sum stays bytecode.
+fn merged(members: Vec<(u16, Option<u16>, u16)>) -> Option<Vec<(u16, Option<u16>, u32)>> {
+    let mut out: Vec<(u16, Option<u16>, u32)> = Vec::with_capacity(members.len());
+    let mut at: HashMap<u16, usize> = HashMap::new();
+    for (item, cap, w) in members {
+        match at.get(&item) {
+            Some(&k) if out[k].1 != cap => return None,
+            Some(&k) => out[k].2 += u32::from(w),
+            None => {
+                at.insert(item, out.len());
+                out.push((item, cap, u32::from(w)));
+            }
+        }
+    }
+    Some(out)
 }
 
 /// An operand of `size` (1 or 2) bytes, little-endian.
@@ -307,11 +318,11 @@ impl Reads {
     }
 }
 
-fn arr<'a>(v: &'a Value, path: &str) -> R<&'a Vec<Value>> {
+pub(crate) fn arr<'a>(v: &'a Value, path: &str) -> R<&'a Vec<Value>> {
     v.as_array().ok_or_else(|| format!("{path}: expected an array"))
 }
 
-fn s<'a>(v: &'a Value, path: &str) -> R<&'a str> {
+pub(crate) fn s<'a>(v: &'a Value, path: &str) -> R<&'a str> {
     v.as_str().ok_or_else(|| format!("{path}: expected a string"))
 }
 
@@ -347,8 +358,10 @@ struct Compiler<'m> {
     def_depth: Vec<u32>,
     code: Vec<u8>,
     dedupe: HashMap<Vec<u8>, u32>,
-    /// Item groups: (item, cap) members, `None` for an uncapped count.
-    groups: Vec<Vec<(u16, Option<u16>)>>,
+    /// Item groups: (item, cap, weight) members, `None` for an uncapped count.
+    groups: Vec<Vec<(u16, Option<u16>, u32)>>,
+    /// The world's shuffles: what an `at` read stands for ([`crate::shuffle`]).
+    shuffles: Option<&'m Decl>,
     w: Widths,
 }
 
@@ -376,17 +389,43 @@ fn counter_keys<'m>(v: &'m Value, out: &mut Vec<&'m str>) {
 /// # Errors
 /// A message naming the manifest path of the first malformed or unknown construct.
 pub fn compile(m: &Value) -> R<Vec<u8>> {
-    let (rules, game) = sections(m)?;
+    let (rules, game, shuffles) = compiled(m)?;
+    let more: Vec<(u16, &[u8])> = shuffles.iter().map(|b| (SECTION_SHUFFLES, &b[..])).collect();
+    package(rules, game, &more)
+}
+
+/// The package file of a compiled world's two sections, then `more` sections stored as is
+/// (id and bytes): the one place the file is laid out.
+///
+/// # Errors
+/// A section over 4 GiB.
+pub fn package(rules: Vec<u8>, game: Vec<u8>, more: &[(u16, &[u8])]) -> R<Vec<u8>> {
     let raw = |id, bytes| Section { id, bytes, deflate: false };
-    file_bytes(&[raw(SECTION_GAME, game), raw(SECTION_RULES, rules)]).map_err(|e| e.to_string())
+    let mut all = vec![raw(SECTION_GAME, game), raw(SECTION_RULES, rules)];
+    all.extend(more.iter().map(|(id, bytes)| raw(*id, bytes.to_vec())));
+    file_bytes(&all).map_err(|e| e.to_string())
 }
 
 /// The rules section and the game section stand-in.
 ///
 /// # Errors
 /// As [`compile`].
-#[allow(clippy::too_many_lines)] // one pass in section order reads best as one function
 pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
+    compiled(m).map(|(rules, game, _)| (rules, game))
+}
+
+/// The rules section, the game section stand-in, and the shuffle section when the world
+/// declares shuffles.
+pub(crate) type Compiled = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// [`sections`], and the shuffle section of a world that declares shuffles
+/// ([`crate::shuffle::section`]): the manifest's shuffles are read once for all three.
+///
+/// # Errors
+/// As [`compile`].
+#[allow(clippy::too_many_lines)] // one pass in section order reads best as one function
+pub(crate) fn compiled(m: &Value) -> R<Compiled> {
+    let shuffles = Decl::of(m)?;
     let mut item_rows = Vec::new();
     let mut items = HashMap::new();
     for (k, it) in arr(&m["items"], "items")?.iter().enumerate() {
@@ -436,6 +475,25 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         defaults.push(i32::try_from(d).map_err(|_| format!("{p}: {d} does not fit 32 bits"))?);
         options.push(key);
     }
+    // A `none` shuffle's result is one more option per slot: the index of the thing there
+    // this seed, set by the shuffle stage and folded like any option.
+    if let Some(k) = options.iter().find(|k| k.starts_with("at.")) {
+        return Err(format!("options[{k:?}]: `at.` names are kept for shuffle results"));
+    }
+    if let Some(d) = &shuffles {
+        for key in d.option_keys() {
+            defaults.push(0);
+            options.push(key);
+        }
+        // An option is one byte in a rule.
+        let most = usize::from(u8::MAX) + 1;
+        if options.len() > most {
+            return Err(format!(
+                "shuffles: {} options and slots that rules can read, at most {most} together",
+                options.len()
+            ));
+        }
+    }
     small::<u8>(options.len().saturating_sub(1), "options")?;
     let rolls: Vec<&str> = m
         .get("rolls")
@@ -445,6 +503,18 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
     let mut counters = Vec::new();
     counter_keys(m, &mut counters);
     let raw_defs = m["defs"].as_object().ok_or("defs: expected an object")?;
+    // A slot a rule reads as a rule is one more def: every thing it can hold with its rule,
+    // compiled once and referred to by every read.
+    let mut with_reads = None;
+    if let Some(d) = &shuffles {
+        if let Some(k) = raw_defs.keys().find(|k| k.starts_with("at.")) {
+            return Err(format!("defs[{k:?}]: `at.` names are kept for shuffle results"));
+        }
+        let mut all = raw_defs.clone();
+        all.extend(d.defs(m));
+        with_reads = Some(all);
+    }
+    let raw_defs = with_reads.as_ref().unwrap_or(raw_defs);
     let w = Widths::new(items.len(), raw_defs.len(), counters.len());
     let mut c = Compiler {
         items,
@@ -466,10 +536,18 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
         code: vec![op::TRUE, op::FALSE],
         dedupe: HashMap::new(),
         groups: Vec::new(),
+        shuffles: shuffles.as_ref(),
         w,
     };
     for k in 0..raw_defs.len() {
         c.def(k)?;
+    }
+    // Every thing's rule is a rule like any other: checked here under its own path.
+    for sh in shuffles.iter().flat_map(|d| &d.shuffles) {
+        for (t, rule) in sh.things.iter().filter_map(|t| Some((t, t.rule.as_ref()?))) {
+            let path = format!("shuffles.{}.things.{}.rule", sh.name, t.name);
+            c.b(rule, &path, &mut Vec::new(), &mut Reads::default(), false)?;
+        }
     }
 
     let t = &m["x.time"];
@@ -637,13 +715,17 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
     for g in &c.groups {
         starts.push(starts[starts.len() - 1] + small::<u32>(g.len(), "group members")?);
     }
-    let members: Vec<&(u16, Option<u16>)> = c.groups.iter().flatten().collect();
+    let members: Vec<&(u16, Option<u16>, u32)> = c.groups.iter().flatten().collect();
     put_packed(&mut subs[sub::GROUPS], &starts);
     put_packed(&mut subs[sub::GROUPS], &members.iter().map(|m| u32::from(m.0)).collect::<Vec<_>>());
     put_packed(
         &mut subs[sub::GROUPS],
         &members.iter().map(|m| m.1.map_or(0, |c| u32::from(c) + 1)).collect::<Vec<_>>(),
     );
+    // Only a world with a weight other than 1 has the list, so other sections keep their bytes.
+    if members.iter().any(|m| m.2 != 1) {
+        put_packed(&mut subs[sub::GROUPS], &members.iter().map(|m| m.2).collect::<Vec<_>>());
+    }
 
     let mut out = Vec::new();
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -664,7 +746,7 @@ pub fn sections(m: &Value) -> R<(Vec<u8>, Vec<u8>)> {
     let mut game = Vec::new();
     put_ids(&mut game, &item_rows);
     put_ids(&mut game, &loc_rows);
-    Ok((out, game))
+    Ok((out, game, shuffles.as_ref().map(Decl::stored).transpose()?))
 }
 
 impl<'m> Compiler<'m> {
@@ -785,6 +867,10 @@ impl<'m> Compiler<'m> {
             let [x, y] = arr(a, &p)?.as_slice() else {
                 return Err(format!("{p}: expected two operands"));
             };
+            // A test of which thing a shuffle put in a slot is a test of that slot's option.
+            if self.shuffles.is_some() && self.name_test(k, (x, y), (path, &p), out, r)? {
+                return Ok(());
+            }
             out.extend_from_slice(&[op::CMP, u8::try_from(cmp).unwrap_or(0)]);
             let (mut rx, mut ry) = (Reads::default(), Reads::default());
             self.i(x, &format!("{p}[0]"), out, &mut rx)?;
@@ -927,9 +1013,38 @@ impl<'m> Compiler<'m> {
                     }
                 }
             }
+            // The rule of the thing a shuffle put in a slot: the slot's shared def.
+            "at" => return self.at_rule(a, &p, out, r),
             _ => return Err(format!("{path}: unknown rule node {k:?}")),
         }
         Ok(())
+    }
+
+    /// A rule-position `at` read: a reference to the slot's shared def. Kept out of
+    /// [`Compiler::b_node`] so the deep recursion there does not carry its locals.
+    #[inline(never)]
+    fn at_rule(&mut self, a: &Value, p: &str, out: &mut Vec<u8>, r: &mut Reads) -> R<()> {
+        let d = self.shuffles.ok_or_else(|| format!("{p}: the world has no shuffles"))?;
+        let def = json!({"ref": d.rule_def(a, p)?});
+        self.b_node(&def, p, out, r, false)
+    }
+
+    /// A comparison with an `at` read on one side: compiled as the test of the slot's option
+    /// it stands for; `false` when neither side is one. Out of line as [`Compiler::at_rule`].
+    #[inline(never)]
+    fn name_test(
+        &mut self,
+        op: &str,
+        (x, y): (&Value, &Value),
+        (path, p): (&str, &str),
+        out: &mut Vec<u8>,
+        r: &mut Reads,
+    ) -> R<bool> {
+        let Some(test) = self.shuffles.map(|d| d.name_test(op, x, y, p)).transpose()?.flatten()
+        else {
+            return Ok(false);
+        };
+        self.b_node(&test, path, out, r, false).map(|()| true)
     }
 
     fn i(&mut self, v: &Value, path: &str, out: &mut Vec<u8>, r: &mut Reads) -> R<()> {
@@ -1015,19 +1130,29 @@ impl<'m> Compiler<'m> {
             let members = members
                 .into_iter()
                 .enumerate()
-                .map(|(j, (k, cap))| Ok((self.item(&json!(k), &format!("{p}[{}]", j + 1))?, cap)))
+                .map(|(j, (k, cap, w))| {
+                    Ok((self.item(&json!(k), &format!("{p}[{}]", j + 1))?, cap, w))
+                })
                 .collect::<R<Vec<_>>>()?;
-            r.items.extend(members.iter().map(|m| m.0));
-            let g = match self.groups.iter().position(|x| *x == members) {
-                Some(g) => g,
-                None => {
-                    self.groups.push(members);
-                    self.groups.len() - 1
-                }
-            };
-            out.push(op::GROUP);
-            out.extend_from_slice(&small::<u16>(g, "item groups")?.to_le_bytes());
-            return Ok(());
+            if members.len() > config::RULE_GROUP_MAX_MEMBERS {
+                return Err(format!(
+                    "{p}: a sum of more than {} members",
+                    config::RULE_GROUP_MAX_MEMBERS
+                ));
+            }
+            if let Some(members) = merged(members) {
+                r.items.extend(members.iter().map(|m| m.0));
+                let g = match self.groups.iter().position(|x| *x == members) {
+                    Some(g) => g,
+                    None => {
+                        self.groups.push(members);
+                        self.groups.len() - 1
+                    }
+                };
+                out.push(op::GROUP);
+                out.extend_from_slice(&small::<u16>(g, "item groups")?.to_le_bytes());
+                return Ok(());
+            }
         }
         match arity {
             Some(n) if args.len() != n => return Err(format!("{p}: {name} takes two operands")),

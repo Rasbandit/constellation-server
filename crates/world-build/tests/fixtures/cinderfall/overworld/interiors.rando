@@ -1,0 +1,51 @@
+# House interiors. Each one is a dead end whose door is shuffled (the `interiors` shuffle).
+use items
+use logic
+
+region hearth_inn {
+  check inn_cellar
+  check guest_room: can_cut
+  exit hearth_square door inn_door group inside
+}
+
+region hearth_smithy {
+  check anvil
+  check smith_reward: has(blade, 2)
+  exit hearth_square door smithy_door group inside
+}
+
+region hearth_chapel {
+  check chapel_altar
+  check bell_rope: can_shoot
+  exit hearth_market door chapel_door group inside
+}
+
+region ashen_cottage {
+  check cottage_shelf
+  check hearth_ashes: can_burn
+  exit ashen_road door cottage_door group inside
+}
+
+region ruined_mill {
+  check millstone
+  check flour_loft: can_cross_gap
+  exit ashen_fields door mill_door group inside
+}
+
+region marsh_hut {
+  check witch_cauldron
+  check hut_rafters
+  exit marsh_edge door hut_door group inside
+}
+
+region peak_lodge {
+  check lodge_fire
+  check trophy_wall: can_fight(2)
+  exit peak_path door lodge_door group inside
+}
+
+region coast_lighthouse {
+  check keeper_log
+  check lamp_room: can_burn
+  exit coast_strand door lighthouse_door group inside
+}

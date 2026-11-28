@@ -30,8 +30,7 @@ impl<'w> Room<'w> {
             .map(|p| fetch_instance(legacy, &a.out, seed, Some(p)))
             .collect::<R<Vec<_>>>()?;
         let pairs: Vec<(&World, &_)> = insts.iter().map(|i| (w, i)).collect();
-        let plans =
-            room::plans(&pairs, config::FILL_SETUP_WORKERS).map_err(|e| format!("{e:?}"))?;
+        let plans = room::plans(&pairs)?;
         let seeds = insts
             .into_iter()
             .zip(plans)
@@ -210,8 +209,7 @@ fn means(rows: &[Vec<f64>], players: usize) -> Vec<f64> {
 }
 
 fn shares(seats: &[Seat<'_>], placed: &[Vec<Option<Given>>]) -> R<Vec<f64>> {
-    Ok(cross_world_share(seats, placed)
-        .map_err(|e| format!("{e:?}"))?
+    Ok(cross_world_share(seats, placed)?
         .iter()
         .map(|(x, all)| *x as f64 / (*all).max(1) as f64)
         .collect())
@@ -271,7 +269,7 @@ pub(super) fn run(
             &json!({"op": "room_spheres", "seed": seed, "placements": slot_map(&their_slots)}),
         )?;
         let t = Instant::now();
-        let mine = room_spheres(&seats, &theirs).map_err(|e| format!("{e:?}"))?;
+        let mine = room_spheres(&seats, &theirs)?;
         cx.engine_seconds += t.elapsed().as_secs_f64();
         let (ok, detail, lkeys, lbeat) = spheres_check(&room, seed, &their_slots, &lsph, &mine);
         replay.record(ok, || detail.unwrap_or_default());
@@ -290,7 +288,7 @@ pub(super) fn run(
                     &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
                 )
-                .map_err(|e| format!("fill {seed}: {e:?}"))?;
+                .map_err(|e| format!("fill {seed}: {}", String::from(e)))?;
                 cx.engine_seconds += t.elapsed().as_secs_f64();
                 cx.work.0.absorb(&filled.stats);
                 cx.work.1 += 1;
@@ -303,8 +301,8 @@ pub(super) fn run(
                 model = Some(sp);
             }
             let same = files.windows(2).all(|p| p[0] == p[1]);
-            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| format!("{:016x}", fnv1a(f))).collect::<Vec<_>>()}));
-            hashes.push(json!([fill_seed, format!("{:016x}", fnv1a(&files[0]))]));
+            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| fnv1a(f)).collect::<Vec<_>>()}));
+            hashes.push(json!([fill_seed, fnv1a(&files[0])]));
             write(&a.out.join(format!("ours/room_placements_{seed}.json")), &files[0])?;
             let our_slots = room.slots(&ours);
             let lsph = legacy.call(
@@ -312,7 +310,7 @@ pub(super) fn run(
             )?;
             let model = match model {
                 Some(m) => m,
-                None => room_spheres(&seats, &ours).map_err(|e| format!("{e:?}"))?,
+                None => room_spheres(&seats, &ours)?,
             };
             let (ok, detail, lkeys, lbeat) = spheres_check(&room, seed, &our_slots, &lsph, &model);
             judged.record(ok, || detail.unwrap_or_default());

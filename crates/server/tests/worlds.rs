@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BIN: &str = env!("CARGO_BIN_EXE_constellation-server");
-const TOKEN: &str = "test-admin-token-test-admin-token";
+/// A value in the server's environment that the sandbox must never show the sidecar. It is a
+/// variable of no meaning to the server, so it changes nothing about the rooms (a room password
+/// would).
+const SECRET: &str = "test-room-password-test-room-pw";
 
 /// The seed name of every world the fake sidecar generates.
 const GENERATED: &str = "generated-seed";
@@ -47,13 +50,13 @@ impl Setup {
             serde_json::from_str(&std::fs::read_to_string(e2e::fixture_path()).unwrap()).unwrap();
         bundle["seed_name"] = json!(GENERATED);
         std::fs::write(tools.join("bundle.json"), bundle.to_string()).unwrap();
-        // What the fake sidecar must not see: the token (in the server's environment) and
+        // What the fake sidecar must not see: the probe value (in the server's environment) and
         // host folders.
         let hidden: Vec<String> = ["data", "ap", "tools", ""]
             .iter()
             .map(|p| root.join(p).display().to_string())
             .collect();
-        let probe = json!({"value": TOKEN, "hidden_paths": hidden});
+        let probe = json!({"value": SECRET, "hidden_paths": hidden});
         std::fs::write(tools.join("probe.json"), probe.to_string()).unwrap();
         Self { root }
     }
@@ -61,7 +64,7 @@ impl Setup {
     fn env(&self) -> Vec<(String, String)> {
         let p = |s: &str| self.root.join(s).display().to_string();
         vec![
-            ("CONSTELLATION_ADMIN_TOKEN".into(), TOKEN.into()),
+            ("CONSTELLATION_HOST_SECRET_PROBE".into(), SECRET.into()),
             ("CONSTELLATION_AP_DIR".into(), p("ap")),
             ("CONSTELLATION_AP_PYTHON".into(), "/usr/bin/python3".into()),
             ("CONSTELLATION_AP_GEN_SCRIPT".into(), p("tools/fake/ap_gen.py")),
@@ -87,21 +90,47 @@ async fn http(
     server: &Server,
     method: &str,
     path: &str,
-    token: Option<&str>,
+    signed_in: bool,
     body: &[u8],
 ) -> (u16, Value) {
-    request(&server.addr.to_string(), method, path, token, body).await
+    let cookie = if signed_in { Some(session(server).await) } else { None };
+    request(&server.addr.to_string(), method, path, cookie.as_deref(), body).await
+}
+
+/// The session cookie of the test's one account on `server`: signed up on first use.
+async fn session(server: &Server) -> String {
+    static COOKIES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let addr = server.addr.to_string();
+    let known = COOKIES.lock().unwrap().iter().find(|(a, _)| *a == addr).map(|(_, c)| c.clone());
+    if let Some(c) = known {
+        return c;
+    }
+    let body = br#"{"username":"tester","password":"a long enough password"}"#;
+    let (mut s, mut raw) = (tokio::net::TcpStream::connect(&addr).await.unwrap(), Vec::new());
+    let head = format!(
+        "POST /api/signup HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    s.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    assert!(text.starts_with("HTTP/1.1 201"), "{text}");
+    let line = text.lines().find(|l| l.to_lowercase().starts_with("set-cookie:")).unwrap();
+    let cookie = line.split_once(':').unwrap().1.trim().split(';').next().unwrap().to_owned();
+    COOKIES.lock().unwrap().push((addr, cookie.clone()));
+    cookie
 }
 
 async fn request(
     addr: &str,
     method: &str,
     path: &str,
-    token: Option<&str>,
+    cookie: Option<&str>,
     body: &[u8],
 ) -> (u16, Value) {
     let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let auth = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -120,7 +149,7 @@ async fn request(
 async fn upload_list_generate_poll_and_done() {
     let setup = Setup::new("flow");
     let server = setup.start();
-    let t = Some(TOKEN);
+    let t = true;
 
     let (st, world) =
         http(&server, "PUT", "/api/apworlds?name=My%20World.apworld", t, b"my_world").await;
@@ -180,13 +209,12 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(st, 200, "{back}");
     let fixture_json: Value = serde_json::from_str(&fixture_text).unwrap();
     assert_eq!(back, fixture_json);
+    // The status is in the store (#119), so the job folder, its copies of the inputs, is gone.
+    // Its log line says what the folder held: the chosen world by module and both yamls.
+    let removed = server.wait_for_log("job folder removed").unwrap();
+    assert!(removed.contains(&id) && removed.contains("apworlds/my_world.apworld"), "{removed}");
     let world_dir = setup.root.join("data/worlds").join(&id);
-    let mut files: Vec<String> = std::fs::read_dir(&world_dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    files.sort();
-    assert_eq!(files, ["status.json"], "the job's copies of its inputs are removed");
+    assert!(!world_dir.exists(), "the job folder is removed when the job ends");
     // What the sandbox showed the sidecar, and what it let it do.
     let g = &done["generation"];
     assert_eq!(g["custom_worlds"], json!(["my_world.apworld"]), "only the chosen world, by module");
@@ -205,10 +233,11 @@ async fn upload_list_generate_poll_and_done() {
     assert_eq!(world["id"].as_str(), Some(world_id.as_str()));
     drop(server.stop());
 
-    // The status is on disk: a new server process still reports it.
+    // With no database the store is in memory, so a new server process has no such world, as
+    // it has no rooms; on Postgres a status survives (`worlds::tests::pg` in the server).
     let server = setup.start();
-    let (st, after) = http(&server, "GET", &format!("/api/worlds/{id}"), t, b"").await;
-    assert_eq!((st, after), (200, done));
+    let (st, _) = http(&server, "GET", &format!("/api/worlds/{id}"), t, b"").await;
+    assert_eq!(st, 404);
 }
 
 #[tokio::test]
@@ -243,6 +272,64 @@ async fn with_a_rooms_folder_a_finished_world_becomes_a_room_reached_by_its_key(
 
     let url = format!("ws://{}", st["address"].as_str().unwrap());
     let (_, connected, _) = e2e::join_via(server.addr, &url, "Alice").await.unwrap();
+    assert_eq!(connected["cmd"], "Connected", "{connected}");
+}
+
+/// The game `e2e::connect_packet` asks for.
+const GAME: &str = "Archipela-Go 2: Electric Boogaloo";
+
+/// A manifest world through the web API: the manifest and JSON player files are uploaded, the
+/// engine generates the seed (no sidecar runs), and a client joins the hosted room.
+#[tokio::test]
+async fn a_manifest_world_uploaded_over_http_becomes_a_room_a_client_joins() {
+    let setup = Setup::new("manifest");
+    let rooms = setup.root.join("rooms");
+    std::fs::create_dir_all(&rooms).unwrap();
+    let data = setup.root.join("data").display().to_string();
+    let env = setup.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let server = Server::start_rooms(Path::new(BIN), &rooms, &["--data-dir", &data], &env).unwrap();
+    let t = true;
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (st, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    assert_eq!(st, 201, "{m}");
+    let (st, listed) = http(&server, "GET", "/api/manifests?limit=10", t, b"").await;
+    assert_eq!((st, &listed["items"][0]["id"], &listed["next"]), (200, &m["id"], &Value::Null));
+    let mut yamls = Vec::new();
+    for (k, name) in ["Ann", "Bo"].into_iter().enumerate() {
+        let mut player = doc["instances"][k].clone();
+        player["name"] = json!(name);
+        player["game"] = json!(GAME);
+        let (st, y) = http(
+            &server,
+            "PUT",
+            &format!("/api/yamls?name={name}.yaml"),
+            t,
+            player.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(st, 201, "{y}");
+        yamls.push(y["id"].clone());
+    }
+    let req = json!({"manifest": m["id"], "yamls": yamls}).to_string();
+    let (st, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 202, "{job}");
+    server.wait_for_log("generation done").unwrap();
+    let st = status(&server, job["id"].as_str().unwrap()).await;
+    assert_eq!(
+        (st["status"].as_str(), st["engine"].as_str()),
+        (Some("done"), Some("data-only")),
+        "{st}"
+    );
+    let url = format!("ws://{}", st["address"].as_str().unwrap());
+    let (_, connected, _) = e2e::join_via(server.addr, &url, "Bo").await.unwrap();
     assert_eq!(connected["cmd"], "Connected", "{connected}");
 }
 
@@ -310,10 +397,8 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     let setup = Setup::new("room-view");
     let (server, id, st) = hosted_world(&setup).await;
     let fixture = e2e::fixture().unwrap();
-    let view = |server: &Server| {
-        let path = format!("/api/worlds/{id}/room");
-        let addr = server.addr.to_string();
-        async move { request(&addr, "GET", &path, Some(TOKEN), b"").await }
+    let view = async |server: &Server| {
+        http(server, "GET", &format!("/api/worlds/{id}/room"), true, b"").await
     };
     let (code, room) = view(&server).await;
     assert_eq!(code, 200, "{room}");
@@ -335,8 +420,9 @@ async fn a_hosted_rooms_view_shows_real_sessions_and_streams_its_events() {
     // The event stream, on its own connection, before anything happens.
     let addr = server.addr.to_string();
     let mut sse = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let cookie = session(&server).await;
     let head = format!(
-        "GET /api/worlds/{id}/room/events HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+        "GET /api/worlds/{id}/room/events HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\r\n"
     );
     sse.write_all(head.as_bytes()).await.unwrap();
     let opened = read_until(&mut sse, "\r\n\r\n").await;
@@ -395,11 +481,11 @@ async fn a_world_with_no_running_room_has_no_view() {
     let id = generate_one(&server, b"Alice").await;
     server.wait_for_log("generation done").unwrap();
     for path in [format!("/api/worlds/{id}/room"), format!("/api/worlds/{id}/room/events")] {
-        let (code, body) = http(&server, "GET", &path, Some(TOKEN), b"").await;
+        let (code, body) = http(&server, "GET", &path, true, b"").await;
         assert_eq!(code, 404, "{path}: {body}");
     }
-    let (code, _) = http(&server, "GET", &format!("/api/worlds/{id}/room"), None, b"").await;
-    assert_eq!(code, 401, "the view needs the admin token");
+    let (code, _) = http(&server, "GET", &format!("/api/worlds/{id}/room"), false, b"").await;
+    assert_eq!(code, 401, "the view needs a session");
 }
 
 #[tokio::test]
@@ -417,7 +503,7 @@ async fn without_a_rooms_folder_a_world_status_has_no_room() {
 async fn a_generation_past_its_time_limit_is_killed_and_reported_failed() {
     let setup = Setup::new("timeout");
     let server = setup.start_with(&[("CONSTELLATION_GEN_TIMEOUT_MS", "1000")]);
-    let t = Some(TOKEN);
+    let t = true;
     let (_, y) = http(&server, "PUT", "/api/yamls?name=slow.yaml", t, b"SLOW").await;
     let req = json!({"apworlds": [], "yamls": [y["id"]]}).to_string();
     let (_, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
@@ -451,7 +537,7 @@ fn processes_naming(needle: &str) -> Vec<u32> {
 }
 
 async fn generate_one(server: &Server, yaml: &[u8]) -> String {
-    let t = Some(TOKEN);
+    let t = true;
     let (st, y) = http(server, "PUT", "/api/yamls?name=y.yaml", t, yaml).await;
     assert!(st == 201 || st == 200, "{y}");
     let req = json!({"apworlds": [], "yamls": [y["id"]]}).to_string();
@@ -461,7 +547,7 @@ async fn generate_one(server: &Server, yaml: &[u8]) -> String {
 }
 
 async fn status(server: &Server, id: &str) -> Value {
-    http(server, "GET", &format!("/api/worlds/{id}"), Some(TOKEN), b"").await.1
+    http(server, "GET", &format!("/api/worlds/{id}"), true, b"").await.1
 }
 
 #[tokio::test]
@@ -526,33 +612,29 @@ async fn generations_run_one_at_a_time() {
 async fn an_upload_over_its_cap_is_refused_with_413() {
     let setup = Setup::new("cap");
     let server = setup.start();
-    let t = Some(TOKEN);
+    let t = true;
     let big = vec![b'a'; 1024 * 1024 + 1];
     assert_eq!(http(&server, "PUT", "/api/yamls?name=big.yaml", t, &big).await.0, 413);
     assert_eq!(http(&server, "PUT", "/api/yamls?name=ok.yaml", t, &big[1..]).await.0, 201);
 }
 
 #[tokio::test]
-async fn every_route_needs_the_admin_token() {
+async fn every_route_needs_a_session_and_an_account_may_use_them_all() {
     let setup = Setup::new("auth");
     let server = setup.start();
-    // The burst of wrong tokens is 5 per client address: four tokenless requests and one wrong.
     for (method, path) in [
         ("GET", "/api/apworlds"),
         ("PUT", "/api/yamls?name=a.yaml"),
         ("POST", "/api/worlds"),
         ("GET", "/api/worlds/00"),
+        ("GET", "/api/rooms"),
     ] {
-        let (st, _) = http(&server, method, path, None, b"x").await;
+        let (st, _) = http(&server, method, path, false, b"x").await;
         assert_eq!(st, 401, "{method} {path}");
     }
-    let (st, _) = http(&server, "GET", "/api/apworlds", Some("wrong"), b"").await;
-    assert_eq!(st, 401);
-    let (st, _) = http(&server, "GET", "/api/apworlds", Some("wrong"), b"").await;
-    assert_eq!(st, 429, "past the burst, wrong tokens are rate limited");
-    let (st, _) = http(&server, "GET", "/api/apworlds", Some(TOKEN), b"").await;
-    assert_eq!(st, 200, "the right token is never limited");
-    let (st, _) = http(&server, "GET", "/healthz", None, b"").await;
+    let (st, _) = http(&server, "GET", "/api/apworlds", true, b"").await;
+    assert_eq!(st, 200, "a signed-up account may list uploads");
+    let (st, _) = http(&server, "GET", "/healthz", false, b"").await;
     assert_eq!(st, 200, "the room's own routes are unchanged");
 }
 
@@ -560,7 +642,7 @@ async fn every_route_needs_the_admin_token() {
 async fn bad_input_is_refused_before_it_touches_a_path() {
     let setup = Setup::new("bad");
     let server = setup.start();
-    let t = Some(TOKEN);
+    let t = true;
     for path in
         ["/api/worlds/..%2F..%2Fetc", "/api/worlds/ABC", &format!("/api/worlds/{}", "a".repeat(63))]
     {
@@ -592,14 +674,93 @@ async fn bad_input_is_refused_before_it_touches_a_path() {
     assert_eq!(st, 400);
 }
 
+/// Through the real upload route: a player file with no game is refused by the sidecar's inspect,
+/// and one for another game than the manifest's is refused when the world is requested.
 #[tokio::test]
-async fn without_a_token_the_server_warns_and_serves_the_api_open() {
-    let setup = Setup::new("notoken");
+async fn player_files_of_a_manifest_world_need_a_name_and_the_manifests_game() {
+    let setup = Setup::new("manifest-players");
+    let server = setup.start();
+    let t = true;
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (_, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    let player = |name: &str, game: Option<&str>| {
+        let mut p = doc["instances"][0].clone();
+        p["name"] = json!(name);
+        if let Some(g) = game {
+            p["game"] = json!(g);
+        }
+        p.to_string()
+    };
+    let (st, e) =
+        http(&server, "PUT", "/api/yamls?name=a.yaml", t, player("Ann", None).as_bytes()).await;
+    assert_eq!(st, 422, "{e}");
+    let (st, other) =
+        http(&server, "PUT", "/api/yamls?name=b.yaml", t, player("Bo", Some("Other")).as_bytes())
+            .await;
+    assert_eq!(st, 201, "{other}");
+    let req = json!({"manifest": m["id"], "yamls": [other["id"]]}).to_string();
+    let (st, e) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 400, "{e}");
+}
+
+/// The fill runs in a child process that is killed at its time limit, not just waited for.
+#[tokio::test]
+async fn a_manifest_fill_past_its_time_is_killed_and_reported_failed() {
+    let setup = Setup::new("manifest-timeout");
+    // A copy of the binary under this test's own folder, so only this test's children name it.
+    let bin = setup.root.join("server-copy");
+    std::fs::copy(BIN, &bin).unwrap();
     let data = setup.root.join("data").display().to_string();
-    let env: Vec<(String, String)> = setup.env().into_iter().skip(1).collect();
+    // Too short for any process to start and finish.
+    let mut env = setup.env();
+    env.push(("CONSTELLATION_FILL_TIMEOUT_MS".into(), "1".into()));
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let server = Server::start(Path::new(BIN), &["--data-dir", &data], &env).unwrap();
-    server.wait_for_log("admin API is open").unwrap();
-    let (st, _) = http(&server, "GET", "/api/apworlds", None, b"").await;
-    assert_eq!(st, 200, "open mode: no header needed");
+    let server = Server::start(&bin, &["--data-dir", &data], &env).unwrap();
+    let t = true;
+    let doc: Value =
+        serde_json::from_str(include_str!("../../data-fill/tests/fixtures/room_world.json"))
+            .unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["game"] = json!(GAME);
+    manifest["version"] = json!("1");
+    let (_, m) =
+        http(&server, "PUT", "/api/manifests?name=m.json", t, manifest.to_string().as_bytes())
+            .await;
+    let mut p = doc["instances"][0].clone();
+    p["name"] = json!("Ann");
+    p["game"] = json!(GAME);
+    let (_, y) = http(&server, "PUT", "/api/yamls?name=a.yaml", t, p.to_string().as_bytes()).await;
+    let req = json!({"manifest": m["id"], "yamls": [y["id"]]}).to_string();
+    let (st, job) = http(&server, "POST", "/api/worlds", t, req.as_bytes()).await;
+    assert_eq!(st, 202, "{job}");
+    server.wait_for_log("generation failed").unwrap();
+    let st = status(&server, job["id"].as_str().unwrap()).await;
+    assert_eq!(st["status"], "failed", "{st}");
+    assert!(st["error"].as_str().unwrap().contains("timed out"), "{st}");
+    let marker = bin.display().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && processes_naming("fill-job").iter().any(|p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+    {
+        tokio::task::yield_now().await;
+    }
+    // Only the server itself names its copy now; a fill child would too, with `fill-job`.
+    let left: Vec<u32> = processes_naming("fill-job")
+        .into_iter()
+        .filter(|p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+        .collect();
+    assert_eq!(left, Vec::<u32>::new(), "no fill child is left");
 }

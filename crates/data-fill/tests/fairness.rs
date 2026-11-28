@@ -7,6 +7,8 @@ use data_fill::fairness::{
 use data_fill::{Instance, Plan, World};
 use serde_json::Value;
 
+mod support;
+
 fn freq(rows: &[(u16, u32, u64)], samples: u64) -> Freq {
     let mut f = Freq { samples, ..Freq::default() };
     for (i, l, n) in rows {
@@ -82,10 +84,10 @@ fn uniform_distinct_saturates_at_the_location_count() {
 }
 
 fn fixture() -> (World, Instance, Vec<u16>, Vec<bool>) {
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/fairness_world.json")).expect("fixture parses");
-    let inst: Instance = serde_json::from_value(v["instance"].clone()).expect("instance");
-    let w = World::load(&v["manifest"]).expect("world");
+    let v = support::fixture("fairness_world");
+    let (manifest, mut insts) = data_fill::room::from_doc(&v).expect("instance");
+    let inst = insts.remove(0);
+    let w = World::load(manifest).expect("world");
     let pool = inst.pool.iter().map(|k| w.item(k).expect("item")).collect();
     let prog = inst.progression(&w);
     (w, inst, pool, prog)
@@ -108,7 +110,13 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
         assert_eq!(s.fill.p(key_a, l), 0.0);
     }
     let r = report(&w, &s);
-    assert!(r["baseline"]["p_value"].as_f64().is_some());
+    // The product's fill (a room of this one player) against uniform beatable placements: a
+    // fixed run, so this is no flake.
+    let p = r["baseline"]["p_value"].as_f64().unwrap_or(0.0);
+    assert!(
+        p >= config::FILL_FAIRNESS_MIN_P,
+        "the fill is told apart from uniform placements: p {p}"
+    );
     assert!(
         r["baseline"]["max_deviation"]["value"].as_f64().is_some_and(|d| (0.0..=1.0).contains(&d))
     );
@@ -118,16 +126,9 @@ fn baseline_keeps_only_beatable_placements_and_report_measures_bias() {
 #[test]
 fn a_room_is_measured_against_the_same_baseline() {
     use data_fill::fairness::{Flat, report_named, sample_room};
-    use data_fill::room::{self, Seat};
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
-    let insts = room::instances(v["instances"].as_array().expect("list")).expect("instances");
-    let worlds = room::worlds(&vec![&v["manifest"]; insts.len()], 1).expect("worlds");
-    let pairs: Vec<_> = worlds.iter().zip(&insts).collect();
-    let plans = room::plans(&pairs, 1).expect("plans");
-    let prog: Vec<Vec<bool>> = worlds.iter().zip(&insts).map(|(w, i)| i.progression(w)).collect();
-    let seats: Vec<Seat<'_>> =
-        (0..3).map(|p| Seat { w: &worlds[p], plan: &plans[p], progression: &prog[p] }).collect();
+    use data_fill::room;
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
+    let (worlds, seats) = (&c.worlds, c.seats());
     let flat = Flat::new(&seats).expect("flat");
     let s = sample_room(&seats, &flat, 400, 400, 100_000).expect("room");
     assert_eq!((s.fill.samples, s.failed, s.baseline.samples), (400, 0, 400));
@@ -153,8 +154,7 @@ fn a_room_is_measured_against_the_same_baseline() {
 fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     use data_fill::fairness::{Flat, sample_room};
     use data_fill::room::{self, Seat};
-    let v: Value =
-        serde_json::from_str(include_str!("fixtures/room_world.json")).expect("fixture parses");
+    let v = support::fixture("room_world");
     let w = World::load(&v["manifest"]).expect("world");
     let mut inst: Instance = serde_json::from_value(v["instances"][0].clone()).expect("instance");
     inst.locked.insert("l6".to_owned(), "coin".to_owned());
@@ -175,4 +175,18 @@ fn a_room_with_a_mismatched_seat_is_refused_before_anything_is_indexed() {
     let flat = Flat::new(&seats).expect("flat");
     assert!(room::check_placed(&seats, &[vec![None]]).is_err());
     assert!(sample_room(&seats, &flat, 1, 0, 0).is_err());
+}
+
+/// The shape of the fill's seeds on the small room: every seed filled, and the spheres that
+/// hold a required item counted for the first seeds asked.
+#[test]
+fn the_shape_of_the_fills_seeds_is_reported_on_the_small_room() {
+    use data_fill::fairness::{shape, shape_report};
+    use data_fill::room;
+    let c = room::Compiled::from_doc(&support::fixture("room_world")).expect("room");
+    let seats = c.seats();
+    let exact = shape(&seats, 300, 20).expect("exact");
+    let own = shape_report(&exact);
+    assert_eq!((exact.failed, exact.seeds, exact.required.len()), (0, 300, 20));
+    assert!(own["required_spheres_mean"].as_f64().is_some_and(|x| x >= 1.0), "{own}");
 }

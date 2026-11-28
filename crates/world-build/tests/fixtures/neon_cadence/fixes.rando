@@ -1,0 +1,22 @@
+# Hand-written changes over the generated catalog. The catalog is never edited by hand: its
+# header hash would refuse the build. Each change names its target, so regenerating the
+# catalog keeps them, and a target that disappears is an error here.
+use catalog
+
+# The first song is the tutorial: its hard clear needs no lens.
+replace check amber_drift.amber_drift_hard_clear: true
+
+# A chart the export lists that the game never shipped.
+remove check velvet_echo.velvet_echo_hard_perfect
+
+# A song cut from the release: its region and the way to it go.
+remove exit song_select.jade_lantern
+remove region jade_lantern
+
+# A song that also opens with the neon pack.
+replace exit song_select.cobalt_signal: has_any(orbit_pack, neon_pack) and count(tier_pass) >= 2
+
+# The jukebox in the song select screen.
+extend region song_select {
+  check jukebox_secret: has(metronome) and count(tier_pass) >= 1
+}

@@ -40,11 +40,13 @@ impl RoomSpheres {
 }
 
 /// A room of one player's spheres as a single player's.
-fn one_player(s: RoomSpheres) -> Spheres {
-    Spheres {
-        spheres: s.spheres.into_iter().map(|v| v.into_iter().map(|x| x.1).collect()).collect(),
-        beatable: s.beatable[0],
-        unreachable: s.unreachable.into_iter().map(|x| x.1).collect(),
+impl From<RoomSpheres> for Spheres {
+    fn from(s: RoomSpheres) -> Self {
+        Spheres {
+            spheres: s.spheres.into_iter().map(|v| v.into_iter().map(|x| x.1).collect()).collect(),
+            beatable: s.beatable.first().copied().unwrap_or(false),
+            unreachable: s.unreachable.into_iter().map(|x| x.1).collect(),
+        }
     }
 }
 
@@ -54,26 +56,7 @@ pub fn spheres(w: &World, plan: &Plan, placed: &[Option<u16>], progression: &[bo
     let seat = [Seat { w, plan, progression }];
     let mut r = [plan.base(w, &[])];
     let at = |_: u16, l: u32| placed[l as usize].map(|item| Given { to: 0, item });
-    let s = collect(&seat, &mut r, &at);
-    one_player(s)
-}
-
-/// [`spheres`] of a filled seed from the fill's own final state `r` (every placed item
-/// collected): the rounds evaluate only the sites that state derived, in its buffers.
-pub(crate) fn from_state(
-    w: &World,
-    plan: &Plan,
-    r: &mut Reach<'_>,
-    placed: &[Option<u16>],
-    progression: &[bool],
-) -> Spheres {
-    r.only_what_holds();
-    plan.rebase(r, &[]);
-    let seat = [Seat { w, plan, progression }];
-    let at = |_: u16, l: u32| placed[l as usize].map(|item| Given { to: 0, item });
-    let s = collect(&seat, std::slice::from_mut(r), &at);
-    r.release();
-    one_player(s)
+    collect(&seat, &mut r, &at).into()
 }
 
 /// The spheres of a room's placements (`placed[player][location]`), from fresh states.
@@ -136,11 +119,7 @@ fn collect(
         for (p, l) in &new {
             taken[usize::from(*p)][*l as usize] = true;
             if let Some(g) = at(*p, *l)
-                && seats[usize::from(g.to)]
-                    .progression
-                    .get(usize::from(g.item))
-                    .copied()
-                    .unwrap_or(false)
+                && crate::room::is_progression(seats, g)
             {
                 models[usize::from(g.to)].add(g.item, 1);
             }

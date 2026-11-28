@@ -1,0 +1,35 @@
+# Progressive items come in copies; each copy is one more tier.
+item blade progression x 3
+item gauntlet progression x 2
+item quiver progression x 2
+item lantern progression
+item kelp_charm progression
+item grapple progression
+item glider progression
+item bombs progression
+item cinder_wand progression
+item shield progression
+item relic progression x 4
+item throne_seal progression
+item heart_vessel useful x 6
+item map_scrap useful x 4
+item coin filler
+item spark_trap trap
+pool fill { coin 20, spark_trap 1 }
+
+group fire_tools = { lantern, cinder_wand }
+group mobility = { grapple, glider, kelp_charm }
+
+# Dungeon keys stay inside their own dungeon: each dungeon file wraps its rooms in a
+# placement block for its set.
+table dungeon(key: name, keys: int) {
+  mire 2
+  ember 3
+  frost 2
+  tide 2
+}
+
+for d in dungeon {
+  item {d.key}_key progression x d.keys
+  item {d.key}_great_key progression
+}

@@ -1,0 +1,36 @@
+# The foundry: smelters and conveyor belts, reached from the scrapyard or under water.
+use items
+use logic
+
+region smelter_floor {
+  check foreman_desk
+  check cooling_tank
+  check skylight: can_reach_high and can_cross_gap
+  exit scrapyard
+  exit conveyor_loft
+}
+
+region conveyor_loft {
+  for i in 1..4 {
+    check parts_bin_{i}
+  }
+  check top_belt: can_climb_shaft
+  # The ledge above the belts: reached here by climbing and jumping across.
+  check catwalk_ledge: can_climb_shaft and can_cross_gap
+  exit smelter_floor
+  exit flooded_drift: can_swim
+  exit slag_vault: can_break_walls
+}
+
+region slag_vault {
+  check slag_crucible
+  check dark_furnace: can_see_dark
+  exit conveyor_loft
+  exit overseer_floor: can_cross_gap
+}
+
+region overseer_floor {
+  check foundry_overseer: can_fight_boss and can_see_dark
+  event boss_down: can_fight_boss and can_see_dark
+  exit slag_vault
+}

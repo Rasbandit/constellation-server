@@ -1,6 +1,6 @@
 name: release
-# The image is built on main and on tags, never on PRs (packaging PRs get the seconds-long
-# container-lint workflow). A push to main builds it, runs it under compose and, if that passes,
+# The image is built on main and on tags, never on PRs. The smoke job lints the packaging first
+# (hadolint, shellcheck, the entrypoint and db-roles tests, the compose config). A push to main builds it, runs it under compose and, if that passes,
 # publishes it to GHCR as `main` and `sha-<short sha>`. A tag vX.Y.Z (equal to the Cargo.toml
 # version) publishes the version tags and `latest`. A manual run (workflow_dispatch) builds and
 # runs it on any branch without pushing.
@@ -22,6 +22,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008 # apt packages are not version-pinned: bookworm-slim security updates matter more
+      - run: shellcheck docker/*.sh
+      # Exit 3 -> 0, other codes pass through, SIGTERM is forwarded.
+      - run: sh docker/test-entrypoint.sh
+      - run: sh docker/test-db-roles.sh
+      # The secret files only need to exist for the config check (the smoke step fills them).
+      - run: |
+          mkdir -p secrets && touch secrets/database_url secrets/migrate_database_url secrets/postgres_password secrets/app_password secrets/migrate_password
+          GEN_REPO_URL=x GEN_REPO_REF=x docker compose config -q
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
         with:
@@ -42,49 +54,46 @@ jobs:
           GEN_REPO_REF: ${{ vars.GEN_REPO_REF }}
       # Run the built image under compose: uid, secret read, healthcheck, Postgres 18 volume.
       - run: |
-          mkdir secrets
+          mkdir -p secrets
           echo ci-password > secrets/postgres_password
-          echo 'postgres://constellation:ci-password@postgres/constellation' > secrets/database_url
-          chmod 400 secrets/database_url
-          sudo chown 10001 secrets/database_url
+          echo ci-app-password > secrets/app_password
+          echo ci-migrate-password > secrets/migrate_password
+          echo 'postgres://constellation_app:ci-app-password@postgres/constellation' > secrets/database_url
+          echo 'postgres://constellation_migrate:ci-migrate-password@postgres/constellation' > secrets/migrate_database_url
+          chmod 400 secrets/database_url secrets/migrate_database_url
+          sudo chown 10001 secrets/database_url secrets/migrate_database_url
           CONSTELLATION_TAG=ci docker compose up --no-build --wait --wait-timeout 120
-      # The default compose runs the admin API open (POC): /api answers 200 with no token. Then a
-      # yaml upload runs the sandbox (bubblewrap under the seccomp profile) and must land under
-      # /data/yamls/<game>/.
+      # /api needs a session: 401 without one. Sign up, then a yaml upload runs the sandbox
+      # (bubblewrap under the seccomp profile) and must land in the store (a 201 with its id).
       - run: |
           A=http://127.0.0.1:38281
-          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 200
-          curl -sf $A/api/auth | grep -q '"token_required":false'
+          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
+          curl -sf $A/api/auth | grep -q '"signup_open":true'
+          printf '{"username":"smoke","password":"smoke-password-1"}' > signup.json
+          curl -sf -c jar -X POST --data-binary @signup.json $A/api/signup
+          test "$(curl -s -b jar -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 200
           printf 'name: Smoke\ngame: Smoke Game\n' > smoke.yaml
-          code=$(curl -s -X PUT -o up.out -w '%{http_code}' --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
+          code=$(curl -s -b jar -X PUT -o up.out -w '%{http_code}' --data-binary @smoke.yaml "$A/api/yamls?name=smoke.yaml")
           cat up.out; echo " (HTTP $code)"
           test "$code" = 201
-          docker compose exec -T server sh -c 'ls /data/yamls/smoke-game/*.yaml'
+      # The server runs as the runtime role: connected as it, and that role cannot change the schema.
+      - run: |
+          n=$(docker compose exec -T postgres psql -U constellation -d constellation -tAc "select count(*) from pg_stat_activity where usename = 'constellation_app'")
+          test "$n" -gt 0
+          docker compose exec -T postgres sh -c 'PGPASSWORD=ci-app-password psql -h 127.0.0.1 -U constellation_app -d constellation -c "CREATE TABLE sneaky (a int)" 2>&1' | grep -q 'permission denied'
       # The one public port serves the UI and the version: `/` is the app, a missing asset is a
-      # 404, /version carries the build, and an unknown /api path is a 404, not the app.
+      # 404, /version carries the build, and an unknown /api path is never the app: 401 without a
+      # session, 404 with one (the cookie jar from the sign-up step).
       - run: |
           P=http://127.0.0.1:38281
           curl -sf $P/ | grep -qi '<div id="root">'
           curl -sf -H 'Accept: text/html' $P/abcdefgh23 | grep -qi '<div id="root">'
           test "$(curl -s -o /dev/null -w '%{http_code}' $P/assets/missing.js)" = 404
-          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/nope)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/api/nope)" = 401
+          test "$(curl -s -b jar -o /dev/null -w '%{http_code}' $P/api/nope)" = 404
           curl -sf $P/version | grep -q '"version":"'
           js=$(curl -sf $P/ | grep -o '/assets/[^"]*\.js' | head -1)
           curl -sfI -H 'Accept-Encoding: br' "$P$js" | grep -qi 'content-encoding: br'
-      # Token mode (the switch for later): the same image with the token override answers 401
-      # without the token and 200 with it (the 429 limiter is covered by the server's own tests).
-      # The token is masked, never echoed.
-      - run: |
-          openssl rand -hex 16 > secrets/admin_token
-          chmod 400 secrets/admin_token
-          sudo chown 10001 secrets/admin_token
-          T=$(sudo cat secrets/admin_token)
-          echo "::add-mask::$T"
-          CONSTELLATION_TAG=ci docker compose -f docker-compose.yml -f docker-compose.token.yml up -d --no-build --wait --wait-timeout 120
-          A=http://127.0.0.1:38281
-          curl -sf $A/api/auth | grep -q '"token_required":true'
-          test "$(curl -s -o /dev/null -w '%{http_code}' $A/api/apworlds)" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" $A/api/apworlds)" = 200
       - if: failure()
         run: docker compose logs
       - if: always()

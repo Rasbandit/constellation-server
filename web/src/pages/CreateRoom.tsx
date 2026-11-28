@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, liveRooms, HttpError } from '../api/client';
-import type { ApWorld, CollectMode, PlayerFile, ReadinessCheck, ReleaseMode, RoomRules } from '../api/types';
+import type { ApWorld, CollectMode, ManifestWorld, PlayerFile, ReadinessCheck, ReleaseMode, RoomRules } from '../api/types';
 import { Phases } from '../components/phases';
 import { Card, Dropzone, Empty, Modal, useToast } from '../components/ui';
 import { bytes } from '../lib/format';
 import { gamesOf } from '../api/uploads';
+import { jsonKind } from '../lib/jsonKind';
 import { NAME_MAX, checkReadiness } from '../lib/readiness';
 
 const defaultRules: RoomRules = { hintCostPct: 10, releaseMode: 'goal', collectMode: 'goal', password: '', spoilerLog: true };
@@ -18,6 +19,7 @@ export function CreateRoom() {
   const [name, setName] = useState('');
   const [players, setPlayers] = useState<PlayerFile[]>([]);
   const [worlds, setWorlds] = useState<ApWorld[]>([]);
+  const [manifests, setManifests] = useState<ManifestWorld[]>([]);
   const [rules, setRules] = useState<RoomRules>(defaultRules);
   const [showRules, setShowRules] = useState(false);
   const [builtin, setBuiltin] = useState<string[]>([]);
@@ -39,11 +41,11 @@ export function CreateRoom() {
 
   const readiness = useMemo(
     // A live room is named by its key; the name field is not shown then.
-    () => checkReadiness({ roomName: liveRooms ? 'live' : name, apworlds: worlds, players, builtinGames: builtin }),
-    [name, worlds, players, builtin],
+    () => checkReadiness({ roomName: liveRooms ? 'live' : name, apworlds: worlds, manifests, players, builtinGames: builtin }),
+    [name, worlds, manifests, players, builtin],
   );
   const neededGames = useMemo(() => [...new Set(players.flatMap((p) => gamesOf(p.game)))].sort(), [players]);
-  const gameChoices = useMemo(() => [...new Set([...builtin, ...known, ...worlds.map((w) => w.game)])].sort(), [builtin, known, worlds]);
+  const gameChoices = useMemo(() => [...new Set([...builtin, ...known, ...worlds.map((w) => w.game), ...manifests.map((m) => m.game)])].sort(), [builtin, known, worlds, manifests]);
 
   async function track<T>(p: Promise<T>): Promise<T> {
     setBusy((b) => b + 1);
@@ -54,13 +56,22 @@ export function CreateRoom() {
     }
   }
 
+  /** A `.json` file dropped in the wrong zone is refused here, before it is uploaded. */
+  const refuseWrongZone = async (f: File, zone: 'manifest' | 'player') => {
+    const kind = await jsonKind(f);
+    if (kind === 'other' || kind === zone) return false;
+    toast(`${f.name} looks like a ${kind === 'manifest' ? 'world manifest' : 'player file'}; drop it in the ${kind === 'manifest' ? 'manifest' : 'player'} area.`, 'error');
+    return true;
+  };
+
   const addPlayerFiles = (files: File[]) =>
-    files.forEach((f) =>
+    files.forEach(async (f) => {
+      if (await refuseWrongZone(f, 'player')) return;
       track(api.uploadPlayerFile(f)).then(
         (added) => setPlayers((ps) => [...ps, ...added]),
         (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
-      ),
-    );
+      );
+    });
 
   const addWorldFiles = (files: File[]) =>
     files.forEach((f) =>
@@ -69,6 +80,15 @@ export function CreateRoom() {
         (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
       ),
     );
+
+  const addManifestFiles = (files: File[]) =>
+    files.forEach(async (f) => {
+      if (await refuseWrongZone(f, 'manifest')) return;
+      track(api.uploadManifest(f)).then(
+        (m) => setManifests((ms) => [...ms, m]),
+        (e: Error) => toast(`${f.name}: ${e.message}`, 'error'),
+      );
+    });
 
   const updatePlayer = (id: string, patch: Partial<PlayerFile>) =>
     setPlayers((ps) => ps.map((p) => (p.id === id ? { ...p, ...patch, error: patch.game ? undefined : p.error } : p)));
@@ -87,7 +107,7 @@ export function CreateRoom() {
     setCreating(true);
     setServerChecks(null);
     try {
-      const room = await api.createRoom({ name, apworlds: worlds, players, rules });
+      const room = await api.createRoom({ name, apworlds: worlds, manifest: manifests[0] ?? null, players, rules });
       toast('Room created');
       nav(`/rooms/${room.id}/admin?key=${encodeURIComponent(room.adminKey ?? '')}&created=1`);
     } catch (e) {
@@ -148,10 +168,10 @@ export function CreateRoom() {
             }
           >
             <Dropzone
-              accept=".yaml,.yml"
+              accept=".yaml,.yml,.json"
               onFiles={addPlayerFiles}
-              title="Drop player YAML files"
-              hint="Several at once; a file can hold several players. Or use Add game/player for one player with their files."
+              title="Drop player files"
+              hint="YAML files, or JSON files with a name and a game for a manifest world. Several at once; a YAML file can hold several players. Or use Add game/player for one player with their files."
             />
             {players.length > 0 && (
               <div className="table-wrap">
@@ -188,7 +208,7 @@ export function CreateRoom() {
                             {p.error && <div className="small error-text">{p.error}</div>}
                             {gamesOf(p.game).length > 1 && <div className="small muted">Weighted: the generator picks one</div>}
                             {gamesOf(p.game).map((g) => (
-                              <WorldStatus key={g} game={g} label={gamesOf(p.game).length > 1 ? g : undefined} worlds={worlds} builtin={builtin} />
+                              <WorldStatus key={g} game={g} label={gamesOf(p.game).length > 1 ? g : undefined} worlds={worlds} manifests={manifests} builtin={builtin} />
                             ))}
                           </td>
                           <td>
@@ -243,12 +263,13 @@ export function CreateRoom() {
               <ul className="needs">
                 {neededGames.map((g) => {
                   const w = worlds.filter((x) => x.game === g);
+                  const m = manifests.filter((x) => x.game === g);
                   const users = players.filter((p) => gamesOf(p.game).includes(g)).map((p) => p.name);
-                  const state = w.length > 1 ? 'dup' : w.length === 1 ? 'ok' : builtin.includes(g) ? 'builtin' : 'missing';
+                  const state = w.length > 1 ? 'dup' : w.length === 1 ? 'ok' : m.length > 0 ? 'manifest' : builtin.includes(g) ? 'builtin' : 'missing';
                   return (
                     <li key={g} className={`need need-${state}`}>
                       <span className="need-icon" aria-hidden>
-                        {state === 'ok' || state === 'builtin' ? '✓' : '!'}
+                        {state === 'ok' || state === 'builtin' || state === 'manifest' ? '✓' : '!'}
                       </span>
                       <div className="need-main">
                         <strong>{g}</strong>
@@ -256,6 +277,7 @@ export function CreateRoom() {
                       </div>
                       <div className="need-state small">
                         {state === 'ok' && `${w[0].fileName} · v${w[0].version}`}
+                        {state === 'manifest' && `${m[0].fileName} · v${m[0].version} (data-only)`}
                         {state === 'builtin' && 'Built into the server'}
                         {state === 'missing' && <span className="error-text">Missing</span>}
                         {state === 'dup' && <span className="error-text">{w.length} versions, keep one</span>}
@@ -266,6 +288,30 @@ export function CreateRoom() {
               </ul>
             )}
             <Dropzone accept=".apworld" onFiles={addWorldFiles} title="Drop .apworld files" hint="The game and version are read from each file." />
+            <Dropzone
+              accept=".json"
+              onFiles={addManifestFiles}
+              title="Or drop a world manifest (.json)"
+              hint="A data-only world: the server fills it itself and runs no world code. The game and version are read from the file."
+            />
+            {manifests.length > 0 && (
+              <ul className="file-list">
+                {manifests.map((m) => (
+                  <li key={m.id}>
+                    <div>
+                      <strong>{m.fileName}</strong>
+                      <span className="muted small">
+                        {' '}
+                        {m.game} · v{m.version} · {bytes(m.sizeBytes)}
+                      </span>
+                    </div>
+                    <button type="button" className="btn btn-ghost btn-small" onClick={() => setManifests((ms) => ms.filter((x) => x.id !== m.id))}>
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
             {worlds.length > 0 && (
               <ul className="file-list">
                 {worlds.map((w) => (
@@ -309,7 +355,7 @@ export function CreateRoom() {
               </div>
             )}
             <div className="summary small muted">
-              {players.length} players · {neededGames.length} games · {worlds.length} files
+              {players.length} players · {neededGames.length} games · {worlds.length + manifests.length} files
               {busy > 0 && ` · uploading ${busy}...`}
             </div>
             <button
@@ -340,11 +386,12 @@ export function CreateRoom() {
   );
 }
 
-function WorldStatus({ game, label, worlds, builtin }: { game: string; label?: string; worlds: ApWorld[]; builtin: string[] }) {
+function WorldStatus({ game, label, worlds, manifests, builtin }: { game: string; label?: string; worlds: ApWorld[]; manifests: ManifestWorld[]; builtin: string[] }) {
   const n = worlds.filter((w) => w.game === game).length;
   const pre = label ? `${label}: ` : '';
   if (n === 1) return <div className="small muted">{pre}✓ APWorld uploaded</div>;
   if (n > 1) return <div className="small error-text">{pre}{n} APWorlds, keep one</div>;
+  if (manifests.some((m) => m.game === game)) return <div className="small muted">{pre}✓ Manifest uploaded</div>;
   if (builtin.includes(game)) return <div className="small muted">{pre}✓ Built in</div>;
   return <div className="small error-text">{pre}APWorld missing</div>;
 }

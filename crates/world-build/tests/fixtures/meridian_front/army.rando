@@ -1,0 +1,24 @@
+# What the expedition fields. Each unit item unlocks one unit type for every mission after it
+# arrives; each upgrade copy is one more research tier for the whole army.
+item rifle_squad progression
+item scout_buggy progression
+item skimmer progression
+item mortar_crawler progression
+item command_barge progression
+item targeting_suite progression x 2
+item hull_plating progression x 4
+
+# Resources the game hands out as filler, and sabotage as the trap.
+item fuel_drum filler
+item spare_parts filler
+item sabotage trap
+pool fill { fuel_drum 8, spare_parts 4, sabotage 1 }
+
+# Army strength is a weighted sum: a unit type is worth more the heavier it is, and each
+# upgrade tier adds one. Missions ask for `army(n)`.
+def army(n) = count(rifle_squad) + 2 * count(scout_buggy) + 3 * count(skimmer) + 4 * count(mortar_crawler) + 6 * count(command_barge) + count(targeting_suite) + count(hull_plating) >= n
+
+# Air cover: skimmers, or the command barge's drones.
+def has_air = has_any(skimmer, command_barge)
+# Breaking a fortified line wants artillery, or skimmers with both targeting tiers.
+def can_siege = has(mortar_crawler) or (has(skimmer) and has(targeting_suite, 2))

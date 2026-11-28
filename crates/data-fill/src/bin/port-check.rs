@@ -16,7 +16,7 @@ use data_fill::check::{
 };
 use data_fill::fairness::{histogram, sample, uniform_distinct};
 use data_fill::spheres::{Spheres, spheres};
-use data_fill::{Instance, Plan, Stats, World, fill_spheres};
+use data_fill::{Instance, Plan, Seat, Stats, World, fill_room_spheres};
 
 #[path = "port-check/room.rs"]
 mod room;
@@ -329,7 +329,7 @@ fn load_seed<'w>(
     player: Option<u64>,
 ) -> R<Seed<'w>> {
     let inst = fetch_instance(legacy, out, seed, player)?;
-    let plan = Plan::new(w, &inst).map_err(|e| format!("{e:?}"))?;
+    let plan = Plan::new(w, &inst)?;
     let progression = inst.progression(w);
     Ok(Seed { seed, inst, w, plan, progression })
 }
@@ -474,6 +474,10 @@ fn run(a: &Args) -> R<Value> {
     let m = read_json(&a.manifest)?;
     // The compiled section is per world version: one compile shared by every seed.
     let world = World::load(&m)?;
+    if world.has_shuffles() {
+        // The comparison solves and fills the world as loaded.
+        return Err(data_fill::shuffle::UNSTAGED.to_owned());
+    }
     let mut legacy = Legacy::spawn(&a.legacy)?;
     let hello = legacy.call(&json!({"op": "hello"}))?;
     let mut cx = Ctx {
@@ -547,27 +551,26 @@ fn run(a: &Args) -> R<Value> {
             for _ in 0..3 {
                 let t = Instant::now();
                 // Spheres come from the fill's own final state, not a fresh sweep.
-                let (filled, sp) = fill_spheres(
-                    s.w,
-                    &s.plan,
+                // A room of this one player: the product's fill.
+                let seat = [Seat { w: s.w, plan: &s.plan, progression: &s.progression }];
+                let (filled, sp) = fill_room_spheres(
+                    &seat,
                     &mut SpecRng::from_u64(fill_seed),
                     config::FILL_MAX_ATTEMPTS,
-                    &s.progression,
                 )
-                .map_err(|e| format!("fill {seed}: {e:?}"))?;
-                model = Some(sp);
+                .map_err(|e| format!("fill {seed}: {}", String::from(e)))?;
+                model = Some(Spheres::from(sp));
                 cx.engine_seconds += t.elapsed().as_secs_f64();
                 cx.work.0.absorb(&filled.stats);
                 cx.work.1 += 1;
                 cx.work.2 += u64::from(filled.solves);
-                ours = filled
-                    .placed
+                ours = filled.placed[0]
                     .iter()
                     .enumerate()
-                    .filter_map(|(l, i)| {
+                    .filter_map(|(l, g)| {
                         Some((
                             s.w.loc_key(u32::try_from(l).ok()?).to_owned(),
-                            s.w.item_key((*i)?).to_owned(),
+                            s.w.item_key((*g)?.item).to_owned(),
                         ))
                     })
                     .collect();
@@ -575,8 +578,8 @@ fn run(a: &Args) -> R<Value> {
                 files.push(serde_json::to_vec_pretty(&file).unwrap_or_default());
             }
             let same = files.windows(2).all(|p| p[0] == p[1]);
-            let hash = format!("{:016x}", fnv1a(&files[0]));
-            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| format!("{:016x}", fnv1a(f))).collect::<Vec<_>>()}));
+            let hash = fnv1a(&files[0]);
+            determinism.record(same, || json!({"seed": seed, "hashes": files.iter().map(|f| fnv1a(f)).collect::<Vec<_>>()}));
             hashes.push(json!([fill_seed, hash]));
             write(&a.out.join(format!("ours/placements_{seed}.json")), &files[0])?;
             let lsph = legacy.call(&json!({"op": "spheres", "seed": seed, "placements": ours}))?;

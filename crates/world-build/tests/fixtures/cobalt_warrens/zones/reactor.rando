@@ -1,0 +1,17 @@
+# The reactor: the last zone, under the mines. Its door takes the keycard once enough bosses
+# are down: each boss fires `boss_down`, and `counter` is how many of them did.
+use items
+use logic
+
+region reactor_door {
+  check door_console
+  check maintenance_hatch: counter(boss_down) >= 1
+  exit collapsed_mine: can_climb_shaft
+  exit reactor_core: has(reactor_keycard) and counter(boss_down) >= opt.bosses_needed
+}
+
+region reactor_core {
+  check coolant_cache
+  event reactor_shut_down: can_fight_boss and can_see_dark
+  exit reactor_door
+}

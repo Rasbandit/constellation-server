@@ -5,8 +5,9 @@
 //! The race tests (fence race, cancel safety) are gate G-DB items (doc 11 section 4.8).
 #![allow(clippy::arithmetic_side_effects, reason = "test counters stay far below u64::MAX")]
 use crate::{
-    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, LogStore, MemLogStore,
-    Snapshot, StoreError, blob_key,
+    AppendBatch, AppendError, AppendReceipt, BlobStore, CursorUpdate, JobState, JobStore, LogStore,
+    ManifestRecord, ManifestStore, MemLogStore, Snapshot, StoreError, UploadKind, UploadRecord,
+    UploadStore, blob_key,
 };
 use proto::{Cid, Epoch, Event, EventKind, ItemSeq, RoomId, Seq, SlotNo, Timestamp};
 use std::sync::Arc;
@@ -17,13 +18,36 @@ use tokio::sync::Notify;
 const R: RoomId = RoomId(1);
 
 /// A store plus the directory's claim, which is not part of the trait.
-trait Store: LogStore + BlobStore {
+trait Store:
+    LogStore
+    + BlobStore
+    + ManifestStore
+    + UploadStore
+    + JobStore
+    + crate::AccountStore
+    + crate::CatalogueStore
+{
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send;
+    /// Change a stored upload's file without its id: a torn row.
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 impl Store for MemLogStore {
     fn bump(&self, room: RoomId) -> impl Future<Output = Epoch> + Send {
         std::future::ready(self.claim(room))
+    }
+
+    fn tear_for_tests(
+        &self,
+        kind: UploadKind,
+        id: &crate::BlobKey,
+    ) -> impl Future<Output = ()> + Send {
+        self.tear_upload_for_tests(kind, id);
+        std::future::ready(())
     }
 }
 
@@ -31,6 +55,10 @@ impl Store for MemLogStore {
 impl Store for crate::PgLogStore {
     async fn bump(&self, room: RoomId) -> Epoch {
         self.claim(room).await.unwrap()
+    }
+
+    async fn tear_for_tests(&self, kind: UploadKind, id: &crate::BlobKey) {
+        self.tear_upload_for_tests(kind, id).await;
     }
 }
 
@@ -247,6 +275,71 @@ async fn blobs_are_stored_once_by_key_and_checked_on_write<S: Store>(s: Arc<S>) 
     assert_eq!(s.get(&kb).await.unwrap(), None, "the refused put wrote nothing");
 }
 
+/// A prepared world is found by its manifest and the engine that prepared it: another engine
+/// (an older build) or another manifest reads as none, and a later put replaces the key.
+async fn a_prepared_world_is_found_by_manifest_and_layout<S: Store>(s: Arc<S>) {
+    let (m, other) = (blob_key(b"manifest"), blob_key(b"another manifest"));
+    let (a, b) = (blob_key(b"prepared a"), blob_key(b"prepared b"));
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@a", &a).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(a));
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), None, "another build's is stale");
+    assert_eq!(s.prepared_key(&other, "1@a").await.unwrap(), None);
+    s.prepared_put(&m, "1@b", &b).await.unwrap();
+    s.prepared_put(&m, "1@a", &b).await.unwrap();
+    assert_eq!(s.prepared_key(&m, "1@a").await.unwrap(), Some(b), "rebuilt: the key is replaced");
+    assert_eq!(s.prepared_key(&m, "1@b").await.unwrap(), Some(b));
+    assert_eq!(s.prepared_key(&m, "").await.unwrap(), None);
+}
+
+fn manifest(name: &str, game: &str, body: &[u8]) -> ManifestRecord {
+    ManifestRecord {
+        id: blob_key(body),
+        name: name.to_owned(),
+        game: game.to_owned(),
+        version: "1".to_owned(),
+        bytes: body.len() as u64,
+        items: 2,
+        locations: 3,
+    }
+}
+
+/// A manifest is stored once by id with its listing columns, read back whole and checked on
+/// write; a listing pages by id after a cursor, filters by game, and never holds the bytes.
+async fn manifests_are_deduplicated_checked_and_listed_in_pages<S: Store>(s: Arc<S>) {
+    let bodies: Vec<Vec<u8>> = (0..5).map(|i| format!("manifest {i}").into_bytes()).collect();
+    let mut want: Vec<ManifestRecord> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| manifest(&format!("m{i}"), if i % 2 == 0 { "Even" } else { "Odd" }, b))
+        .collect();
+    for (r, b) in want.iter().zip(&bodies) {
+        s.manifest_put(r, b).await.unwrap();
+    }
+    // The same manifest again keeps its first record and bytes.
+    s.manifest_put(&manifest("renamed", "Other", &bodies[0]), &bodies[0]).await.unwrap();
+    assert_eq!(s.manifest_record(&want[0].id).await.unwrap().as_ref(), Some(&want[0]));
+    assert_eq!(s.manifest_bytes(&want[0].id).await.unwrap(), Some(bodies[0].clone()));
+    assert_eq!(s.manifest_record(&blob_key(b"none")).await.unwrap(), None);
+    assert_eq!(s.manifest_bytes(&blob_key(b"none")).await.unwrap(), None);
+    // A put under an id the bytes do not hash to is refused and writes nothing.
+    let lie = manifest("lie", "Even", b"other bytes");
+    assert!(matches!(s.manifest_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
+    assert_eq!(s.manifest_record(&lie.id).await.unwrap(), None);
+
+    want.sort_by_key(|r| r.id);
+    let first = s.manifest_list(None, None, 2).await.unwrap();
+    assert_eq!(first, want[..2]);
+    let next = s.manifest_list(None, Some(&first[1].id), 2).await.unwrap();
+    assert_eq!(next, want[2..4]);
+    let rest = s.manifest_list(None, Some(&next[1].id), 10).await.unwrap();
+    assert_eq!(rest, want[4..]);
+    let odd: Vec<_> = want.iter().filter(|r| r.game == "Odd").cloned().collect();
+    assert_eq!(s.manifest_list(Some("Odd"), None, 10).await.unwrap(), odd);
+    assert_eq!(s.manifest_list(Some("None"), None, 10).await.unwrap(), []);
+    assert_eq!(s.manifest_list(None, None, 0).await.unwrap(), []);
+}
+
 /// A room's seed is written once; the same seed again is fine, a different one is refused
 /// (never dropped while reporting success), and rooms keep their own.
 async fn a_seed_is_written_once_and_a_different_one_is_refused<S: Store>(s: Arc<S>) {
@@ -400,6 +493,346 @@ async fn a_cancelled_append_lands_whole_or_not_at_all_and_the_next_one_works<S: 
     println!("cancel safety: {cancels} of 200 rounds cancelled, head {head}");
 }
 
+fn upload(kind: UploadKind, game: &str, body: &[u8]) -> UploadRecord {
+    let id = blob_key(body);
+    let meta = format!("{game} {}", String::from_utf8_lossy(body));
+    UploadRecord { kind, id, game: game.to_owned(), meta }
+}
+
+fn game(name: &str) -> crate::Game {
+    crate::Game {
+        name: name.to_owned(),
+        description: format!("about {name}"),
+        created_by: "admin".to_owned(),
+    }
+}
+
+/// A game name is taken once ignoring case and keeps the case it was made with; games list
+/// a page at a time by key, bytewise on both stores (so a non-ASCII name sorts after `z`).
+async fn catalogue_games_are_unique_ignoring_case_and_listed_bytewise<S: Store>(s: Arc<S>) {
+    for name in ["Wind Waker", "Ōkami", "beta", "Alpha", "Zelda"] {
+        assert!(s.game_create(&game(name)).await.unwrap(), "{name}");
+    }
+    assert!(!s.game_create(&game("wind WAKER")).await.unwrap(), "taken ignoring case");
+    assert_eq!(s.game_get("WIND waker").await.unwrap(), Some(game("Wind Waker")));
+    assert_eq!(s.game_get("ŌKAMI").await.unwrap().map(|g| g.name).as_deref(), Some("Ōkami"));
+    assert_eq!(s.game_get("nothing").await.unwrap(), None);
+    let names = |page: Vec<crate::Game>| page.into_iter().map(|g| g.name).collect::<Vec<_>>();
+    assert_eq!(names(s.game_list(None, 2).await.unwrap()), ["Alpha", "beta"]);
+    let rest = s.game_list(Some("BETA"), 10).await.unwrap();
+    assert_eq!(names(rest), ["Wind Waker", "Zelda", "Ōkami"]);
+    assert_eq!(s.game_list(Some("Ōkami"), 10).await.unwrap(), []);
+}
+
+/// An owner is an existing account of an existing game, granted once (the first grant is
+/// kept); removing it says whether there was one, and deleting the account ends it.
+async fn catalogue_owners_are_granted_once_and_end_with_their_account<S: Store>(s: Arc<S>) {
+    use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+    for name in ["bob", "ann", "cyd"] {
+        assert!(s.user_create(name, "hash").await.unwrap());
+    }
+    // A game's maker is its first owner when it is an account.
+    let made = crate::Game { created_by: "cyd".to_owned(), ..game("Cyd's Game") };
+    assert!(s.game_create(&made).await.unwrap());
+    assert_eq!(s.game_owners("cyd's game").await.unwrap(), ["cyd"]);
+    assert_eq!(s.game_owner_remove("Cyd's Game", "cyd").await.unwrap(), LastOwner);
+    assert_eq!(s.game_owners("Cyd's Game").await.unwrap(), ["cyd"], "the last owner stays");
+    assert!(s.game_create(&game("Owned Game")).await.unwrap());
+    assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new(), "admin: none");
+    assert!(s.game_owner_add("owned game", "bob", "admin").await.unwrap());
+    assert!(s.game_owner_add("Owned Game", "bob", "ann").await.unwrap(), "already: still true");
+    assert!(s.game_owner_add("OWNED GAME", "ann", "bob").await.unwrap());
+    assert!(!s.game_owner_add("Owned Game", "nobody", "admin").await.unwrap(), "no account");
+    assert!(!s.game_owner_add("No Game", "ann", "admin").await.unwrap(), "no game");
+    assert_eq!(s.game_owners("owned game").await.unwrap(), ["ann", "bob"]);
+    assert_eq!(s.game_owners("No Game").await.unwrap(), Vec::<String>::new());
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), Removed);
+    assert_eq!(s.game_owner_remove("Owned Game", "bob").await.unwrap(), NotOwner, "once");
+    assert_eq!(s.game_owner_remove("No Game", "ann").await.unwrap(), NotOwner);
+    assert_eq!(s.game_owner_remove("Owned Game", "ann").await.unwrap(), LastOwner);
+    s.user_delete("ann").await.unwrap();
+    assert_eq!(s.game_owners("Owned Game").await.unwrap(), Vec::<String>::new());
+}
+
+/// A version is added only to an existing game, for an existing apworld upload, under a
+/// version number the game does not have; it starts as checking. A new room uses the newest
+/// live version checked with the server's generator; a withdrawal is final.
+async fn catalogue_versions_follow_their_states_and_the_newest_live_one_is_used<S: Store>(
+    s: Arc<S>,
+) {
+    use crate::NewVersion;
+    use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+    use crate::VersionState::{Checking, Failed, Live, NeedsUpdate, Withdrawn};
+    for v in [Checking, Live, Failed, Withdrawn, NeedsUpdate] {
+        assert_eq!(crate::VersionState::parse(v.as_str()), Some(v));
+    }
+    assert!(s.game_create(&game("Versioned")).await.unwrap());
+    let world = upload(UploadKind::Apworld, "Versioned", b"world zip");
+    s.upload_put(&world, b"world zip").await.unwrap();
+    let player = upload(UploadKind::Yaml, "Versioned", b"player yaml");
+    s.upload_put(&player, b"player yaml").await.unwrap();
+    let new = |game: &str, version: &str, apworld: crate::BlobKey| NewVersion {
+        game: game.to_owned(),
+        version: version.to_owned(),
+        note: format!("notes for {version}"),
+        apworld,
+        generator: "gen-1".to_owned(),
+    };
+    assert_eq!(s.version_add(&new("No Game", "1.0", world.id)).await.unwrap(), NoGame);
+    let none = blob_key(b"never uploaded");
+    assert_eq!(s.version_add(&new("Versioned", "1.0", none)).await.unwrap(), NoUpload);
+    let yaml = s.version_add(&new("Versioned", "1.0", player.id)).await.unwrap();
+    assert_eq!(yaml, NoUpload, "a player file is not a world");
+    assert_eq!(s.version_add(&new("versioned", "1.0", world.id)).await.unwrap(), Added);
+    assert_eq!(s.version_add(&new("VERSIONED", "1.0", world.id)).await.unwrap(), Taken);
+    assert_eq!(s.version_add(&new("Versioned", "1.1", world.id)).await.unwrap(), Added);
+    let latest = async |generator: &str| {
+        let found = s.version_latest_live("versioned", generator).await.unwrap();
+        found.map(|v| v.version)
+    };
+    assert_eq!(latest("gen-1").await, None, "both are checking");
+    assert!(s.version_set("Versioned", "1.0", Live, "gen-1", None).await.unwrap());
+    assert!(s.version_set("Versioned", "1.1", Failed, "gen-1", Some("boom")).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.0"), "a failed one is never used");
+    assert!(s.version_set("Versioned", "1.1", Live, "gen-1", None).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.1"), "the newest live one");
+    assert_eq!(latest("gen-2").await, None, "checked with another generator");
+    assert!(s.version_set("Versioned", "1.1", Withdrawn, "gen-1", None).await.unwrap());
+    assert_eq!(latest("gen-1").await.as_deref(), Some("1.0"));
+    assert!(!s.version_set("Versioned", "1.1", Live, "gen-1", None).await.unwrap(), "final");
+    assert!(!s.version_set("Versioned", "9.9", Live, "gen-1", None).await.unwrap(), "none");
+    assert!(s.version_set("Versioned", "1.0", NeedsUpdate, "gen-2", Some("x")).await.unwrap());
+    assert_eq!((latest("gen-1").await, latest("gen-2").await), (None, None));
+    let all = s.versions("VERSIONED").await.unwrap();
+    let want = [("1.1", Withdrawn, "gen-1", None), ("1.0", NeedsUpdate, "gen-2", Some("x"))];
+    let got: Vec<_> = all
+        .iter()
+        .map(|v| (v.version.as_str(), v.state, v.generator.as_str(), v.error.as_deref()))
+        .collect();
+    assert_eq!(got, want, "newest upload first");
+    assert!(all.iter().all(|v| v.game == "Versioned" && v.apworld == world.id));
+    assert_eq!(all[1].note, "notes for 1.0");
+    assert_eq!(s.versions("No Game").await.unwrap(), []);
+}
+
+/// A restart finds every version still checking, oldest upload first; a scan is recorded on
+/// a version whatever its state, and reads back with it.
+async fn catalogue_checking_versions_are_found_and_scans_recorded<S: Store>(s: Arc<S>) {
+    use crate::VersionState::{Checking, Live};
+    assert!(s.game_create(&game("Scanned")).await.unwrap());
+    let world = upload(UploadKind::Apworld, "Scanned", b"scanned zip");
+    s.upload_put(&world, b"scanned zip").await.unwrap();
+    for v in ["1", "2", "3"] {
+        let new = crate::NewVersion {
+            game: "Scanned".to_owned(),
+            version: v.to_owned(),
+            note: String::new(),
+            apworld: world.id,
+            generator: String::new(),
+        };
+        assert_eq!(s.version_add(&new).await.unwrap(), crate::VersionAdded::Added);
+    }
+    assert!(s.version_set("Scanned", "2", Live, "gen-1", None).await.unwrap());
+    // Other tests' versions may share the store: only this game's count here.
+    let checking = s.versions_checking().await.unwrap();
+    let mine: Vec<_> = checking.iter().filter(|v| v.game == "Scanned").collect();
+    let mine: Vec<_> = mine.iter().map(|v| (v.version.as_str(), v.state)).collect();
+    assert_eq!(mine, [("1", Checking), ("3", Checking)], "oldest first, live ones not");
+    assert!(s.versions("Scanned").await.unwrap().iter().all(|v| v.scan.is_none()));
+    let flags = r#"[{"file":"w/__init__.py","line":3,"reason":"opens a network connection"}]"#;
+    assert!(s.version_scan_set("scanned", "2", flags).await.unwrap(), "any state");
+    assert!(s.version_scan_set("Scanned", "3", "[]").await.unwrap());
+    assert!(!s.version_scan_set("Scanned", "9", "[]").await.unwrap(), "no such version");
+    let scans: Vec<_> = s.versions("Scanned").await.unwrap().into_iter().map(|v| v.scan).collect();
+    assert_eq!(scans, [Some("[]".to_owned()), Some(flags.to_owned()), None]);
+}
+
+/// An upload is stored once by kind and id with its record, read back whole and checked on
+/// write; the two kinds never see each other, and a listing is one kind's, ascending by id.
+async fn uploads_are_deduplicated_by_kind_checked_and_listed<S: Store>(s: Arc<S>) {
+    let bodies: Vec<Vec<u8>> = (0..4).map(|i| format!("upload {i}").into_bytes()).collect();
+    let worlds: Vec<UploadRecord> =
+        bodies.iter().map(|b| upload(UploadKind::Apworld, "g", b)).collect();
+    for (r, b) in worlds.iter().zip(&bodies) {
+        s.upload_put(r, b).await.unwrap();
+    }
+    // The same file again keeps its first record and bytes.
+    s.upload_put(&upload(UploadKind::Apworld, "other", &bodies[0]), &bodies[0]).await.unwrap();
+    let (k, id) = (UploadKind::Apworld, worlds[0].id);
+    assert_eq!(s.upload_meta(k, &id).await.unwrap(), Some(worlds[0].meta.clone()));
+    assert_eq!(s.upload_bytes(k, &id).await.unwrap(), Some(bodies[0].clone()));
+    // The same bytes as a player file are another upload.
+    assert_eq!(s.upload_meta(UploadKind::Yaml, &id).await.unwrap(), None);
+    let player = upload(UploadKind::Yaml, "p", &bodies[0]);
+    s.upload_put(&player, &bodies[0]).await.unwrap();
+    assert_eq!(s.upload_list(UploadKind::Yaml).await.unwrap(), [player.meta]);
+    // Bytes that are not the id's are refused and leave nothing.
+    let lie = upload(UploadKind::Apworld, "g", b"other bytes");
+    assert!(matches!(s.upload_put(&lie, b"not those").await, Err(StoreError::Corrupt(_))));
+    assert_eq!(s.upload_meta(UploadKind::Apworld, &lie.id).await.unwrap(), None);
+    assert_eq!(s.upload_bytes(UploadKind::Apworld, &blob_key(b"none")).await.unwrap(), None);
+    // Whole when stored; a missing one, or one of the other kind, is not.
+    assert!(s.upload_intact(k, &id).await.unwrap());
+    // A torn row (tampered bytes) is not intact on either store.
+    s.tear_for_tests(k, &id).await;
+    assert!(!s.upload_intact(k, &id).await.unwrap(), "torn");
+    s.upload_put(&worlds[0], &bodies[0]).await.unwrap();
+    assert!(s.upload_intact(k, &id).await.unwrap(), "healed");
+    assert!(!s.upload_intact(UploadKind::Apworld, &blob_key(b"none")).await.unwrap());
+    assert!(!s.upload_intact(UploadKind::Yaml, &worlds[1].id).await.unwrap());
+    let mut want = worlds;
+    want.sort_by_key(|r| r.id);
+    let metas: Vec<String> = want.into_iter().map(|r| r.meta).collect();
+    assert_eq!(s.upload_list(UploadKind::Apworld).await.unwrap(), metas);
+}
+
+/// A job's status is written whole and read back; only queued and running jobs go stale, a
+/// stale one is failed once, and a job marked alive since it was listed is not failed.
+async fn jobs_are_read_back_and_only_stale_unfinished_ones_fail<S: Store>(s: Arc<S>) {
+    let id = |c: char| c.to_string().repeat(64);
+    let (q, r, d) = (id('a'), id('b'), id('c'));
+    s.job_put(&q, JobState::Queued, "q1").await.unwrap();
+    s.job_put(&r, JobState::Running, "r1").await.unwrap();
+    s.job_put(&d, JobState::Done, "d1").await.unwrap();
+    let status = async |id: &str| s.job_status(id).await.unwrap().map(|(status, _)| status);
+    assert_eq!(status(&q).await.as_deref(), Some("q1"));
+    let (_, ago) = s.job_status(&q).await.unwrap().unwrap();
+    assert!(ago < Duration::from_secs(60), "just written: {ago:?}");
+    assert_eq!(status(&id('f')).await, None);
+    let hour = Duration::from_secs(3600);
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
+    assert!(!s.job_fail_stale(&q, "failed", hour).await.unwrap());
+    assert!(s.job_fail_stale(&r, "r failed", Duration::ZERO).await.unwrap());
+    assert!(!s.job_fail_stale(&r, "again", Duration::ZERO).await.unwrap(), "once");
+    assert!(!s.job_fail_stale(&d, "done stays", Duration::ZERO).await.unwrap());
+    assert_eq!(status(&r).await.as_deref(), Some("r failed"));
+    assert_eq!(status(&d).await.as_deref(), Some("d1"));
+    // All the stale ones at once, JSON kept and marked failed; a done one is left alone.
+    let (j1, j2) = (id('d'), id('e'));
+    s.job_put(&j1, JobState::Running, r#"{"id": "d", "slots": 2}"#).await.unwrap();
+    s.job_put(&j2, JobState::Queued, "not json").await.unwrap();
+    assert_eq!(s.job_fail_all_stale(hour, "lost").await.unwrap(), Vec::<String>::new());
+    let failed_now = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(failed_now, [q.clone(), j1.clone(), j2.clone()], "ascending; the done one stays");
+    let json = async |id: &str| -> serde_json::Value {
+        serde_json::from_str(&status(id).await.unwrap()).unwrap()
+    };
+    let failed = serde_json::json!({"id": "d", "slots": 2, "status": "failed", "error": "lost"});
+    assert_eq!(json(&j1).await, failed);
+    assert_eq!(json(&j2).await, serde_json::json!({"status": "failed", "error": "lost"}));
+    assert!(s.job_fail_all_stale(Duration::ZERO, "again").await.unwrap().is_empty(), "once");
+    // Text that is not a JSON object never aborts the sweep: it is replaced, the rest fail.
+    let bad = ["{broken", r#"{"a": "\u0000"}"#, "[1]"];
+    let ids: Vec<String> = ('1'..='4').map(id).collect();
+    for (i, text) in bad.iter().chain(&[r#"{"ok": 1}"#]).enumerate() {
+        s.job_put(&ids[i], JobState::Running, text).await.unwrap();
+    }
+    let all = s.job_fail_all_stale(Duration::ZERO, "lost").await.unwrap();
+    assert_eq!(all, ids, "every one failed, none aborted the sweep");
+    let bare = serde_json::json!({"status": "failed", "error": "lost"});
+    for i in 0..3 {
+        assert_eq!(json(&ids[i]).await, bare, "{}", bad[i]);
+    }
+    assert_eq!(json(&ids[3]).await["ok"], 1);
+    // A put replaces the status; a touch of a finished job changes nothing.
+    s.job_put(&q, JobState::Done, "q2").await.unwrap();
+    s.job_touch(&q).await.unwrap();
+    assert!(s.job_fail_all_stale(Duration::ZERO, "x").await.unwrap().is_empty());
+    assert_eq!(status(&q).await.as_deref(), Some("q2"));
+    // A server that comes back finishes over a sweep's failed.
+    s.job_put(&r, JobState::Done, "r done").await.unwrap();
+    assert_eq!(status(&r).await.as_deref(), Some("r done"));
+}
+
+/// A status put only when there is none never replaces one that is stored, of any state.
+async fn a_job_put_if_absent_never_replaces_a_stored_status<S: Store>(s: Arc<S>) {
+    let id = "a".repeat(64);
+    assert!(s.job_put_if_absent(&id, JobState::Running, "old file").await.unwrap());
+    assert!(!s.job_put_if_absent(&id, JobState::Failed, "newer?").await.unwrap());
+    s.job_put(&id, JobState::Done, "newer row").await.unwrap();
+    assert!(!s.job_put_if_absent(&id, JobState::Running, "stale file").await.unwrap());
+    let (status, _) = s.job_status(&id).await.unwrap().unwrap();
+    assert_eq!(status, "newer row");
+}
+
+async fn accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted<S: Store>(s: Arc<S>) {
+    let name = format!("ann-{}", s.bump(RoomId(1)).await.0);
+    assert!(s.user_create(&name, "hash-1").await.unwrap());
+    assert!(!s.user_create(&name, "hash-2").await.unwrap(), "a name is taken once");
+    assert_eq!(s.user_hash(&name).await.unwrap().as_deref(), Some("hash-1"));
+    assert_eq!(s.user_hash("nobody-here").await.unwrap(), None);
+    let (live, dead, gone) = ([1; 32], [2; 32], [3; 32]);
+    let hour = Duration::from_secs(3600);
+    s.session_put(&live, &name, hour).await.unwrap();
+    s.session_put(&dead, &name, Duration::ZERO).await.unwrap();
+    s.session_put(&gone, &name, hour).await.unwrap();
+    assert_eq!(s.session_user(&live).await.unwrap().as_deref(), Some(name.as_str()));
+    assert_eq!(s.session_user(&dead).await.unwrap(), None, "an expired login is dead");
+    s.session_delete(&gone).await.unwrap();
+    assert_eq!(s.session_user(&gone).await.unwrap(), None);
+    assert_eq!(s.session_user(&[9; 32]).await.unwrap(), None);
+}
+
+/// Rooms 11, 12 and 13 must be listed already (Postgres reads them from the directory).
+async fn a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all<S: Store>(s: &S) {
+    let room = |n: u8| crate::OwnedRoom {
+        world_id: Some(format!("w{n}")),
+        seed_name: format!("seed{}", 10 + n),
+        room_key: format!("key{n}"),
+        owner: None,
+        age_secs: 0,
+    };
+    s.room_claim(RoomId(11), Some("pw:a"), &room(1)).await.unwrap();
+    s.room_claim(RoomId(12), Some("pw:b"), &room(2)).await.unwrap();
+    s.room_claim(RoomId(11), Some("pw:b"), &room(1)).await.unwrap();
+    let mine = s.rooms_owned(Some("pw:a")).await.unwrap();
+    assert_eq!(mine.iter().map(|r| r.seed_name.as_str()).collect::<Vec<_>>(), ["seed11"]);
+    assert_eq!(mine[0].owner.as_deref(), Some("pw:a"), "an owner is kept");
+    assert!(s.rooms_owned(Some("pw:nobody")).await.unwrap().is_empty());
+    s.room_claim(RoomId(13), None, &room(3)).await.unwrap();
+    let all = s.rooms_owned(None).await.unwrap();
+    assert!(all.iter().any(|r| r.owner.is_none()), "the admin view lists rooms with no owner");
+    assert!(all.len() >= 3);
+}
+
+/// Room 21 must be listed already with key `aaaaaaaaaa` (Postgres reads it from the directory).
+async fn room_admins_are_granted_once_found_by_key_and_end_with_their_account<S: Store>(s: &S) {
+    let (key, other) = ("aaaaaaaaaa", "bbbbbbbbbb");
+    let room = crate::OwnedRoom {
+        world_id: Some("w21".into()),
+        seed_name: "seed21".into(),
+        room_key: key.into(),
+        owner: None,
+        age_secs: 0,
+    };
+    s.room_claim(RoomId(21), Some("pw:own"), &room).await.unwrap();
+    assert_eq!(s.room_by_key(key).await.unwrap().unwrap().seed_name, "seed21");
+    assert_eq!(s.room_by_key(other).await.unwrap(), None);
+    for name in ["bea", "cy"] {
+        assert!(s.user_create(name, "h").await.unwrap());
+    }
+    assert!(s.room_admins(key).await.unwrap().is_empty());
+    assert!(s.room_admin_add(key, "bea", "own").await.unwrap());
+    assert!(s.room_admin_add(key, "bea", "cy").await.unwrap(), "a repeat grant is fine");
+    assert_eq!(s.room_admins(key).await.unwrap(), ["bea"], "listed once");
+    assert!(!s.room_admin_add(key, "ghost", "own").await.unwrap(), "no such account");
+    assert!(!s.room_admin_add(other, "cy", "own").await.unwrap(), "no such room");
+    let seen =
+        |rooms: Vec<crate::OwnedRoom>| rooms.into_iter().map(|r| r.room_key).collect::<Vec<_>>();
+    assert_eq!(seen(s.rooms_administered("bea").await.unwrap()), [key]);
+    assert!(s.rooms_administered("cy").await.unwrap().is_empty(), "only its own adminships");
+    assert!(s.room_admin_remove(key, "bea").await.unwrap());
+    assert!(!s.room_admin_remove(key, "bea").await.unwrap(), "nothing left to remove");
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
+    for name in ["bea", "cy"] {
+        assert!(s.room_admin_add(key, name, "own").await.unwrap());
+    }
+    s.user_delete("bea").await.unwrap();
+    assert_eq!(s.room_admins(key).await.unwrap(), ["cy"], "a deleted account is no admin");
+    assert_eq!(s.user_hash("bea").await.unwrap(), None);
+    assert!(s.rooms_administered("bea").await.unwrap().is_empty());
+}
+
 macro_rules! suite {
     ($store:ident, $make:ident, [$($name:ident),* $(,)?]) => {
         mod $store {
@@ -434,6 +867,16 @@ macro_rules! contract {
                 an_older_snapshot_never_replaces_a_newer_one,
                 rooms_do_not_see_each_other,
                 blobs_are_stored_once_by_key_and_checked_on_write,
+                manifests_are_deduplicated_checked_and_listed_in_pages,
+                a_prepared_world_is_found_by_manifest_and_layout,
+                uploads_are_deduplicated_by_kind_checked_and_listed,
+                jobs_are_read_back_and_only_stale_unfinished_ones_fail,
+                a_job_put_if_absent_never_replaces_a_stored_status,
+                accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted,
+                catalogue_games_are_unique_ignoring_case_and_listed_bytewise,
+                catalogue_owners_are_granted_once_and_end_with_their_account,
+                catalogue_versions_follow_their_states_and_the_newest_live_one_is_used,
+                catalogue_checking_versions_are_found_and_scans_recorded,
                 a_seed_is_written_once_and_a_different_one_is_refused,
                 no_append_that_starts_after_a_claim_returns_commits_under_the_old_epoch,
                 no_epoch_0_append_commits_after_the_first_claim_returns,
@@ -449,10 +892,21 @@ async fn mem_store() -> MemLogStore {
 
 contract!(mem, mem_store);
 
+#[tokio::test]
+async fn mem_hosts_list_only_their_own_rooms() {
+    a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&MemLogStore::new()).await;
+}
+
+#[tokio::test]
+async fn mem_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+    room_admins_are_granted_once_found_by_key_and_end_with_their_account(&MemLogStore::new()).await;
+}
+
 #[cfg(feature = "pg-tests")]
 mod pg_only {
     use super::*;
     use crate::{OpenError, PgLogStore, World};
+    use sqlx::Connection as _;
 
     fn pool(connections: u32) -> config::Limits {
         config::Limits { db_pool_connections: connections, ..config::Limits::DESIGN }
@@ -464,6 +918,23 @@ mod pg_only {
         )
         .await
         .unwrap()
+    }
+
+    /// Another migrator holding sqlx's advisory lock (a second server starting, a parallel
+    /// test) makes this connect wait longer than the runtime `lock_timeout`; it must still
+    /// connect once the lock is free. Fails when the migrations run under `lock_timeout`.
+    #[tokio::test]
+    async fn a_connect_waits_for_another_migrator_past_the_runtime_lock_timeout() {
+        use sqlx::migrate::Migrate as _;
+        let url = schema().await;
+        let mut holder = sqlx::PgConnection::connect(&url).await.unwrap();
+        holder.lock().await.unwrap();
+        let limits = config::Limits { db_lock_timeout_ms: 100, ..pool(2) };
+        let mut connecting = tokio::spawn(async move { PgLogStore::connect(&url, &limits).await });
+        let waited = tokio::time::timeout(Duration::from_millis(500), &mut connecting).await;
+        assert!(waited.is_err(), "still waiting for the lock, not failed: {waited:?}");
+        holder.unlock().await.unwrap();
+        connecting.await.unwrap().expect("connected once the lock was free");
     }
 
     /// Gate G-DB: a writer stuck inside a transaction while holding the owner row lock must
@@ -506,7 +977,86 @@ mod pg_only {
         hash: &[u8],
         key: &str,
     ) -> Result<String, OpenError> {
-        s.open_room(room, "seed", 1, hash, key, World::V1(b"{}")).await.map(|o| o.key)
+        s.open_room(room, &format!("seed{}", room.0), 1, hash, key, World::V1(b"{}"))
+            .await
+            .map(|o| o.key)
+    }
+
+    #[tokio::test]
+    async fn pg_hosts_list_only_their_own_rooms() {
+        let s = pg_store().await;
+        open(&s, RoomId(11), &[1], "aaaaaaaaaa").await.unwrap();
+        open(&s, RoomId(12), &[2], "bbbbbbbbbb").await.unwrap();
+        open(&s, RoomId(13), &[3], "cccccccccc").await.unwrap();
+        a_host_lists_only_its_own_rooms_and_the_admin_view_lists_all(&s).await;
+    }
+
+    #[tokio::test]
+    async fn pg_room_admins_are_granted_once_found_by_key_and_end_with_their_account() {
+        let s = pg_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+    }
+
+    /// A store that migrated as the schema's owner (the test's own login) and runs as the
+    /// runtime role `config::DB_APP_ROLE`, made here with a login and no other right.
+    async fn restricted_store() -> PgLogStore {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+        const PASSWORD: &str = "restricted-test-only";
+        let url = schema().await;
+        let role = config::DB_APP_ROLE;
+        let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+        // Another test may make the role at the same time: the duplicate is fine.
+        let make = format!(
+            "DO $r$ BEGIN CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(make)).execute(&mut c).await.unwrap();
+        let owner = PgConnectOptions::from_str(&url).unwrap();
+        let runtime = owner.clone().username(role).password(PASSWORD);
+        PgLogStore::connect_with(runtime, Some(owner), &pool(4)).await.unwrap()
+    }
+
+    /// The runtime role does the server's normal work (rooms, accounts, admins) and cannot
+    /// change the schema or the migration history, and is no superuser. Fails if the runtime
+    /// pool logs in as the owner, or the grants cover more than data.
+    #[tokio::test]
+    async fn the_runtime_role_does_normal_work_but_cannot_change_the_schema() {
+        let s = restricted_store().await;
+        open(&s, RoomId(21), &[1], "aaaaaaaaaa").await.unwrap();
+        room_admins_are_granted_once_found_by_key_and_end_with_their_account(&s).await;
+        accounts_are_unique_and_a_login_ends_when_it_expires_or_is_deleted(Arc::new(s)).await;
+    }
+
+    #[tokio::test]
+    async fn the_runtime_role_is_refused_every_schema_change() {
+        let s = restricted_store().await;
+        let pool = s.pool_for_tests();
+        let who: String = sqlx::query_scalar("SELECT current_user").fetch_one(pool).await.unwrap();
+        assert_eq!(who, config::DB_APP_ROLE, "the pool runs as the runtime role");
+        let superuser: bool =
+            sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(!superuser);
+        for ddl in [
+            "CREATE TABLE sneaky (a int)",
+            "DROP TABLE rooms",
+            "DROP TABLE users",
+            "ALTER TABLE users ADD COLUMN x int",
+            "TRUNCATE users",
+            "DELETE FROM _sqlx_migrations",
+            "CREATE SCHEMA sneaky",
+        ] {
+            let e = sqlx::raw_sql(ddl).execute(pool).await.expect_err(ddl);
+            let text = e.to_string();
+            assert!(
+                text.contains("permission denied") || text.contains("must be owner"),
+                "{ddl}: {text}"
+            );
+        }
     }
 
     #[tokio::test]

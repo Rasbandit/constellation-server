@@ -1,4 +1,4 @@
-import { getAdminToken, rejectAdminToken } from './token';
+import { markSignedOut } from './account';
 
 /** What the page needs from a server-sent event stream. */
 export interface StreamHandlers {
@@ -14,8 +14,8 @@ export interface StreamHandlers {
 const RETRY_MS = 2000;
 
 /**
- * An event stream read with `fetch`, because `EventSource` cannot send the `Authorization` header
- * and the token must never go in the URL. Resumes with `Last-Event-ID`; a 401 drops the token.
+ * An event stream read with `fetch` (the session cookie goes along), so it can resume with
+ * `Last-Event-ID`; a 401 marks the page signed out.
  * Returns the function that stops it.
  */
 export function openEventStream(url: string, event: string, h: StreamHandlers): () => void {
@@ -25,11 +25,9 @@ export function openEventStream(url: string, event: string, h: StreamHandlers): 
     while (!abort.signal.aborted) {
       try {
         const headers: Record<string, string> = { Accept: 'text/event-stream' };
-        const token = getAdminToken();
-        if (token) headers.Authorization = `Bearer ${token}`;
         if (lastId) headers['Last-Event-ID'] = lastId;
         const res = await fetch(url, { headers, signal: abort.signal });
-        if (res.status === 401) rejectAdminToken();
+        if (res.status === 401) markSignedOut();
         if (!res.ok || !res.body) return h.onClosed();
         h.onOpen();
         const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();

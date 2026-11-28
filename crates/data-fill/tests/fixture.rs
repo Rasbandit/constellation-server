@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 
-use data_fill::{Instance, Plan, World, fill, validate};
+use data_fill::room::{Seat, fill_room, validate_room};
+use data_fill::{FillError, Instance, Plan, World};
 use serde_json::{Value, json};
 use spec_rng::SpecRng;
 
@@ -198,6 +199,27 @@ fn fill_instance() -> Instance {
     inst
 }
 
+/// The product's fill of one player (a room of one): the item at each location.
+fn fill(
+    (w, plan, inst): (&World, &Plan, &Instance),
+    rng: &mut SpecRng,
+    attempts: u32,
+) -> Result<Vec<Option<u16>>, FillError> {
+    let progression = inst.progression(w);
+    let seat = [Seat { w, plan, progression: &progression }];
+    let filled = fill_room(&seat, rng, attempts)?;
+    Ok(filled.placed[0].iter().map(|g| g.map(|g| g.item)).collect())
+}
+
+/// Play the one player's seed: is the goal reached, and how many existing locations.
+fn validate((w, plan, inst): (&World, &Plan, &Instance), placed: &[Option<u16>]) -> (bool, usize) {
+    let progression = inst.progression(w);
+    let seat = [Seat { w, plan, progression: &progression }];
+    let row = placed.iter().map(|i| i.map(|item| data_fill::Given { to: 0, item })).collect();
+    let (beatable, reached) = validate_room(&seat, &[row]).unwrap();
+    (beatable[0], reached[0])
+}
+
 #[test]
 fn fill_is_beatable_confined_and_deterministic() {
     let w = world(&manifest());
@@ -207,15 +229,12 @@ fn fill_is_beatable_confined_and_deterministic() {
     let well = w.loc("well").unwrap() as usize;
     for seed in 0u8..32 {
         let mut a = SpecRng::from_seed([seed; 32]);
-        let filled = fill(&w, &plan, &mut a, config::FILL_MAX_ATTEMPTS).unwrap();
-        assert_eq!(filled.placed.iter().flatten().count(), 6);
-        assert_eq!(filled.placed[well], Some(charm), "seed {seed}: charm confined to the well");
-        assert_eq!(validate(&w, &plan, &filled.placed), (true, 6), "seed {seed}");
+        let filled = fill((&w, &plan, &inst), &mut a, config::FILL_MAX_ATTEMPTS).unwrap();
+        assert_eq!(filled.iter().flatten().count(), 6);
+        assert_eq!(filled[well], Some(charm), "seed {seed}: charm confined to the well");
+        assert_eq!(validate((&w, &plan, &inst), &filled), (true, 6), "seed {seed}");
         let mut b = SpecRng::from_seed([seed; 32]);
-        assert_eq!(
-            fill(&w, &plan, &mut b, config::FILL_MAX_ATTEMPTS).unwrap().placed,
-            filled.placed
-        );
+        assert_eq!(fill((&w, &plan, &inst), &mut b, config::FILL_MAX_ATTEMPTS).unwrap(), filled);
     }
 }
 
@@ -225,14 +244,14 @@ fn fill_reports_count_mismatch_and_impossible_seeds() {
     let mut inst = fill_instance();
     inst.pool.pop();
     let plan = Plan::new(&w, &inst).unwrap();
-    let err = fill(&w, &plan, &mut SpecRng::from_seed([0; 32]), 3).unwrap_err();
-    assert!(matches!(err, data_fill::FillError::Count { items: 5, locations: 6 }));
+    let err = fill((&w, &plan, &inst), &mut SpecRng::from_seed([0; 32]), 3).unwrap_err();
+    assert!(matches!(err, FillError::Count { items: 5, locations: 6 }));
     // The charm confined to a location that needs the charm cannot be placed.
     let mut inst = fill_instance();
     inst.location_groups = HashMap::from([("flower".to_owned(), "town".to_owned())]);
     let plan = Plan::new(&w, &inst).unwrap();
-    let err = fill(&w, &plan, &mut SpecRng::from_seed([0; 32]), 3).unwrap_err();
-    assert_eq!(err, data_fill::FillError::Stuck { item: "charm".to_owned(), attempts: 3 });
+    let err = fill((&w, &plan, &inst), &mut SpecRng::from_seed([0; 32]), 3).unwrap_err();
+    assert_eq!(err, FillError::Stuck { item: "charm".to_owned(), player: 0, attempts: 3 });
 }
 
 #[test]
@@ -320,6 +339,53 @@ fn a_sum_of_copies_over_items_is_one_group_counter() {
     assert!(gift(&["lamp", "coin", "coin"]));
     assert!(!gift(&["coin", "coin"]));
     assert!(gift(&["coin", "coin", "coin"]));
+}
+
+/// A manifest whose rules hold weighted group sums: a cap, weight 0, the largest weight, an
+/// item named twice (merged past the largest literal) and a sum that merges into one member.
+fn weighted() -> Value {
+    let mut m = manifest();
+    let times = |c: Value, w: i64| json!({"int": ["*", c, w]});
+    let lamp = json!({"int": ["min", {"count": "lamp"}, 1]});
+    let sum = json!({"int": ["+", times(lamp, 5), times(json!({"count": "rope"}), 0),
+                     times(json!({"count": "coin"}), 32_767), times(json!({"count": "coin"}), 32_767),
+                     {"count": "charm"}]});
+    m["regions"][0]["checks"][0]["rule"] = json!({"ge": [sum, 6]});
+    let one = json!({"int": ["+", {"count": "coin"}, times(json!({"count": "coin"}), 2)]});
+    m["regions"][1]["checks"][0]["rule"] = json!({"ge": [one, 3]});
+    m
+}
+
+/// A weighted group decodes to terms that compile back to the same bytes, and solves as
+/// written: a lamp (capped at one, weight 5) and a charm, or one coin, or three coins alone in
+/// the one-member sum.
+#[test]
+fn a_weighted_group_decodes_to_a_manifest_that_compiles_to_the_same_bytes() {
+    let bytes = data_fill::section::compile(&weighted()).unwrap();
+    let w = World::from_package(&bytes).unwrap();
+    let d = data_fill::decode::manifest(&w);
+    assert_eq!(data_fill::section::compile(&d).unwrap(), bytes);
+    let gift = |items: &[&str]| solve(&w, ALL, items).0.contains(&"gift".to_owned());
+    assert!(!gift(&["lamp", "lamp", "rope"]), "the second lamp is capped, rope weighs 0");
+    assert!(gift(&["lamp", "charm"]));
+    assert!(gift(&["coin"]));
+    assert!(!gift(&["charm", "charm"]));
+}
+
+/// The byte-flip check of [`a_damaged_section_is_rejected_before_any_solve`] on a world with a
+/// weights list, so the loader's weights path is flipped too.
+#[test]
+fn a_damaged_weighted_section_is_rejected_before_any_solve() {
+    let bytes = data_fill::section::compile(&weighted()).unwrap();
+    assert!(World::from_package(&bytes).is_ok());
+    for cut in 1..=8 {
+        assert!(World::from_package(&bytes[..bytes.len() - cut]).is_err(), "cut {cut}");
+    }
+    for k in 0..bytes.len() {
+        let mut b = bytes.clone();
+        b[k] ^= 0xff;
+        let _ = World::from_package(&b);
+    }
 }
 
 #[test]

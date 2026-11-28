@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real end-to-end generation through the server's admin API (`just ap-gen-check`): start the
+# Real end-to-end generation through the server's world API (`just ap-gen-check`): start the
 # server with a throwaway --data-dir, upload one apworld and one player yaml, generate in the
 # sandbox with a local Archipelago checkout, and wait for the bundle. Local only.
 #
@@ -18,25 +18,26 @@ work=$(mktemp -d)
 pid=
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$work"' EXIT
 
-token=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-# The header goes to curl from a file, so the token never shows in `ps`.
-printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
+# A throwaway account (the password never shows in `ps`: it goes to curl from a file).
+pw=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+printf '{"username":"check","password":"%s"}' "$pw" >"$work/signup.json"
 mkdir "$work/rooms"
 cp "$root/crates/e2e/fixtures/two-slot.json" "$work/rooms/fixture.json"
-CONSTELLATION_ADMIN_TOKEN=$token CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHON=$python \
+CONSTELLATION_AP_DIR=$ap CONSTELLATION_AP_PYTHON=$python \
     CONSTELLATION_AP_GEN_SCRIPT=$root/tools/ap-gen/ap_gen.py CONSTELLATION_ROOMS_SCAN_MS=200 \
     "${CARGO_TARGET_DIR:-$root/target}/debug/constellation-server" --rooms "$work/rooms" \
     --port 0 --data-dir "$work/data" 2>"$work/log" &
 pid=$!
 for _ in $(seq 100); do
-    # The admin API is on the room's port.
+    # The world API is on the room's port.
     grep -q 'listening addr=' "$work/log" && break
     sleep 0.1
 done
 addr=$(grep -o 'listening addr=[^ ]*' "$work/log" | head -1 | cut -d= -f2)
 [ -n "${addr:-}" ] || { cat "$work/log"; exit 1; }
 
-api() { curl -sS --fail-with-body -H @"$work/auth" "$@"; }
+curl -sS --fail-with-body -c "$work/jar" -X POST --data-binary @"$work/signup.json" "http://$addr/api/signup" >/dev/null
+api() { curl -sS --fail-with-body -b "$work/jar" "$@"; }
 urlname() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$(basename "$1")"; }
 w=$(api -X PUT --data-binary @"$apworld" "http://$addr/api/apworlds?name=$(urlname "$apworld")")
 y=$(api -X PUT --data-binary @"$yaml" "http://$addr/api/yamls?name=$(urlname "$yaml")")

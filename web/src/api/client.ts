@@ -1,6 +1,6 @@
-import { getAdminToken, rejectAdminToken } from './token';
+import { markSignedOut } from './account';
 import { toRoom, type RoomView } from './roomView';
-import { toApWorld, toPlayers, type ApWorldRecord, type YamlRecord } from './uploads';
+import { toApWorld, toManifest, toPlayers, type ApWorldRecord, type ManifestRecord, type YamlRecord } from './uploads';
 import type {
   ApiError,
   AuditEntry,
@@ -35,12 +35,10 @@ async function call<T>(method: string, path: string, opts: { body?: unknown; raw
     headers['Content-Type'] = 'application/json';
     body = JSON.stringify(opts.body);
   }
-  const token = getAdminToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(path, { method, headers, body });
   if (res.status === 401) {
-    rejectAdminToken();
-    throw new HttpError(401, { error: 'The admin token is missing or wrong.' });
+    markSignedOut();
+    throw new HttpError(401, { error: 'Sign in to continue.' });
   }
   const text = await res.text();
   let data: unknown;
@@ -72,7 +70,8 @@ export const liveRooms = adminApi;
 /** `GET /api/worlds/:id` (crates/server/src/worlds.rs). */
 interface WorldStatus {
   id: string;
-  status: 'queued' | 'running' | 'done' | 'failed';
+  /** `stalled`: its server stopped checking in for a while; it may come back, so keep waiting. */
+  status: 'queued' | 'running' | 'stalled' | 'done' | 'failed';
   error?: string;
   seed_name?: string;
   room_key?: string;
@@ -97,7 +96,8 @@ export async function generateWorld(
   if (req.players.length === 0 || req.players.some((p) => !p.yamlId)) {
     throw new Error('Every player needs an uploaded YAML to generate on the server');
   }
-  const body = { apworlds: [...new Set(req.apworlds.map((w) => w.id))], yamls: [...new Set(req.players.map((p) => p.yamlId))] };
+  const yamls = [...new Set(req.players.map((p) => p.yamlId))];
+  const body = req.manifest ? { manifest: req.manifest.id, yamls } : { apworlds: [...new Set(req.apworlds.map((w) => w.id))], yamls };
   const job = await call<{ id: string }>('POST', '/api/worlds', { body });
   for (let done = 0; done < ROOM_POLLS; ) {
     const s = await call<WorldStatus>('GET', `/api/worlds/${enc(job.id)}`);
@@ -109,15 +109,58 @@ export async function generateWorld(
   throw new Error('The world was generated but the server never hosted it; start the server with --rooms');
 }
 
+/** A row of `GET /api/rooms` (crates/server/src/worlds.rs `list_rooms`). `id` is the world, null for a room made before accounts. */
+export interface OwnedRoom {
+  id: string | null;
+  name: string;
+  room_key: string;
+  owner: string | null;
+  age_secs: number;
+  /** The caller's role on this room. */
+  role: 'owner' | 'admin';
+}
+
+/** `GET /api/rooms/:key/admins`: who may manage a room, and the caller's own role on it. */
+export interface RoomAdmins {
+  owner: string | null;
+  admins: string[];
+  role: 'owner' | 'admin';
+}
+
+/** The list row as the room list shows it: a live room has no player counts or state to show yet. */
+export function ownedRoomToSummary(r: OwnedRoom, now = Date.now()): RoomSummary {
+  return {
+    id: r.id ?? r.room_key,
+    name: r.name,
+    state: 'running',
+    createdAt: new Date(now - r.age_secs * 1000).toISOString(),
+    slots: 0,
+    slotsOnline: 0,
+    slotsDone: 0,
+    games: [],
+    code: null,
+  };
+}
+
 export const api = {
   games: () => call<{ builtin: string[]; known: string[] }>('GET', '/api/games'),
   catalog: (game: string) => call<GameCatalog>('GET', `/api/games/${enc(game)}`),
   /** Inspected and stored by the server; the same file again returns the stored one. */
   uploadApWorld: (f: File) => call<ApWorldRecord>('PUT', `/api/apworlds?name=${enc(f.name)}`, { raw: f }).then(toApWorld),
+  /** Checked by the server's engine; the game and version are read from the file. */
+  uploadManifest: (f: File) => call<ManifestRecord>('PUT', `/api/manifests?name=${enc(f.name)}`, { raw: f }).then(toManifest),
   /** One player per document in the file. */
   uploadPlayerFile: (f: File) => call<YamlRecord>('PUT', `/api/yamls?name=${enc(f.name)}`, { raw: f }).then(toPlayers),
 
-  rooms: () => call<RoomSummary[]>('GET', '/api/rooms'),
+  /** Live: the rooms the signed-in account owns or administers. */
+  rooms: (): Promise<RoomSummary[]> =>
+    adminApi ? call<OwnedRoom[]>('GET', '/api/rooms').then((rs) => rs.map((r) => ownedRoomToSummary(r))) : call<RoomSummary[]>('GET', '/api/rooms'),
+  /** The admins of a room by its key; 404 for anyone with no role on it. Removing yourself answers nothing (204). */
+  roomAdmins: (key: string) => ({
+    list: () => call<RoomAdmins>('GET', `/api/rooms/${enc(key)}/admins`),
+    add: (name: string) => call<RoomAdmins>('PUT', `/api/rooms/${enc(key)}/admins/${enc(name)}`),
+    remove: (name: string) => call<RoomAdmins | undefined>('DELETE', `/api/rooms/${enc(key)}/admins/${enc(name)}`),
+  }),
   resolveCode: (code: string) => call<{ roomId: string }>('GET', `/api/codes/${enc(code)}`),
   /** With the admin API, the server generates and hosts the world, and the room is that world. */
   createRoom: (req: CreateRoomRequest): Promise<Room> =>

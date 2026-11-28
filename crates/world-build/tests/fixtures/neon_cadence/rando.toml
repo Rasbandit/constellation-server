@@ -1,0 +1,7 @@
+# What a world is, beside its logic (design doc 19 section 2). `rando pack` reads it.
+[world]
+name = "neon_cadence"
+version = "1.0.0"
+authors = ["Constellation contributors"]
+license = "LicenseRef-PolyForm-Strict-1.0.0"
+description = "Neon Cadence: trial world 2 of doc 18. Invented for the build tool's tests."

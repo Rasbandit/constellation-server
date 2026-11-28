@@ -114,6 +114,10 @@ input[type='range'] { width: 100%; accent-color: var(--accent); }
 .topnav { display: flex; gap: 4px; }
 .topnav a { padding: 6px 12px; border-radius: 8px; color: var(--muted); }
 .topnav a.active { background: var(--accent-soft); color: var(--accent); }
+.user-menu { margin: 0 0 0 auto; display: flex; gap: 8px; align-items: center; }
+.avatar { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--accent-text); font-weight: 700; }
+.menu { inset: auto; top: 56px; right: 24px; margin: 0; padding: 12px; min-width: 200px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; }
+.menu p { margin: 0 0 8px; }
 .topnav a:hover { text-decoration: none; color: var(--text); }
 .page { max-width: 1240px; margin: 0 auto; padding: 24px 16px 64px; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }

@@ -34,6 +34,37 @@ pub struct MemLogStore {
     /// Blobs (game packages) and room seeds: write once, like the tables.
     packages: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
     seeds: Mutex<BTreeMap<RoomId, Vec<u8>>>,
+    manifests: Mutex<BTreeMap<BlobKey, (crate::ManifestRecord, Vec<u8>)>>,
+    /// (manifest id, engine) to the blob key of the prepared world.
+    prepared: Mutex<BTreeMap<(BlobKey, String), BlobKey>>,
+    uploads: Mutex<BTreeMap<(crate::UploadKind, BlobKey), Upload>>,
+    jobs: Mutex<BTreeMap<String, Job>>,
+    users: Mutex<BTreeMap<String, String>>,
+    /// Login (by token hash) to its account and its end.
+    sessions: Mutex<BTreeMap<[u8; 32], (String, std::time::Instant)>>,
+    /// Hosted rooms: the record and when it was made.
+    owned: Mutex<BTreeMap<RoomId, (crate::OwnedRoom, std::time::Instant)>>,
+    /// Room admins: (room key, account) to who granted it.
+    admins: Mutex<BTreeMap<(String, String), String>>,
+    /// Catalogue games by key, their owners ((game key, account) to who granted it), and
+    /// every game's versions in upload order with their game's key.
+    games: Mutex<BTreeMap<String, crate::Game>>,
+    game_owners: Mutex<BTreeMap<(String, String), String>>,
+    versions: Mutex<Vec<(String, crate::GameVersion)>>,
+    /// How many of the next `job_put`s fail, as a store that is down for a while does.
+    job_put_failures: Mutex<usize>,
+}
+
+/// An upload's record and file.
+type Upload = (crate::UploadRecord, Vec<u8>);
+
+/// A job's state, status and when it was last marked alive.
+type Job = (crate::JobState, String, std::time::Instant);
+
+/// Queued or running, and not marked alive for `older_than`.
+fn stale(job: &Job, older_than: core::time::Duration) -> bool {
+    use crate::JobState::{Queued, Running};
+    matches!(job.0, Queued | Running) && job.2.elapsed() >= older_than
 }
 
 /// Insert unless present, under the lock; what is stored after.
@@ -50,7 +81,7 @@ pub(crate) fn same_or_refused(stored: &[u8], seed: &[u8]) -> Result<(), StoreErr
     }
 }
 
-fn get<K: Ord>(m: &Mutex<BTreeMap<K, Vec<u8>>>, k: &K) -> Option<Vec<u8>> {
+fn get<K: Ord, V: Clone>(m: &Mutex<BTreeMap<K, V>>, k: &K) -> Option<V> {
     m.lock().unwrap_or_else(PoisonError::into_inner).get(k).cloned()
 }
 
@@ -223,6 +254,613 @@ impl crate::raw::RawBlobs for MemLogStore {
         key: &BlobKey,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
         ready(Ok(get(&self.packages, key)))
+    }
+}
+
+impl MemLogStore {
+    /// Damage a stored blob's bytes, as a torn write would, so a test can see it refused and
+    /// healed.
+    pub fn tear_blob_for_tests(&self, key: &BlobKey) {
+        let mut packages = self.packages.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(bytes) = packages.get_mut(key) {
+            bytes.push(0);
+        }
+    }
+
+    /// Damage a stored manifest's bytes, as a torn write would, so a test can see it healed.
+    pub fn tear_manifest_for_tests(&self, id: &BlobKey) {
+        let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(id) {
+            bytes.push(0);
+        }
+    }
+}
+
+impl crate::ManifestStore for MemLogStore {
+    fn manifest_put(
+        &self,
+        record: &crate::ManifestRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let ok = crate::blob_key(bytes) == record.id;
+        if ok {
+            let mut m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+            let row = m.entry(record.id).or_insert_with(|| (record.clone(), bytes.to_vec()));
+            // A torn row is healed, as on Postgres.
+            if crate::is_torn(&row.1, &record.id) {
+                bytes.clone_into(&mut row.1);
+            }
+        }
+        ready(if ok {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("a manifest put under an id it does not hash to".into()))
+        })
+    }
+
+    fn manifest_record(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<crate::ManifestRecord>, StoreError>> + Send {
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(id).map(|(r, _)| r.clone())))
+    }
+
+    fn manifest_bytes(
+        &self,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(match m.get(id) {
+            Some((_, b)) if crate::blob_key(b) != *id => {
+                Err(StoreError::Corrupt("a stored manifest does not match its id".into()))
+            }
+            found => Ok(found.map(|(_, b)| b.clone())),
+        })
+    }
+
+    fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut m = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
+        m.insert((*id, engine.to_owned()), *package);
+        ready(Ok(()))
+    }
+
+    fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> impl Future<Output = Result<Option<BlobKey>, StoreError>> + Send {
+        ready(Ok(get(&self.prepared, &(*id, engine.to_owned()))))
+    }
+
+    fn manifest_list(
+        &self,
+        game: Option<&str>,
+        after: Option<&BlobKey>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<crate::ManifestRecord>, StoreError>> + Send {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let m = self.manifests.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = after.map_or(Unbounded, |a| Excluded(*a));
+        let page = m
+            .range((from, Unbounded))
+            .map(|(_, (r, _))| r)
+            .filter(|r| game.is_none_or(|g| r.game == g))
+            .take(limit)
+            .cloned()
+            .collect();
+        ready(Ok(page))
+    }
+}
+
+impl MemLogStore {
+    /// Damage a stored upload's bytes, as a torn write would, so a test can see the read
+    /// check and the heal.
+    pub fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
+        let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, bytes)) = m.get_mut(&(kind, *id)) {
+            bytes.push(0);
+        }
+    }
+}
+
+impl crate::UploadStore for MemLogStore {
+    fn upload_put(
+        &self,
+        record: &crate::UploadRecord,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let ok = crate::blob_key(bytes) == record.id;
+        if ok {
+            let mut m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+            let row = m
+                .entry((record.kind, record.id))
+                .or_insert_with(|| (record.clone(), bytes.to_vec()));
+            // A torn row is healed, as on Postgres.
+            if crate::is_torn(&row.1, &record.id) {
+                bytes.clone_into(&mut row.1);
+            }
+        }
+        ready(if ok {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt("an upload put under an id it does not hash to".into()))
+        })
+    }
+
+    fn upload_meta(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).map(|(r, _)| r.meta.clone())))
+    }
+
+    fn upload_bytes(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(crate::checked_upload(m.get(&(kind, *id)).map(|(_, b)| b.clone()), id))
+    }
+
+    fn upload_intact(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(m.get(&(kind, *id)).is_some_and(|(_, b)| !crate::is_torn(b, id))))
+    }
+
+    fn upload_list(
+        &self,
+        kind: crate::UploadKind,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let m = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        let all = m.iter().filter(|((k, _), _)| *k == kind).map(|(_, (r, _))| r.meta.clone());
+        ready(Ok(all.collect()))
+    }
+}
+
+impl MemLogStore {
+    /// Fail the next `n` `job_put`s with [`StoreError::Unavailable`].
+    pub fn fail_job_puts_for_tests(&self, n: usize) {
+        *self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner) = n;
+    }
+
+    /// Mark job `id` as last alive `by` ago, as if its process stopped then.
+    pub fn age_job_for_tests(&self, id: &str, by: core::time::Duration) {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id) {
+            job.2 = job.2.checked_sub(by).unwrap_or(job.2);
+        }
+    }
+}
+
+impl crate::JobStore for MemLogStore {
+    fn job_put(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut failures = self.job_put_failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let down = failures.checked_sub(1).inspect(|n| *failures = *n).is_some();
+        drop(failures);
+        if down {
+            return ready(Err(StoreError::Unavailable));
+        }
+        let job = (state, status.to_owned(), std::time::Instant::now());
+        self.jobs.lock().unwrap_or_else(PoisonError::into_inner).insert(id.to_owned(), job);
+        ready(Ok(()))
+    }
+
+    fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let vacant = !jobs.contains_key(id);
+        if vacant {
+            jobs.insert(id.to_owned(), (state, status.to_owned(), std::time::Instant::now()));
+        }
+        ready(Ok(vacant))
+    }
+
+    fn job_status(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<(String, core::time::Duration)>, StoreError>> + Send
+    {
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(jobs.get(id).map(|j| (j.1.clone(), j.2.elapsed()))))
+    }
+
+    fn job_touch(&self, id: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+        use crate::JobState::{Queued, Running};
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(id).filter(|j| matches!(j.0, Queued | Running)) {
+            job.2 = std::time::Instant::now();
+        }
+        ready(Ok(()))
+    }
+
+    fn job_fail_all_stale(
+        &self,
+        older_than: core::time::Duration,
+        error: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut failed = Vec::new();
+        for (id, job) in jobs.iter_mut().filter(|(_, j)| stale(j, older_than)) {
+            let status = crate::failed_status(&job.1, error);
+            *job = (crate::JobState::Failed, status, std::time::Instant::now());
+            failed.push(id.clone());
+        }
+        ready(Ok(failed))
+    }
+
+    fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: core::time::Duration,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let failed = match jobs.get_mut(id).filter(|j| stale(j, older_than)) {
+            Some(job) => {
+                *job = (crate::JobState::Failed, status.to_owned(), std::time::Instant::now());
+                true
+            }
+            None => false,
+        };
+        ready(Ok(failed))
+    }
+}
+
+impl crate::AccountStore for MemLogStore {
+    fn user_create(
+        &self,
+        name: &str,
+        hash: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
+        let vacant = !users.contains_key(name);
+        if vacant {
+            users.insert(name.to_owned(), hash.to_owned());
+        }
+        ready(Ok(vacant))
+    }
+
+    fn user_hash(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        ready(Ok(self.users.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()))
+    }
+
+    fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: core::time::Duration,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let end = std::time::Instant::now() + ttl;
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        sessions.retain(|_, (_, end)| *end > now);
+        sessions.insert(*token_hash, (name.to_owned(), end));
+        ready(Ok(()))
+    }
+
+    fn session_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send {
+        let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let live = sessions.get(token_hash).filter(|(_, end)| *end > std::time::Instant::now());
+        ready(Ok(live.map(|(name, _)| name.clone())))
+    }
+
+    fn session_delete(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner).remove(token_hash);
+        ready(Ok(()))
+    }
+
+    fn room_claim(
+        &self,
+        room: RoomId,
+        owner: Option<&str>,
+        room_info: &crate::OwnedRoom,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send {
+        let mut record = room_info.clone();
+        record.owner = owner.map(str::to_owned);
+        let mut owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        owned.entry(room).or_insert((record, std::time::Instant::now()));
+        ready(Ok(()))
+    }
+
+    fn rooms_owned(
+        &self,
+        owner: Option<&str>,
+    ) -> impl Future<Output = Result<Vec<crate::OwnedRoom>, StoreError>> + Send {
+        ready(Ok(self.listed(|r| owner.is_none_or(|o| r.owner.as_deref() == Some(o)))))
+    }
+
+    fn room_by_key(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<crate::OwnedRoom>, StoreError>> + Send {
+        ready(Ok(self.listed(|r| r.room_key == key).pop()))
+    }
+
+    fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> impl Future<Output = Result<Vec<crate::OwnedRoom>, StoreError>> + Send {
+        let admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = |r: &crate::OwnedRoom| (r.room_key.clone(), username.to_owned());
+        ready(Ok(self.listed(|r| admins.contains_key(&key(r)))))
+    }
+
+    fn room_admins(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(admins.keys().filter(|(k, _)| k == key).map(|(_, u)| u.clone()).collect()))
+    }
+
+    fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let known =
+            self.users.lock().unwrap_or_else(PoisonError::into_inner).contains_key(username)
+                && !self.listed(|r| r.room_key == key).is_empty();
+        if known {
+            let mut admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+            admins
+                .entry((key.to_owned(), username.to_owned()))
+                .or_insert_with(|| granted_by.to_owned());
+        }
+        ready(Ok(known))
+    }
+
+    fn room_admin_remove(
+        &self,
+        key: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let mut admins = self.admins.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(admins.remove(&(key.to_owned(), username.to_owned())).is_some()))
+    }
+
+    fn user_delete(&self, name: &str) -> impl Future<Output = Result<(), StoreError>> + Send {
+        self.users.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner).retain(|_, (u, _)| u != name);
+        self.admins.lock().unwrap_or_else(PoisonError::into_inner).retain(|(_, u), _| u != name);
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        owners.retain(|(_, u), _| u != name);
+        ready(Ok(()))
+    }
+}
+
+impl crate::CatalogueStore for MemLogStore {
+    fn game_create(
+        &self,
+        game: &crate::Game,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        // Locked in game_owner_add's order: users, games, owners.
+        let users = self.users.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = crate::game_key(&game.name);
+        let vacant = !games.contains_key(&key);
+        if vacant {
+            if users.contains_key(&game.created_by) {
+                let by = game.created_by.clone();
+                owners.insert((key.clone(), by.clone()), by);
+            }
+            games.insert(key, game.clone());
+        }
+        ready(Ok(vacant))
+    }
+
+    fn game_get(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<crate::Game>, StoreError>> + Send {
+        let games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        ready(Ok(games.get(&crate::game_key(name)).cloned()))
+    }
+
+    fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<crate::Game>, StoreError>> + Send {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let games = self.games.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = after.map_or(Unbounded, |a| Excluded(crate::game_key(a)));
+        let page = games.range((from, Unbounded)).take(limit).map(|(_, g)| g.clone()).collect();
+        ready(Ok(page))
+    }
+
+    fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let known =
+            self.users.lock().unwrap_or_else(PoisonError::into_inner).contains_key(username)
+                && self.games.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&key);
+        if known {
+            let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+            owners.entry((key, username.to_owned())).or_insert_with(|| granted_by.to_owned());
+        }
+        ready(Ok(known))
+    }
+
+    fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> impl Future<Output = Result<crate::OwnerRemoved, StoreError>> + Send {
+        use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+        let key = crate::game_key(game);
+        let mut owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let one = (key.clone(), username.to_owned());
+        let done = if !owners.contains_key(&one) {
+            NotOwner
+        } else if owners.keys().filter(|(g, _)| *g == key).count() == 1 {
+            LastOwner
+        } else {
+            owners.remove(&one);
+            Removed
+        };
+        ready(Ok(done))
+    }
+
+    fn game_owners(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<String>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let owners = self.game_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let names = owners.keys().filter(|(g, _)| *g == key).map(|(_, u)| u.clone()).collect();
+        ready(Ok(names))
+    }
+
+    fn version_add(
+        &self,
+        version: &crate::NewVersion,
+    ) -> impl Future<Output = Result<crate::VersionAdded, StoreError>> + Send {
+        use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+        let key = crate::game_key(&version.game);
+        let game = self.games.lock().unwrap_or_else(PoisonError::into_inner).get(&key).cloned();
+        let upload = (crate::UploadKind::Apworld, version.apworld);
+        let uploaded =
+            self.uploads.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&upload);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let added = match game {
+            None => NoGame,
+            Some(_) if !uploaded => NoUpload,
+            Some(_) if versions.iter().any(|(g, v)| *g == key && v.version == version.version) => {
+                Taken
+            }
+            Some(game) => {
+                let new = crate::GameVersion {
+                    game: game.name,
+                    version: version.version.clone(),
+                    note: version.note.clone(),
+                    apworld: version.apworld,
+                    generator: version.generator.clone(),
+                    state: crate::VersionState::Checking,
+                    error: None,
+                    scan: None,
+                };
+                versions.push((key, new));
+                Added
+            }
+        };
+        ready(Ok(added))
+    }
+
+    fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: crate::VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter_mut().find(|(g, v)| {
+            *g == key && v.version == version && v.state != crate::VersionState::Withdrawn
+        });
+        let set = found.map(|(_, v)| {
+            v.state = state;
+            generator.clone_into(&mut v.generator);
+            v.error = error.map(str::to_owned);
+        });
+        ready(Ok(set.is_some()))
+    }
+
+    fn versions(
+        &self,
+        game: &str,
+    ) -> impl Future<Output = Result<Vec<crate::GameVersion>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter().rev().filter(|(g, _)| *g == key).map(|(_, v)| v.clone());
+        ready(Ok(found.collect()))
+    }
+
+    fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> impl Future<Output = Result<Option<crate::GameVersion>, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let latest = versions.iter().rev().find(|(g, v)| {
+            *g == key && v.state == crate::VersionState::Live && v.generator == generator
+        });
+        ready(Ok(latest.map(|(_, v)| v.clone())))
+    }
+
+    fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let key = crate::game_key(game);
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = versions.iter_mut().find(|(g, v)| *g == key && v.version == version);
+        let set = found.map(|(_, v)| v.scan = Some(scan.to_owned()));
+        ready(Ok(set.is_some()))
+    }
+
+    fn versions_checking(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::GameVersion>, StoreError>> + Send {
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        let checking = versions.iter().filter(|(_, v)| v.state == crate::VersionState::Checking);
+        ready(Ok(checking.map(|(_, v)| v.clone()).collect()))
+    }
+}
+
+impl MemLogStore {
+    /// The hosted rooms `keep` accepts, newest first.
+    fn listed(&self, keep: impl Fn(&crate::OwnedRoom) -> bool) -> Vec<crate::OwnedRoom> {
+        let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut rooms: Vec<_> = owned
+            .values()
+            .filter(|(r, _)| keep(r))
+            .map(|(r, made)| crate::OwnedRoom { age_secs: made.elapsed().as_secs(), ..r.clone() })
+            .collect();
+        rooms.sort_by_key(|r| r.age_secs);
+        rooms
     }
 }
 

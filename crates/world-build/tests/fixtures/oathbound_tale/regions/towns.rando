@@ -1,0 +1,56 @@
+# The four towns. Each has an inn, a quest or two, and a shop.
+use items
+use logic
+
+table town(key: name) {
+  millbrook
+  saltmere
+  cragholm
+  highmarch
+}
+
+# A shop is a room of its town with `shop_slots` shelves, each a check. With `safe_shops` on,
+# no shelf holds progression.
+for t in town {
+  region {t.key}_shop {
+    for s in 1..5 where s <= opt.shop_slots {
+      check {t.key}_shop_{s} no_progression opt.safe_shops
+    }
+    exit {t.key}
+  }
+}
+
+region millbrook {
+  check millbrook_inn_chest
+  check elder_request
+  check locked_cellar: can_pick_locks
+  exit millbrook_shop
+  exit west_fields
+}
+
+region saltmere {
+  check saltmere_inn_chest
+  check harbor_master: has(ferry_pass)
+  check fishwife_errand
+  exit saltmere_shop
+  exit west_fields
+  exit salt_coast
+  exit lighthouse_steps: has(skiff)
+}
+
+region cragholm {
+  check cragholm_inn_chest
+  check smith_commission: rank(2)
+  exit cragholm_shop
+  exit frost_pass
+  exit mine_entrance: has(miners_lamp)
+}
+
+region highmarch {
+  check highmarch_inn_chest
+  check council_audience: party(2) and can_read_script
+  check treasury_vault: can_pick_locks and rank(3)
+  exit highmarch_shop
+  exit ashen_road
+  exit keep_gate: has(war_writ) and party(opt.party_needed)
+}

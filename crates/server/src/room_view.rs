@@ -113,7 +113,8 @@ async fn entries(
 /// The room's events as server-sent events: durable ones carry their room `seq` as the SSE id,
 /// joins, leaves, chat and resets carry none. A viewer that falls behind is resubscribed from
 /// its last durable event; one that resumes past the head (the room restarted) or more than
-/// `cap` events back gets a reset and the newest `cap` events.
+/// `cap` events back gets a reset and the newest `cap` events. The stream ends when `until`
+/// completes (the viewer lost access).
 ///
 /// # Errors
 /// When the room task has stopped.
@@ -122,9 +123,10 @@ pub(crate) async fn events(
     held: Held,
     after: Seq,
     cap: u64,
+    until: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Response, RoomError> {
     use futures_util::StreamExt;
-    let stream = entries(room, after, cap, Some(held)).await?.map(|(id, v)| {
+    let stream = entries(room, after, cap, Some(held)).await?.take_until(until).map(|(id, v)| {
         let e = SseEvent::default().data(v.to_string());
         Ok::<_, Infallible>(match id {
             Some(id) => e.id(id.to_string()),

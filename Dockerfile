@@ -1,6 +1,6 @@
 # Room server, the web UI it serves on the same port (--web-dir), and the upload and generation API
 # (--data-dir): python, bubblewrap and the generator checkout. GEN_REPO_URL and GEN_REPO_REF are required build args (docs/container.md).
-# The rust-toolchain.toml channel is `stable`, so the builder image tracks stable too.
+# The builder image matches the Rust version pinned in rust-toolchain.toml; bump both together.
 # The web UI: built from the lockfile only, then compressed once here so the server never has to.
 # Only /web/dist reaches the runtime image (no bun, no node_modules). The manifest and lockfile are
 # copied first so the dependency layer is cached until they change.
@@ -9,11 +9,11 @@ WORKDIR /web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web/ ./
-# The server answers /api through an operator proxy (docs/container.md), so the build calls it.
+# The server answers /api on its own port (docs/container.md), so the build calls it.
 ENV CONSTELLATION_WEB_ADMIN_API=1
 RUN bun --bun run build && bun scripts/precompress.mjs
 
-FROM rust:1-bookworm AS build
+FROM rust:1.100.0-bookworm AS build
 WORKDIR /src
 # Only what cargo reads: the web/ folder never reaches this stage, so a web-only edit leaves this
 # layer and the cargo build cached (and the other way round for the web stage).

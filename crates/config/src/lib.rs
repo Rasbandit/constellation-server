@@ -60,6 +60,16 @@ pub struct Limits {
     /// `CONSTELLATION_ROOM_TOUCH_SECS`). A room leaving memory, and a clean stop, write it
     /// at once.
     pub room_touch_secs: u64,
+    /// A room that fails to load, or whose task ends within `room_healthy_secs` of its load,
+    /// waits this long before it loads again, doubled for each such failure in a row up to
+    /// `room_retry_max_ms` (#64). Doc 01 D1.7's reconnect backoff numbers: 1 s, then
+    /// doubling, at most 60 s, reset after 30 s healthy (`CONSTELLATION_ROOM_RETRY_FIRST_MS`).
+    pub room_retry_first_ms: u64,
+    /// The longest wait between loads of a failing room (`CONSTELLATION_ROOM_RETRY_MAX_MS`).
+    pub room_retry_max_ms: u64,
+    /// A room in memory this long is healthy: its failures in a row are forgotten
+    /// (`CONSTELLATION_ROOM_HEALTHY_SECS`).
+    pub room_healthy_secs: u64,
     /// Draws of a new room key before a new room gives up until the next scan; each draw
     /// collides with an existing key only with odds of about one in 2^50 per stored room.
     pub room_key_draws: usize,
@@ -90,6 +100,9 @@ pub struct Limits {
     /// Room view streams (admin API, server-sent events) open at once per process; more get
     /// HTTP 503.
     pub view_streams: usize,
+    /// How often an open room view stream checks that its account still has a role on the room
+    /// (a removed admin or deleted account loses the stream within this long; design value).
+    pub view_access_recheck_ms: u64,
     /// A socket that has not connected to a slot within this long is closed
     /// (`CONSTELLATION_CONNECT_TIMEOUT_MS`).
     pub connect_timeout_ms: u64,
@@ -144,11 +157,32 @@ pub struct Limits {
     pub hint_burst: u32,
     /// Refill of that bucket, thousandths per second (1000 = 1 per second).
     pub hint_refill_milli_per_sec: u32,
-    /// Wrong admin tokens one client address may send in a burst; more get HTTP 429 until the
-    /// bucket refills (design value). A right token is never counted.
-    pub admin_auth_fail_burst: u32,
+    /// Shortest account password, in characters (design value; NIST SP 800-63B says at least 8).
+    pub password_min_chars: usize,
+    /// Longest account password, in bytes: argon2 hashes all of it, so it is capped (design value).
+    pub password_max_bytes: usize,
+    /// Shortest account name, in characters (design value).
+    pub account_name_min_chars: usize,
+    /// Longest account name, in bytes (design value).
+    pub account_name_max_bytes: usize,
+    /// How long a login lasts without another one, seconds (design value: 14 days).
+    pub session_ttl_secs: u64,
+    /// Failed logins one client address may make in a burst; more get HTTP 429 until the bucket
+    /// refills (design value). A good login is never counted.
+    pub login_fail_burst: u32,
     /// Refill of that bucket, thousandths per second (100 = one every 10 s).
-    pub admin_auth_fail_refill_milli_per_sec: u32,
+    pub login_fail_refill_milli_per_sec: u32,
+    /// Passwords hashed or checked at once (design value); more get HTTP 503. Each is a core and
+    /// ~19 MiB, and the per-address counts only apply once the work is done.
+    pub password_hash_parallel: usize,
+    /// Whether anyone may make an account (`CONSTELLATION_SIGNUP=open|closed`, default open).
+    /// Closed: the sign-up page and `POST /api/signup` refuse; existing accounts still log in.
+    pub signup_open: bool,
+    /// Accounts one client address may make in a burst; more get HTTP 429 until the bucket
+    /// refills (design value).
+    pub signup_burst: u32,
+    /// Refill of that bucket, thousandths per second (10 = one every 100 s).
+    pub signup_refill_milli_per_sec: u32,
     /// Largest `.apworld` upload, bytes (design value: real worlds are a few MB; a few bundled
     /// ones are tens of MB).
     pub apworld_max_bytes: usize,
@@ -158,11 +192,133 @@ pub struct Limits {
     pub apworld_max_entries: u64,
     /// Largest player `.yaml` upload, bytes (design value: real ones are a few KB).
     pub yaml_max_bytes: usize,
+    /// Largest world manifest upload, bytes (design value: the large test world is 830 KB).
+    pub manifest_max_bytes: usize,
+    /// Largest `rando.toml`, bytes (design doc 19 section 2.2, design value: a full one is
+    /// under 1 KiB).
+    pub world_toml_max_bytes: usize,
+    /// Longest `rando.toml` `name`, bytes (doc 19 section 2.3, design value).
+    pub world_name_max_bytes: usize,
+    /// Longest `rando.toml` `version`, bytes (doc 19 section 2.3, design value).
+    pub world_version_max_bytes: usize,
+    /// Most `authors` in `rando.toml` (doc 19 section 2.3, design value).
+    pub world_authors_max: usize,
+    /// Longest author, characters (doc 19 section 2.3, design value).
+    pub world_author_max_chars: usize,
+    /// Longest `description`, characters (doc 19 section 2.3, design value).
+    pub world_description_max_chars: usize,
+    /// Longest `license` expression, bytes (doc 19 section 2.3, design value).
+    pub world_license_max_bytes: usize,
+    /// Longest `homepage` or `repository` URL, bytes (doc 19 section 2.3, design value).
+    pub world_url_max_bytes: usize,
+    /// Most files `[assets] files` may list (doc 19 section 2.3, design value).
+    pub world_assets_max: usize,
+    /// Largest asset file, bytes (doc 19 section 2.3, design value).
+    pub world_asset_max_bytes: usize,
+    /// Largest sum of a world's assets, bytes (doc 19 section 2.3, design value).
+    pub world_assets_max_bytes: usize,
+    /// Largest icon, bytes (doc 19 section 2.3, design value).
+    pub world_icon_max_bytes: usize,
+    /// Largest `source/` of a world package, all files together, bytes (doc 19 section 5.2,
+    /// design value: 256 files at the per-file cap would be 2 GiB). `rando pack` holds to the
+    /// package caps too, so it never writes a package the server refuses for size.
+    pub package_max_source_bytes: usize,
+    /// Largest world package, bytes (doc 19 section 5.2, design value: 8 MiB manifest, 16 MiB
+    /// source and 16 MiB assets).
+    pub package_max_bytes: usize,
+    /// Most entries in a world package (doc 19 section 5.2, design value: 256 modules, 64
+    /// assets and the fixed entries).
+    pub package_max_entries: usize,
+    /// Longest entry path in a world package, bytes (doc 19 section 5.2, design value).
+    pub package_max_path_bytes: usize,
+    /// Largest `settings.json` in a world package, bytes (doc 20 section 5, a design value,
+    /// not derived: it repeats the manifest's names and adds labels).
+    pub package_max_settings_bytes: usize,
+    /// Bytes of manifests the server keeps in memory for generation (least recently used go
+    /// first); the database holds every one (design value).
+    pub manifest_cache_bytes: usize,
+    /// Most records one listing page returns, whatever the caller asks (design value).
+    pub list_page_max: usize,
+    /// Longest catalogue game name, in bytes (design value: real game names are under 60).
+    pub catalogue_name_max_bytes: usize,
+    /// Longest catalogue game description, in bytes (design value).
+    pub catalogue_description_max_bytes: usize,
+    /// Longest catalogue version number, in bytes (design value).
+    pub catalogue_version_max_bytes: usize,
+    /// Longest catalogue version note ("what changed"), in bytes (design value).
+    pub catalogue_note_max_bytes: usize,
+    /// Test seeds a catalogue version must generate without an error before it goes live, each
+    /// with a random seed and a default player (design value, agreed in #189: a real world took
+    /// about 22 s, so 20 take about 7 minutes one at a time).
+    pub catalogue_check_seeds: usize,
+    /// Test seeds generating or waiting to, server-wide. Each also waits its turn for a
+    /// generation slot (`gen_concurrency`) in the same line as players, so a player is behind
+    /// at most this many; at most `gen_concurrency` (design value).
+    pub catalogue_check_concurrency: usize,
+    /// Manifest checks (a child process each) running at once; more are refused as busy.
+    pub manifest_check_concurrency: usize,
+    /// Address-space cap of a fill or manifest check child process, bytes (design value).
+    pub fill_memory_bytes: u64,
+    /// Process and thread cap of a fill or manifest check child process. The system counts every
+    /// task of the server's user against it, so it is a brake on runaway spawning, not a tight
+    /// bound; 0 leaves it off (design value).
+    pub fill_max_processes: u64,
+    /// CPU-seconds cap of a fill or manifest check child process (design value).
+    pub fill_cpu_secs: u64,
+    /// Wall-clock limit of one fill child process, after which it is killed (design value).
+    pub fill_timeout_ms: u64,
+    /// Fill worker processes that stay up and take one fill job after another
+    /// (`server::pool`). 0, the default, is no pool: each fill runs in a process of its own.
+    /// With a pool, a fill needs a worker, so there must be one for every generation that may
+    /// run at once: the valid settings are 0, or `gen_concurrency` and up
+    /// ([`Limits::check`]; workers past `gen_concurrency` are never started). One worker is
+    /// one core (a fill runs on one thread). `CONSTELLATION_FILL_POOL_WORKERS`.
+    /// Each worker runs under the same caps as a fill child process, and a job past
+    /// `fill_timeout_ms` ends its worker.
+    pub fill_pool_workers: usize,
+    /// Fill jobs a pooled worker takes before it is replaced by a fresh process (design
+    /// value, not measured).
+    pub fill_worker_jobs: usize,
+    /// Most memory the loaded worlds one pooled worker keeps between jobs may hold
+    /// ([`PREPARED_CACHE_BYTES`]).
+    pub fill_worker_cache_bytes: usize,
+    /// A pooled worker whose address space after a job is over this share of
+    /// `fill_memory_bytes`, in percent, is replaced by a fresh process: what earlier fills
+    /// left allocated must leave the next job at least the rest of the cap (design value).
+    pub fill_worker_recycle_percent: u64,
+    /// Generations running at once (legacy and manifest worlds alike; the cap #77 names).
+    pub gen_concurrency: usize,
+    /// Most generations queued or running at once; a new one past it is refused as busy
+    /// (design value).
+    pub gen_queue_max: usize,
+    /// Uploads and generation requests one client address may make in a burst, then
+    /// `admin_write_refill_milli_per_sec` per second after (design values).
+    pub admin_write_burst: u32,
+    /// Refill of the per-address write allowance, thousandths of a request per second.
+    pub admin_write_refill_milli_per_sec: u32,
     /// Wall-clock limit of one sandboxed inspect call, after which it is killed (design value).
     pub inspect_timeout_ms: u64,
     /// Wall-clock limit of one sandboxed generation, after which it is killed
     /// (`CONSTELLATION_GEN_TIMEOUT_MS`; design value: one real world took about 22 s here).
     pub gen_timeout_ms: u64,
+    /// A queued or running generation marks itself alive in the store this often, so another
+    /// server instance can tell it from one whose process stopped (#119; a cost trade, not a
+    /// design value).
+    pub gen_heartbeat_secs: u64,
+    /// A queued or running generation not marked alive for this long reads as `stalled`: its
+    /// server stopped, or lost the store for a while and may come back. Several heartbeats, so
+    /// one slow write never shows a live job as stalled.
+    pub gen_stale_secs: u64,
+    /// A generation not marked alive for this long is failed by any instance's sweep: its
+    /// server is gone. Longer than `gen_timeout_ms` ([`Limits::check`]), so a server that
+    /// lost the store mid-job, and could not write its heartbeats, can still end the job by
+    /// its own timeout before the sweep fails it (the heartbeat covers a job of any length;
+    /// this covers only failed writes). A cost trade, not a design value. A server that does
+    /// come back still writes how its job really ended.
+    pub gen_lost_secs: u64,
+    /// Most files a job folder's log line names (a removed folder, or one a stopped server
+    /// left); past it the line says how many more (a cost trade: log line length).
+    pub job_log_files_max: usize,
     /// Address space cap of the sandboxed Python process, bytes (`prlimit --as`,
     /// `CONSTELLATION_GEN_MEMORY_BYTES`; design value).
     pub gen_memory_bytes: u64,
@@ -191,30 +347,223 @@ pub struct Limits {
     pub gen_cgroup_tasks: u64,
 }
 
-/// Shortest admin token accepted, bytes: the admin API runs uploaded code, so a guessable
-/// token is refused (design value: 32 bytes, as from `openssl rand -hex 16`).
-pub const ADMIN_TOKEN_MIN_BYTES: usize = 32;
-
 /// Deepest rule nesting a world's rules section may hold, counting every node and every def a
 /// rule reaches through `ref`: the loader rejects deeper rules, so the recursive evaluators
 /// stay well inside a thread's stack (design value; real worlds nest under 20).
 pub const RULES_MAX_DEPTH: u32 = 256;
 
-/// Full fills a seed may start before the data-only fill gives up as stuck (each retry takes
-/// the next draws of the seed's random stream; a design value).
-pub const FILL_MAX_ATTEMPTS: u32 = 20;
+/// Largest weight of one member of a weighted group sum (`data_fill`'s `GROUP`): the largest
+/// integer a rule's bytecode holds (16 bits signed), so a weighted sum compares against any
+/// threshold a rule can write. With [`RULE_GROUP_MAX_MEMBERS`] it bounds a sum below 2^31 times
+/// the copies of one item, far inside `i64` (a design value).
+pub const RULE_WEIGHT_MAX: i64 = i16::MAX as i64;
 
-/// Worker threads that compile worlds and resolve instances of a room's players in parallel
-/// before a multiworld fill (a design value; the fill itself is sequential, and results never
-/// depend on this number).
-pub const FILL_SETUP_WORKERS: usize = 4;
+/// Most members of one group sum, plain or weighted; compiler and loader refuse more (a design
+/// value: the group index is 16 bits wide, and a group is not meant to be larger).
+pub const RULE_GROUP_MAX_MEMBERS: usize = u16::MAX as usize;
 
-/// Most threads any one parallel setup takes, whatever worker count a caller asks for (a design
+/// Most terms a rule may take as a bit rule (`data_fill`'s fold: an OR of terms, each a set of
+/// atom bits that must all be set). Turning AND over OR into that form multiplies terms, so a
+/// rule that would need more, at any step of the way, stays bytecode (a design value: the real
+/// test world's rules are counted in the PR that added this).
+pub const RULE_BITS_MAX_TERMS: usize = 16;
+
+/// Most tests (atom bits and time windows) one term of a bit rule may hold. A def's terms are
+/// copied into every rule that refers to it and AND joins the lists, so without this a long
+/// def referred to from many sites grows the bit rules by sites times its length; a rule with a
+/// longer term, at any step of the way, stays bytecode (a design value).
+pub const RULE_BITS_MAX_TERM_TESTS: usize = 32;
+
+/// Most tests a loaded world's bit rules may hold in all (two bytes each), def terms copied
+/// into sites counted: once reached, the rules not yet compiled stay bytecode. A site's rule
+/// is at most [`RULE_BITS_MAX_TERMS`] terms of [`RULE_BITS_MAX_TERM_TESTS`] tests, so this
+/// bounds a load whatever the manifest (a design value: the heavy synthetic world of 1,000
+/// checks holds under a tenth of it).
+pub const RULE_BITS_MAX_WORLD_TESTS: usize = 1 << 18;
+
+/// Full fills a seed may start before the data-only fill gives up as stuck: a net for what the
+/// exact fill's repairs in place cannot mend, not its way of coping (each retry takes the next
+/// draws of the seed's random stream and goes deepest first; how often it is entered is in the
+/// fill report, `attempts`). A design value. Counted on 9,926 rooms with 20 allowed (tight
+/// synthetic worlds of 60 to 1,000 checks at 1, 3, 10 and 100 players, both fixture worlds,
+/// 3,000 seeds each): none needed more than 3, one needed 3, and none that drawn order fills in
+/// 20 attempts is stuck here in 3.
+pub const FILL_MAX_ATTEMPTS: u32 = 3;
+
+/// Version of a prepared world's layout beside its rules section (`data_fill::prepared`): which
+/// sections the file holds and what is in them. Raise it with any change to that. A world is
+/// also prepared again by every new server build, so this guards builds that share a version
+/// text (local and test builds).
+pub const PREPARED_WORLD_LAYOUT: u16 = 2;
+
+/// Attempts one world's shuffles get per seed (`data_fill::shuffle`): a failed layout or
+/// whole-world check starts every shuffle of that world again on the next attempt's random
+/// streams, and at the cap the room's generation fails naming the world and the shuffle (a
+/// design value, doc 17 section 4.7 of the design docs).
+pub const SHUFFLE_MAX_ATTEMPTS: u32 = 4;
+
+/// Most shuffles one world may declare (a design value).
+pub const SHUFFLES_MAX: usize = 64;
+
+/// Most slots over all shuffles of one world, and most things of one shuffle (a design value:
+/// the largest entrance shuffle we know of is reported at 611 exits). Bounds the permission
+/// tables, which hold a cell per slot and thing.
+pub const SHUFFLE_MAX_SLOTS: usize = 1024;
+
+/// Longest shuffle name in bytes: a name keys a random stream, and a stream label is short
+/// (`spec_rng::derive`).
+pub const SHUFFLE_NAME_MAX_BYTES: usize = 48;
+
+/// Most steps the load of a world's layout index may take: per shuffled exit, the regions
+/// that reach its region by exits that are not shuffled (what the layout solve tells a branch
+/// from a dead end by, about 2 bytes each), and the exits walked to find them (a design
 /// value).
-pub const FILL_MAX_WORKERS: usize = 64;
+pub const SHUFFLE_MAX_BEHIND: usize = 1 << 20;
+
+/// Most permission rows one shuffle may carry: a row is applied to the whole table of its
+/// shuffle when the world is compiled (a design value).
+pub const SHUFFLE_MAX_ROWS: usize = 64;
+
+/// Most things a shuffle may have when a rule reads its result as a rule: such a read is one
+/// shared rule listing every candidate, and a rule lists at most this many parts (the
+/// engine's limit, one byte).
+pub const SHUFFLE_MAX_READ_THINGS: usize = 255;
+
+/// Longest error text the shuffle checks give back, bytes: a message may quote names from the
+/// manifest, and a name's length is not known to be small when it is quoted (a design value).
+pub const SHUFFLE_ERROR_MAX_BYTES: usize = 4096;
+
+/// Most memory the loaded worlds one pooled fill worker keeps between jobs may hold
+/// (`server::pool`; the design value of `Limits::fill_worker_cache_bytes`), the least recently
+/// used going first. A kept world counts what it holds (`data_fill::prepared::Prepared::
+/// held_bytes`, checked against a counting allocator in CI). From issue 200.
+pub const PREPARED_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// CPU time kept in hand when a pooled fill worker is judged fit for one more job: its
+/// process CPU cap (`fill_cpu_secs`) must cover what its jobs so far may have used, one more
+/// whole job, and this much for its start and what it does between jobs (design value).
+pub const FILL_WORKER_CPU_MARGIN_MS: u64 = 1000;
+
+/// Placed items an exact fill tries to move, one fresh solve of the room each, for one item
+/// that has nowhere to go (`data_fill::room`, `displace`), before the attempt counts as stuck
+/// (a design value).
+pub const FILL_DISPLACE_TRIES: usize = 32;
+
+/// Rule evaluations an exact fill may spend on repair, over all its attempts: the fresh solves
+/// of moves, one solve's worth more per move for the pass over the rounds after it, and per
+/// divided round the evaluations of the attempt's first solve with none of the rounds' items
+/// (`data_fill::room`, `charge_division`), counted the same by the fill and its cross-check.
+/// Within the budget means at most this much spent: once more is spent, checked before each
+/// solve and at each division, the attempt is stuck (so a fill ends at most one solve past
+/// it), and so is any later one that needs a move or a division. A budget of work, not of
+/// time: a seed is the same on every machine. A design value with a margin over the
+/// most repaired bench room, keys at 100 players, which charges 34.9 to 37.5 million
+/// (counted, `bench-room` run 45948967615, seeds 1 to 3): 1.7 times that. By the growth of
+/// that charge over room size (counted at 22 and 100 players) it lets key rooms up to about
+/// 120 players and chain rooms up to about 200 fill without a restart (estimated). Time is
+/// not bounded by it: on that run keys at 100 players took 4.3 to 4.4 s for 78 to 83 million
+/// evaluations in all (measured), about 55 ns an evaluation; at that rate the budget is about
+/// 3.5 s of repair, and at the heavy profile's 186 ns about 12 s (both estimated).
+pub const FILL_REPAIR_EVALS: u64 = 64_000_000;
+
+/// The least p value the product's fill may show against uniform beatable placements on the
+/// one-player fixture world (`data-fill` `tests/fairness.rs`; a design value: drawn order gives
+/// 0.39 there, each player's items deepest first gave 0.00008, counted over 300 seeds).
+pub const FILL_FAIRNESS_MIN_P: f64 = 0.01;
+
+/// Random orders of a world's progression the early capacity ratio is the mean over
+/// (`data_fill::capacity`), the setup-time warning that a world leaves little room early on
+/// (as many orders as the measurement that found the ratio used; a design value).
+pub const FILL_CAPACITY_ORDERS: u32 = 30;
+
+/// Longest game or version name a manifest may carry, bytes (a design value; it is kept in
+/// listing columns and an index). Also the longest name in a shuffle's vocabulary (a slot, a
+/// thing, a group, an exit key, a door).
+pub const MANIFEST_NAME_MAX_BYTES: usize = 128;
+
+/// Deepest a rule string may nest (parentheses, `not`, function arguments), as written: the
+/// provisional author cap of design doc 16 (question 2, a design value), well inside the
+/// engine's [`RULES_MAX_DEPTH`].
+pub const WORLD_RULE_MAX_DEPTH: usize = 64;
+
+/// Most errors one build reports before it stops collecting (a design value: enough to fix a
+/// file in one pass, bounded so a broken file cannot print without end).
+pub const WORLD_BUILD_MAX_ERRORS: usize = 200;
+
+/// Most parts one rule node of the engine takes: the parts of an `all` or `any`, the items of
+/// `has_any` and `has_all`, the operands of a sum, `min` or `max`, and `n` in `has` (the
+/// engine's limit, one byte).
+pub const RULE_MAX_PARTS: usize = 255;
+
+/// Largest item or location id on the wire and in a world's ledger: 2^53 - 1, the range world
+/// ids keep to so every client holds them exactly (a format value, not a limit).
+pub const ID_MAX: i64 = (1 << 53) - 1;
+
+/// Largest seed number `rando generate` takes or draws: 2^53 - 1, so the number in a JSON
+/// spoiler reads back exactly in any JSON reader (a format value, not a limit).
+pub const SEED_NUMBER_MAX: u64 = (1 << 53) - 1;
+
+/// Deepest that blocks (`for`, `region`, `extend`) may nest in a `.rando` file: the parser and
+/// the expansion recurse once per block (a design value; a world nests three or four deep).
+pub const WORLD_BLOCK_MAX_DEPTH: usize = 32;
+
+/// Most items, checks or regions one world may declare: the engine's 16-bit index width
+/// (design doc 16 section 5.3).
+pub const WORLD_TABLE_MAX: usize = 65_536;
+
+/// Largest `.rando` file (or table file) the build tool reads, bytes: the input is untrusted,
+/// and a world of a few thousand checks is well under a megabyte (a design value).
+pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most files (modules and table files) one world may read (a design value).
+pub const WORLD_MODULES_MAX: usize = 256;
+
+/// Most declarations the families of one world may expand to, so a product of a few long
+/// lists cannot run away (a design value: the survey's largest family is a few thousand).
+pub const WORLD_FAMILY_MAX: usize = 100_000;
+
+/// Stack of the thread a world build runs on, bytes: lowering recurses once per rule node, up
+/// to [`RULES_MAX_DEPTH`] nodes deep through defs, at several frames a node (a design value,
+/// well over what that depth takes in a debug build; only the pages used are committed).
+pub const WORLD_BUILD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most copies of one item a world may hold, and the largest fill weight and grant (design doc
+/// 16 section 5.3, a design value that fits the engine's 16-bit numbers).
+pub const WORLD_ITEM_COPIES_MAX: i64 = 32_767;
+
+/// Most options a world may declare: the engine's limit, an option being one byte in a rule.
+pub const WORLD_OPTIONS_MAX: usize = 256;
+
+/// Most start item copies one seed's instance may grant in all, so a world's numbers never
+/// decide how much memory the per-seed step takes (a design value: start items are a handful).
+pub const WORLD_START_COPIES_MAX: usize = 1024;
+
+/// Most option combinations the build tool's pool test tries (design doc 16 section 3.4): past
+/// it the test is skipped with a warning, and generation still checks the actual settings (a
+/// design value).
+pub const WORLD_POOL_TEST_MAX_COMBINATIONS: usize = 4096;
+
+/// The generator version a data-only seed records (what clients of the compatible protocol
+/// expect; a format value, not a limit).
+pub const SEED_GENERATOR_VERSION: (u32, u32, u32) = (0, 6, 8);
+
+/// Hint cost, percent of a slot's locations, that a data-only seed starts with (design value).
+pub const SEED_HINT_COST_PCT: u8 = 10;
+
+/// Hint points a data-only seed gives per checked location (design value).
+pub const SEED_CHECK_POINTS: u32 = 1;
 
 /// Most players one room's fill takes (a design value; player numbers are 16 bits).
 pub const ROOM_MAX_PLAYERS: usize = 1024;
+
+/// Writes of a generation's last status while the store is down: how many tries (a cost trade:
+/// with the doubling wait about 15 s in all, one `gen_heartbeat_secs`, which rides out a store
+/// restart).
+pub const GEN_FINAL_WRITE_TRIES: u32 = 6;
+
+/// The wait after the first failed write of a generation's last status, ms; it doubles after
+/// each further one ([`GEN_FINAL_WRITE_TRIES`]).
+pub const GEN_FINAL_WRITE_WAIT_MS: u64 = 500;
 
 impl Limits {
     /// The design values (see each field).
@@ -237,6 +586,9 @@ impl Limits {
         room_idle_secs: 15 * 60,
         room_abandon_secs: 30 * 24 * 60 * 60,
         room_touch_secs: 60,
+        room_retry_first_ms: 1_000,
+        room_retry_max_ms: 60_000,
+        room_healthy_secs: 30,
         room_key_draws: 3,
         fanout_burst: 10,
         fanout_refill_milli_per_sec: 2000,
@@ -250,6 +602,7 @@ impl Limits {
         max_connections: 10_000,
         view_history_events: 400,
         view_streams: 64,
+        view_access_recheck_ms: 5000,
         connect_timeout_ms: 30_000,
         idle_timeout_ms: 60_000,
         ping_interval_ms: 20_000,
@@ -271,14 +624,66 @@ impl Limits {
         kv_max_room_log_bytes: 512 * 1024 * 1024,
         hint_burst: 10,
         hint_refill_milli_per_sec: 1000,
-        admin_auth_fail_burst: 5,
-        admin_auth_fail_refill_milli_per_sec: 100,
+        password_min_chars: 10,
+        password_max_bytes: 256,
+        account_name_min_chars: 3,
+        account_name_max_bytes: 64,
+        session_ttl_secs: 14 * 24 * 60 * 60,
+        login_fail_burst: 5,
+        login_fail_refill_milli_per_sec: 100,
+        password_hash_parallel: 4,
+        signup_open: true,
+        signup_burst: 3,
+        signup_refill_milli_per_sec: 10,
         apworld_max_bytes: 64 * 1024 * 1024,
         apworld_max_unpacked_bytes: 256 * 1024 * 1024,
         apworld_max_entries: 20_000,
         yaml_max_bytes: 1024 * 1024,
+        manifest_max_bytes: 8 * 1024 * 1024,
+        world_toml_max_bytes: 64 * 1024,
+        world_name_max_bytes: 64,
+        world_version_max_bytes: 64,
+        world_authors_max: 16,
+        world_author_max_chars: 128,
+        world_description_max_chars: 1000,
+        world_license_max_bytes: 256,
+        world_url_max_bytes: 2048,
+        world_assets_max: 64,
+        world_asset_max_bytes: 2 * 1024 * 1024,
+        world_assets_max_bytes: 16 * 1024 * 1024,
+        world_icon_max_bytes: 256 * 1024,
+        package_max_source_bytes: 16 * 1024 * 1024,
+        package_max_bytes: 40 * 1024 * 1024,
+        package_max_entries: 512,
+        package_max_path_bytes: 255,
+        package_max_settings_bytes: 4 * 1024 * 1024,
+        manifest_cache_bytes: 64 * 1024 * 1024,
+        list_page_max: 200,
+        catalogue_name_max_bytes: 100,
+        catalogue_description_max_bytes: 2000,
+        catalogue_version_max_bytes: 32,
+        catalogue_note_max_bytes: 4000,
+        catalogue_check_seeds: 20,
+        catalogue_check_concurrency: 1,
+        manifest_check_concurrency: 2,
+        fill_memory_bytes: 1024 * 1024 * 1024,
+        fill_cpu_secs: 120,
+        fill_max_processes: 8192,
+        fill_timeout_ms: 60_000,
+        fill_pool_workers: 0,
+        fill_worker_jobs: 256,
+        fill_worker_cache_bytes: PREPARED_CACHE_BYTES,
+        fill_worker_recycle_percent: 50,
+        gen_concurrency: 1,
+        gen_queue_max: 64,
+        admin_write_burst: 30,
+        admin_write_refill_milli_per_sec: 1000,
         inspect_timeout_ms: 30_000,
         gen_timeout_ms: 15 * 60 * 1000,
+        gen_heartbeat_secs: 15,
+        gen_stale_secs: 60,
+        gen_lost_secs: 20 * 60,
+        job_log_files_max: 32,
         gen_memory_bytes: 4 * 1024 * 1024 * 1024,
         gen_error_max_bytes: 16 * 1024,
         gen_stdout_max_bytes: 64 * 1024 * 1024 + 1024 * 1024,
@@ -291,6 +696,54 @@ impl Limits {
     };
 }
 
+impl Limits {
+    /// Whether the limits fit together; the one place the rules between them are written.
+    ///
+    /// # Errors
+    /// The first rule broken, as a message naming the limits.
+    pub const fn check(&self) -> Result<(), &'static str> {
+        if self.gen_stale_secs < 3 * self.gen_heartbeat_secs {
+            return Err("gen_stale_secs must be at least 3 times gen_heartbeat_secs");
+        }
+        if self.gen_lost_secs < self.gen_stale_secs {
+            return Err("gen_lost_secs must not be less than gen_stale_secs");
+        }
+        if self.gen_lost_secs.saturating_mul(1000) <= self.gen_timeout_ms {
+            return Err("gen_lost_secs (in ms) must exceed gen_timeout_ms \
+                 (CONSTELLATION_GEN_TIMEOUT_MS)");
+        }
+        if self.password_min_chars == 0 || self.password_min_chars > self.password_max_bytes {
+            return Err("password_min_chars must be 1 to password_max_bytes");
+        }
+        if self.catalogue_check_concurrency == 0
+            // Generation treats 0 as 1.
+            || (self.catalogue_check_concurrency > self.gen_concurrency
+                && self.catalogue_check_concurrency > 1)
+        {
+            return Err("catalogue_check_concurrency must be 1 to gen_concurrency");
+        }
+        if self.catalogue_check_seeds == 0 {
+            return Err("catalogue_check_seeds must be at least 1");
+        }
+        if self.fill_worker_jobs == 0 {
+            return Err("fill_worker_jobs must be at least 1");
+        }
+        // Generation treats a gen_concurrency of 0 as 1.
+        let generations = if self.gen_concurrency == 0 { 1 } else { self.gen_concurrency };
+        if self.fill_pool_workers != 0 && self.fill_pool_workers < generations {
+            return Err("fill_pool_workers must be 0 (no pool) or at least gen_concurrency: \
+                 with fewer, generations that could fill side by side would wait for a worker");
+        }
+        if self.fill_worker_recycle_percent == 0 || self.fill_worker_recycle_percent > 100 {
+            return Err("fill_worker_recycle_percent must be 1 to 100");
+        }
+        if self.password_hash_parallel == 0 {
+            return Err("password_hash_parallel must be at least 1");
+        }
+        Ok(())
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self::DESIGN
@@ -298,9 +751,11 @@ impl Default for Limits {
 }
 
 /// The only place the process environment is read.
+///
+/// # Errors
+/// Overrides that break a rule between the limits ([`Limits::check`]).
 #[cfg(feature = "std")]
-#[must_use]
-pub fn load() -> Limits {
+pub fn load() -> Result<Limits, String> {
     fn num(key: &str) -> Option<u64> {
         std::env::var(key).ok().and_then(|s| s.parse().ok())
     }
@@ -312,9 +767,20 @@ pub fn load() -> Limits {
         l.sim_seeds = v;
     }
     l.sim_replay_seed = num("SIM_SEED");
+    l.signup_open = match std::env::var("CONSTELLATION_SIGNUP").ok().as_deref() {
+        None | Some("" | "open") => true,
+        Some("closed") => false,
+        Some(_) => return Err("CONSTELLATION_SIGNUP must be `open` or `closed`".into()),
+    };
     for (key, field) in [
         ("CONSTELLATION_MAX_CONNECTIONS", &mut l.max_connections),
         ("CONSTELLATION_MAX_RESIDENT_ROOMS", &mut l.max_resident_rooms),
+        ("CONSTELLATION_GEN_CONCURRENCY", &mut l.gen_concurrency),
+        ("CONSTELLATION_GEN_QUEUE_MAX", &mut l.gen_queue_max),
+        ("CONSTELLATION_FILL_POOL_WORKERS", &mut l.fill_pool_workers),
+        ("CONSTELLATION_MANIFEST_CACHE_BYTES", &mut l.manifest_cache_bytes),
+        ("CONSTELLATION_CATALOGUE_CHECK_SEEDS", &mut l.catalogue_check_seeds),
+        ("CONSTELLATION_CATALOGUE_CHECK_CONCURRENCY", &mut l.catalogue_check_concurrency),
     ] {
         if let Some(v) = num(key).and_then(|v| usize::try_from(v).ok()) {
             *field = v;
@@ -326,17 +792,23 @@ pub fn load() -> Limits {
         ("CONSTELLATION_PING_INTERVAL_MS", &mut l.ping_interval_ms),
         ("CONSTELLATION_GEN_TIMEOUT_MS", &mut l.gen_timeout_ms),
         ("CONSTELLATION_GEN_MEMORY_BYTES", &mut l.gen_memory_bytes),
+        ("CONSTELLATION_FILL_MEMORY_BYTES", &mut l.fill_memory_bytes),
+        ("CONSTELLATION_FILL_TIMEOUT_MS", &mut l.fill_timeout_ms),
         ("CONSTELLATION_GEN_CGROUP_MEMORY_BYTES", &mut l.gen_cgroup_memory_bytes),
         ("CONSTELLATION_ROOMS_SCAN_MS", &mut l.rooms_scan_ms),
         ("CONSTELLATION_ROOM_IDLE_SECS", &mut l.room_idle_secs),
         ("CONSTELLATION_ROOM_ABANDON_SECS", &mut l.room_abandon_secs),
         ("CONSTELLATION_ROOM_TOUCH_SECS", &mut l.room_touch_secs),
+        ("CONSTELLATION_ROOM_RETRY_FIRST_MS", &mut l.room_retry_first_ms),
+        ("CONSTELLATION_ROOM_RETRY_MAX_MS", &mut l.room_retry_max_ms),
+        ("CONSTELLATION_ROOM_HEALTHY_SECS", &mut l.room_healthy_secs),
     ] {
         if let Some(v) = num(key) {
             *field = v;
         }
     }
-    l
+    l.check().map_err(|e| format!("limits: {e}"))?;
+    Ok(l)
 }
 
 /// Values that must not appear on a command line (visible to every local user in `ps`).
@@ -350,9 +822,11 @@ pub struct Secrets {
     /// first line of the file named by `CONSTELLATION_DATABASE_URL_FILE`. `None` runs on the
     /// in-memory log, which a restart loses.
     pub database_url: Option<String>,
-    /// Bearer token for the upload and generation API: `CONSTELLATION_ADMIN_TOKEN`, or the first
-    /// line of the file named by `CONSTELLATION_ADMIN_TOKEN_FILE`. Without it the API is open (the server warns at start).
-    pub admin_token: Option<String>,
+    /// Postgres URL for the migrations, as the role that owns the tables:
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL`, or the first line of the file named by
+    /// `CONSTELLATION_MIGRATE_DATABASE_URL_FILE`. `None`: the migrations run as the runtime
+    /// role (what a deployment from before the split does; the server logs it).
+    pub migrate_database_url: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -360,11 +834,11 @@ impl core::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let pw = self.room_password.as_ref().map(|_| "<redacted>");
         let db = self.database_url.as_ref().map(|_| "<redacted>");
-        let admin = self.admin_token.as_ref().map(|_| "<redacted>");
+        let migrate = self.migrate_database_url.as_ref().map(|_| "<redacted>");
         f.debug_struct("Secrets")
             .field("room_password", &pw)
             .field("database_url", &db)
-            .field("admin_token", &admin)
+            .field("migrate_database_url", &migrate)
             .finish()
     }
 }
@@ -409,21 +883,15 @@ fn secrets_from(
     if let Some(url) = &database_url {
         check_database_url(url)?;
     }
+    let migrate_database_url = var_or_file("CONSTELLATION_MIGRATE_DATABASE_URL", &var, &read)?;
+    if let Some(url) = &migrate_database_url {
+        check_database_url(url)?;
+    }
     Ok(Secrets {
         room_password: var_or_file("CONSTELLATION_ROOM_PASSWORD", &var, &read)?,
         database_url,
-        admin_token: admin_token(var_or_file("CONSTELLATION_ADMIN_TOKEN", &var, &read)?)?,
+        migrate_database_url,
     })
-}
-
-#[cfg(feature = "std")]
-fn admin_token(token: Option<String>) -> Result<Option<String>, String> {
-    match token {
-        Some(t) if t.len() < ADMIN_TOKEN_MIN_BYTES => Err(format!(
-            "CONSTELLATION_ADMIN_TOKEN is shorter than {ADMIN_TOKEN_MIN_BYTES} bytes (not shown)"
-        )),
-        t => Ok(t),
-    }
 }
 
 /// Where seed generation finds Archipelago and our sidecar. All three are needed for the
@@ -446,12 +914,21 @@ pub struct Generation {
     pub container_mode: bool,
 }
 
+/// The Postgres role the server runs as: SELECT, INSERT, UPDATE and DELETE on our tables and
+/// USAGE on their sequences, nothing else (no CREATE, no DDL, no superuser). The migrations run
+/// as [`DB_MIGRATE_ROLE`] (`CONSTELLATION_MIGRATE_DATABASE_URL`), which owns the tables and
+/// grants this role its rights after each migration. `docker/db-roles.sh` creates both.
+pub const DB_APP_ROLE: &str = "constellation_app";
+
+/// The Postgres role that owns the tables and runs the migrations (see [`DB_APP_ROLE`]).
+pub const DB_MIGRATE_ROLE: &str = "constellation_migrate";
+
 /// The secret file variables (see [`Secrets`]); their files must never be visible to a sandbox.
 #[cfg(feature = "std")]
 const SECRET_FILE_VARS: [&str; 3] = [
     "CONSTELLATION_ROOM_PASSWORD_FILE",
     "CONSTELLATION_DATABASE_URL_FILE",
-    "CONSTELLATION_ADMIN_TOKEN_FILE",
+    "CONSTELLATION_MIGRATE_DATABASE_URL_FILE",
 ];
 
 /// Read [`Generation`] from the environment: `None` when none of its variables is set.
@@ -571,6 +1048,8 @@ mod tests {
         assert_eq!(l.rooms_scan_ms, 2_000);
         assert_eq!((l.room_idle_secs, l.room_abandon_secs), (900, 2_592_000));
         assert_eq!((l.room_touch_secs, l.room_key_draws), (60, 3));
+        assert_eq!((l.room_retry_first_ms, l.room_retry_max_ms), (1_000, 60_000));
+        assert_eq!(l.room_healthy_secs, 30);
     }
 
     #[test]
@@ -597,6 +1076,49 @@ mod tests {
         assert!(missing.unwrap_err().contains("/nope"));
         let empty = secrets_from(env(&[("CONSTELLATION_ROOM_PASSWORD", "")]), file);
         assert!(empty.unwrap_err().contains("empty"));
+    }
+
+    /// The role names live here; the roles script and the compose files (which cannot import a
+    /// constant) must spell them the same.
+    #[test]
+    fn the_roles_script_and_compose_use_the_role_names_from_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap();
+        let init = read("docker/db-roles.sh");
+        for role in [DB_APP_ROLE, DB_MIGRATE_ROLE] {
+            assert!(
+                init.contains(&format!("CREATE ROLE {role} LOGIN")),
+                "{role} in the roles script"
+            );
+        }
+        let env_example = read(".env.example");
+        assert!(env_example.contains("CONSTELLATION_MIGRATE_DATABASE_URL_FILE"));
+        let smoke = read(".github/workflows/release.yml");
+        assert!(smoke.contains(&format!("postgres://{DB_APP_ROLE}:")));
+        assert!(smoke.contains(&format!("postgres://{DB_MIGRATE_ROLE}:")));
+    }
+
+    #[test]
+    fn the_migration_url_comes_from_its_own_variable_or_file_and_prints_redacted() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
+        };
+        let file = |_: &std::path::Path| Ok("postgres://m:p@h/db\n".to_owned());
+        let direct =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://m@h/db")]), file)
+                .unwrap();
+        assert_eq!(direct.migrate_database_url.as_deref(), Some("postgres://m@h/db"));
+        assert_eq!(direct.database_url, None, "the runtime URL is its own");
+        let from_file =
+            secrets_from(env(&[("CONSTELLATION_MIGRATE_DATABASE_URL_FILE", "/m")]), file).unwrap();
+        assert_eq!(from_file.migrate_database_url.as_deref(), Some("postgres://m:p@h/db"));
+        assert!(!format!("{from_file:?}").contains("postgres://"), "{from_file:?}");
+        assert_eq!(secrets_from(env(&[]), file).unwrap().migrate_database_url, None);
+        let bad = secrets_from(
+            env(&[("CONSTELLATION_MIGRATE_DATABASE_URL", "postgres://h/db?bogus=1")]),
+            file,
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
@@ -675,6 +1197,7 @@ mod tests {
             .env("CONSTELLATION_PING_INTERVAL_MS", "-4")
             .env("CONSTELLATION_GEN_TIMEOUT_MS", "1234")
             .env("CONSTELLATION_GEN_MEMORY_BYTES", "5678")
+            .env("CONSTELLATION_SIGNUP", "closed")
             .env("CONSTELLATION_ROOM_PASSWORD", "pw-probe")
             .env("CONSTELLATION_AP_DIR", "/probe/ap")
             .env("CONSTELLATION_AP_PYTHON", "/probe/python")
@@ -693,6 +1216,7 @@ mod tests {
             d.idle_timeout_ms, d.ping_interval_ms
         );
         assert!(text.contains(&want), "want {want:?} in {text}");
+        assert!(text.contains("probe signup false"), "closed by CONSTELLATION_SIGNUP: {text}");
         assert!(
             text.contains("probe secrets Some(\"pw-probe\") Some(\"postgres://probe@h/db\")"),
             "{text}"
@@ -709,7 +1233,8 @@ mod tests {
         if std::env::var("CONFIG_ENV_PROBE").is_err() {
             return;
         }
-        let l = load();
+        let l = load().unwrap();
+        println!("probe signup {}", l.signup_open);
         println!(
             "probe limits {} {} {:?} {} {} {} {} {} {} {}",
             l.dedupe_window_secs,
@@ -768,10 +1293,73 @@ mod tests {
         assert_eq!(l.kv_max_room_log_bytes, 512 * 1024 * 1024);
     }
 
+    /// The fill worker pool is off unless asked for (zero workers: each fill in a process of
+    /// its own). Asked for, it must have a worker for every generation that may run at once,
+    /// or fills that ran side by side would wait in line for a worker.
+    #[test]
+    fn the_fill_pool_is_off_by_default_and_never_smaller_than_gen_concurrency() {
+        let l = Limits::DESIGN;
+        assert_eq!((l.fill_pool_workers, l.fill_worker_jobs), (0, 256));
+        assert_eq!((PREPARED_CACHE_BYTES, l.fill_worker_cache_bytes), (32 << 20, 32 << 20));
+        assert_eq!((l.fill_worker_recycle_percent, FILL_WORKER_CPU_MARGIN_MS), (50, 1000));
+        assert!(l.check().is_ok(), "off");
+        // On: 1 worker for 1 generation at a time, 4 or 6 for 4; never 1, 2 or 3 for 4.
+        let with = |fill_pool_workers, gen_concurrency| {
+            Limits { fill_pool_workers, gen_concurrency, ..l }.check()
+        };
+        for (workers, generations) in [(1, 1), (1, 0), (4, 4), (6, 4), (0, 4)] {
+            assert!(with(workers, generations).is_ok(), "{workers} for {generations}");
+        }
+        for (workers, generations) in [(1, 4), (3, 4), (1, 2)] {
+            let e = with(workers, generations).unwrap_err();
+            assert!(e.contains("fill_pool_workers"), "{workers} for {generations}: {e}");
+        }
+        let e = Limits { fill_worker_jobs: 0, ..l }.check().unwrap_err();
+        assert!(e.contains("fill_worker_jobs"), "{e}");
+        for percent in [0, 101] {
+            let e = Limits { fill_worker_recycle_percent: percent, ..l }.check().unwrap_err();
+            assert!(e.contains("fill_worker_recycle_percent"), "{e}");
+        }
+    }
+
     #[test]
     fn upload_and_generation_limits_are_design_values() {
         let l = Limits::DESIGN;
         assert_eq!((l.apworld_max_bytes, l.yaml_max_bytes), (64 << 20, 1 << 20));
+        assert_eq!(l.manifest_max_bytes, 8 << 20);
+        assert_eq!(
+            (l.world_toml_max_bytes, l.world_name_max_bytes, l.world_version_max_bytes),
+            (64 << 10, 64, 64)
+        );
+        assert_eq!(
+            (l.world_authors_max, l.world_author_max_chars, l.world_description_max_chars),
+            (16, 128, 1000)
+        );
+        assert_eq!((l.world_license_max_bytes, l.world_url_max_bytes), (256, 2048));
+        assert_eq!(
+            (l.world_assets_max, l.world_asset_max_bytes, l.world_assets_max_bytes),
+            (64, 2 << 20, 16 << 20)
+        );
+        assert_eq!(l.world_icon_max_bytes, 256 << 10);
+        assert_eq!(
+            (l.package_max_source_bytes, l.package_max_bytes, l.package_max_entries),
+            (16 << 20, 40 << 20, 512)
+        );
+        assert_eq!(l.package_max_path_bytes, 255);
+        assert_eq!(l.package_max_settings_bytes, 4 << 20);
+        assert_eq!((l.gen_concurrency, l.gen_queue_max), (1, 64));
+        assert_eq!(
+            (l.fill_memory_bytes, l.fill_cpu_secs, l.fill_timeout_ms),
+            (1 << 30, 120, 60_000)
+        );
+        assert_eq!(l.fill_max_processes, 8192);
+        assert_eq!((l.admin_write_burst, l.admin_write_refill_milli_per_sec), (30, 1000));
+        assert_eq!(
+            (l.password_min_chars, l.password_max_bytes, l.account_name_max_bytes),
+            (10, 256, 64)
+        );
+        assert_eq!((l.session_ttl_secs, l.login_fail_burst), (1_209_600, 5));
+        assert!(l.signup_open, "sign-up is open unless the operator closes it");
         assert_eq!((l.apworld_max_unpacked_bytes, l.apworld_max_entries), (256 << 20, 20_000));
         assert_eq!((l.inspect_timeout_ms, l.gen_timeout_ms), (30_000, 900_000));
         assert_eq!((l.gen_memory_bytes, l.gen_error_max_bytes), (4 << 30, 16 * 1024));
@@ -786,31 +1374,21 @@ mod tests {
             (256, 4 << 30, 80)
         );
         assert!(l.gen_cgroup_tasks > l.gen_max_processes, "room for bwrap's own processes");
+        assert_eq!((l.gen_heartbeat_secs, l.gen_stale_secs), (15, 60));
+        assert_eq!((l.gen_lost_secs, l.job_log_files_max), (1200, 32));
+        assert_eq!(l.check(), Ok(()));
     }
 
+    /// An operator's override must keep the rules between the limits, not only the defaults.
     #[test]
-    fn the_admin_token_comes_from_the_variable_or_a_file_and_prints_redacted() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).to_owned())
-        };
-        const T32: &str = "t0ken-t0ken-t0ken-t0ken-t0ken-32";
-        let file = |_: &std::path::Path| Ok("t0ken-from-file-t0ken-from-file-\n".to_owned());
-        let direct = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN", T32)]), file).unwrap();
-        assert_eq!(direct.admin_token.as_deref(), Some(T32));
-        assert!(!format!("{direct:?}").contains("t0ken"), "{direct:?}");
-        let from_file = secrets_from(env(&[("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")]), file);
-        assert_eq!(
-            from_file.unwrap().admin_token.as_deref(),
-            Some("t0ken-from-file-t0ken-from-file-")
-        );
-        const T31: &[(&str, &str)] = &[("CONSTELLATION_ADMIN_TOKEN", T32.split_at(1).1)];
-        let short = secrets_from(env(T31), file);
-        let e = short.unwrap_err();
-        assert!(e.contains("shorter than 32") && !e.contains("t0ken"), "{e}");
-        let both: &'static [(&str, &str)] =
-            &[("CONSTELLATION_ADMIN_TOKEN", "a"), ("CONSTELLATION_ADMIN_TOKEN_FILE", "/t")];
-        assert!(secrets_from(env(both), file).unwrap_err().contains("not both"));
-        assert_eq!(secrets_from(env(&[]), file).unwrap().admin_token, None);
+    fn limits_that_break_a_rule_are_refused() {
+        let d = Limits::DESIGN;
+        let timeout = Limits { gen_timeout_ms: d.gen_lost_secs * 1000, ..d };
+        assert!(timeout.check().unwrap_err().contains("gen_timeout_ms"));
+        let beats = Limits { gen_stale_secs: 2 * d.gen_heartbeat_secs, ..d };
+        assert!(beats.check().unwrap_err().contains("gen_heartbeat_secs"));
+        let order = Limits { gen_lost_secs: d.gen_stale_secs - 1, ..d };
+        assert!(order.check().unwrap_err().contains("gen_stale_secs"));
     }
 
     #[test]
@@ -834,12 +1412,12 @@ mod tests {
             ("CONSTELLATION_AP_PYTHON", "/venv/bin/python"),
             ("CONSTELLATION_AP_GEN_SCRIPT", "/tools/ap-gen/ap_gen.py"),
             ("HOME", "/home/u"),
-            ("CONSTELLATION_ADMIN_TOKEN_FILE", "/etc/c/token"),
+            ("CONSTELLATION_ROOM_PASSWORD_FILE", "/etc/c/token"),
             ("CONSTELLATION_DATABASE_URL_FILE", "/etc/c/db"),
         ];
         let g = generation_from(env(with_private)).unwrap().unwrap();
         let want: Vec<std::path::PathBuf> =
-            ["/home/u", "/etc/c/db", "/etc/c/token"].iter().map(Into::into).collect();
+            ["/home/u", "/etc/c/token", "/etc/c/db"].iter().map(Into::into).collect();
         assert_eq!(g.private, want);
         let part = generation_from(env(&[("CONSTELLATION_AP_DIR", "/ap")])).unwrap_err();
         assert!(part.contains("CONSTELLATION_AP_PYTHON"), "{part}");

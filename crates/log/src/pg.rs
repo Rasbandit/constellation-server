@@ -152,6 +152,75 @@ fn decode(seq: i64, body: &[u8]) -> Result<Event, StoreError> {
     }
 }
 
+/// The warning for a runtime connection that holds more than data rights: logged in as the
+/// table owner (`config::DB_MIGRATE_ROLE`) or as a superuser. None when it is fine.
+fn privilege_warning(user: &str, superuser: bool) -> Option<String> {
+    let why = if superuser {
+        format!("a superuser ({user})")
+    } else if user == config::DB_MIGRATE_ROLE {
+        format!("the table owner ({user})")
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the server runs as {why}, so a bug or injection could change the schema; point \
+         CONSTELLATION_DATABASE_URL at the {} role (see docs/container.md)",
+        config::DB_APP_ROLE
+    ))
+}
+
+/// Warn when the runtime pool is more privileged than it needs to be (not an error: a
+/// deployment from before the role split must still start).
+async fn warn_if_privileged(pool: &PgPool) {
+    let row: Result<(String, bool), _> = sqlx::query_as(
+        "SELECT current_user::text, COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)",
+    )
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok((user, superuser)) => {
+            if let Some(w) = privilege_warning(&user, superuser) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not check the runtime database role"),
+    }
+}
+
+/// After the migrations, as the table owner: give [`config::DB_APP_ROLE`] SELECT, INSERT, UPDATE
+/// and DELETE on every table of the schema and USAGE on its sequences, and the same on tables
+/// the owner makes later (default privileges). It never gets CREATE, DDL or the migration
+/// history. Idempotent; skipped with a warning when the role does not exist. The role name is
+/// a constant of ours, never input.
+async fn grant_runtime_role(pool: &PgPool) -> Result<(), StoreError> {
+    let role = config::DB_APP_ROLE;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+    if !exists {
+        tracing::warn!(role, "the runtime database role does not exist; nothing granted");
+        return Ok(());
+    }
+    let sql = format!(
+        "DO $grants$ BEGIN \
+         EXECUTE format('GRANT USAGE ON SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}', current_schema()); \
+         EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT USAGE, SELECT ON SEQUENCES TO {role}', current_schema()); \
+         EXECUTE format('REVOKE ALL ON %I._sqlx_migrations FROM {role}', current_schema()); \
+         END $grants$"
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .map(drop)
+        .map_err(|e| db::<StoreError>(&e))
+}
+
 impl PgLogStore {
     /// Connect with the pool size and session timeouts from `limits`, and apply any pending
     /// migrations. The timeouts bound every wait: a writer that hangs mid-transaction is ended
@@ -162,21 +231,73 @@ impl PgLogStore {
     /// `Unavailable` when the URL is invalid, the database cannot be reached or a migration
     /// fails.
     pub async fn connect(url: &str, limits: &Limits) -> Result<Self, StoreError> {
-        // These session settings apply to the migrations below too (a stuck migration lock errors).
-        let options = PgConnectOptions::from_str(url).map_err(|e| db::<StoreError>(&e))?.options([
-            ("statement_timeout", limits.db_statement_timeout_ms),
-            ("lock_timeout", limits.db_lock_timeout_ms),
-            ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
-        ]);
-        let pool = PgPoolOptions::new()
-            .max_connections(limits.db_pool_connections.max(1))
-            .connect_with(options)
+        Self::connect_split(url, None, limits).await
+    }
+
+    /// [`Self::connect`] with the migrations run as another role: with `migrate_url` (the role
+    /// that owns the tables), they run on a short-lived pool of its own and then grant
+    /// [`config::DB_APP_ROLE`] its rights (see [`grant_runtime_role`]), and the runtime pool
+    /// never migrates. Without it the runtime role migrates, as a deployment from before the
+    /// split does.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_split(
+        url: &str,
+        migrate_url: Option<&str>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
+        let parse = |u: &str| PgConnectOptions::from_str(u).map_err(|e| db::<StoreError>(&e));
+        Self::connect_with(parse(url)?, migrate_url.map(parse).transpose()?, limits).await
+    }
+
+    /// [`Self::connect_split`] on parsed options.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_with(
+        runtime: PgConnectOptions,
+        migrate: Option<PgConnectOptions>,
+        limits: &Limits,
+    ) -> Result<Self, StoreError> {
+        let session = |o: PgConnectOptions, lock_timeout: bool| {
+            let o = o.options([
+                ("statement_timeout", limits.db_statement_timeout_ms),
+                ("idle_in_transaction_session_timeout", limits.db_idle_in_transaction_timeout_ms),
+            ]);
+            if lock_timeout { o.options([("lock_timeout", limits.db_lock_timeout_ms)]) } else { o }
+        };
+        let owner = migrate.clone();
+        if owner.is_none() {
+            tracing::warn!(
+                "migrating with the runtime database role: set CONSTELLATION_MIGRATE_DATABASE_URL \
+                 so the server can run without the right to change the schema"
+            );
+        }
+        // The migrations run on a pool of their own, without `lock_timeout`: sqlx serialises
+        // concurrent migrators (another server starting, another test) with an advisory lock,
+        // and the short runtime `lock_timeout` would fail the one that has to wait for it.
+        // `statement_timeout` still bounds that wait, and a stuck migration.
+        let migrating = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(session(owner.unwrap_or_else(|| runtime.clone()), false))
             .await
             .map_err(|e| db::<StoreError>(&e))?;
-        MIGRATOR.run(&pool).await.map_err(|e| {
+        MIGRATOR.run(&migrating).await.map_err(|e| {
             tracing::error!(error = %e, "migration failed");
             StoreError::Unavailable
         })?;
+        if migrate.is_some() {
+            grant_runtime_role(&migrating).await?;
+            tracing::info!("migrated as the migration role; running as the runtime role");
+        }
+        migrating.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(limits.db_pool_connections.max(1))
+            .connect_with(session(runtime, true))
+            .await
+            .map_err(|e| db::<StoreError>(&e))?;
+        warn_if_privileged(&pool).await;
         Ok(Self { pool })
     }
 
@@ -613,6 +734,489 @@ impl crate::raw::RawBlobs for PgLogStore {
     }
 }
 
+/// Manifests in the `world_manifests` table (migration 0004).
+impl crate::ManifestStore for PgLogStore {
+    async fn manifest_put(
+        &self,
+        r: &crate::ManifestRecord,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if crate::blob_key(bytes) != r.id {
+            return Err(StoreError::Corrupt(
+                "a manifest put under an id it does not hash to".into(),
+            ));
+        }
+        let (r, bytes) = (r.clone(), bytes.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    // Write once; a row whose bytes are not its id's (torn) is healed.
+                    "INSERT INTO world_manifests (id, name, game, version, size, items, locations, bytes) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT (id) DO UPDATE SET bytes = EXCLUDED.bytes \
+                     WHERE sha256(world_manifests.bytes) <> world_manifests.id",
+                )
+                .bind(r.id.to_vec())
+                .bind(&r.name)
+                .bind(&r.game)
+                .bind(&r.version)
+                .bind(bound(r.bytes))
+                .bind(i32::try_from(r.items).unwrap_or(i32::MAX))
+                .bind(i32::try_from(r.locations).unwrap_or(i32::MAX))
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn manifest_record(
+        &self,
+        id: &BlobKey,
+    ) -> Result<Option<crate::ManifestRecord>, StoreError> {
+        let id = id.to_vec();
+        let rows = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, ManifestRow>("SELECT id, name, game, version, size, items, locations FROM world_manifests WHERE id = $1")
+                        .bind(&id)
+                        .fetch_all(&mut *c)
+                        .await
+                        .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().next().map(ManifestRow::record).transpose()
+    }
+
+    async fn manifest_bytes(&self, id: &BlobKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = id.to_vec();
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT bytes FROM world_manifests WHERE id = $1")
+                        .bind(&key)
+                        .fetch_optional(&mut *c)
+                        .await
+                        .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        match found {
+            Some(b) if crate::blob_key(&b) != *id => {
+                Err(StoreError::Corrupt("a stored manifest does not match its id".into()))
+            }
+            found => Ok(found),
+        }
+    }
+
+    /// In the `prepared_worlds` table (migration 0011).
+    async fn prepared_put(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+        package: &BlobKey,
+    ) -> Result<(), StoreError> {
+        let (id, engine, package) = (id.to_vec(), engine.to_owned(), package.to_vec());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO prepared_worlds (manifest, engine, package) VALUES ($1, $2, $3) \
+                     ON CONFLICT (manifest, engine) DO UPDATE SET package = EXCLUDED.package",
+                )
+                .bind(&id)
+                .bind(&engine)
+                .bind(&package)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn prepared_key(
+        &self,
+        id: &BlobKey,
+        engine: &str,
+    ) -> Result<Option<BlobKey>, StoreError> {
+        let (id, engine) = (id.to_vec(), engine.to_owned());
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT package FROM prepared_worlds WHERE manifest = $1 AND engine = $2",
+                    )
+                    .bind(&id)
+                    .bind(&engine)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        found
+            .map(|k| {
+                k.try_into()
+                    .map_err(|_| StoreError::Corrupt("a prepared key is not 32 bytes".into()))
+            })
+            .transpose()
+    }
+
+    async fn manifest_list(
+        &self,
+        game: Option<&str>,
+        after: Option<&BlobKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::ManifestRecord>, StoreError> {
+        let (game, after) = (game.map(str::to_owned), after.map(|a| a.to_vec()));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, ManifestRow>("SELECT id, name, game, version, size, items, locations FROM world_manifests \
+                         WHERE ($1::text IS NULL OR game = $1) \
+                         AND ($2::bytea IS NULL OR id > $2) ORDER BY id LIMIT $3")
+                    .bind(game)
+                    .bind(after)
+                    .bind(limit)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(ManifestRow::record).collect()
+    }
+}
+
+#[cfg(all(test, feature = "pg-tests"))]
+impl PgLogStore {
+    /// Change an upload's file without its id, as a torn row is.
+    pub(crate) async fn tear_upload_for_tests(&self, kind: crate::UploadKind, id: &BlobKey) {
+        let (kind, id) = (kind, id.to_vec());
+        let done = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "UPDATE world_uploads SET bytes = bytes || '\\x00'::bytea \
+                         WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await;
+        done.unwrap();
+    }
+}
+
+/// Uploads in the `world_uploads` table (migration 0005).
+impl crate::UploadStore for PgLogStore {
+    async fn upload_put(&self, r: &crate::UploadRecord, bytes: &[u8]) -> Result<(), StoreError> {
+        if crate::blob_key(bytes) != r.id {
+            return Err(StoreError::Corrupt(
+                "an upload put under an id it does not hash to".into(),
+            ));
+        }
+        let (r, bytes) = (r.clone(), bytes.to_vec());
+        let size = bound(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    // Write once; a row whose bytes are not its id's (torn) is healed.
+                    "INSERT INTO world_uploads (kind, id, game, size, meta, bytes) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (kind, id) DO UPDATE SET bytes = EXCLUDED.bytes \
+                     WHERE sha256(world_uploads.bytes) <> world_uploads.id",
+                )
+                .bind(r.kind.as_str())
+                .bind(r.id.to_vec())
+                .bind(&r.game)
+                .bind(size)
+                .bind(&r.meta)
+                .bind(&bytes)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn upload_meta(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<String>, StoreError> {
+        let id = id.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT meta FROM world_uploads WHERE kind = $1 AND id = $2")
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn upload_bytes(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let (key, want) = (id.to_vec(), *id);
+        let found: Option<Vec<u8>> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT bytes FROM world_uploads WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        // An upload may be up to its cap: hashed off the runtime's threads.
+        tokio::task::spawn_blocking(move || crate::checked_upload(found, &want))
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+    }
+
+    async fn upload_intact(
+        &self,
+        kind: crate::UploadKind,
+        id: &BlobKey,
+    ) -> Result<bool, StoreError> {
+        let id = id.to_vec();
+        let whole: Option<bool> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT sha256(bytes) = id FROM world_uploads WHERE kind = $1 AND id = $2",
+                    )
+                    .bind(kind.as_str())
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(whole.unwrap_or(false))
+    }
+
+    async fn upload_list(&self, kind: crate::UploadKind) -> Result<Vec<String>, StoreError> {
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT meta FROM world_uploads WHERE kind = $1 ORDER BY id")
+                    .bind(kind.as_str())
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
+/// The seconds of `d` as Postgres takes them in `make_interval`.
+fn secs(d: core::time::Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+/// Generation statuses in the `world_jobs` table (migration 0006).
+impl crate::JobStore for PgLogStore {
+    async fn job_put(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        let (id, status) = (id.to_owned(), status.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO world_jobs (id, state, status) VALUES ($1, $2, $3) \
+                     ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, \
+                     status = EXCLUDED.status, updated_at = now()",
+                )
+                .bind(&id)
+                .bind(state.as_str())
+                .bind(&status)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_put_if_absent(
+        &self,
+        id: &str,
+        state: crate::JobState,
+        status: &str,
+    ) -> Result<bool, StoreError> {
+        let (id, status) = (id.to_owned(), status.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO world_jobs (id, state, status) VALUES ($1, $2, $3) \
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(state.as_str())
+                .bind(&status)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, core::time::Duration)>, StoreError> {
+        let id = id.to_owned();
+        let row: Option<(String, f64)> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT status, EXTRACT(EPOCH FROM now() - updated_at)::float8 \
+                         FROM world_jobs WHERE id = $1",
+                    )
+                    .bind(&id)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        // Both times from the database's clock: never negative but for rounding.
+        Ok(row.map(|(status, ago)| (status, core::time::Duration::from_secs_f64(ago.max(0.0)))))
+    }
+
+    async fn job_touch(&self, id: &str) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE world_jobs SET updated_at = now() \
+                     WHERE id = $1 AND state IN ('queued', 'running')",
+                )
+                .bind(&id)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn job_fail_all_stale(
+        &self,
+        older_than: core::time::Duration,
+        error: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let (older, error) = (secs(older_than), error.to_owned());
+        let mut failed: Vec<String> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        // A status that is not a JSON object is replaced, as the memory store does.
+                        "UPDATE world_jobs SET state = 'failed', updated_at = now(), \
+                         status = (world_jobs_status_object(status) \
+                                   || jsonb_build_object('status', 'failed', 'error', $2::text))::text \
+                         WHERE state IN ('queued', 'running') \
+                         AND updated_at <= now() - make_interval(secs => $1) RETURNING id",
+                    )
+                    .bind(older)
+                    .bind(&error)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        failed.sort();
+        Ok(failed)
+    }
+
+    async fn job_fail_stale(
+        &self,
+        id: &str,
+        status: &str,
+        older_than: core::time::Duration,
+    ) -> Result<bool, StoreError> {
+        let (id, status, older) = (id.to_owned(), status.to_owned(), secs(older_than));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE world_jobs SET state = 'failed', status = $2, updated_at = now() \
+                     WHERE id = $1 AND state IN ('queued', 'running') \
+                     AND updated_at <= now() - make_interval(secs => $3)",
+                )
+                .bind(&id)
+                .bind(&status)
+                .bind(older)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
+/// A manifest's listing columns (never its bytes).
+#[derive(sqlx::FromRow)]
+struct ManifestRow {
+    id: Vec<u8>,
+    name: String,
+    game: String,
+    version: String,
+    size: i64,
+    items: i32,
+    locations: i32,
+}
+
+impl ManifestRow {
+    fn record(self) -> Result<crate::ManifestRecord, StoreError> {
+        let bad = |what: &str| StoreError::Corrupt(format!("a manifest row has a bad {what}"));
+        Ok(crate::ManifestRecord {
+            id: self.id.try_into().map_err(|_| bad("id"))?,
+            name: self.name,
+            game: self.game,
+            version: self.version,
+            bytes: u64::try_from(self.size).map_err(|_| bad("size"))?,
+            items: u32::try_from(self.items).map_err(|_| bad("items"))?,
+            locations: u32::try_from(self.locations).map_err(|_| bad("locations"))?,
+        })
+    }
+}
+
 impl LogStore for PgLogStore {
     async fn append(&self, batch: AppendBatch<'_>) -> Result<AppendReceipt, AppendError> {
         let job = Job::new(&batch)?;
@@ -816,6 +1420,19 @@ pub mod testing {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn a_runtime_connection_with_more_than_data_rights_is_warned_about() {
+    let owner = privilege_warning(config::DB_MIGRATE_ROLE, false).unwrap();
+    assert!(
+        owner.contains("table owner") && owner.contains("CONSTELLATION_DATABASE_URL"),
+        "{owner}"
+    );
+    let root = privilege_warning("postgres", true).unwrap();
+    assert!(root.contains("superuser") && root.contains(config::DB_APP_ROLE), "{root}");
+    assert_eq!(privilege_warning(config::DB_APP_ROLE, false), None);
+}
+
 /// The nightly workflow excludes `fence`'s `&&` to `||` mutant by name (equivalent, see the
 /// comment in `fence`). A second `&&` in `fence` would be excluded silently with it, so this
 /// fails first: whoever adds one must narrow the exclusion in nightly.yml.
@@ -825,4 +1442,636 @@ fn fence_has_exactly_the_one_and_the_mutants_exclusion_names() {
     let (_, from_fence) = include_str!("pg.rs").split_once("async fn fence(").expect("fence");
     let (body, _) = from_fence.split_once("\n}\n").expect("fence ends");
     assert_eq!(body.matches("&&").count(), 1, "narrow the fence exclusion in nightly.yml");
+}
+
+/// A listed room as the owner query reads it: world id, seed name, key, owner, age.
+type OwnedRow = (Option<String>, String, String, Option<String>, i64);
+
+/// Accounts, logins and room ownership (migration 0007).
+impl crate::AccountStore for PgLogStore {
+    async fn user_create(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
+        let (name, hash) = (name.to_owned(), hash.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO users (name, hash) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                    .bind(&name)
+                    .bind(&hash)
+                    .execute(&mut *c)
+                    .await
+                    .map(|done| done.rows_affected() == 1)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn user_hash(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let name = name.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT hash FROM users WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_put(
+        &self,
+        token_hash: &[u8; 32],
+        name: &str,
+        ttl: core::time::Duration,
+    ) -> Result<(), StoreError> {
+        let (token, name, ttl) = (token_hash.to_vec(), name.to_owned(), secs(ttl));
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // Dead sessions are swept as new ones are made, so the table stays small.
+                sqlx::query("DELETE FROM sessions WHERE expires_at <= now()")
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))?;
+                sqlx::query(
+                    "INSERT INTO sessions (token_hash, username, expires_at) \
+                     VALUES ($1, $2, now() + make_interval(secs => $3))",
+                )
+                .bind(&token)
+                .bind(&name)
+                .bind(ttl)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_user(&self, token_hash: &[u8; 32]) -> Result<Option<String>, StoreError> {
+        let token = token_hash.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT username FROM sessions WHERE token_hash = $1 AND expires_at > now()",
+                )
+                .bind(&token)
+                .fetch_optional(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn session_delete(&self, token_hash: &[u8; 32]) -> Result<(), StoreError> {
+        let token = token_hash.to_vec();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+                    .bind(&token)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_claim(
+        &self,
+        room: RoomId,
+        owner: Option<&str>,
+        room_info: &crate::OwnedRoom,
+    ) -> Result<(), StoreError> {
+        let (owner, world) = (owner.map(str::to_owned), room_info.world_id.clone());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE rooms SET owner = $2, world_id = $3 WHERE room_id = $1 AND world_id IS NULL",
+                )
+                .bind(room_key(room))
+                .bind(&owner)
+                .bind(&world)
+                .execute(&mut *c)
+                .await
+                .map(drop)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn rooms_owned(&self, owner: Option<&str>) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        self.listed("AND ($1::text IS NULL OR owner = $1)", owner).await
+    }
+
+    async fn room_by_key(&self, key: &str) -> Result<Option<crate::OwnedRoom>, StoreError> {
+        Ok(self.listed("AND room_key = $1", Some(key)).await?.pop())
+    }
+
+    async fn rooms_administered(
+        &self,
+        username: &str,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        self.listed(
+            "AND room_id IN (SELECT room_id FROM room_admins WHERE username = $1)",
+            Some(username),
+        )
+        .await
+    }
+
+    async fn room_admins(&self, key: &str) -> Result<Vec<String>, StoreError> {
+        let key = key.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT a.username FROM room_admins a JOIN rooms r USING (room_id) \
+                     WHERE r.room_key = $1 ORDER BY a.username",
+                )
+                .bind(&key)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_add(
+        &self,
+        key: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, user, by) = (key.to_owned(), username.to_owned(), granted_by.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // The insert takes a room only when the account exists too; the result says
+                // whether both do (a repeat grant inserts nothing and keeps the first).
+                sqlx::query_scalar(
+                    "WITH ins AS (INSERT INTO room_admins (room_id, username, granted_by) \
+                       SELECT r.room_id, u.name, $3 FROM rooms r, users u \
+                       WHERE r.room_key = $1 AND u.name = $2 ON CONFLICT DO NOTHING) \
+                     SELECT EXISTS (SELECT 1 FROM rooms WHERE room_key = $1) \
+                        AND EXISTS (SELECT 1 FROM users WHERE name = $2)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .bind(&by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn room_admin_remove(&self, key: &str, username: &str) -> Result<bool, StoreError> {
+        let (key, user) = (key.to_owned(), username.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "DELETE FROM room_admins WHERE username = $2 \
+                     AND room_id = (SELECT room_id FROM rooms WHERE room_key = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn user_delete(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.to_owned();
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM users WHERE name = $1")
+                    .bind(&name)
+                    .execute(&mut *c)
+                    .await
+                    .map(drop)
+                    .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+}
+
+impl PgLogStore {
+    /// The listed rooms matching `filter` (an `AND` clause on `$1`), newest first.
+    async fn listed(
+        &self,
+        filter: &'static str,
+        arg: Option<&str>,
+    ) -> Result<Vec<crate::OwnedRoom>, StoreError> {
+        let arg = arg.map(str::to_owned);
+        let rows: Vec<OwnedRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    // `filter` is one of this file's own literals, never input.
+                    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                        "SELECT world_id, seed_name, room_key, owner, \
+                         GREATEST(0, EXTRACT(EPOCH FROM now() - created_at))::bigint \
+                         FROM rooms WHERE room_key IS NOT NULL AND finished_at IS NULL \
+                         {filter} ORDER BY created_at DESC, room_id"
+                    )))
+                    .bind(&arg)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(world_id, seed_name, room_key, owner, age)| {
+                Ok(crate::OwnedRoom {
+                    world_id,
+                    seed_name,
+                    room_key,
+                    owner,
+                    age_secs: stored(age, "room age")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A catalogue game's row.
+#[derive(sqlx::FromRow)]
+struct GameRow {
+    name: String,
+    description: String,
+    created_by: String,
+}
+
+impl From<GameRow> for crate::Game {
+    fn from(r: GameRow) -> Self {
+        Self { name: r.name, description: r.description, created_by: r.created_by }
+    }
+}
+
+/// A catalogue version's row, with its game's name.
+#[derive(sqlx::FromRow)]
+struct VersionRow {
+    name: String,
+    version: String,
+    note: String,
+    apworld: Vec<u8>,
+    generator: String,
+    state: String,
+    error: Option<String>,
+    scan: Option<String>,
+}
+
+impl VersionRow {
+    fn version(self) -> Result<crate::GameVersion, StoreError> {
+        let bad = |what: &str| StoreError::Corrupt(format!("a catalogue version has a bad {what}"));
+        Ok(crate::GameVersion {
+            game: self.name,
+            version: self.version,
+            note: self.note,
+            apworld: self.apworld.try_into().map_err(|_| bad("apworld id"))?,
+            generator: self.generator,
+            state: crate::VersionState::parse(&self.state).ok_or_else(|| bad("state"))?,
+            error: self.error,
+            scan: self.scan,
+        })
+    }
+}
+
+impl crate::CatalogueStore for PgLogStore {
+    async fn game_create(&self, game: &crate::Game) -> Result<bool, StoreError> {
+        let (key, game) = (crate::game_key(&game.name), game.clone());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // One statement: the owner row goes in only with the new game, and only when
+                // its maker is an account.
+                sqlx::query_scalar(
+                    "WITH g AS (INSERT INTO catalogue_games (key, name, description, created_by) \
+                       VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING key), \
+                     o AS (INSERT INTO catalogue_owners (game, username, granted_by) \
+                       SELECT g.key, u.name, u.name FROM g, users u WHERE u.name = $4) \
+                     SELECT EXISTS (SELECT 1 FROM g)",
+                )
+                .bind(&key)
+                .bind(&game.name)
+                .bind(&game.description)
+                .bind(&game.created_by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn game_get(&self, name: &str) -> Result<Option<crate::Game>, StoreError> {
+        let key = crate::game_key(name);
+        let row: Option<GameRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT name, description, created_by FROM catalogue_games WHERE key = $1",
+                    )
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn game_list(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::Game>, StoreError> {
+        let after = after.map(crate::game_key);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<GameRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT name, description, created_by FROM catalogue_games \
+                         WHERE $1::text IS NULL OR key > $1 ORDER BY key LIMIT $2",
+                    )
+                    .bind(&after)
+                    .bind(limit)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn game_owner_add(
+        &self,
+        game: &str,
+        username: &str,
+        granted_by: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, user, by) = (crate::game_key(game), username.to_owned(), granted_by.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                // As room_admin_add: the insert takes a game only when the account exists too,
+                // and a repeat grant inserts nothing and keeps the first.
+                sqlx::query_scalar(
+                    "WITH ins AS (INSERT INTO catalogue_owners (game, username, granted_by) \
+                       SELECT g.key, u.name, $3 FROM catalogue_games g, users u \
+                       WHERE g.key = $1 AND u.name = $2 ON CONFLICT DO NOTHING) \
+                     SELECT EXISTS (SELECT 1 FROM catalogue_games WHERE key = $1) \
+                        AND EXISTS (SELECT 1 FROM users WHERE name = $2)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .bind(&by)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn game_owner_remove(
+        &self,
+        game: &str,
+        username: &str,
+    ) -> Result<crate::OwnerRemoved, StoreError> {
+        use crate::OwnerRemoved::{LastOwner, NotOwner, Removed};
+        let (key, user) = (crate::game_key(game), username.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                let err = |e: sqlx::Error| db::<StoreError>(&e);
+                let mut tx = c.begin().await.map_err(err)?;
+                // Removals of one game's owners take turns on its row. Each statement after the
+                // lock reads afresh (READ COMMITTED), so it counts what the one before left.
+                sqlx::query("SELECT 1 FROM catalogue_games WHERE key = $1 FOR UPDATE")
+                    .bind(&key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(err)?;
+                let (owner, owners): (bool, i64) = sqlx::query_as(
+                    "SELECT EXISTS (SELECT 1 FROM catalogue_owners \
+                       WHERE game = $1 AND username = $2), \
+                     (SELECT count(*) FROM catalogue_owners WHERE game = $1)",
+                )
+                .bind(&key)
+                .bind(&user)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(err)?;
+                let done = match (owner, owners) {
+                    (false, _) => NotOwner,
+                    (true, ..=1) => LastOwner,
+                    (true, _) => {
+                        sqlx::query(
+                            "DELETE FROM catalogue_owners WHERE game = $1 AND username = $2",
+                        )
+                        .bind(&key)
+                        .bind(&user)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(err)?;
+                        Removed
+                    }
+                };
+                tx.commit().await.map_err(err)?;
+                Ok(done)
+            })
+        })
+        .await
+    }
+
+    async fn game_owners(&self, game: &str) -> Result<Vec<String>, StoreError> {
+        let key = crate::game_key(game);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT username FROM catalogue_owners WHERE game = $1 \
+                     ORDER BY username COLLATE \"C\"",
+                )
+                .bind(&key)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn version_add(
+        &self,
+        version: &crate::NewVersion,
+    ) -> Result<crate::VersionAdded, StoreError> {
+        use crate::VersionAdded::{Added, NoGame, NoUpload, Taken};
+        let (key, v) = (crate::game_key(&version.game), version.clone());
+        let (game, upload, added): (bool, bool, bool) = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    // One statement: the insert runs only when the game and the upload exist,
+                    // and the result says which were found and whether it went in.
+                    sqlx::query_as(
+                        "WITH g AS (SELECT key FROM catalogue_games WHERE key = $1), \
+                         u AS (SELECT id FROM world_uploads WHERE kind = 'apworld' AND id = $4), \
+                         ins AS (INSERT INTO catalogue_versions \
+                           (game, version, note, apworld, generator, state) \
+                           SELECT g.key, $2, $3, u.id, $5, 'checking' FROM g, u \
+                           ON CONFLICT (game, version) DO NOTHING RETURNING 1) \
+                         SELECT EXISTS (SELECT 1 FROM g), EXISTS (SELECT 1 FROM u), \
+                           EXISTS (SELECT 1 FROM ins)",
+                    )
+                    .bind(&key)
+                    .bind(&v.version)
+                    .bind(&v.note)
+                    .bind(v.apworld.as_slice())
+                    .bind(&v.generator)
+                    .fetch_one(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        Ok(match (game, upload, added) {
+            (false, _, _) => NoGame,
+            (true, false, _) => NoUpload,
+            (true, true, false) => Taken,
+            (true, true, true) => Added,
+        })
+    }
+
+    async fn version_set(
+        &self,
+        game: &str,
+        version: &str,
+        state: crate::VersionState,
+        generator: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let key = crate::game_key(game);
+        let (version, generator) = (version.to_owned(), generator.to_owned());
+        let error = error.map(str::to_owned);
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE catalogue_versions \
+                     SET state = $3, generator = $4, error = $5, updated_at = now() \
+                     WHERE game = $1 AND version = $2 AND state <> 'withdrawn'",
+                )
+                .bind(&key)
+                .bind(&version)
+                .bind(state.as_str())
+                .bind(&generator)
+                .bind(&error)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn versions(&self, game: &str) -> Result<Vec<crate::GameVersion>, StoreError> {
+        let key = crate::game_key(game);
+        let rows: Vec<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.game = $1 ORDER BY v.seq DESC",
+                    )
+                    .bind(&key)
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(VersionRow::version).collect()
+    }
+
+    async fn version_latest_live(
+        &self,
+        game: &str,
+        generator: &str,
+    ) -> Result<Option<crate::GameVersion>, StoreError> {
+        let (key, generator) = (crate::game_key(game), generator.to_owned());
+        let row: Option<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.game = $1 AND v.generator = $2 AND v.state = 'live' \
+                         ORDER BY v.seq DESC LIMIT 1",
+                    )
+                    .bind(&key)
+                    .bind(&generator)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        row.map(VersionRow::version).transpose()
+    }
+
+    async fn version_scan_set(
+        &self,
+        game: &str,
+        version: &str,
+        scan: &str,
+    ) -> Result<bool, StoreError> {
+        let (key, version, scan) = (crate::game_key(game), version.to_owned(), scan.to_owned());
+        self.isolated(move |c| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE catalogue_versions SET scan = $3, updated_at = now() \
+                     WHERE game = $1 AND version = $2",
+                )
+                .bind(&key)
+                .bind(&version)
+                .bind(&scan)
+                .execute(&mut *c)
+                .await
+                .map(|done| done.rows_affected() == 1)
+                .map_err(|e| db::<StoreError>(&e))
+            })
+        })
+        .await
+    }
+
+    async fn versions_checking(&self) -> Result<Vec<crate::GameVersion>, StoreError> {
+        let rows: Vec<VersionRow> = self
+            .isolated(move |c| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT g.name, v.version, v.note, v.apworld, v.generator, v.state, \
+                         v.error, v.scan FROM catalogue_versions v \
+                         JOIN catalogue_games g ON g.key = v.game \
+                         WHERE v.state = 'checking' ORDER BY v.seq",
+                    )
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(|e| db::<StoreError>(&e))
+                })
+            })
+            .await?;
+        rows.into_iter().map(VersionRow::version).collect()
+    }
 }

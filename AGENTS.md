@@ -30,5 +30,6 @@ The task list lives in GitHub issues, not in files. [`docs/ROADMAP.md`](docs/ROA
 - Never push to someone else's branch or edit a PR you did not open.
 - New code follows the Concurrency rules in `CONTRIBUTING.md` (many cores from day one). Do not rewrite existing code just for them.
 - One PR per issue. Follow-up fixes are commits on that PR.
+- Generation output may change between versions (see Workflow in `CONTRIBUTING.md`): do not shape a change to keep an old seed, and update a snapshot test in a commit that says so.
 - Issues, PRs and comments in this repo are public. Anything that mentions Archipelago follows the rules in `CONTRIBUTING.md`, and a human reviews it before it is posted.
-- Do not run heavy work on a shared machine: targeted tests locally, the full suite on the manual `nightly` workflow.
+- Do not run heavy work on a shared machine: targeted tests locally, the rest on CI (format, unit, web, version and Postgres tests on every PR).

@@ -163,6 +163,8 @@ Two things this run found. The start inventory of the player with shuffled clock
 
 ### Scaling with players
 
+As of 2026-11-26 the fill has one path, the split path (one solve, then every group's state by adding to it and taking the additions back), at every room size and for confined items too. The carried path (truth maintenance) and the forward path (a fresh solve per round, on threads) described below were removed; the tables are history. A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`).
+
 `measure_room` (feature `memory-harness`) fills a room of N players of the test world (the two instances in turn, so the 10 and 20 player rooms repeat settings), release build, one fill of seed 1, `systemd-run -p CPUQuota=200%`; the world is loaded once and shared; fill time is the median of five fills; engine peak heap is the counting allocator's peak, world load included.
 
 | Players | Setup, 1 thread (ms) | Fill, median of 5 (ms) | Fill per player (ms) | Rule evaluations (millions) | Retractions per removal (mean) | Rounds (spheres) | Share in other worlds | Engine peak heap (MB) |
@@ -174,11 +176,41 @@ Two things this run found. The start inventory of the player with shuffled clock
 | 20 (extra) | 386.6 | 3 597 | 180 | 10.6 | 1 551 | 77 | 0.92 | 7.37 |
 
 - **Memory per added player: about 350 KB** (a plan and a solve state; the world and its rules section are shared). From 1 to 20 players the peak grows 0.71 to 7.37 MB, linear: 291 KB for the second player, then 346 to 351 KB each.
-- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and it runs on `config::FILL_SETUP_WORKERS` threads in the product.
-- **Fill time per added player grows with the room**: 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
+- **Setup per added player: about 20 ms** on one thread (parse the instance, resolve the plan), and a generation in the product runs it on `config::GENERATION_WORKERS` threads (one; the tools use `config::FILL_SETUP_WORKERS`). (History: since 2026-11-26 setup runs on one thread in every caller, and the worker count is gone.)
+- **Fill time per added player grows with the room on the carried path** (rooms under 8 players since the forward path below): 19, 35, 43, 106 and 180 ms per player at 1, 2, 3, 10 and 20 players; total time grows about as players^1.7 (rule evaluations as players^1.6). This is **worse than linear and flagged**: one removal retracts more as the room grows (mean 252 to 1 551 facts), and a room has more removals. Marginal cost of the 2nd player is 51 ms, of the 3rd 60 ms, of each of players 4 to 10 about 133 ms, of players 11 to 20 about 254 ms. Issue #93 tracks it. For scale, a 10 player room fills in 1.1 s.
 - The cheap changes (a min-heap of suspects over players, a worklist of players with something to run, piles indexed by owner) are in: placements are byte-identical to before them (61 fills over 1, 2, 3 and 10 players, clock on and off, and the three-player fixture) and the time dropped 10 to 12 percent at 10 and 20 players. What is left is rule evaluation (the evaluations column is unchanged), not bookkeeping.
-- Every fill is one full solve, then incremental steps (`solves` 1 in all rows).
+- Every fill in this table is one full solve, then incremental steps (`solves` 1 in all rows). That holds on the carried path; the forward path solves once per round (next section).
 
+
+### Rooms of 8 players or more: a forward solve per round
+
+The table above is the carried path (`room::Path::Carry`). At the time of this table, a room of 8 players or more placed its rounds on `room::Path::Forward` (every room now takes `room::Path::Split`): the room is solved afresh for each round with none of the round's items held, forward only, each player's state on one of `config::ROOM_FORWARD_WORKERS` (4) threads. The placements are the same on both paths: a round's state is the unique least fixed point for what is held and placed, and placing reads only what it reaches (tests `a_forward_solve_per_round_places_what_truth_maintenance_does` and `the_forward_path_is_the_same_with_one_worker_and_with_many`).
+
+The test world cannot be committed, so CI measures synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`). The heavy profile follows the test world's counts per check (0.21 regions, 2.4 rule sites, 0.07 defs, 45 time slices, clocks on, 2.4 nodes per rule site against about 2.6). Measured on one GitHub-hosted runner by the `bench-room` job (release build, one seed per size, fill ms as the median of 5, 2026-11-26, commit 7944108); runs on other runners differed by about 20 percent. "Carried" is this branch's carried path on one thread. Rule evaluations are the same for any thread count.
+
+| Profile | Players | Carried: fill ms | Carried: rule evaluations | Forward, 1 thread: fill ms | Forward, 4 threads: fill ms | Forward: rule evaluations |
+|---|---|---|---|---|---|---|
+| light | 1 | 3.4 | 43,855 | 6.5 | 6.9 | 253,458 |
+| light | 10 | 112.0 | 1,117,203 | 91.7 | 78.5 | 2,687,618 |
+| light | 20 | 278.0 | 2,553,983 | 207.2 | 140.9 | 5,361,691 |
+| light | 50 | 1,351.2 | 11,441,303 | 558.3 | 332.4 | 13,425,303 |
+| light | 100 | 3,707.2 | 27,459,539 | 1,193.6 | 651.0 | 26,840,369 |
+| heavy | 1 | 18.1 | 149,132 | 26.1 | 26.3 | 488,289 |
+| heavy | 10 | 587.0 | 4,204,093 | 356.8 | 236.3 | 5,364,638 |
+| heavy | 20 | 1,636.9 | 11,060,637 | 707.1 | 412.4 | 10,518,266 |
+| heavy | 50 | 8,095.2 | 48,917,059 | 1,856.4 | 1,031.1 | 26,224,539 |
+| heavy | 100 | 28,567.6 | 145,327,726 | 4,137.5 | 2,406.7 | 52,251,328 |
+
+Fitted exponent of fill time over players: carried 1.52 (light) and 1.59 (heavy); forward 1.13 and 1.09 on one thread, 0.98 and 0.96 on four. At 100 players of the heavy profile the forward solve alone is 6.9 times faster than the carried path, and four threads add 1.7 times. Peak heap in the job's table counts the calling thread only; read it from the one-thread rows.
+
+- **How close the heavy profile is to the test world.** The test world's fills above, scaled by checks (1,000 of 1,516), are 12.7, 699 and 2,373 ms at 1, 10 and 20 players. The heavy profile's carried fills are 18.1, 587 and 1,637 ms in this run (43 percent above, 16 and 31 percent below); two earlier runs gave 18.5, 582 and 1,606 ms and 21.8, 702 and 1,913 ms (72 percent above, level, 19 percent below). The rooms are near; one player is heavier than the test world per check, and the profile grows more slowly from 1 to 10 players (about 32 times against 55). The two were measured on different machines, so the comparison is rough. Rule evaluations, which do not depend on the machine: 149 thousand, 4.2 million and 11.1 million against the test world's 96 thousand, 3.78 million and 10.6 million (not scaled).
+- **Where the two paths cross is not measured** between 1 and 10 players; the forward path is slower for one player and faster at 10 on both profiles. 8 is a cautious pick.
+- **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
+- The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
+
+## Opt-in fill modes (removed)
+
+Two opt-in fill modes, level fill and shuffle then repair, were built and measured here (commit 20d879c, 2026-11-25): about one forward solve each instead of one per round, 24 to 27 times faster than the exact fill at 100 players, at the cost of seeds that spread items measurably unlike the exact fill. Under D-138 the product has one fill method, so both were removed with their dials, constants, bench rows and tests. Their design, tables and seed-shape numbers are in `git` history (this section at that commit). `fill-fairness --shape on` reports the exact fill's seed shape on one room.
 
 ## Fairness
 
