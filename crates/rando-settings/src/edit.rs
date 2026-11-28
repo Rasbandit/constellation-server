@@ -4,6 +4,7 @@
 //! bytes never enter the file. Edits act only on top-level statements.
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -17,13 +18,13 @@ use crate::diag;
 use crate::fmt::value_text;
 use crate::schema::Schema;
 
-fn bad(msg: &str) -> Diagnostic {
-    diag("edit", "settings.bad_value", None, msg.to_owned(), None)
+fn bad(msg: &str) -> Box<Diagnostic> {
+    Box::new(diag("edit", "settings.bad_value", None, msg.to_owned(), None))
 }
 
 /// `src` parsed, refused when it has a syntax error, and the top-level line for `key`, after
 /// checking `key` is one name that no block of the file changes.
-fn open(src: &str, key: &str, l: &Limits) -> Result<(File, Option<usize>), Diagnostic> {
+fn open(src: &str, key: &str, l: &Limits) -> Result<(File, Option<usize>), Box<Diagnostic>> {
     match lex(key, rando_syntax::Pos::new(1, 1), Kind::Settings) {
         Ok((t, c))
             if c.is_empty()
@@ -34,7 +35,7 @@ fn open(src: &str, key: &str, l: &Limits) -> Result<(File, Option<usize>), Diagn
     }
     let (f, errs) = parse(src, "edit", l);
     if let Some(e) = errs.into_iter().find(|d| d.key.as_deref() != Some("settings.header")) {
-        return Err(e);
+        return Err(e.into());
     }
     let in_block = f.body.iter().any(|line| match &line.stmt {
         Stmt::Block { body, .. } => {
@@ -45,7 +46,7 @@ fn open(src: &str, key: &str, l: &Limits) -> Result<(File, Option<usize>), Diagn
     if in_block {
         let msg = format!("A rule of this file changes '{key}', so it is edited as a rule.");
         let help = "edit the rule: on the Rules panel, with set_rule, or as text".to_owned();
-        return Err(diag("edit", "settings.in_block", None, msg, Some(help)));
+        return Err(diag("edit", "settings.in_block", None, msg, Some(help)).into());
     }
     let at = f.body.iter().position(
         |line| matches!(&line.stmt, Stmt::Setting { key: k, op: Op::Set, .. } if k.v == key),
@@ -53,7 +54,7 @@ fn open(src: &str, key: &str, l: &Limits) -> Result<(File, Option<usize>), Diagn
     Ok((f, at))
 }
 
-fn splice(src: &str, edits: &mut Vec<(usize, usize, String)>) -> String {
+fn splice(src: &str, edits: &mut [(usize, usize, String)]) -> String {
     edits.sort_by_key(|e| core::cmp::Reverse(e.0));
     let mut out = src.to_owned();
     for (a, b, t) in edits.iter() {
@@ -95,7 +96,7 @@ pub fn set(
     value: &str,
     schema: Option<&Schema>,
     l: &Limits,
-) -> Result<String, Diagnostic> {
+) -> Result<String, Box<Diagnostic>> {
     let (new, toks) = parse_value(value.trim_matches([' ', '\t']), l)?;
     let printed = value_text(&toks, value.trim_matches([' ', '\t']));
     let (f, at) = open(src, key, l)?;
@@ -195,7 +196,7 @@ fn list_edits(
 ///
 /// # Errors
 /// As [`set`].
-pub fn reset(src: &str, key: &str, l: &Limits) -> Result<String, Diagnostic> {
+pub fn reset(src: &str, key: &str, l: &Limits) -> Result<String, Box<Diagnostic>> {
     let (f, at) = open(src, key, l)?;
     let Some(i) = at else { return Ok(src.to_owned()) };
     let span = f.body[i].span;
@@ -245,11 +246,7 @@ mod tests {
     #[test]
     fn a_list_is_spliced_entry_by_entry() {
         let out = ok(HAND, "keep_home", "[lantern, rope, boots]");
-        assert_eq!(
-            out,
-            HAND.replace("  rope,\r\n]", "  rope,\r\n  boots,\r\n]")
-                .replace("  rope,\r\n  boots,", "  rope,\r\n  boots,")
-        );
+        assert_eq!(out, HAND.replace("  rope,\r\n]", "  rope,\r\n  boots,\r\n]"));
         let removed = ok(HAND, "keep_home", "[rope]");
         assert!(removed.contains("keep_home = [# the light\r\n  rope,\r\n]"), "{removed}");
         let one_line = "settings for w\nk = [a, b, c] # list\n";

@@ -8,7 +8,7 @@
 use alloc::borrow::ToOwned;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use config::Limits;
@@ -794,7 +794,7 @@ impl C<'_> {
                     out.insert(k.v.clone(), x);
                 }
                 if opt.key == "start_with" {
-                    self.from_shuffle(&out, v.pos);
+                    self.check_from_shuffle(&out, v.pos);
                 }
                 Some(Value::Object(out))
             }
@@ -817,7 +817,7 @@ impl C<'_> {
     }
 
     /// `start_with.from_shuffle` takes at most the copies the shuffle holds.
-    fn from_shuffle(&mut self, rec: &Map<String, Value>, pos: Pos) {
+    fn check_from_shuffle(&mut self, rec: &Map<String, Value>, pos: Pos) {
         for pair in rec.get("from_shuffle").and_then(Value::as_array).into_iter().flatten() {
             let (Some(name), Some(n)) = (pair[0].as_str(), pair[1].as_u64()) else { continue };
             if let Some(have) = self.s.items.get(name).and_then(|i| i.copies)
@@ -1287,10 +1287,7 @@ impl C<'_> {
             Some(json!([e.name.v, n.map_or(json!("all"), |n| json!(n))]))
         };
         let (items_json, drawn) = match &items.v {
-            Items::One(e) => match entry(self, e, items.pos) {
-                Some(j) => (json!([j]), 0),
-                None => return None,
-            },
+            Items::One(e) => (json!([entry(self, e, items.pos)?]), 0),
             Items::List(list) => {
                 let mut out = Vec::new();
                 for e in list {
@@ -1486,6 +1483,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::ast::parse;
     use crate::testdata::{CINDERFALL, LANTERNFALL};
+    use alloc::string::ToString;
     use alloc::vec;
 
     const L: Limits = Limits::DESIGN;

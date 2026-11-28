@@ -155,15 +155,14 @@ fn join(toks: &[Token], src: &str, order: &[usize], flip: Option<usize>) -> Stri
         if t.t == Tok::Comma && matches!(next, Some(Tok::RBrack | Tok::RBrace | Tok::Close)) {
             continue;
         }
-        let space = match (prev, &t.t) {
-            (None, _) => false,
-            (Some(Tok::Open | Tok::LBrack), _) => false,
-            (_, Tok::Comma | Tok::Close | Tok::RBrack | Tok::Percent) => false,
-            (Some(Tok::Plus | Tok::Minus), Tok::Eq) => false,
-            (Some(Tok::LBrace), Tok::RBrace) => false,
-            (Some(Tok::Name(_)), Tok::Open) => false,
-            _ => true,
-        };
+        let space = !matches!(
+            (prev, &t.t),
+            (None | Some(Tok::Open | Tok::LBrack), _)
+                | (_, Tok::Comma | Tok::Close | Tok::RBrack | Tok::Percent)
+                | (Some(Tok::Plus | Tok::Minus), Tok::Eq)
+                | (Some(Tok::LBrace), Tok::RBrace)
+                | (Some(Tok::Name(_)), Tok::Open)
+        );
         if space {
             s.push(' ');
         }
@@ -188,15 +187,16 @@ fn layout(f: &File, with_comments: bool) -> String {
     if with_comments {
         for (ci, c) in f.comments.iter().enumerate() {
             let k = c.before;
-            if !c.own_line && k > 0 {
-                if let Some(li) = out.iter().position(|o| o.range.start < k && k <= o.range.end) {
-                    if out[li].range.end == k && trailing[li].is_none() {
-                        trailing[li] = Some(ci);
-                    } else {
-                        above[li].push(ci);
-                    }
-                    continue;
+            if !c.own_line
+                && k > 0
+                && let Some(li) = out.iter().position(|o| o.range.start < k && k <= o.range.end)
+            {
+                if out[li].range.end == k && trailing[li].is_none() {
+                    trailing[li] = Some(ci);
+                } else {
+                    above[li].push(ci);
                 }
+                continue;
             }
             let li = if k >= ntok {
                 out.len()

@@ -294,7 +294,10 @@ fn str_list(v: &Value, what: &str) -> Result<Vec<String>, String> {
 }
 
 /// `[{"name": ...}, ...]`, the shape every schema list has.
-fn names(v: Option<&Value>, what: &str) -> Result<Vec<(String, Map<String, Value>)>, String> {
+/// A schema list's entries: each name and its object.
+type Named = Vec<(String, Map<String, Value>)>;
+
+fn names(v: Option<&Value>, what: &str) -> Result<Named, String> {
     let Some(v) = v else { return Ok(Vec::new()) };
     let list = v.as_array().ok_or_else(|| format!("`{what}` is not a list"))?;
     list.iter()

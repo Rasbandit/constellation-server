@@ -9,6 +9,7 @@
 //! a file is reported in one pass.
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -385,7 +386,7 @@ pub fn parse(src: &str, file: &str, l: &Limits) -> (File, Vec<Diagnostic>) {
                 out.body.push(line);
             }
             Err(e) => {
-                p.errs.push(e);
+                p.errs.push(*e);
                 p.skip_line(start);
             }
         }
@@ -409,14 +410,14 @@ pub fn parse(src: &str, file: &str, l: &Limits) -> (File, Vec<Diagnostic>) {
 ///
 /// # Errors
 /// Anything else, as a `settings.bad_value` or `settings.limit` diagnostic.
-pub fn parse_value(text: &str, l: &Limits) -> Result<(Value, Vec<Token>), Diagnostic> {
-    let bad = |msg: &str| diag("value", "settings.bad_value", None, msg.to_owned(), None);
+pub fn parse_value(text: &str, l: &Limits) -> Result<(Value, Vec<Token>), Box<Diagnostic>> {
+    let bad = |msg: &str| Box::new(diag("value", "settings.bad_value", None, msg.to_owned(), None));
     if text.len() > l.settings_max_value_bytes {
         let msg = format!(
             "A value may be at most {} bytes (settings_max_value_bytes).",
             l.settings_max_value_bytes
         );
-        return Err(diag("value", "settings.limit", None, msg, None));
+        return Err(diag("value", "settings.limit", None, msg, None).into());
     }
     if text.contains(['\n', '\r']) {
         return Err(bad("A value is one line: it holds no line break."));
@@ -432,7 +433,7 @@ pub fn parse_value(text: &str, l: &Limits) -> Result<(Value, Vec<Token>), Diagno
     let mut p = P { toks: &toks, i: 0, file: "value", l, errs: Vec::new(), stmts: 0 };
     p.check_tokens();
     if let Some(e) = p.errs.pop() {
-        return Err(e);
+        return Err(e.into());
     }
     let v = p.value()?;
     if p.i < toks.len() {
@@ -450,11 +451,11 @@ struct P<'a> {
     stmts: usize,
 }
 
-type R<T> = Result<T, Diagnostic>;
+type R<T> = Result<T, Box<Diagnostic>>;
 
 impl P<'_> {
-    fn err(&self, pos: Option<Pos>, msg: String) -> Diagnostic {
-        diag(self.file, "settings.syntax", pos, msg, None)
+    fn err(&self, pos: Option<Pos>, msg: String) -> Box<Diagnostic> {
+        Box::new(diag(self.file, "settings.syntax", pos, msg, None))
     }
 
     /// The caps that are about one token: name and string length, integer range.
@@ -649,7 +650,7 @@ impl P<'_> {
                 out.format =
                     Some(Node { v: n.v, pos: self.toks[start].pos, span: self.span_from(start) });
             } else if let Err(e) = self.end_line() {
-                self.errs.push(e);
+                self.errs.push(*e);
                 self.skip_line(start);
             }
             out.head.push(start..self.i);
@@ -673,7 +674,7 @@ impl P<'_> {
             _ => None,
         };
         let Some(header) = header else {
-            let mut e = diag(
+            let e = diag(
                 self.file,
                 "settings.header",
                 Some(self.here()),
@@ -682,7 +683,6 @@ impl P<'_> {
                     .into(),
                 Some("add a first line such as `settings for lanternfall`".into()),
             );
-            e.pos = Some(self.here());
             self.errs.push(e);
             return;
         };
@@ -690,12 +690,12 @@ impl P<'_> {
             match self.world_ref() {
                 Ok(w) => out.world = w,
                 Err(e) => {
-                    self.errs.push(e);
+                    self.errs.push(*e);
                     self.skip_line(start);
                 }
             }
         } else if let Err(e) = self.end_line() {
-            self.errs.push(e);
+            self.errs.push(*e);
             self.skip_line(start);
         }
         out.header = Some(self.node(start, header));
@@ -726,7 +726,7 @@ impl P<'_> {
                 _ => break,
             };
             if let Err(e) = r {
-                self.errs.push(e);
+                self.errs.push(*e);
                 self.skip_line(start);
             }
             out.head.push(start..self.i);
@@ -835,7 +835,7 @@ impl P<'_> {
             } else {
                 "settings.syntax"
             };
-            return Err(diag(self.file, key, Some(self.here()), msg, None));
+            return Err(diag(self.file, key, Some(self.here()), msg, None).into());
         }
         self.i += 1;
         let stmt = match word.as_str() {
@@ -922,7 +922,7 @@ impl P<'_> {
                     Some(self.toks[start].pos),
                     format!("a `{word}` line belongs in the header, before the first setting"),
                 );
-                e.help = Some(format!("move this line up, under the `settings for` line"));
+                e.help = Some("move this line up, under the `settings for` line".into());
                 return Err(e);
             }
             "lock" | "game" | "share" => {
@@ -1023,7 +1023,7 @@ impl P<'_> {
             match self.statement(true) {
                 Ok(l) => body.push(l),
                 Err(e) => {
-                    self.errs.push(e);
+                    self.errs.push(*e);
                     self.skip_line(at);
                 }
             }
