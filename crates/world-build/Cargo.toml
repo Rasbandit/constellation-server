@@ -18,6 +18,9 @@ config = { path = "../config", default-features = false }
 # which every built manifest goes through as a last check. Without it the tool still checks
 # and builds canonical JSON (doc 18 section 5.2).
 data-fill = { path = "../data-fill", optional = true }
+# The lexer, `Pos`, the diagnostics type, "did you mean" and canonical JSON, shared with the
+# settings language (design doc 20 section 8.1).
+rando-syntax = { path = "../rando-syntax" }
 # The comparison operators and their monotone rule, shared with the engine.
 rule-ops = { path = "../rule-ops" }
 # The seed bundle type `rando generate` reads its spoiler from (with feature `engine`).

@@ -1,0 +1,20 @@
+[package]
+name = "rando-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The canonical JSON writer's value type, `alloc` only (the workspace spec), so the crate stays
+# `no_std` and builds for WebAssembly.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

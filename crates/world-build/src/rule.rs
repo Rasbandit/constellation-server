@@ -9,30 +9,7 @@
 use crate::lex::{Tok, Token, lex, show};
 use crate::model::Pos;
 
-/// A comparison, in the engine's operand order (`rule_ops::CMP_OPS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cmp {
-    /// `==`
-    Eq,
-    /// `!=`
-    Ne,
-    /// `<`
-    Lt,
-    /// `<=`
-    Le,
-    /// `>`
-    Gt,
-    /// `>=`
-    Ge,
-}
-
-impl Cmp {
-    /// The engine's operand index.
-    #[must_use]
-    pub fn index(self) -> usize {
-        self as usize
-    }
-}
+pub use rando_syntax::Cmp;
 
 /// An arithmetic operator other than `+`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

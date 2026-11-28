@@ -3,8 +3,11 @@
 //! (interpolated names are glued pieces) and whether a newline did (a table row ends at one).
 //! Comments are kept beside the tokens, for the formatter.
 
-use crate::model::Pos;
-use crate::rule::Cmp;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::{Cmp, Pos};
 
 /// Words that are always keywords: those that start a declaration or a member, `when`,
 /// `match`, and the rule's own words. A reserved word is written as a name in backticks:

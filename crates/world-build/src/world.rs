@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::lex::CHECK_MODIFIERS;
 use crate::lower::{Lower, Mode, Names, OptTy, Readable, Sort, truth};
 use crate::model::{At, Lit, Members, Pos, Rule, Verb, World};
-use crate::{Built, Error, instance};
+use crate::{Built, Error, Severity, instance};
 
 /// The format line this version reads.
 pub(crate) const FORMAT: &str = "cgm-data/1";
@@ -46,7 +46,7 @@ impl Errs {
     fn make(&self, pos: Option<Pos>, msg: impl Into<String>, help: &str) -> Error {
         let help = (!help.is_empty()).then(|| help.to_owned());
         let file = pos.and_then(|p| self.files.get(p.file as usize)).or(self.files.first());
-        Error { file: file.cloned().unwrap_or_default(), pos, msg: msg.into(), help }
+        Error::new(file.cloned().unwrap_or_default(), pos, msg.into(), help)
     }
 
     /// An error at `pos`. Past [`config::WORLD_BUILD_MAX_ERRORS`] errors (or warnings) the rest
@@ -63,8 +63,13 @@ impl Errs {
     /// An error or warning about the whole of `file`, a file that is not a `.rando` module.
     pub(crate) fn in_file(&mut self, file: &str, msg: impl Into<String>, help: &str, warn: bool) {
         let help = (!help.is_empty()).then(|| help.to_owned());
-        let e = Error { file: file.to_owned(), pos: None, msg: msg.into(), help };
-        if warn { self.warnings.push(e) } else { self.errors.push(e) }
+        let mut e = Error::new(file.to_owned(), None, msg.into(), help);
+        if warn {
+            e.severity = Severity::Warning;
+            self.warnings.push(e);
+        } else {
+            self.errors.push(e);
+        }
     }
 
     fn push(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
@@ -94,7 +99,8 @@ impl Errs {
             return;
         }
         if self.warnings.len() < config::WORLD_BUILD_MAX_ERRORS {
-            let e = self.make(pos, msg, help);
+            let mut e = self.make(pos, msg, help);
+            e.severity = Severity::Warning;
             self.warnings.push(e);
         } else {
             self.dropped_warnings += 1;
@@ -104,8 +110,9 @@ impl Errs {
     /// The warnings, and one more line for what the cap dropped.
     pub(crate) fn warnings_list(mut self) -> Vec<Error> {
         if self.dropped_warnings > 0 {
-            let e =
+            let mut e =
                 self.make(None, format!("{} more warnings not shown", self.dropped_warnings), "");
+            e.severity = Severity::Warning;
             self.warnings.push(e);
         }
         self.warnings
@@ -313,21 +320,21 @@ pub(crate) fn build(w: &World, file: &str) -> Result<Built, Vec<Error>> {
             .spawn_scoped(s, || build_here(w, file))
             .map_or_else(
                 |e| {
-                    Err(vec![Error {
-                        file: file.to_owned(),
-                        pos: None,
-                        msg: format!("cannot start the build: {e}"),
-                        help: None,
-                    }])
+                    Err(vec![Error::new(
+                        file.to_owned(),
+                        None,
+                        format!("cannot start the build: {e}"),
+                        None,
+                    )])
                 },
                 |h| {
                     h.join().unwrap_or_else(|_| {
-                        Err(vec![Error {
-                            file: file.to_owned(),
-                            pos: None,
-                            msg: "the build stopped unexpectedly".into(),
-                            help: Some("please report it with the world file".into()),
-                        }])
+                        Err(vec![Error::new(
+                            file.to_owned(),
+                            None,
+                            "the build stopped unexpectedly".into(),
+                            Some("please report it with the world file".into()),
+                        )])
                     })
                 },
             )
