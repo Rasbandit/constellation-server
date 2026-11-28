@@ -285,10 +285,9 @@ pub fn spoiler_text(s: &Value) -> String {
             format!(
                 "  warning: {} players' worlds have less room early on than progression to place (lowest early capacity {}); the fill leaned on repairs",
                 f["tight_players"],
-                f["lowest_early_capacity_milli"].as_u64().map_or_else(
-                    || "unknown".to_owned(),
-                    |m| format!("{}.{:03}", m / 1000, m % 1000)
-                )
+                f["lowest_early_capacity_milli"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_owned(), data_fill::seed::thousandths)
             ),
         );
     }

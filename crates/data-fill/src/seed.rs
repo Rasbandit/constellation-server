@@ -139,6 +139,13 @@ pub struct FillReport {
     pub capacity_milli: u32,
 }
 
+/// A count in thousandths (as [`FillReport::capacity_milli`] holds a ratio) written as a decimal
+/// with three places: 1125 is `1.125`, 1000 is `1.000`. Exact: no float is involved.
+#[must_use]
+pub fn thousandths(milli: u64) -> String {
+    format!("{}.{:03}", milli / 1000, milli % 1000)
+}
+
 /// [`generate`] on a prepared world: nothing is compiled and the game's tables are not built
 /// again, the fill starts from the stored form. The same bundle as the manifest gives, and how
 /// its fill went.
@@ -382,5 +389,15 @@ mod tests {
         let (flagged, lowest) = super::capacity(&c.seats(), &insts);
         assert_eq!(flagged, 2);
         assert!(lowest < 1000, "{lowest}");
+    }
+
+    #[test]
+    fn thousandths_are_written_with_three_places() {
+        assert_eq!(super::thousandths(1125), "1.125");
+        assert_eq!(super::thousandths(1000), "1.000");
+        assert_eq!(super::thousandths(1100), "1.100");
+        assert_eq!(super::thousandths(7), "0.007");
+        assert_eq!(super::thousandths(0), "0.000");
+        assert_eq!(super::thousandths(u64::from(u32::MAX)), "4294967.295");
     }
 }
