@@ -3,8 +3,8 @@
 This repo is a proof of concept. It has to answer three questions, with tests as the evidence:
 
 1. **Does it work with what already exists?** Clients and games built for Archipelago connect to our server and play a real multiworld without noticing a difference.
-2. **Does the Constellation standard work?** A client written against our own protocol (CWP, doc 01 in the `constellation` design repo) plays a room, and plays in the *same* room as a client compatible with Archipelago.
-3. **Can real games move to the standard?** A few existing games are described as Constellation game manifests (CGM, data only: doc 01 section 3.2, and doc 07 for how far data can go) and generate seeds that match what they generate today.
+2. **Does our native protocol work?** A client written against our own protocol (doc 01 in the `constellation` design repo) plays a room, and plays in the *same* room as a client compatible with Archipelago.
+3. **Can real games move to data-only worlds?** A few existing games are written as `.rando` worlds (data only: doc 18, D-141) and generate seeds that match what they generate today on IDs, item pools and beatability.
 
 Every pitfall we hit on the way is a result, not a failure. Write it down (see "Findings" at the end).
 
@@ -84,23 +84,11 @@ These four serve question 3 (lane games, M3). Each follows a decided design doc 
 
 **The settings language** (doc 20, D-143, D-144). Goal: player and room settings as a small `.rando` file type. Done: option scope and labels, and `settings.json` in the package (#231), and the shared lexer with a settings file kind (#232). Open: the checker and tools of doc 20 sections 7 and 8.
 
-**Generic shuffles, entrance and room shuffle first** (doc 17, D-137). Goal: one system for randomization that is not item placement. Done: the first slice in `data_fill::shuffle`, with entrance shuffle (#207; [`data-only-world-experiment.md`](data-only-world-experiment.md) section 4). Open: the write edges in the run order (#210) and the rest of doc 17 (#211).
+**Generic shuffles, entrance and room shuffle first** (doc 17, D-137). Goal: one system for randomization that is not item placement. Done: the first slice in `data_fill::shuffle`, with entrance shuffle (#207). Open: the write edges in the run order (#210) and the rest of doc 17 (#211).
 
 ## Tech choices
 
 The web UI is a Vite and React app in `web/`, served by the server binary on the room port (#107). The server stays one binary to deploy; contributors working on the UI need Node tooling (`web/package.json`).
-
-## Start order
-
-Each person can start on day one without waiting for anyone:
-
-1. Lane A: #19 client matrix, then #21 (#20 is done).
-2. Lane B: #13 cursors (#12 schema is done), then #14 and #15.
-3. Lane C: #28 rule evaluator, then #29 (#27 validator is done).
-4. Lane D: #35 chaos run and #37 simulator, then #33 once approved, then #22 or #23 wherever is behind.
-5. Lane E (if a fifth person joins): pick from the open `lane:web` issues.
-
-Cross-lane handoff to watch: #17 needs lane A's test helpers (`crates/e2e`).
 
 ## Findings
 

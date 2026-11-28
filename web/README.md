@@ -2,7 +2,7 @@
 
 A React + Vite front end for creating, playing and hosting rooms. On its own it runs on a stub: `mock/` answers every `/api/*` endpoint inside the Vite dev server with seeded, in-memory demo data and always takes the happy path. Pointed at a real server (see "Uploads through the server"), it creates and shows real rooms instead.
 
-Note: `docs/ROADMAP.md` (Tech choices) picks server-rendered Askama + htmx for the web UI. This prototype is a separate exploration; which stack ships is the maintainers' decision.
+This is the web UI that ships: the server binary serves its build on the room port (`docs/ROADMAP.md`, Tech choices; `docs/container.md`, Web UI).
 
 ## Run
 
@@ -63,7 +63,7 @@ Admin endpoints need `X-Admin-Key` (403 without it), under `/api/rooms/:id/admin
 
 The feed is resumable: entries carry the room log `seq`, and after a reconnect the page asks for `feed?after=<last seq>` before relying on the stream again.
 
-The two upload routes are the server's own (branch `feat/web-upload-rooms`, `crates/server/src/worlds.rs`): same paths, raw bodies, records and status codes, with errors as plain text. `src/api/uploads.ts` turns the records into what the pages use: one player per YAML document, and a weighted `game` ("A, B") needs an APWorld for each game it can roll.
+The two upload routes are the server's own (`crates/server/src/worlds/`): same paths, raw bodies, records and status codes, with errors as plain text. `src/api/uploads.ts` turns the records into what the pages use: one player per YAML document, and a weighted `game` ("A, B") needs an APWorld for each game it can roll.
 
 ## Uploads through the server
 

@@ -139,36 +139,10 @@ target/release/port-check --manifest my_world.manifest.json \
 
 ### Scaling with players
 
-As of 2026-11-26 the fill has one path, the split path (one solve, then every group's state by adding to it and taking the additions back), at every room size and for confined items too. The carried path (truth maintenance) and the forward path (a fresh solve per round, on threads) described below were removed; the tables are history. A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`).
+The fill has one method, the exact (assumed) fill (D-138), on one path at every room size and for confined items too: the room is solved once, then every group's state (a confined item, or a round) is reached by adding to that solve and taking the additions back (`room.rs`, `Steps::split`). A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`). Same instance, seed and engine version give the same bytes; a new engine version may change them (D-140).
 
-### Rooms of 8 players or more: a forward solve per round
+Current numbers come from the `bench-room` CI job (`.github/workflows/bench.yml`): synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`), a light and a heavy profile (the heavy one shaped after a large converted world, with time slices and clocks on), release build, one thread; it runs on PRs labelled `perf` and on manual dispatch. The older carried and forward paths, their tables and the removed opt-in fill modes are in `git` history (this file before 2026-11-28).
 
-The table above is the carried path (`room::Path::Carry`). At the time of this table, a room of 8 players or more placed its rounds on `room::Path::Forward` (every room now takes `room::Path::Split`): the room is solved afresh for each round with none of the round's items held, forward only, each player's state on one of `config::ROOM_FORWARD_WORKERS` (4) threads. The placements are the same on both paths: a round's state is the unique least fixed point for what is held and placed, and placing reads only what it reaches (tests `a_forward_solve_per_round_places_what_truth_maintenance_does` and `the_forward_path_is_the_same_with_one_worker_and_with_many`).
-
-CI measures synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`). The heavy profile is shaped after a large converted world, with time slices and clocks on. Measured on one GitHub-hosted runner by the `bench-room` job (release build, one seed per size, fill ms as the median of 5, 2026-11-26, commit 7944108); runs on other runners differed by about 20 percent. "Carried" is this branch's carried path on one thread. Rule evaluations are the same for any thread count.
-
-| Profile | Players | Carried: fill ms | Carried: rule evaluations | Forward, 1 thread: fill ms | Forward, 4 threads: fill ms | Forward: rule evaluations |
-|---|---|---|---|---|---|---|
-| light | 1 | 3.4 | 43,855 | 6.5 | 6.9 | 253,458 |
-| light | 10 | 112.0 | 1,117,203 | 91.7 | 78.5 | 2,687,618 |
-| light | 20 | 278.0 | 2,553,983 | 207.2 | 140.9 | 5,361,691 |
-| light | 50 | 1,351.2 | 11,441,303 | 558.3 | 332.4 | 13,425,303 |
-| light | 100 | 3,707.2 | 27,459,539 | 1,193.6 | 651.0 | 26,840,369 |
-| heavy | 1 | 18.1 | 149,132 | 26.1 | 26.3 | 488,289 |
-| heavy | 10 | 587.0 | 4,204,093 | 356.8 | 236.3 | 5,364,638 |
-| heavy | 20 | 1,636.9 | 11,060,637 | 707.1 | 412.4 | 10,518,266 |
-| heavy | 50 | 8,095.2 | 48,917,059 | 1,856.4 | 1,031.1 | 26,224,539 |
-| heavy | 100 | 28,567.6 | 145,327,726 | 4,137.5 | 2,406.7 | 52,251,328 |
-
-Fitted exponent of fill time over players: carried 1.52 (light) and 1.59 (heavy); forward 1.13 and 1.09 on one thread, 0.98 and 0.96 on four. At 100 players of the heavy profile the forward solve alone is 6.9 times faster than the carried path, and four threads add 1.7 times. Peak heap in the job's table counts the calling thread only; read it from the one-thread rows.
-
-- **Where the two paths cross is not measured** between 1 and 10 players; the forward path is slower for one player and faster at 10 on both profiles. 8 is a cautious pick.
-- **Confined items** are placed one at a time before the rounds and stay on the carried path. The synthetic rooms have none, so a room with many confined items per player is not covered by these numbers.
-- The forward path evaluates every rule site of every world once per round. Its cost per evaluation is what is left to cut.
-
-## Opt-in fill modes (removed)
-
-Two opt-in fill modes, level fill and shuffle then repair, were built and measured here (commit 20d879c, 2026-11-25): about one forward solve each instead of one per round, 24 to 27 times faster than the exact fill at 100 players, at the cost of seeds that spread items measurably unlike the exact fill. Under D-138 the product has one fill method, so both were removed with their dials, constants, bench rows and tests. Their design, tables and seed-shape numbers are in `git` history (this section at that commit). `fill-fairness --shape on` reports the exact fill's seed shape on one room.
 
 ## Fairness
 

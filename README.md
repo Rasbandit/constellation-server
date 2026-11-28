@@ -5,7 +5,7 @@ Design lives in the sibling `constellation` repo, `docs/design/05-rust-architect
 
 Status: first milestone (D-100). One process hosts one room from a seed bundle, or one room per bundle in a folder, and serves clients compatible with Archipelago; the log is in Postgres when a database URL is set (the room survives a restart or a crash, D-98), otherwise in memory. A proof of concept, not for production use; the plan is [`docs/ROADMAP.md`](docs/ROADMAP.md) and how to help is [`CONTRIBUTING.md`](CONTRIBUTING.md). Text mentioning Archipelago needs the review in the design repo's `CLAUDE.md`. What the compatible edge supports, with the test that proves each part: [`docs/compat-status.md`](docs/compat-status.md).
 
-Container image, compose file and how clients reach a room: [`docs/container.md`](docs/container.md).
+Deploy and operate (container image, compose file, reverse proxy, CI, releases, continuous deploy): [`docs/container.md`](docs/container.md).
 
 ## Layout
 - `crates/proto`: wire ids and the error registry (doc 01 D1.7). Leaf crate, no IO. Also `Command`, `Event` and the id newtypes (`Cid`, `RoomId`, `Epoch`, `Timestamp`). `proto::cwp` holds the CWP v1 wire types (design doc 01 D1.10, proposal D-123): the frames, validated names, the integer range, the type and path registries, typed decode and encode, and a message codec that still answers a frame it cannot decode. The generated schema is committed at `crates/proto/schema/cwp-v1.json` (validate against `#/$defs/ClientFrame` and `#/$defs/ServerFrame`; the file's root also carries the registry, paths and error table under keys that are not JSON Schema keywords); a snapshot test compares it as JSON and, on a change, writes the new one to the system temp directory for review. Golden transcripts in `crates/proto/golden/` are replayed by a checker that enforces the D1.10 rules (ordering, dedupe, audience, replay, results), and a set of wrong transcripts proves each rule is enforced.
@@ -43,7 +43,7 @@ A client reaches a room through its key in the path: `ws://<host>:<port>/<key>`.
 
 `--port 0` picks a free port; the bound address is logged. `GET /healthz` answers `ok`. `GET /version` answers the build version.
 
-`--web-dir <folder>` serves the built web UI (`web/`, `bun run build` then `bun scripts/precompress.mjs`) on the same port: `/` and every other plain GET is the UI (a file from the folder, else `index.html` for a page load; a missing file or `/assets/*` path is a 404), while a WebSocket upgrade on `/<key>` still joins the room, and with `--bundle` an upgrade on any path does. The container image sets it. The admin API is on this same port under `/api` (token-gated, below); see `docs/container.md` for a reverse proxy. SIGTERM or Ctrl-C stops it.
+`--web-dir <folder>` serves the built web UI (`web/`, `bun run build` then `bun scripts/precompress.mjs`) on the same port: `/` and every other plain GET is the UI (a file from the folder, else `index.html` for a page load; a missing file or `/assets/*` path is a 404), while a WebSocket upgrade on `/<key>` still joins the room, and with `--bundle` an upgrade on any path does. The container image sets it. The admin API is on this same port under `/api` (session-gated, below); see `docs/container.md` for a reverse proxy. SIGTERM or Ctrl-C stops it.
 The room password is never a flag (it would show in `ps`): set `CONSTELLATION_ROOM_PASSWORD`, or `CONSTELLATION_ROOM_PASSWORD_FILE` to a file whose first line is the password; it overrides the seed's. Limits come from `crates/config` (design values), some overridable by environment: `CONSTELLATION_MAX_CONNECTIONS` (10 000; over it, HTTP 503), `CONSTELLATION_CONNECT_TIMEOUT_MS` (30 000: a socket with no slot connected by then is closed), `CONSTELLATION_IDLE_TIMEOUT_MS` (60 000) and `CONSTELLATION_PING_INTERVAL_MS` (20 000).
 
 ### With Postgres (the room survives restarts)
@@ -93,14 +93,6 @@ Generator seed 7 reproduces the committed fixture exactly (checked 2026-11-17; B
 This repo is source-available, not open source: [PolyForm Strict 1.0.0](LICENSE.md). You may read, run and test it for noncommercial purposes; commercial use, redistribution and derived works need a written license from the owner. Contributors get the extra permissions in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 We depend on `yawc` (MPL-2.0, D-97) and on MIT and Apache-2.0 crates as cargo dependencies; none of their source is in this repo. `THIRD_PARTY_NOTICES.md` is not written yet: it becomes required when we distribute a binary (it must then carry the notices of every bundled crate), and is created then.
-
-## Known deviations from doc 05 7.1 and 7.2
-- `Item` events carry `from` (the checking slot) and no `item_uid`, and events have no ULID id (`seq` is the id). Location and item ids are `i64`, and a location id is only unique within its slot's world, so the placement table is keyed by (slot, location).
-- `Command::Goal` and `EventKind::Goal` record a slot's goal (D-100 needs it); not in the doc 05 sketch.
-- `fold(snapshot, limits, tail)` takes the limits and returns `Result`; `Ctx::limits` is a borrow.
-- `Applied` has one `reply` plus `depends_on` (the hold rule: do not release a reply until that `seq` is durable), and no `effects`.
-- `LogStore` has `read_cursors` and no outbox rows yet. `Cid` and `RoomId` are integers.
-- The Postgres schema (`migrations/0001_log.sql`) is doc 02 section 5.5 cut down: no foreign keys, unencrypted event bodies, the latest snapshot only, cursors in `slot_cursors`. `seq`, `item_seq` and epochs above `i64::MAX` are refused by `PgLogStore` (Postgres has no unsigned 64-bit type).
 
 ## Rules (doc 05 6.2)
 1. L0/L1 crates never depend on tokio, sqlx, axum, a clock or an OS RNG.
