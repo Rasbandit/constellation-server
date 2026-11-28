@@ -13,4 +13,4 @@ What it exercises:
 - **A check in two regions**: `flooded_shelf` is declared in `mire_flooded` and repeated in `mire_hall` with `also`, each with its own rule.
 - **Fixed placements** (`holds relic`), `no_progression`, small families (`for i in 1..4`), groups and `has_any`.
 
-The optional dungeon's rooms each have a `when`: at `off` the build removes them with their checks and exits, which a world with a shuffle needs (engine issue 211). `ledger.json` is what `rando build` writes; the test holds it fixed.
+The optional dungeon's rooms each have a `when`: at `off` the build removes them with their checks and exits, which a world with a shuffle needs (engine issue 211). `rando.lock` is what `rando build` writes; the test holds it fixed.

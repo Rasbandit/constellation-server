@@ -27,8 +27,10 @@ use crate::world::{Errs, FORMAT};
 
 /// The entry file of a world folder.
 pub const ENTRY: &str = "world.rando";
-/// The ledger file of a world folder (doc 18 section 2.11).
-pub const LEDGER: &str = "ledger.json";
+/// The ledger file of a world folder (doc 18 section 2.11, doc 19).
+pub const LEDGER: &str = "rando.lock";
+/// The ledger's name before `rando.lock`: read only to refuse it with the upgrade step.
+pub(crate) const OLD_LEDGER: &str = "ledger.json";
 /// The extension of a module named by `use`.
 pub const EXT: &str = ".rando";
 

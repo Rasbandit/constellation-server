@@ -63,7 +63,7 @@ pub struct Built {
     pub warnings: Vec<Error>,
     text: String,
     model: world::Model,
-    /// The ledger to write back after a build from files (`ledger.json`).
+    /// The ledger to write back after a build from files (`rando.lock`).
     pub ledger: Option<String>,
 }
 

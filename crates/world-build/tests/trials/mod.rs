@@ -17,7 +17,7 @@ fn root(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
-/// Every file of a fixture folder (`.rando`, `.csv`, `ledger.json`) by relative path.
+/// Every file of a fixture folder (`.rando`, `.csv`, `rando.lock`) by relative path.
 fn read_all(dir: &Path) -> BTreeMap<String, String> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for e in std::fs::read_dir(dir).unwrap() {
@@ -34,10 +34,6 @@ fn read_all(dir: &Path) -> BTreeMap<String, String> {
     walk(dir, dir, &mut out);
     out
 }
-
-/// Fixtures with no committed `ledger.json`: Tidewell's ids are its declaration order, pinned
-/// by its own test against its model.
-const NO_LEDGER: &[&str] = &["tidewell"];
 
 /// Every folder in `tests/fixtures`, by name. Each must be a world (have a `world.rando`), so a
 /// misnamed entry file fails here instead of leaving its folder untested.
@@ -125,13 +121,9 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
         let b = ok(&Dir(root(&name)));
         assert!(b.warnings.is_empty(), "{name}: {:?}", b.warnings);
         // The committed ledger is what the build writes: no id moved.
-        let ledger = std::fs::read_to_string(root(&name).join("ledger.json"));
-        if NO_LEDGER.contains(&name.as_str()) {
-            assert!(ledger.is_err(), "{name} has a ledger.json; take it off NO_LEDGER");
-        } else {
-            let committed = ledger.unwrap_or_else(|e| panic!("{name}/ledger.json: {e}"));
-            assert_eq!(b.ledger.as_deref(), Some(committed.as_str()), "{name}");
-        }
+        let committed = std::fs::read_to_string(root(&name).join("rando.lock"))
+            .unwrap_or_else(|e| panic!("{name}/rando.lock: {e}"));
+        assert_eq!(b.ledger.as_deref(), Some(committed.as_str()), "{name}");
         canonical(&name);
         fills(&b, &HashMap::new(), 50);
     }

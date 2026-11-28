@@ -7,7 +7,7 @@
 //!   layout; with `--check`, change nothing and fail when a file would change.
 //! - `rando build [dir] [-o manifest.json] [--instance instance.json] [--allow-edited]
 //!   [--publish]`: check, then write the canonical manifest (to standard output without `-o`)
-//!   and `ledger.json` back into `dir`; `--instance` also writes the per-seed instance at the
+//!   and `rando.lock` back into `dir` (warning loudly when it had none); `--instance` also writes the per-seed instance at the
 //!   options' defaults.
 //! - `rando generate [dir] [--seed N] [--players N] [--option name=value ...] [--options file]
 //!   [-o out/] [--format text|json] [--check-seeds K]`: build in memory with the checks of
@@ -282,7 +282,15 @@ fn main() -> ExitCode {
     if steps.iter().all(Result::is_ok)
         && let Some(l) = &built.ledger
     {
-        steps.push(write(&dir.join(LEDGER), l));
+        let lock = dir.join(LEDGER);
+        let fresh = std::fs::symlink_metadata(&lock).is_err();
+        steps.push(write(&lock, l));
+        if fresh && steps.iter().all(Result::is_ok) {
+            eprintln!(
+                "warning: there was no {LEDGER}, so new ids were assigned to every item and check and written to {}: commit it, and never delete it. Seeds and clients carry these ids, so a published world must keep them.",
+                lock.display()
+            );
+        }
     }
     let failed: Vec<String> = steps.into_iter().filter_map(Result::err).collect();
     failed.iter().for_each(|e| eprintln!("error: {e}"));

@@ -1,5 +1,5 @@
-//! The id ledger (design doc 18 section 2.11): `ledger.json`, written only by the tool,
-//! append-only. Items and checks are numbered separately, each keyed by a stable key (the
+//! The id ledger (design doc 18 section 2.11): `rando.lock`, written only by the tool,
+//! append-only, with a `format` and a `note` saying what it holds. Items and checks are numbered separately, each keyed by a stable key (the
 //! name, or a written `key "..."`), never by position. A `was` moves an old key's id to its
 //! new name. A key no longer declared is retired, and its id is never given again. A build to
 //! publish marks every declared key published; a published key may be renamed with `was` but
@@ -9,12 +9,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use super::{Files, Ident, LEDGER};
+use super::{Files, Ident, LEDGER, OLD_LEDGER};
 use crate::model::{At, World};
 use crate::world::Errs;
 
 /// Largest id: inside 2^53 - 1, the range world ids keep to.
 const MAX_ID: i64 = config::ID_MAX;
+
+/// The lock format this tool reads and writes. A lock with no `format` predates the field and
+/// has the same shape.
+const FORMAT: i64 = 1;
+
+/// Written into every lock: JSON has no comments, so the warning is a field.
+const NOTE: &str = "rando writes this file. It holds the permanent ids of this world's items and checks: commit it, never delete or edit it by hand.";
 
 /// One entry of a ledger table.
 #[derive(Clone, Copy)]
@@ -74,7 +81,16 @@ pub(crate) fn assign(
 ) -> String {
     let game = w.game.as_ref().map(|g| g.v.clone()).unwrap_or_default();
     let old: Value = match files.read(LEDGER) {
-        None => json!({}),
+        None => {
+            // Never renumber over a lock that is only misnamed.
+            if files.read(OLD_LEDGER).is_some() {
+                errs.whole(
+                    format!("{OLD_LEDGER} is the old name of {LEDGER}"),
+                    &format!("rename it, keeping its ids: `git mv {OLD_LEDGER} {LEDGER}`, then build again"),
+                );
+            }
+            json!({})
+        }
         Some(Err(e)) => {
             errs.whole(e, "");
             json!({})
@@ -87,6 +103,14 @@ pub(crate) fn assign(
             json!({})
         }),
     };
+    if let Some(f) = old.get("format")
+        && f.as_i64() != Some(FORMAT)
+    {
+        errs.whole(
+            format!("{LEDGER} has format {f}; this rando reads format {FORMAT}"),
+            "update rando; never edit or delete the lock to make a build pass",
+        );
+    }
     if let Some(other) = old["world"].as_str()
         && other != game
     {
@@ -95,7 +119,7 @@ pub(crate) fn assign(
             "a ledger is never shared between worlds",
         );
     }
-    let mut out = json!({"world": game});
+    let mut out = json!({"format": FORMAT, "note": NOTE, "world": game});
     for (check, field) in [(false, "items"), (true, "checks")] {
         let mut table = read_table(&old[field], &field[..field.len() - 1], errs);
         let mut next = table.values().map(|x| x.id).max().unwrap_or(0) + 1;

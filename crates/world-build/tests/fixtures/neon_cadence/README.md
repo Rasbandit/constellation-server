@@ -12,4 +12,4 @@ What it exercises:
 - **Weighted sums**: stars worth 1, 2 and 5, `count(bronze_star) + 2 * count(silver_star) + 5 * count(gold_star) >= n`, through a def with a parameter.
 - **The id ledger across a regeneration** (test only): rows reordered and one inserted in the middle keep every id, the new song gets new ids, a song removed from the source makes the overlay that names it fail with `overlay.target_missing`, and a hand edit of the generated file is refused.
 
-`ledger.json` is what `rando build` writes; the test holds it fixed.
+`rando.lock` is what `rando build` writes; the test holds it fixed.

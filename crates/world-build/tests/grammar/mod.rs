@@ -507,7 +507,7 @@ mod review {
         )]);
         let first = ok(&old);
         let mut files = world(&two.replace(" KEY_A", "").replace("KEY_B", "was old"));
-        files.0.insert("ledger.json".into(), first.ledger.clone().unwrap());
+        files.0.insert("rando.lock".into(), first.ledger.clone().unwrap());
         let l = ledger(&ok(&files));
         assert_eq!(l["checks"]["drop"]["id"], ledger(&first)["checks"]["old"]["id"], "{l}");
     }
