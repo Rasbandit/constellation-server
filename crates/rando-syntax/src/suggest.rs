@@ -1,12 +1,14 @@
 //! "Did you mean": the declared name nearest an unknown one, by edit distance.
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// The candidate nearest `name` within a small edit distance (1 for names of up to 4
 /// characters, 2 up to 8, 3 beyond), ties broken by the first in sorted order; `None` when
 /// none is that close.
-pub(crate) fn nearest<'a>(
-    name: &str,
-    candidates: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+pub fn nearest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let most = match name.chars().count() {
         0..=4 => 1,
         5..=8 => 2,
@@ -26,11 +28,7 @@ pub(crate) fn nearest<'a>(
 }
 
 /// `help` led by "did you mean `x`?" when a candidate is near `name`.
-pub(crate) fn help<'a>(
-    name: &str,
-    candidates: impl IntoIterator<Item = &'a str>,
-    help: &str,
-) -> String {
+pub fn help<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>, help: &str) -> String {
     match nearest(name, candidates) {
         Some(n) if help.is_empty() => format!("did you mean `{n}`?"),
         Some(n) => format!("did you mean `{n}`? Otherwise {help}"),
@@ -39,7 +37,7 @@ pub(crate) fn help<'a>(
 }
 
 /// Levenshtein distance over characters.
-fn distance(a: &str, b: &str) -> usize {
+pub fn distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {

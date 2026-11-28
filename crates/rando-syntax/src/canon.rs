@@ -3,6 +3,10 @@
 //! to `serde_json`'s map order, which a `preserve_order` feature anywhere in a build would
 //! change.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use serde_json::Value;
 
 /// `v` as canonical JSON text.
