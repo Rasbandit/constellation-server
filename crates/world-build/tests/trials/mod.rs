@@ -35,13 +35,21 @@ fn read_all(dir: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Every world folder in `tests/fixtures`, by name.
+/// Fixtures with no committed `ledger.json`: Tidewell's ids are its declaration order, pinned
+/// by its own test against its model.
+const NO_LEDGER: &[&str] = &["tidewell"];
+
+/// Every folder in `tests/fixtures`, by name. Each must be a world (have a `world.rando`), so a
+/// misnamed entry file fails here instead of leaving its folder untested.
 fn fixtures() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root(""))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.join("world.rando").is_file())
-        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .filter(|p| p.is_dir())
+        .map(|p| {
+            assert!(p.join("world.rando").is_file(), "{} has no world.rando", p.display());
+            p.file_name().unwrap().to_str().unwrap().to_owned()
+        })
         .collect();
     names.sort();
     names
@@ -116,9 +124,12 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
     for name in names {
         let b = ok(&Dir(root(&name)));
         assert!(b.warnings.is_empty(), "{name}: {:?}", b.warnings);
-        // A committed ledger is what the build writes: no id moved. (Tidewell has none: its ids
-        // are the declaration order, pinned by its own test.)
-        if let Ok(committed) = std::fs::read_to_string(root(&name).join("ledger.json")) {
+        // The committed ledger is what the build writes: no id moved.
+        let ledger = std::fs::read_to_string(root(&name).join("ledger.json"));
+        if NO_LEDGER.contains(&name.as_str()) {
+            assert!(ledger.is_err(), "{name} has a ledger.json; take it off NO_LEDGER");
+        } else {
+            let committed = ledger.unwrap_or_else(|e| panic!("{name}/ledger.json: {e}"));
             assert_eq!(b.ledger.as_deref(), Some(committed.as_str()), "{name}");
         }
         canonical(&name);
@@ -126,25 +137,36 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
     }
 }
 
-/// The genre examples' options at their ends, as an author writes them, fill beatable.
+/// The genre examples at their defaults and at their options' ends, as an author writes them:
+/// each setting has the number of checks its README states, and fills beatable.
 #[test]
-fn the_genre_examples_fill_beatable_at_their_option_extremes() {
-    let cases: &[(&str, &[(&str, &str)])] = &[
-        ("meridian_front", &[("chapters", "2"), ("side_ops", "off")]),
-        ("meridian_front", &[("chapters", "3"), ("mission_order", "open")]),
-        ("hollow_reach", &[("tricks", "advanced"), ("guardians_needed", "1")]),
-        ("hollow_reach", &[("tricks", "basic"), ("start_dash", "on")]),
-        ("ember_spire", &[("floors", "5"), ("ascensions", "0"), ("wins_needed", "1")]),
-        ("ember_spire", &[("floors", "50"), ("ascensions", "5"), ("wins_needed", "4")]),
-        ("crownless_saga", &[("shop_slots", "1"), ("safe_shops", "off"), ("party_needed", "4")]),
-        ("crownless_saga", &[("shop_slots", "5"), ("party_needed", "1")]),
-        ("bramble_isles", &[("gems_for_summit", "30"), ("pods_per_world", "2")]),
-        ("bramble_isles", &[("gems_for_summit", "15"), ("pods_per_world", "8")]),
+fn the_genre_examples_have_their_check_counts_and_fill_at_their_option_extremes() {
+    let cases: &[(&str, &[(&str, &str)], usize)] = &[
+        ("meridian_front", &[], 51),
+        ("meridian_front", &[("chapters", "2"), ("side_ops", "off")], 18),
+        ("meridian_front", &[("chapters", "3"), ("campaign_order", "open")], 39),
+        ("cobalt_warrens", &[], 44),
+        ("cobalt_warrens", &[("tricks", "advanced"), ("bosses_needed", "0")], 44),
+        ("cobalt_warrens", &[("tricks", "basic"), ("start_thruster", "on")], 44),
+        ("gloam_delve", &[], 40),
+        ("gloam_delve", &[("depths", "5"), ("hardships", "0"), ("wins_needed", "1")], 15),
+        ("gloam_delve", &[("depths", "50"), ("hardships", "4"), ("wins_needed", "5")], 80),
+        ("oathbound_tale", &[], 46),
+        (
+            "oathbound_tale",
+            &[("shop_slots", "1"), ("safe_shops", "off"), ("party_needed", "4")],
+            38,
+        ),
+        ("oathbound_tale", &[("shop_slots", "5"), ("party_needed", "1")], 54),
+        ("bramble_isles", &[], 65),
+        ("bramble_isles", &[("marbles_for_summit", "30"), ("pods_per_world", "2")], 45),
+        ("bramble_isles", &[("marbles_for_summit", "15"), ("pods_per_world", "8")], 75),
     ];
-    for (name, pairs) in cases {
+    for (name, pairs, checks) in cases {
         let b = ok(&Dir(root(name)));
         let options =
             pairs.iter().map(|(k, v)| ((*k).to_owned(), b.option_value(k, v).unwrap())).collect();
+        assert_eq!(b.instance(&options).unwrap().locations.len(), *checks, "{name} {pairs:?}");
         fills(&b, &options, 10);
     }
 }
