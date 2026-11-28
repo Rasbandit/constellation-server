@@ -170,7 +170,11 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
         }
         x.asts[*f as usize].decls = decls;
     }
+    // `also` is checked on the files as written, then again for what overlays add: an
+    // overlay that removes the plain declaration leaves the repeats as the check.
+    let authored = x.check_also(None);
     x.apply_overlays();
+    x.check_also(Some(&authored));
     x.visibility();
     x.generated(files, opts);
     // A failed parse would retire or move the ids of what it lost: no ledger then.
@@ -1364,6 +1368,53 @@ impl X {
             sh.things = Some(At::new(Members::Names(things), p));
         }
         self.world.shuffles.push(sh);
+    }
+
+    /// A check in several regions has exactly one plain declaration, and every repeat says
+    /// `also`, so a name copied by mistake is never merged. With `authored` (the names declared
+    /// before overlays applied) only what an overlay added is checked: a second plain one, or
+    /// `also` on a name nothing declared. Returns the names declared.
+    fn check_also(&mut self, authored: Option<&HashSet<String>>) -> HashSet<String> {
+        // Per name, one declaration per region in file order; a name a region declares twice
+        // has its own error, and is left out here.
+        let mut decls: BTreeMap<String, Vec<(String, Pos, bool)>> = BTreeMap::new();
+        let mut twice: HashSet<String> = HashSet::new();
+        for r in &self.world.regions {
+            let mut here = HashSet::new();
+            for c in &r.checks {
+                if !here.insert(c.key.v.as_str()) {
+                    twice.insert(c.key.v.clone());
+                    continue;
+                }
+                decls.entry(c.key.v.clone()).or_default().push((
+                    r.key.v.clone(),
+                    c.key.pos,
+                    c.also,
+                ));
+            }
+        }
+        for (name, list) in decls.iter().filter(|(n, _)| !twice.contains(*n)) {
+            let plain: Vec<&(String, Pos, bool)> = list.iter().filter(|d| !d.2).collect();
+            if let [(region, at, _), rest @ ..] = plain.as_slice() {
+                let file = self.paths.get(at.file as usize).cloned().unwrap_or_default();
+                for (_, p, _) in rest {
+                    self.errs.err(
+                        *p,
+                        format!("check `{name}` is already declared in region `{region}` ({file}:{}:{})", at.line, at.col),
+                        "to reach the same check from this region too, write `check NAME also`; otherwise rename one",
+                    );
+                }
+            } else if let Some((_, p, _)) = list.first()
+                && authored.is_none_or(|a| !a.contains(name))
+            {
+                self.errs.err(
+                    *p,
+                    format!("check `{name}` is marked `also`, and no other declaration of it lacks `also`"),
+                    "`also` marks a repeat of a check another region declares; drop it here",
+                );
+            }
+        }
+        decls.into_keys().collect()
     }
 
     /// Overlays, in the order their files apply (doc 18 section 2.8): every target named,

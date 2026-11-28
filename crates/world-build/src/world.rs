@@ -647,40 +647,6 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
             space.declare(errs, e, Sort::Event);
         }
     }
-    // A check in several regions: exactly one declaration is plain, every repeat says `also`,
-    // so a name copied by mistake is never merged into another check.
-    let mut decls: BTreeMap<&str, Vec<(&str, &crate::model::Check)>> = BTreeMap::new();
-    for r in &w.regions {
-        for c in &r.checks {
-            let list = decls.entry(c.key.v.as_str()).or_default();
-            if !list.iter().any(|(q, _)| *q == r.key.v) {
-                list.push((r.key.v.as_str(), c));
-            }
-        }
-    }
-    for (name, list) in &decls {
-        let plain: Vec<&(&str, &crate::model::Check)> =
-            list.iter().filter(|(_, c)| !c.also).collect();
-        if let [(region, first), rest @ ..] = plain.as_slice() {
-            let at = first.key.pos;
-            let file = errs.files.get(at.file as usize).cloned().unwrap_or_default();
-            for (_, c) in rest {
-                errs.err(
-                    c.key.pos,
-                    format!("check `{name}` is already declared in region `{region}` ({file}:{}:{})", at.line, at.col),
-                    "to reach the same check from this region too, write `check NAME also`; otherwise rename one",
-                );
-            }
-        } else if let Some((_, c)) = list.first() {
-            errs.err(
-                c.key.pos,
-                format!(
-                    "check `{name}` is marked `also`, and no other declaration of it lacks `also`"
-                ),
-                "`also` marks a repeat of a check another region declares; drop it here",
-            );
-        }
-    }
     if w.regions.len() > config::WORLD_TABLE_MAX {
         errs.whole(
             format!(
@@ -910,8 +876,9 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
                 );
             }
             let rule = lw.rule(&x.rule, Mode::Rule).map_or_else(truth, |v| v.0);
-            sites.push((x.rule.pos, Some(r.key.v.as_str()), truth(), rule.clone()));
             let to_when = when_of(&x.to.v);
+            // The exit exists where its target does too: gone with a removed target.
+            sites.push((x.rule.pos, Some(r.key.v.as_str()), to_when.clone(), rule.clone()));
             let mut e = json!({"rule": both(&when, both(&to_when, rule)), "to": x.to.v});
             let key = match (&x.door, parallel) {
                 (Some(d), true) => format!("{}:{}:{}", r.key.v, x.to.v, d.v),

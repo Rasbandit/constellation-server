@@ -995,6 +995,13 @@ impl P<'_> {
                         .into_iter()
                         .find(|w| self.word(w))
                         .or_else(|| CHECK_MODIFIERS.into_iter().find(|w| self.ctx(w)));
+                    if self.ctx("also") {
+                        return Err((
+                            self.here(),
+                            "`also` goes right after the check's name: `check NAME also: rule`"
+                                .into(),
+                        ));
+                    }
                     let Some(w) = word else { return Ok(Member::Check(Box::new(c))) };
                     if seen.contains(&w) {
                         return Err((self.here(), format!("`{w}` is given twice")));

@@ -72,7 +72,20 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
     }
     for i in from..=toks.len() {
         for (end, at, level) in wraps.get(&i).into_iter().flatten() {
-            let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
+            // The line the node starts on, and the space written before it: none after `(` or at
+            // a line start (a fixed 1 here measured a line one longer on the second pass, when
+            // a `(` `fmt` had added was a token before the node).
+            let starts =
+                ast.layout.brk.get(i).copied().flatten().or_else(|| wrap_at.get(&i).copied());
+            let (line, sep) = match starts {
+                Some(d) => (2 * d, 0),
+                None => {
+                    let line = out.rsplit('\n').next().map_or(0, |l| l.chars().count());
+                    let glue = ast.layout.glue.get(i).copied().unwrap_or(false);
+                    let sep = i > from && toks.get(i).is_some_and(|t| space(&toks[i - 1], t, glue));
+                    (line, usize::from(sep))
+                }
+            };
             let mut len = 0;
             for k in i..(*end).min(toks.len()) {
                 let glue = ast.layout.glue.get(k).copied().unwrap_or(false);
@@ -88,7 +101,7 @@ fn layout(ast: &FileAst, from: usize, with_comments: bool) -> String {
                     .flat_map(|k| opens_at.get(&k).into_iter().flatten())
                     .filter(|b| **b <= end)
                     .count();
-            if line + 1 + len > WIDTH {
+            if line + sep + len > WIDTH {
                 for k in at.iter() {
                     wrap_at.insert(*k, depth + 1 + level);
                 }

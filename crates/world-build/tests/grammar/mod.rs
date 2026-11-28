@@ -639,3 +639,127 @@ fn fmt_is_stable_where_it_adds_parentheses_at_the_width() {
         );
     }
 }
+
+/// Second delta review of PR 228 (`also` and `fmt` at the width), each failing first.
+mod delta2 {
+    use super::super::lang::mem;
+    use super::*;
+
+    const HEAD: &str = "world t\nuse base\nuse more\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n";
+
+    /// `fmt` gives the same text on a second pass for rule shapes that put a line at, just
+    /// under and just over the width (99, 100 and 101 characters on the first pass).
+    #[test]
+    fn fmt_is_stable_across_shapes_at_the_width() {
+        let shapes = [
+            "has(aa) or has(bb) and has(cc_{p}) and has(dd) and has(eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee) or has(zz)",
+            "(has(aa) and has(bb_{p}) and has(cc)) or has(dddddddddddddddddddddd) and has(eeeeeeeeeeeeeeee) and has(ff)",
+            "has(aa) or has(bb) or has(cc_{p}) and has(dd) and has(eeeeeeeeeeeeeeeeeeeeeee) and has(ffffff) or has(zz)",
+            "has(aa) and (has(bb) or has(cc_{p}) and has(dd) and has(eeeeeeeeeeeeeeeeee)) or has(ffffffffff) and has(gg)",
+            "has(flute) and has(song) and (has(key_north_{p}) and has(key_west) and has(key_east)) or (counter(home) >= 1 and night)",
+            "has(aa_{p}) and has(bbbbbbbbbbbbbbbbbbbb) and has(cccccccccccccccccccc) and has(dddddddddddddddddddddd)",
+        ];
+        let mut widths = std::collections::BTreeSet::new();
+        for shape in shapes {
+            for n in 0..48 {
+                let rule = shape.replace("{p}", &"x".repeat(n));
+                let src = format!("world t\nregion a {{\n  exit b: {rule}\n}}\n");
+                let once = world_build::front::format_text(&src, "w.rando").unwrap();
+                let twice = world_build::front::format_text(&once, "w.rando").unwrap();
+                assert_eq!(twice, once, "{shape}, n = {n}\n{once}");
+                once.lines().for_each(|l| {
+                    widths.insert(l.chars().count());
+                });
+            }
+        }
+        for w in [99, 100] {
+            assert!(widths.contains(&w), "no first-pass line of {w} characters: {widths:?}");
+        }
+    }
+
+    /// `also` across modules, three declarations (one plain), and an `extend` repeat.
+    #[test]
+    fn also_across_modules_three_declarations_and_extend() {
+        let files = |base: &str, more: &str| {
+            mem(&[("world.rando", HEAD), ("base.rando", base), ("more.rando", more)])
+        };
+        let base = "region a {\n  check x\n  exit b\n  exit c\n}\nregion b {\n  check x also: has(k)\n  exit a\n}\n";
+        let b = ok(&files(base, "region c {\n  check x also: has(junk)\n  exit a\n}\n"));
+        assert_eq!(b.manifest["locations"].as_array().unwrap().len(), 1);
+        // A plain repeat in an `extend` is an error at the overlay's line; `also` merges.
+        let plain = "use base\nregion c {\n  exit a\n}\nextend region c {\n  check x\n}\n";
+        fails(&files(base, plain), "more.rando:6:9", "check `x` is already declared in region `a`");
+        ok(&files(base, &plain.replace("  check x\n}", "  check x also\n}")));
+    }
+
+    /// An overlay that removes the plain declaration leaves the `also` ones as the check.
+    #[test]
+    fn removing_the_plain_declaration_keeps_the_repeats() {
+        let base = "region a {\n  check x\n  check a1\n  exit b\n}\nregion b {\n  check x also: has(k)\n  exit a\n}\n";
+        for overlay in [
+            "use base\nremove check a.x\n",
+            "use base\nregion c {\n  check c1\n  exit b\n}\nextend region b {\n  exit c\n}\nremove region a\nremove exit b.a\n",
+        ] {
+            let files = mem(&[
+                (
+                    "world.rando",
+                    &HEAD.replace("start a", "start b").replace("reach(a)", "reach(b)"),
+                ),
+                ("base.rando", base),
+                ("more.rando", overlay),
+            ]);
+            let b = ok(&files);
+            assert!(
+                b.manifest["locations"].as_array().unwrap().iter().any(|l| l["key"] == "x"),
+                "{overlay}"
+            );
+        }
+    }
+
+    /// `also` written after the rule says where it goes; a same-region duplicate gives only
+    /// its own error.
+    #[test]
+    fn also_after_the_rule_and_a_duplicate_in_one_region() {
+        fails(
+            &world("region a {\n  check drop: has(k) also\n}"),
+            &format!("world.rando:{}:22", line(2)),
+            "`also` goes right after the check's name",
+        );
+        let all = errors(&world(
+            "region a {\n  check drop also\n  check drop\n}\nregion b {\n  check drop\n}",
+        ));
+        assert!(!all.iter().any(|e| e.contains("no other declaration of it lacks")), "{all:#?}");
+    }
+}
+
+/// Found while writing the example worlds (draft PR 229), each failing first.
+mod examples {
+    use super::*;
+
+    /// A long top-level def that is a two-part `or` with a parenthesized part breaks before
+    /// the `or`, as the same rule on an exit does, not inside the parentheses.
+    #[test]
+    fn a_long_def_breaks_before_its_or() {
+        for n in 0..60 {
+            let name = format!("can_reach_{}", "x".repeat(n));
+            let src = format!(
+                "world t\noption tricks: choice(none, basic) = none\ndef {name} = has(climbing_gear_of_the_north) or (opt.tricks == basic and has(lantern_of_dawn))\n"
+            );
+            let once = world_build::front::format_text(&src, "w.rando").unwrap();
+            // Never inside the parentheses while the `or` stays on the first line.
+            assert!(!once.lines().any(|l| l.trim_start().starts_with("and ")), "n = {n}\n{once}");
+            assert_eq!(world_build::front::format_text(&once, "w.rando").unwrap(), once, "n = {n}");
+        }
+    }
+
+    /// An exit into a removed region is gone with it, so the presence check does not read
+    /// its rule when the region is gone.
+    #[test]
+    fn an_exit_into_a_removed_region_is_not_checked_when_it_is_gone() {
+        ok(&world(
+            &format!("{OPTIONAL}\nregion d {{\n  check d1\n  exit a\n  exit c: lever\n}}")
+                .replace("  exit b\n}\nregion b", "  exit b\n  exit d\n}\nregion b")
+                .replace("  check b1: has(k)\n", "  check b1: has(k)\n  event lever: true\n"),
+        ));
+    }
+}
