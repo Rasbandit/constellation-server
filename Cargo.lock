@@ -2481,6 +2481,7 @@ dependencies = [
  "config",
  "data-fill",
  "flate2",
+ "rando-settings",
  "rando-syntax",
  "rule-ops",
  "seed-bundle",
