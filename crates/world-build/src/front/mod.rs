@@ -41,7 +41,7 @@ pub trait Files {
 }
 
 /// A path the front end may open: relative, inside the folder, plain characters only.
-fn safe(path: &str) -> bool {
+pub(crate) fn safe(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
         && path.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
@@ -112,6 +112,8 @@ pub struct Read {
     pub world: World,
     /// The ledger after this build, canonical JSON.
     pub ledger: String,
+    /// The folder's `rando.toml`, when it has one.
+    pub meta: Option<crate::meta::Meta>,
     /// Things worth a look.
     pub warnings: Vec<Error>,
 }
@@ -125,7 +127,7 @@ pub fn read(files: &dyn Files, opts: &Options) -> Result<Read, Vec<Error>> {
     if !p.errors.is_empty() {
         return Err(p.errors);
     }
-    Ok(Read { world: p.world, ledger: p.ledger, warnings: p.warnings })
+    Ok(Read { world: p.world, ledger: p.ledger, meta: p.meta, warnings: p.warnings })
 }
 
 /// What [`read_partly`] gives: the world as far as it was read, even with errors.
@@ -135,6 +137,10 @@ pub struct Partial {
     pub world: World,
     /// The ledger after this build (empty when a file did not parse).
     pub ledger: String,
+    /// The folder's `rando.toml`, when it has one and it is valid.
+    pub meta: Option<crate::meta::Meta>,
+    /// The entry file read: `rando.toml`'s `entry`, or [`ENTRY`].
+    pub entry: String,
     /// Every error found, in file order.
     pub errors: Vec<Error>,
     /// Things worth a look.
@@ -152,7 +158,19 @@ pub struct Partial {
 #[must_use]
 pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let mut x = X::default();
-    x.load(files);
+    let (meta, meta_errs) = match files.read(crate::meta::FILE) {
+        None => (None, Vec::new()),
+        Some(Err(e)) => (None, vec![e]),
+        Some(Ok(t)) => match crate::meta::parse(&t) {
+            Ok(m) => (Some(m), Vec::new()),
+            Err(e) => (None, e),
+        },
+    };
+    let entry = meta.as_ref().map_or(ENTRY, |m| m.entry.as_str()).to_owned();
+    x.load(files, &entry);
+    for e in meta_errs {
+        x.errs.in_file(crate::meta::FILE, e, "", false);
+    }
     let mut broken: Option<HashSet<String>> = None;
     for ast in x.asts.iter().filter(|a| !a.errors.is_empty()) {
         let names = broken.get_or_insert_with(HashSet::new);
@@ -179,6 +197,9 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     x.check_also(Some(&authored));
     x.visibility();
     x.generated(files, opts);
+    if let Some(m) = &meta {
+        x.check_meta(m);
+    }
     // A failed parse would retire or move the ids of what it lost: no ledger then.
     let ledger = if broken.is_none() {
         ledger::assign(&mut x.world, &x.idents, files, opts.publish, &mut x.errs)
@@ -190,7 +211,7 @@ pub fn read_partly(files: &dyn Files, opts: &Options) -> Partial {
     let world = x.world;
     let templates = x.templates.into_inner();
     let errors = merge_repeats(errors, &templates);
-    Partial { world, ledger, errors, warnings, broken, templates }
+    Partial { world, ledger, meta, entry, errors, warnings, broken, templates }
 }
 
 /// Parse and format one file's text.
@@ -440,9 +461,33 @@ impl X {
     }
 
     /// The entry file and every module it reaches, each parsed once.
-    fn load(&mut self, files: &dyn Files) {
-        self.errs = Errs::new(vec![ENTRY.to_owned()]);
-        let entry = self.file_index(ENTRY);
+    /// `rando.toml` against the world: its name is the game key, and the fields `rando pack`
+    /// requires are warned about here, so a new world builds before it has a license.
+    fn check_meta(&mut self, m: &crate::meta::Meta) {
+        let file = crate::meta::FILE;
+        if let Some(g) = &self.world.game
+            && g.v != m.name
+        {
+            self.errs.in_file(
+                file,
+                format!("`world.name` `{}` is not the game key `{}`", m.name, g.v),
+                "a world has one name: make them equal",
+                false,
+            );
+        }
+        for k in m.missing_to_publish() {
+            self.errs.in_file(
+                file,
+                format!("`{k}` is missing; `rando pack` requires it"),
+                "",
+                true,
+            );
+        }
+    }
+
+    fn load(&mut self, files: &dyn Files, entry_path: &str) {
+        self.errs = Errs::new(vec![entry_path.to_owned()]);
+        let entry = self.file_index(entry_path);
         let mut seen = HashSet::new();
         // An explicit stack: (file, next use to follow); a file joins `order` after its uses.
         let mut stack = vec![(entry, None::<Pos>, 0usize)];
@@ -457,7 +502,10 @@ impl X {
                         let msg = format!("`{path}` does not exist");
                         match from {
                             Some(p) => self.errs.err(p, msg, "check the path in this `use`"),
-                            None => self.errs.whole(msg, "a world folder has a `world.rando`"),
+                            None => self.errs.whole(
+                                msg,
+                                "a world folder has a `world.rando`, or names its entry file in `rando.toml`",
+                            ),
                         }
                         continue;
                     }

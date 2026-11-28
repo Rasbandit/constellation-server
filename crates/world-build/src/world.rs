@@ -60,6 +60,13 @@ impl Errs {
         self.push(None, msg, help);
     }
 
+    /// An error or warning about the whole of `file`, a file that is not a `.rando` module.
+    pub(crate) fn in_file(&mut self, file: &str, msg: impl Into<String>, help: &str, warn: bool) {
+        let help = (!help.is_empty()).then(|| help.to_owned());
+        let e = Error { file: file.to_owned(), pos: None, msg: msg.into(), help };
+        if warn { self.warnings.push(e) } else { self.errors.push(e) }
+    }
+
     fn push(&mut self, pos: Option<Pos>, msg: impl Into<String>, help: &str) {
         let msg = msg.into();
         if !self.seen.insert((pos, msg.clone())) {
@@ -341,6 +348,7 @@ fn build_here(w: &World, file: &str) -> Result<Built, Vec<Error>> {
                     text,
                     model,
                     ledger: None,
+                    meta: None,
                 });
             }
             Ok(_) => {}

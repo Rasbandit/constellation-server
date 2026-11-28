@@ -20,6 +20,7 @@ pub mod generate;
 mod instance;
 pub mod lex;
 mod lower;
+pub mod meta;
 pub mod model;
 mod presence;
 pub mod rule;
@@ -65,6 +66,8 @@ pub struct Built {
     model: world::Model,
     /// The ledger to write back after a build from files (`rando.lock`).
     pub ledger: Option<String>,
+    /// The folder's `rando.toml`, when it has one.
+    pub meta: Option<meta::Meta>,
 }
 
 impl Built {
@@ -147,7 +150,7 @@ pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, V
         // A file did not parse: the checks still run on what did, so a mistake elsewhere is
         // not hidden behind the syntax error; what may be a cascade of it is left out.
         let mut all = read.errors;
-        if let Err(more) = build_model(&read.world, front::ENTRY) {
+        if let Err(more) = build_model(&read.world, &read.entry) {
             let more = front::merge_repeats(more, &read.templates);
             all.extend(more.into_iter().filter(|e| !cascade(e, broken)));
         }
@@ -158,12 +161,13 @@ pub fn build(files: &dyn front::Files, opts: &front::Options) -> Result<Built, V
     if !read.errors.is_empty() {
         return Err(read.errors);
     }
-    let mut built = build_model(&read.world, front::ENTRY)
+    let mut built = build_model(&read.world, &read.entry)
         .map_err(|e| front::merge_repeats(e, &read.templates))?;
     let mut warnings = read.warnings;
     warnings.append(&mut built.warnings);
     built.warnings = warnings;
     built.ledger = Some(read.ledger);
+    built.meta = read.meta;
     Ok(built)
 }
 

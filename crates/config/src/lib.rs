@@ -478,6 +478,14 @@ pub const WORLD_SOURCE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Most files (modules and table files) one world may read (a design value).
 pub const WORLD_MODULES_MAX: usize = 256;
 
+/// Largest `rando.toml`, bytes (design doc 19 section 2.2, a design value: a full one is under
+/// 1 KiB).
+pub const WORLD_TOML_MAX_BYTES: usize = 64 * 1024;
+
+/// Most files `rando.toml`'s `[assets] files` may list (design doc 19 section 2.3, a design
+/// value).
+pub const WORLD_ASSETS_MAX: usize = 64;
+
 /// Most declarations the families of one world may expand to, so a product of a few long
 /// lists cannot run away (a design value: the survey's largest family is a few thousand).
 pub const WORLD_FAMILY_MAX: usize = 100_000;

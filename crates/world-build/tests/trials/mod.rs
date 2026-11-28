@@ -35,15 +35,15 @@ fn read_all(dir: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Every folder in `tests/fixtures`, by name. Each must be a world (have a `world.rando`), so a
-/// misnamed entry file fails here instead of leaving its folder untested.
+/// Every folder in `tests/fixtures`, by name. Each must be a world (have a `rando.toml`), so a
+/// folder missing it fails here instead of leaving its folder untested.
 fn fixtures() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root(""))
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.is_dir())
         .map(|p| {
-            assert!(p.join("world.rando").is_file(), "{} has no world.rando", p.display());
+            assert!(p.join("rando.toml").is_file(), "{} has no rando.toml", p.display());
             p.file_name().unwrap().to_str().unwrap().to_owned()
         })
         .collect();
@@ -120,6 +120,7 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
     for name in names {
         let b = ok(&Dir(root(&name)));
         assert!(b.warnings.is_empty(), "{name}: {:?}", b.warnings);
+        assert_eq!(b.meta.as_ref().map(|m| m.name.as_str()), b.manifest["game"].as_str(), "{name}");
         // The committed ledger is what the build writes: no id moved.
         let committed = std::fs::read_to_string(root(&name).join("rando.lock"))
             .unwrap_or_else(|e| panic!("{name}/rando.lock: {e}"));

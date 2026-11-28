@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use world_build::front::{Dir, LEDGER, Options, format_text};
+use world_build::meta::FILE;
 use world_build::{Error, build};
 
 fn usage() -> ExitCode {
@@ -136,14 +137,15 @@ fn stamp(args: &[String]) -> ExitCode {
         }
     }
     let (Some(file), Some(tool)) = (file, tool) else { return usage() };
-    // The world's folder: the nearest folder above the file with an entry file.
+    // The world's folder: the nearest folder above the file with a `rando.toml` (or, until
+    // every world has one, a `world.rando`).
     let Some(root) = file
         .ancestors()
         .skip(1)
-        .find(|d| d.join(world_build::front::ENTRY).is_file())
+        .find(|d| d.join(FILE).is_file() || d.join(world_build::front::ENTRY).is_file())
         .map(Path::to_path_buf)
     else {
-        eprintln!("error: no folder above {} has a `world.rando`", file.display());
+        eprintln!("error: no folder above {} has a `rando.toml`", file.display());
         return ExitCode::FAILURE;
     };
     let folder = Dir(root);
@@ -197,7 +199,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let mut dir = PathBuf::from(".");
+    let mut dir = None::<PathBuf>;
     let (mut out, mut instance) = (None::<PathBuf>, None::<PathBuf>);
     let (mut opts, mut check_only) = (Options::default(), false);
     #[cfg(feature = "engine")]
@@ -228,9 +230,17 @@ fn main() -> ExitCode {
             "--publish" => opts.publish = true,
             "--check" => check_only = true,
             s if s.starts_with('-') => return usage(),
-            s => dir = PathBuf::from(s),
+            s => dir = Some(PathBuf::from(s)),
         }
     }
+    // A folder given must be the world; with none, walk up to the nearest `rando.toml`, as
+    // Cargo finds `Cargo.toml`.
+    let dir = dir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|c| c.ancestors().find(|d| d.join(FILE).is_file()).map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
     // A flag of one command given to another is a mistake, not something to ignore.
     if (gen_flags && verb != "generate")
         || (verb == "generate" && (instance.is_some() || check_only))
@@ -251,6 +261,16 @@ fn main() -> ExitCode {
         }
     };
     report(&built.warnings, "warning");
+    if built.meta.is_none() {
+        // shortcut: a folder with only `world.rando` is still a world; make this an error with
+        // the first portal release (design doc 19 section 8).
+        let world = built.manifest["game"].as_str().unwrap_or("my_world");
+        let version = built.manifest["version"].as_i64().unwrap_or(1);
+        eprintln!(
+            "warning: {} is missing; this folder is read as a world from `world.rando` for now. Add one, for example:\n[world]\nname = \"{world}\"\nversion = \"{version}.0.0\"",
+            dir.join(FILE).display()
+        );
+    }
     if opts.publish && !built.warnings.is_empty() {
         eprintln!("error: publishing refuses a world with warnings");
         return ExitCode::FAILURE;

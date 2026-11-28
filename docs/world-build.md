@@ -4,7 +4,9 @@ Turns a world written in the `.rando` language into the manifest JSON the fill e
 
 ## Write a world
 
-A world is a folder with an entry file `world.rando`, any modules it names with `use`, and the `rando.lock` the tool writes. The example world, "Tidewell Isle" (invented for the tests: 8 regions, 17 checks, 7 items, 4 options, two shuffles), is in `crates/world-build/tests/fixtures/tidewell/`. Its entry file starts:
+A world is a folder with a `rando.toml`, an entry file (`world.rando` unless `rando.toml` names another), any modules it names with `use`, and the `rando.lock` the tool writes.
+
+`rando.toml` (design doc 19 section 2) is the one fixed file name. It marks the folder (with no folder given, `rando` walks up from the current one to the nearest `rando.toml`, as Cargo does) and holds what is not game logic, in `[world]`: `name` (must equal the `world` line's game key), `version` (Semantic Versioning, build metadata refused), `entry` (default `world.rando`), `authors`, `license` (an SPDX expression), `description`, `icon`, `homepage`, `repository`, and `[assets] files`. Unknown keys are errors that name the key. `authors`, `license` and `description` are required by `rando pack`; `check` and `build` only warn when one is missing. A folder with only `world.rando` still builds, with a warning that shows a minimal `rando.toml`; that becomes an error with the first portal release. Limits: `config::WORLD_TOML_MAX_BYTES` (64 KiB), `config::WORLD_ASSETS_MAX` (64 files). Not checked yet: license identifiers against the SPDX list, and icon pixel sizes. The example world, "Tidewell Isle" (invented for the tests: 8 regions, 17 checks, 7 items, 4 options, two shuffles), is in `crates/world-build/tests/fixtures/tidewell/`. Its entry file starts:
 
 ```rando
 world tidewell_isle "Tidewell Isle" version 1
