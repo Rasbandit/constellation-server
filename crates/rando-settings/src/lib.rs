@@ -19,7 +19,7 @@ pub mod ast;
 // pub mod canon;
 pub mod check;
 // pub mod edit;
-// pub mod fmt;
+pub mod fmt;
 pub mod schema;
 #[cfg(test)]
 mod testdata;
