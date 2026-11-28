@@ -51,17 +51,23 @@ pub(crate) fn of(
         })
         .collect();
     // `nothing` is the engine's own filler, never a name an author declared. Copies that read
-    // options have no one number, so they are left out.
+    // options have no one number, and a fill-only item's count is the fill's, so both leave
+    // `copies` out; an item in `pool fill` is marked `filler`.
+    let fill: BTreeSet<&str> = model.fill_with.iter().map(|(k, _)| k.as_str()).collect();
     let items: Vec<Value> = model
         .items
         .iter()
         .filter(|(k, _, _)| k != NOTHING)
         .map(|(k, _, n)| {
-            if model.copies.contains_key(k) {
-                json!({"name": k})
-            } else {
-                json!({"name": k, "copies": n})
+            let filler = fill.contains(k.as_str());
+            let mut v = json!({"name": k});
+            if !model.copies.contains_key(k) && !(filler && *n == 0) {
+                v["copies"] = json!(n);
             }
+            if filler {
+                v["filler"] = json!(true);
+            }
+            v
         })
         .collect();
     // Every list holds objects, so an entry can gain keys within `schema/1`.

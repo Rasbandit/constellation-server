@@ -848,20 +848,22 @@ impl P<'_> {
         } else {
             None
         };
-        // A scope word on the same line (checked by the build), then the player-facing label.
-        let scope = if self.name_on_line() { Some(self.name("the scope")?) } else { None };
+        // The player-facing label, then a scope word on the same line (checked by the build),
+        // in doc 18 section 2.14's order.
         let label = if matches!(self.peek(), Some(Tok::Str(_))) {
             Some(self.string("the option's label")?)
         } else {
             None
         };
+        let scope = if self.name_on_line() { Some(self.name("the scope")?) } else { None };
+        if label.is_none() && scope.is_some() && matches!(self.peek(), Some(Tok::Str(_))) {
+            return Err((
+                self.here(),
+                "the label goes before the scope: write `= teal \"Lamp color\" cosmetic`".into(),
+            ));
+        }
         if self.name_on_line() {
-            let why = if label.is_some() {
-                "the scope goes before the label"
-            } else {
-                "an option takes one scope"
-            };
-            return Err((self.here(), format!("{why}, found {}", self.got())));
+            return Err((self.here(), format!("an option takes one scope, found {}", self.got())));
         }
         Ok(Decl::Option { name, ty: At::new(ty.v, ty_pos), values, range, default, scope, label })
     }

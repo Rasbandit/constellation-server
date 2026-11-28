@@ -262,6 +262,8 @@ fn the_adventure_trial_world_settings_schema_matches_the_golden_file() {
     assert_eq!(b.settings_schema().unwrap(), want, "{}", golden.display());
     assert!(want.contains("{\"name\":\"hut_door\"}"), "the shuffled doors are listed");
     assert!(want.contains("{\"name\":\"anvil\"}"), "places are objects");
+    // A fill-only item is marked filler, with no count: the fill decides how many.
+    assert!(want.contains("{\"filler\":true,\"name\":\"coin\"}"), "coin is filler");
 }
 
 /// An item whose copies read options has no `copies` in the schema: there is no one number.
@@ -272,7 +274,8 @@ fn the_settings_schema_leaves_out_copies_that_read_options() {
     let items = v["items"].as_array().unwrap();
     let shard = items.iter().find(|i| i["name"] == "ember_shard").cloned();
     assert_eq!(shard, Some(serde_json::json!({"name": "ember_shard"})));
-    assert!(items.iter().filter(|i| i["name"] != "ember_shard").all(|i| i["copies"].is_i64()));
+    let rest = items.iter().filter(|i| i["name"] != "ember_shard");
+    assert!(rest.into_iter().all(|i| i["copies"].is_i64() || i["filler"] == true), "{items:?}");
 }
 
 #[test]

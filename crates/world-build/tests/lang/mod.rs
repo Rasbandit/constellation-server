@@ -175,20 +175,22 @@ fn an_option_scope_word_is_checked() {
     let w = world("option a: toggle = off spicy\nregion a {\n  check c\n}");
     fails(&w, &format!("world.rando:{}:24", line(1)), "`spicy` is not an option scope");
     let ok_too =
-        world("option a: toggle cosmetic \"A\"\noption b: toggle\nregion a {\n  check c\n}");
+        world("option a: toggle \"A\" cosmetic\noption b: toggle\nregion a {\n  check c\n}");
     ok(&ok_too);
     // A plain name on the next line is not the option's scope.
     let next = world("option a: toggle\ncosmetic \"A\"\nregion a {\n  check c\n}");
     fails(&next, &format!("world.rando:{}:1", line(2)), "expected a declaration");
-    // The scope goes before the label, an option takes one scope, and a label is never empty.
-    let after = world("option a: toggle \"A\" cosmetic\nregion a {\n  check c\n}");
-    fails(&after, &format!("world.rando:{}:22", line(1)), "the scope goes before the label");
-    let two = world("option a: toggle cosmetic knowledge\nregion a {\n  check c\n}");
-    fails(&two, &format!("world.rando:{}:27", line(1)), "an option takes one scope");
+    // The label goes before the scope (doc 18 section 2.14), and the error shows the order; an
+    // option takes one scope, and a label is never empty.
+    let before = world("option a: toggle cosmetic \"A\"\nregion a {\n  check c\n}");
+    fails(&before, &format!("world.rando:{}:27", line(1)), "the label goes before the scope");
+    fails(&before, &format!("world.rando:{}:27", line(1)), "= teal \"Lamp color\" cosmetic");
+    let two = world("option a: toggle \"A\" cosmetic knowledge\nregion a {\n  check c\n}");
+    fails(&two, &format!("world.rando:{}:31", line(1)), "an option takes one scope");
     let empty = world("option a: toggle = off \"\"\nregion a {\n  check c\n}");
     fails(&empty, &format!("world.rando:{}:24", line(1)), "an option's label cannot be empty");
     // `fmt` keeps the scope and the label.
-    let text = "option c: choice(teal, amber) = teal cosmetic \"Lamp color\"\n";
+    let text = "option c: choice(teal, amber) = teal \"Lamp color\" cosmetic\n";
     assert_eq!(format_text(text, "m").unwrap(), text);
 }
 
