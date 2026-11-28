@@ -64,8 +64,10 @@ pub(crate) fn of(
             }
         })
         .collect();
-    let places: Vec<&Value> =
-        manifest["locations"].as_array().into_iter().flatten().map(|x| &x["key"]).collect();
+    // Every list holds objects, so an entry can gain keys within `schema/1`.
+    let named = |n: &Value| json!({"name": n});
+    let places: Vec<Value> =
+        manifest["locations"].as_array().into_iter().flatten().map(|x| named(&x["key"])).collect();
     let regions = manifest["regions"].as_array().into_iter().flatten();
     let doors: BTreeSet<&str> = regions
         .flat_map(|r| r["exits"].as_array().into_iter().flatten())
@@ -79,6 +81,6 @@ pub(crate) fn of(
         "items": items,
         "places": places,
         "strings": strings,
-        "doors": doors,
+        "doors": doors.into_iter().map(|d| named(&json!(d))).collect::<Vec<_>>(),
     }))
 }

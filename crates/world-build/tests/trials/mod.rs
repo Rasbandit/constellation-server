@@ -260,7 +260,8 @@ fn the_adventure_trial_world_settings_schema_matches_the_golden_file() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cinderfall.settings.json");
     let want = std::fs::read_to_string(&golden).unwrap_or_default();
     assert_eq!(b.settings_schema().unwrap(), want, "{}", golden.display());
-    assert!(want.contains("\"hut_door\""), "the shuffled doors are listed");
+    assert!(want.contains("{\"name\":\"hut_door\"}"), "the shuffled doors are listed");
+    assert!(want.contains("{\"name\":\"anvil\"}"), "places are objects");
 }
 
 /// An item whose copies read options has no `copies` in the schema: there is no one number.

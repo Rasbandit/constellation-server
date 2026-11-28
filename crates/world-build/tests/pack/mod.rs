@@ -466,7 +466,7 @@ fn the_settings_schema_keeps_option_scope_and_label() {
                 "opt.lamp_color.label": {"en": "Lamp color"},
                 "opt.n.label": {"en": "Count"},
             },
-            "items": [{"name": "k", "copies": 1}], "places": ["c"], "doors": [],
+            "items": [{"name": "k", "copies": 1}], "places": [{"name": "c"}], "doors": [],
         })
     );
     // Without `rando.toml` there is no name or version to put in it.
