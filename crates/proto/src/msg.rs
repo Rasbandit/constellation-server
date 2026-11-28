@@ -77,7 +77,7 @@ pub struct HintAsk {
     pub status: u8,
 }
 
-/// Ask for hints (the archived protocol plan section 2): scouts that create hints (free, found ones
+/// Ask for hints: scouts that create hints (free, found ones
 /// kept), and the `!hint` chat commands (new unfound hints cost points, found ones are shown
 /// but not kept).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,9 +8,8 @@
 //! there are more items to seat than places to seat them, which is a likely cause when an
 //! assumed fill of such a world needs repairs. It is a forward-fill notion (the first `j - 1`
 //! items held, where the assumed fill holds everything unplaced), so worlds under 1 can fill
-//! without any: the heavy synthetic profile reads 0.83 and never restarted on the bench. On 14
-//! converted worlds measured locally on 2026-11-26 (not reproducible from this repo) the three
-//! that needed restarts were the three under 1.
+//! without any: the heavy synthetic profile reads 0.83 and never restarted on the bench. A
+//! ratio under 1 is a signal to look at, not a verdict.
 
 use spec_rng::SpecRng;
 

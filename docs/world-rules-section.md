@@ -1,6 +1,6 @@
 # The rules section of a game package
 
-Internal to the engine and unstable (D-126): it may change in any release. Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions of the data-only world experiment, archived in the design repo, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). The package around it is the v2 package file (`seed_bundle::package::file_bytes` and `stored`, uncompressed so the sections are read in place); the game section inside it is still this crate's stand-in (below).
+Internal to the engine and unstable (D-126): it may change in any release. Status: implemented in `crates/data-fill` (`section.rs` compiles, `world.rs` loads and checks, `reach.rs` solves, `fold.rs` folds per seed, `decode.rs` reads back). It describes a binary form of the data manifest that `crates/data-fill` reads today as JSON (doc 07 shape plus the `x.` extensions, see #71), so that one world generation fits in under 1 MB of heap. It is written for section 2 (`SECTION_RULES`) of the per-game package in the seed bundle v2 design (#68) and uses the shared index types in `crates/bits` (`BitSet`, `Packed`, the LSB-first bit stream). The package around it is the v2 package file (`seed_bundle::package::file_bytes` and `stored`, uncompressed so the sections are read in place); the game section inside it is still this crate's stand-in (below).
 
 ## Two layers: authors and the machine
 
@@ -14,7 +14,7 @@ The compiler (`section::compile`) runs once per world version and is the only co
 
 ## Why: where a generation spends time and memory
 
-Measured on a large converted world on 2026-11-25 (the figures are not published here, since that world's source has no redistribution licence), with the JSON manifest as the engine read it then:
+When the engine read the JSON manifest directly, on a large world:
 
 1. **Memory: the JSON tree.** The manifest parsed into `serde_json::Value` was many times its text and was the whole engine peak; most of the text was location records whose names and types the engine never reads. The compiled world after it was a small fraction of that.
 2. **Memory: what stays.** After the inputs are dropped, the engine held compiled rule trees as boxed enums (most nodes behind their own allocation), key strings, key-to-index hash maps and the dependency index as one `Vec` per item. The fill itself was already small; the floor was the representation of the world.
@@ -138,7 +138,7 @@ The format makes a bad big-O impossible rather than unlikely:
 - **Group sums are counters**: "N of these items", weighted or not, costs O(groups the item is in) per collected item and O(1) per read in a solve, never a scan of the group.
 - **No name lookups at generation time**: every key is a dense index in the section; keys are resolved once per seed when the instance is bound (`Plan::new`), never in a solve.
 - **Per fill: O(progression items x per-solve cost)** for the assumed fill (at most one solve per placed progression item), plus O(locations) for the filler.
-- **Per group, no fresh solve.** The fill reaches each group's state from one solve by adding to it and taking the additions back (`Reach::mark`, `Reach::undo_to`): rules are monotone, so only additions follow a mark, and undoing them restores that fixed point value for value. Earlier engines (truth maintenance, a derivation log, a fresh solve per step) are in `git` history.
+- **Per group, no fresh solve.** The fill reaches each group's state from one solve by adding to it and taking the additions back (`Reach::mark`, `Reach::undo_to`): rules are monotone, so only additions follow a mark, and undoing them restores that fixed point value for value.
 
 ### Several players (a room)
 
@@ -154,9 +154,9 @@ The fill has one method, the exact (assumed) fill (D-138), on one path for every
 - **Rounds**: as in the reference multiplayer fill, progression is placed in rounds of one item per player (the last of each player's own pile of the shuffled pool, piles in the order players first appear), and a round is placed against a state that holds none of its items, which favours earlier locations; confined items go one at a time. With one player a round is one item. A round whose state does not reach a free location for each of its items is divided in halves, down to single items. An item that still has nowhere to go takes the location of a placed item that is reached without it, and that item is placed again against the state that has neither (the assumed fill's own step, so the seed is beatable for the same reason); at most `config::FILL_DISPLACE_TRIES` placed items are tried, spread over the order they were placed in, one fresh solve each, and a fill's repair (the moves' solves, one solve's worth for the pass over the rounds after each move, and one solve's worth per divided round) spends at most `config::FILL_REPAIR_EVALS` rule evaluations over all its attempts (a budget of work, the same on every machine). A room that fills without either is placed exactly as before these repairs. Only when a repair fails does the fill start over, at most `config::FILL_MAX_ATTEMPTS` times, and a restart orders each player's pile deepest first (`depth.rs`): one forward solve of the world alone adds, step by step, every copy that would open something, and the step is the copy's depth. That keeps a room of worlds where one key hides everything behind it from falling back to its start regions (issue 212), at a cost: shorter item chains and seeds further from uniform (counted on the bench), which is why it is only the recovery. Setup reports a world whose early capacity ratio (`data_fill::capacity`) is under 1: such a world leaves fewer places early on than items to seat, and leans on these repairs.
 - **Choices where the reference multiplayer fill has options**: one shared pool and one shuffled location list over all players; an item with a placement group stays in its owner's world and group; no progression on an excluded location; every player's goal must be reachable, and a location may be unreachable (see #92); local-item limits are open (#91).
 
-## Measured on the converted world
+## Measured
 
-The compiled section, then truth maintenance, cut fill time and engine peak heap by large factors against the tree-walking engine on the converted world (2026-11-25; figures not published here, for the licence reason above). Fills stayed byte-identical to the tree-walking engine on the recorded seeds (the `golden` example), and `port-check` passed every check. Current numbers on committed synthetic worlds come from the `bench-room` CI job (`docs/port-check.md`).
+Current numbers on committed synthetic worlds come from the `bench-room` CI job (`docs/port-check.md`).
 
 ## Prepared worlds
 
@@ -166,6 +166,6 @@ A stored world is prepared again from the stored manifest, by the generation tha
 
 ## What is not decided here
 
-- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. On the converted world the typed JSON instance alone fit the budget but was most of it.
+- Whether the per-seed instance (pool, existing locations, groups) also becomes a package or seed section, or keeps arriving as JSON. On a large world the typed JSON instance alone fits the budget but is most of it.
 - Whether the dependency index stays in the section. The converter computes it and the loader rebuilds it from the rules and refuses a section whose index differs (a missing reader would never be rechecked); the item group membership index is computed at load. `reach` is allowed in the goal only, by compiler and loader, so no index of region readers is needed.
 - Versioning: a change to any layout here bumps the header's format version; section 2 is listed as unstable in the v2 document until the first release.

@@ -9,10 +9,8 @@
 //! layer) holds with the whole pool.
 //!
 //! Two profiles: [`Shape::default`] (light: few sites, two time slices, short rules) and
-//! [`Shape::heavy`], whose counts per check follow the experiment's test world as counted in
-//! the data-only world experiment, archived in the design repo (1516 checks, 318 regions, 3685
-//! rule sites, 107 defs,
-//! 45 time slices, clocks as items).
+//! [`Shape::heavy`] (per check: about 0.21 regions, 2.4 rule sites and 0.07 defs, with 45 time
+//! slices and clocks as items: the shape of a large world with a day cycle).
 //!
 //! A third, [`Shape::wide`], is another kind of world: one region that holds every check, each
 //! behind a deep OR-of-AND tree over counts of items and sums of counts, so every rule reads
@@ -139,8 +137,8 @@ impl Default for Shape {
 }
 
 impl Shape {
-    /// The heavy profile: per check, the test world's counted regions (0.21), rule sites (2.4),
-    /// defs and events; its 45 time slices; clocks on.
+    /// The heavy profile: per check, about 0.21 regions and 2.4 rule sites, more defs and
+    /// events; 45 time slices; clocks on.
     #[must_use]
     pub fn heavy() -> Self {
         Shape {
@@ -1178,11 +1176,10 @@ mod tests {
         1 + rule.as_object().map_or(0, |o| o.values().map(inner).sum())
     }
 
-    /// The heavy profile against the test world's counts per check
-    /// (the data-only world experiment, archived in the design repo: 1516 checks, 318 regions,
-    /// 3685 rule sites, 107 defs, 45 slices), within a fifth; about 2.6 nodes per rule site.
+    /// The heavy profile against its target counts per check (about 0.21 regions, 2.43 rule
+    /// sites and 0.07 defs, 45 slices), within a fifth; about 2.6 nodes per rule site.
     #[test]
-    fn the_heavy_profile_has_the_test_worlds_counts_per_check() {
+    fn the_heavy_profile_has_its_target_counts_per_check() {
         let shape = Shape::heavy();
         let (m, inst) = world(&shape, 1, 0);
         let checks = inst.locations.len() as f64;
@@ -1197,11 +1194,11 @@ mod tests {
             }
         }
         let near = |got: f64, want: f64, what: &str| {
-            assert!((got / want - 1.0).abs() <= 0.2, "{what}: {got}, the test world has {want}");
+            assert!((got / want - 1.0).abs() <= 0.2, "{what}: {got}, the target is {want}");
         };
-        near(regions.len() as f64 / checks, 318.0 / 1516.0, "regions per check");
-        near(sites as f64 / checks, 3685.0 / 1516.0, "rule sites per check");
-        near(m["defs"].as_object().unwrap().len() as f64 / checks, 107.0 / 1516.0, "defs");
+        near(regions.len() as f64 / checks, 0.21, "regions per check");
+        near(sites as f64 / checks, 2.43, "rule sites per check");
+        near(m["defs"].as_object().unwrap().len() as f64 / checks, 0.07, "defs");
         near(size as f64 / sites as f64, 2.6, "nodes per rule site");
         assert_eq!(m["x.time"]["slices"], 45);
         assert!(m["x.time"]["owned"]["half_days"].as_array().unwrap().len() > 2, "clocks on");

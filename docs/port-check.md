@@ -9,7 +9,7 @@ Both are generic. The only world-specific code is a small Python adapter you wri
 
 ## What you need
 
-1. The manifest of your port (doc 07 shape plus the `x.` extensions of the data-only world experiment, archived in the design repo, see #71). Location and item keys in the manifest are the keys every exchange below uses.
+1. The manifest of your port (doc 07 shape plus the `x.` extensions, see #71). Location and item keys in the manifest are the keys every exchange below uses.
 2. A Python environment where the legacy world runs.
 3. An adapter file (next section). Keep it next to your world, not in this repository, if the legacy world's license does not allow redistribution.
 
@@ -141,7 +141,7 @@ target/release/port-check --manifest my_world.manifest.json \
 
 The fill has one method, the exact (assumed) fill (D-138), on one path at every room size and for confined items too: the room is solved once, then every group's state (a confined item, or a round) is reached by adding to that solve and taking the additions back (`room.rs`, `Steps::split`). A fresh solve of every group's state stays as a test-only cross-check (`room::fill_room_fresh`, feature `cross-check`). Same instance, seed and engine version give the same bytes; a new engine version may change them (D-140).
 
-Current numbers come from the `bench-room` CI job (`.github/workflows/bench.yml`): synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`), a light and a heavy profile (the heavy one shaped after a large converted world, with time slices and clocks on), release build, one thread; it runs on PRs labelled `perf` and on manual dispatch. The older carried and forward paths, their tables and the removed opt-in fill modes are in `git` history (this file before 2026-11-28).
+Current numbers come from the `bench-room` CI job (`.github/workflows/bench.yml`): synthetic worlds of 1,000 checks (`data_fill::synth`, `examples/synth_room.rs`), a light and a heavy profile (the heavy one with more regions and rules per check, time slices and clocks on), release build, one thread; it runs on PRs labelled `perf` and on manual dispatch.
 
 
 ## Fairness
