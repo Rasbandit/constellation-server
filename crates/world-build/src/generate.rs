@@ -144,7 +144,8 @@ impl<'b> Generator<'b> {
                 "rounds_divided": r.divided,
                 "items_moved": r.swaps,
                 "tight_players": r.tight_players,
-                "lowest_early_capacity": (r.capacity_milli != u32::MAX).then(|| f64::from(r.capacity_milli) / 1000.0),
+                // In thousandths, as the engine counts it: canonical JSON holds integers only.
+                "lowest_early_capacity_milli": (r.capacity_milli != u32::MAX).then_some(r.capacity_milli),
             },
         })
     }
@@ -283,7 +284,11 @@ pub fn spoiler_text(s: &Value) -> String {
             &mut out,
             format!(
                 "  warning: {} players' worlds have less room early on than progression to place (lowest early capacity {}); the fill leaned on repairs",
-                f["tight_players"], f["lowest_early_capacity"]
+                f["tight_players"],
+                f["lowest_early_capacity_milli"].as_u64().map_or_else(
+                    || "unknown".to_owned(),
+                    |m| format!("{}.{:03}", m / 1000, m % 1000)
+                )
             ),
         );
     }
