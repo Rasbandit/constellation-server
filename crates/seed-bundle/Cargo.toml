@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# Goes to the public repo: may depend on, and read files of, public crates only
+# (tools/public-boundary/check.sh).
+[package.metadata.rando]
+public = true
+
 [dependencies]
 # The one source of limits (the CLI uses the bundle cap).
 rando-limits = { path = "../rando-limits" }

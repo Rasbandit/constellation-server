@@ -13,6 +13,12 @@ categories.workspace = true
 
 # `no_std` with `alloc`, no IO, no unsafe (design doc 20 section 8.1, doc 05 section 6), so
 # `sdk-core` can embed it and it builds for WebAssembly. No engine and no world compiler.
+
+# Goes to the public repo: may depend on, and read files of, public crates only
+# (tools/public-boundary/check.sh).
+[package.metadata.rando]
+public = true
+
 [dependencies]
 # The caps of doc 20 section 7.1 (`Limits`), without `std`.
 rando-limits = { path = "../rando-limits" }

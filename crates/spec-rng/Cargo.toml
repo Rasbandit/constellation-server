@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# Goes to the public repo: may depend on, and read files of, public crates only
+# (tools/public-boundary/check.sh).
+[package.metadata.rando]
+public = true
+
 [dependencies]
 rand_chacha = { version = "0.10", default-features = false }
 hkdf = "0.13"

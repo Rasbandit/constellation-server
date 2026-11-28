@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# Goes to the public repo: may depend on, and read files of, public crates only
+# (tools/public-boundary/check.sh).
+[package.metadata.rando]
+public = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
