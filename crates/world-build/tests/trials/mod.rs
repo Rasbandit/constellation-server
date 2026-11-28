@@ -137,8 +137,66 @@ fn every_fixture_world_builds_clean_in_canonical_layout_and_fills_beatable() {
     }
 }
 
+/// What a world is at `options`, less the option values themselves: its per-seed instance (which
+/// checks exist, the pool, start items, where progression may go), and what its logic answers
+/// for fixed inventories (64 random ones, where inventory `t` holds each copy of a progression
+/// item of the pool with chance `t` in 65 by a seeded draw, so they run from nearly empty to
+/// nearly full, and every progression copy but one, once per item):
+/// which locations are reached and whether the goal holds. An option that changes a check, a
+/// rule, the pool, a start item or the goal changes some part; one that does nothing, none.
+fn logic(b: &Built, options: &HashMap<String, i64>) -> (serde_json::Value, Vec<(Vec<bool>, bool)>) {
+    let w = data_fill::World::load(&b.manifest).unwrap();
+    let inst = b.instance(options).unwrap();
+    let plan = data_fill::Plan::new(&w, &inst).unwrap();
+    let mut held: Vec<u16> = inst
+        .pool
+        .iter()
+        .filter(|i| inst.pool_class.get(*i).is_some_and(|c| c == "progression"))
+        .map(|i| w.item(i).unwrap())
+        .collect();
+    held.sort_unstable();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut inventories: Vec<Vec<u16>> = (1..=64u64)
+        .map(|t| {
+            let mut draw = |_: &u16| {
+                // xorshift: the same draws every run.
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % 65 < t
+            };
+            held.iter().copied().filter(|i| draw(i)).collect()
+        })
+        .collect();
+    // Everything but one copy of each item: where a count at the top (all four companions, the
+    // last shard) decides.
+    for k in 0..held.len() {
+        if k == 0 || held[k] != held[k - 1] {
+            let mut less = held.clone();
+            less.remove(k);
+            inventories.push(less);
+        }
+    }
+    // Fixed placements (`holds`) are collected where they sit.
+    let locked = plan.locked_placed(&w);
+    let answers = inventories
+        .iter()
+        .map(|extra| {
+            let r = plan.state(&w, extra, &locked);
+            let reached =
+                (0..u32::try_from(w.locations()).unwrap()).map(|l| r.reached(l)).collect();
+            (reached, r.goal())
+        })
+        .collect();
+    let mut seed = b.instance_json(options).unwrap();
+    seed.as_object_mut().unwrap().remove("options");
+    (seed, answers)
+}
+
 /// The genre examples at their defaults and at their options' ends, as an author writes them:
-/// each setting has the number of checks its README states, and fills beatable.
+/// each setting has the number of checks its README states, and fills beatable. Each option of a
+/// case, set alone, also changes what the world's logic answers ([`logic`]), so an option that
+/// changes only rules or the goal is caught doing nothing too.
 #[test]
 fn the_genre_examples_have_their_check_counts_and_fill_at_their_option_extremes() {
     let cases: &[(&str, &[(&str, &str)], usize)] = &[
@@ -168,6 +226,11 @@ fn the_genre_examples_have_their_check_counts_and_fill_at_their_option_extremes(
             pairs.iter().map(|(k, v)| ((*k).to_owned(), b.option_value(k, v).unwrap())).collect();
         assert_eq!(b.instance(&options).unwrap().locations.len(), *checks, "{name} {pairs:?}");
         fills(&b, &options, 10);
+        let default = logic(&b, &HashMap::new());
+        for (k, v) in *pairs {
+            let alone = HashMap::from([((*k).to_owned(), b.option_value(k, v).unwrap())]);
+            assert_ne!(logic(&b, &alone), default, "{name}: {k} = {v} changes nothing");
+        }
     }
 }
 

@@ -10,7 +10,7 @@ Conventions it shows:
 - **One map, joined both ways, with backtracking.** Zones lead into each other in several places (a cable from the airlock to the aqueduct, an underwater drift from the mines to the foundry), and many exits back need different gear than the way in (`collapsed_mine` up to `ore_hall` needs a climb).
 - **A one-way drop.** `ridge` falls into `collapsed_mine` with no exit back, and every exit out of the mine is gated. This is sound for the fill only because the game is assumed to have a warp back to the landing pad: the logic checks what is reachable from the start, not whether a player can walk out of where they are. A world whose game has no such warp must not write a one-way exit into a place it cannot leave.
 - **One location reached two ways.** `catwalk_ledge` is declared in `conveyor_loft` and again in `intake_lift` with `also`, each with its own rule.
-- **Trick difficulty that loosens logic.** `tricks` (`none`, `basic`, `advanced`) adds ways through inside the defs: a `match` in `can_climb_shaft`, and `can_wall_dash`, a def that only `advanced` makes true. The zones never read the option.
+- **Trick difficulty that loosens logic.** `tricks` (`none`, `basic`, `advanced`) adds ways through inside the defs: a `match` in `can_climb_shaft`, and `can_wall_dash` and `can_long_jump`, defs that only `advanced` makes true. The zones never read the option.
 - **A final door with a key and a count.** Each boss fires `boss_down`, and the reactor door needs the keycard and `counter(boss_down) >= opt.bosses_needed`.
 
 Invented: the world, its zones, rooms, gear and bosses.
