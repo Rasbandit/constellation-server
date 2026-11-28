@@ -1370,10 +1370,20 @@ impl X {
         self.world.shuffles.push(sh);
     }
 
+    /// Whether `name` is written in a file that did not parse, so its declaration may be in the
+    /// part that was lost: what the checks here would say about it may be a cascade. The one
+    /// filter every front-end check of a possibly lost name goes through.
+    fn lost(&self, name: &str) -> bool {
+        self.broken.contains(name)
+    }
+
     /// A check in several regions has exactly one plain declaration, and every repeat says
-    /// `also`, so a name copied by mistake is never merged. With `authored` (the names declared
-    /// before overlays applied) only what an overlay added is checked: a second plain one, or
-    /// `also` on a name nothing declared. Returns the names declared.
+    /// `also`, so a name copied by mistake is never merged. The rule is for the files as
+    /// written; overlays may reshape them freely after (remove the plain declaration, or every
+    /// declaration, and re-add repeats), so with `authored` (the names declared before
+    /// overlays applied) only what an overlay added is checked: a second plain one, or `also`
+    /// on a name nothing declared. Names written in a file that did not parse are skipped
+    /// ([`X::lost`]). Returns the names declared.
     fn check_also(&mut self, authored: Option<&HashSet<String>>) -> HashSet<String> {
         // Per name, one declaration per region in file order; a name a region declares twice
         // has its own error, and is left out here.
@@ -1393,7 +1403,9 @@ impl X {
                 ));
             }
         }
-        for (name, list) in decls.iter().filter(|(n, _)| !twice.contains(*n)) {
+        let skip: HashSet<&String> =
+            decls.keys().filter(|n| twice.contains(*n) || self.lost(n)).collect();
+        for (name, list) in decls.iter().filter(|(n, _)| !skip.contains(n)) {
             let plain: Vec<&(String, Pos, bool)> = list.iter().filter(|d| !d.2).collect();
             if let [(region, at, _), rest @ ..] = plain.as_slice() {
                 let file = self.paths.get(at.file as usize).cloned().unwrap_or_default();
@@ -1455,10 +1467,8 @@ impl X {
             };
             let found = self.overlay(&o);
             let lost = match target {
-                Target::Region(n) | Target::Def(n) | Target::Item(n) => self.broken.contains(&n.v),
-                Target::Check(r, c) | Target::Exit(r, c) => {
-                    self.broken.contains(&r.v) || self.broken.contains(&c.v)
-                }
+                Target::Region(n) | Target::Def(n) | Target::Item(n) => self.lost(&n.v),
+                Target::Check(r, c) | Target::Exit(r, c) => self.lost(&r.v) || self.lost(&c.v),
             };
             if !found && !lost {
                 self.errs.err(

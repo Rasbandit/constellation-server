@@ -725,9 +725,7 @@ mod delta2 {
             &format!("world.rando:{}:22", line(2)),
             "`also` goes right after the check's name",
         );
-        let all = errors(&world(
-            "region a {\n  check drop also\n  check drop\n}\nregion b {\n  check drop\n}",
-        ));
+        let all = errors(&world("region a {\n  check drop also\n  check drop\n}"));
         assert!(!all.iter().any(|e| e.contains("no other declaration of it lacks")), "{all:#?}");
     }
 }
@@ -761,5 +759,45 @@ mod examples {
                 .replace("  exit b\n}\nregion b", "  exit b\n  exit d\n}\nregion b")
                 .replace("  check b1: has(k)\n", "  check b1: has(k)\n  event lever: true\n"),
         ));
+    }
+}
+
+/// Round-3 delta review of PR 228, each failing first.
+mod delta3 {
+    use super::super::lang::mem;
+    use super::*;
+
+    /// A plain declaration in a file that did not parse is not reported as missing for the
+    /// `also` repeats elsewhere: the syntax error is the only error.
+    #[test]
+    fn also_whose_plain_declaration_did_not_parse_is_not_an_error() {
+        let files = mem(&[
+            (
+                "world.rando",
+                "world t\nuse rooms/a\nuse rooms/b\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n",
+            ),
+            (
+                "rooms/a.rando",
+                "region a {\n  check a0\n  exit b\n}\nregion q {\n  check x: has(\n}\n",
+            ),
+            ("rooms/b.rando", "region b {\n  check x also: has(k)\n  exit a\n}\n"),
+        ]);
+        let all = errors(&files);
+        assert!(!all.iter().any(|e| e.contains("marked `also`")), "{all:#?}");
+        assert!(all.iter().any(|e| e.starts_with("rooms/a.rando:")), "{all:#?}");
+    }
+
+    /// An overlay that adds `also` for a name nothing declares is an error at the overlay.
+    #[test]
+    fn an_overlay_also_on_an_undeclared_name_is_an_error() {
+        let files = mem(&[
+            (
+                "world.rando",
+                "world t\nuse base\nuse more\nstart a\nitem k progression\nitem junk filler\npool fill { junk 1 }\ngoal reach(a)\n",
+            ),
+            ("base.rando", "region a {\n  check a1\n}\n"),
+            ("more.rando", "use base\nextend region a {\n  check zz also\n}\n"),
+        ]);
+        fails(&files, "more.rando:3:9", "check `zz` is marked `also`");
     }
 }
