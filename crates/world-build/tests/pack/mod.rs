@@ -381,7 +381,7 @@ fn rando_toml_caps_are_limits_and_a_repeated_asset_is_refused() {
     };
     assert!(world_build::meta::parse(TOML, &d).is_ok());
     has(TOML, &config::Limits { world_name_max_bytes: 3, ..d }, "`world.name`");
-    for name in ["_", "__", "_9", "9a"] {
+    for name in ["_", "__", "_9", "a.b"] {
         has(
             &TOML.replace("name = \"tide\"", &format!("name = \"{name}\"")),
             &d,
@@ -410,4 +410,23 @@ fn the_package_lands_beside_rando_toml() {
     assert!(root.join("tide-1.2.0.randopack").is_file());
     assert!(!root.join("src/tide-1.2.0.randopack").exists());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `rando.toml`'s `name` is checked by the game-key rule of the `world` line (`-` and a
+/// leading digit allowed), not the identifier rule, so the two never disagree. The `.rando`
+/// world line cannot write such a key today (its key is an identifier token), so this is
+/// checked on `rando.toml` alone.
+#[test]
+fn rando_toml_name_follows_the_game_key_rule() {
+    for key in ["tide-well", "9lives", "tide"] {
+        let toml = TOML.replace("name = \"tide\"", &format!("name = \"{key}\""));
+        let m = world_build::meta::parse(&toml, &config::Limits::DESIGN)
+            .unwrap_or_else(|e| panic!("{key}: {e:#?}"));
+        assert_eq!(m.name, key);
+    }
+    for bad in ["Tide", "__", "tide well", "-9"] {
+        let toml = TOML.replace("name = \"tide\"", &format!("name = \"{bad}\""));
+        let e = world_build::meta::parse(&toml, &config::Limits::DESIGN).unwrap_err().join("\n");
+        assert!(e.contains("`world.name` is required"), "{bad}: {e}");
+    }
 }

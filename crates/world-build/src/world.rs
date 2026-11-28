@@ -184,13 +184,21 @@ pub(crate) struct Model {
 }
 
 /// The shape of a name the rule language can read: `[a-z_][a-z0-9_]*` with at least one
-/// letter, at most [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule, shared with
-/// `rando.toml`'s `name`.
+/// letter, at most [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for `.rando` identifiers.
 pub(crate) fn name_shape(s: &str) -> bool {
     s.len() <= config::MANIFEST_NAME_MAX_BYTES
         && s.bytes().any(|b| b.is_ascii_lowercase())
         && s.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A game key: lowercase letters, digits, `_` and `-`, with at least one letter, at most
+/// [`config::MANIFEST_NAME_MAX_BYTES`]. The one rule for the `world` line and `rando.toml`'s
+/// `name`; looser than [`name_shape`] on purpose, since a game key is never read in a rule.
+pub(crate) fn game_key_ok(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_lowercase())
+        && s.len() <= config::MANIFEST_NAME_MAX_BYTES
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// A name the rule language can read: [`name_shape`], not reserved.
@@ -379,13 +387,7 @@ fn check(w: &World, errs: &mut Errs) -> Option<(Value, Model)> {
     }
     let game = match &w.game {
         Some(g) => {
-            // At least one letter, as every name ([`name_shape`]).
-            let ok = g.v.bytes().any(|b| b.is_ascii_lowercase())
-                && g.v.len() <= config::MANIFEST_NAME_MAX_BYTES
-                && g.v.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
-                });
-            if !ok {
+            if !game_key_ok(&g.v) {
                 errs.err(
                     g.pos,
                     format!("`{}` is not a game key", g.v),
